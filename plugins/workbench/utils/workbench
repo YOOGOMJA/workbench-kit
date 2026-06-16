@@ -2,7 +2,17 @@
 # workbench 저장소 수준 도구. 사용법: utils/workbench setup
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve the workbench repo from the CWD (where the user invokes this), not from the
+# script's own location — when installed as a plugin, this script lives in the plugin
+# bundle while the workbench is the user's repo. (Mirrors utils/task's wb_root.)
+wb_root() {
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" \
+    || { echo "error: run inside a workbench git repo" >&2; exit 1; }
+  common="$(cd "$common" && pwd)"
+  dirname "$common"
+}
+ROOT="$(wb_root)"
 MANIFEST="$ROOT/codebases.yaml"
 
 cmd_setup() {

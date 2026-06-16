@@ -6,7 +6,12 @@ set -euo pipefail
 
 die() { echo "error: $*" >&2; exit 1; }
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve the workbench repo from the CWD (where the user runs `workbench docs …`),
+# not from the script's location — when installed as a plugin this script is in the
+# plugin bundle while docs/ live in the user's repo. (Mirrors utils/task's wb_root.)
+ROOT="$(git rev-parse --git-common-dir 2>/dev/null)" || die "run inside a workbench git repo"
+ROOT="$(cd "$ROOT" && pwd)"
+ROOT="$(dirname "$ROOT")"
 
 cmd_check() {
   command -v python3 >/dev/null 2>&1 || die "python3 required"

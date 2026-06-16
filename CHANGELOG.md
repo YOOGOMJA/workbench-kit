@@ -27,14 +27,29 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
 - **`AGENTS.core.md` (framework, fixed) + `AGENTS.overlay.md` (your persona)** split,
   composed into `AGENTS.md`. Framework content is English; `persona.language` governs
   operational output language.
-- **`scaffold/`** — what `generate-workbench` lays into a user repo (overlay defaults,
-  templates, `.github`, empty `docs/`, `codebases.yaml`).
-- **`tests/check-skill-frontmatter.sh`** — lint guarding against malformed SKILL.md
-  YAML frontmatter.
+- **`scaffold/`** (bundled in the `workbench-kit` plugin) — what `generate-workbench`
+  lays into a user repo: overlay defaults, `AGENTS.core.md`, templates, `.github`, empty
+  `docs/`, `codebases.yaml`.
+- **`tests/`** — `check-skill-frontmatter.sh` (malformed YAML frontmatter),
+  `check-install-model.sh` (engine utils target the caller repo, not the plugin bundle),
+  plus the engine `task-lifecycle.sh`.
 - **CI** (`.github/workflows/ci.yml`) — frontmatter lint, JSON manifest parse, version
-  sync, ShellCheck, engine lifecycle test, and a compose smoke test.
-- **Release tooling** — `RELEASING.md`, this changelog, `scripts/bump-version.sh`,
-  `scripts/check-version-sync.sh`.
+  sync, ShellCheck, engine lifecycle test, install-model test, compose smoke.
+- **Release tooling** — `AGENTS.md` (repo/dev guide), `RELEASING.md`, this changelog,
+  `scripts/release.sh` (one-shot), `scripts/bump-version.sh`, `scripts/check-version-sync.sh`.
+- **Auto-deploy** — `.github/workflows/release.yml` cuts the tag + GitHub Release
+  automatically when a version bump (matching a `CHANGELOG` section) lands on `main`. No
+  manual tagging.
+- **README** — generated-workbench structure diagram (EN/KO) and repo layout reflecting
+  scaffold bundled inside the bootstrap plugin; Codex install uses `codex plugin add`.
+
+### Fixed
+
+- **Installed-plugin execution model** (PR #1 review). The engine now operates on the
+  caller's workbench repo, not the plugin bundle: `scaffold/` (with `AGENTS.core.md`) moved
+  inside the `workbench-kit` plugin so it's packaged on install; `workbench setup` and
+  `workbench docs` resolve their root from the current repo (git) instead of the script's
+  own path.
 
 ### Known gaps
 

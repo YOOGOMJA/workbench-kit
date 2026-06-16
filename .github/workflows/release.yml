@@ -1,0 +1,52 @@
+name: Release
+
+# Auto-deploy: when main moves and the plugin version has a matching CHANGELOG section
+# that isn't tagged yet, cut the tag + GitHub Release. So releasing = bump version +
+# rename CHANGELOG [Unreleased] -> [X.Y.Z], merge to main. No manual tagging.
+# (Triggers only on branch push, so creating the tag/release does not re-trigger.)
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need existing tags
+
+      - name: Decide whether to release
+        id: rel
+        run: |
+          V="$(grep -m1 '"version"' plugins/workbench/.claude-plugin/plugin.json \
+                | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+          echo "version=$V"
+          if git rev-parse "v$V" >/dev/null 2>&1; then
+            echo "v$V already tagged — nothing to release"
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          awk -v v="$V" '
+            $0 ~ "^## \\["v"\\]" {p=1; next}
+            p && /^## \[/ {exit}
+            p {print}
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "no CHANGELOG [$V] section — treating as not-yet-released"
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "go=true" >> "$GITHUB_OUTPUT"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag + GitHub Release
+        if: steps.rel.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.rel.outputs.version }}" \
+            --target "$GITHUB_SHA" \
+            --title "v${{ steps.rel.outputs.version }}" \
+            --notes-file notes.md
