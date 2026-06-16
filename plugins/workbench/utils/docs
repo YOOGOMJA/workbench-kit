@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# docs-level plumbing. Judgment and grooming remain in the docs-lint skill.
+#
+#   docs check    deterministic docs link integrity check (read-only)
+set -euo pipefail
+
+die() { echo "error: $*" >&2; exit 1; }
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+cmd_check() {
+  command -v python3 >/dev/null 2>&1 || die "python3 required"
+  python3 - "$ROOT" <<'PY'
+import re
+import sys
+from pathlib import Path
+from urllib.parse import unquote
+
+root = Path(sys.argv[1])
+docs = root / "docs"
+errors = []
+checked = 0
+
+
+def rel(path):
+    return path.relative_to(root).as_posix()
+
+
+def error(path, line, message):
+    errors.append(f"ERROR {rel(path)}:{line}: {message}")
+
+
+if not docs.is_dir():
+    print(f"ERROR docs:0: docs directory not found")
+    sys.exit(1)
+
+md_files = sorted(docs.rglob("*.md"))
+stems = {}
+for path in md_files:
+    stems.setdefault(path.stem, []).append(path)
+
+
+def visible_line(line, in_fence):
+    if re.match(r"\s*```", line):
+        return "", not in_fence
+    if in_fence:
+        return "", in_fence
+    return re.sub(r"`[^`]*`", "", line), in_fence
+
+
+def markdown_target_exists(source, target):
+    target = target.strip()
+    if (
+        not target
+        or target.startswith("#")
+        or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target)
+    ):
+        return True
+
+    target = unquote(target.split("#", 1)[0])
+    if not target:
+        return True
+    path = (source.parent / target).resolve(strict=False)
+    return path.exists()
+
+
+def wiki_target_status(target):
+    target = target.split("|", 1)[0].split("#", 1)[0].strip()
+    if not target:
+        return True, ""
+
+    if "/" in target:
+        path = docs / target
+        if path.suffix == "":
+            path = path.with_suffix(".md")
+        return path.exists(), f"missing wikilink target [[{target}]]"
+
+    matches = stems.get(target, [])
+    if not matches and re.fullmatch(r"\d{4}", target):
+        matches = [path for path in md_files if path.stem.startswith(f"{target}-")]
+
+    if len(matches) == 1:
+        return True, ""
+    if len(matches) > 1:
+        names = ", ".join(rel(path) for path in matches)
+        return False, f"ambiguous wikilink target [[{target}]]: {names}"
+    return False, f"missing wikilink target [[{target}]]"
+
+
+index_files = [
+    docs / "index.md",
+    docs / "decisions" / "index.md",
+    docs / "lessons" / "index.md",
+    docs / "runbooks" / "index.md",
+]
+
+for path in index_files:
+    if not path.exists():
+        error(path, 0, "required index file missing")
+        continue
+    in_fence = False
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line, in_fence = visible_line(line, in_fence)
+        for match in re.finditer(r"(?<!!)\[[^\]]+\]\(([^)]+)\)", line):
+            checked += 1
+            target = match.group(1)
+            if not markdown_target_exists(path, target):
+                error(path, line_no, f"missing markdown link target ({target})")
+
+for path in md_files:
+    in_fence = False
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line, in_fence = visible_line(line, in_fence)
+        for match in re.finditer(r"\[\[([^\]]+)\]\]", line):
+            checked += 1
+            ok, message = wiki_target_status(match.group(1))
+            if not ok:
+                error(path, line_no, message)
+
+if errors:
+    print("\n".join(errors))
+    sys.exit(1)
+
+print(f"OK docs check: {len(md_files)} files, {checked} links")
+PY
+}
+
+case "${1:-}" in
+  check) shift; [ $# -eq 0 ] || die "usage: utils/docs check"; cmd_check ;;
+  *) echo "usage: utils/docs check" >&2; exit 1 ;;
+esac

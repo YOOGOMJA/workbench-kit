@@ -1,0 +1,5 @@
+# append-only 로그는 union 머지 — 병행 task가 같은 파일 끝에 append해도
+# 양쪽을 git이 자동 합쳐 충돌이 안 난다. 시간순 정렬은 보장하지 않으며,
+# 정렬·중복 정리는 docs-lint(로그 그루밍)가 맡는다.
+docs/log.md merge=union
+task/log.md merge=union

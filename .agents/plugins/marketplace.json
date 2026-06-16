@@ -1,0 +1,19 @@
+{
+  "name": "workbench-kit",
+  "plugins": [
+    {
+      "name": "workbench",
+      "source": { "source": "local", "path": "./plugins/workbench" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Development",
+      "description": "Engine — worktree/task isolation, incremental knowledge harvest, skill-driven lifecycle (@workbench:task-start …)."
+    },
+    {
+      "name": "workbench-kit",
+      "source": { "source": "local", "path": "./plugins/workbench-kit" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Development",
+      "description": "Bootstrap — interview for persona, then generate a minimal personalized workbench (@workbench-kit:generate-workbench)."
+    }
+  ]
+}

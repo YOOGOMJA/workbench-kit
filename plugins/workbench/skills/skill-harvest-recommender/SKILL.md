@@ -1,0 +1,146 @@
+---
+name: skill-harvest-recommender
+description: >-
+  Use to retrospect a just-finished (or finishing) session/task and surface procedures repeated by hand that could graduate into a skill, runbook, or utils script. Triggers on "anything from this work worth turning into a skill/automation?", "check what to graduate into tooling", "pull out automation candidates before submit", "let's retro this session", and similar requests that look back at work already done to find repeated patterns. Also fires alongside task-submit's knowledge-harvest gate. It only discovers, routes, and selects candidates; actual skill authoring is delegated to skill-creator/writing-skills and ticket creation to ticket-incubate. Distinct from the authoring stage (you already decided what to build) and from static-scan automation recommenders: this is the retrospective front-end.
+---
+
+# skill-harvest-recommender
+
+세션·task에서 *방금 한 작업*을 회고해, 반복될 완결 절차를 스킬(또는 runbook·
+utils)로 졸업시킬 후보를 찾아 추천한다. 워크벤치의 "작업은 휘발, 지식은 축적"을
+*절차* 축으로 확장한다 — 지식은 `docs/`로 harvest되지만, **반복 절차는 도구로
+졸업**해야 다음에 손으로 다시 하지 않는다.
+
+## 경계 — 무엇을 하고, 무엇을 안 하나
+
+이 스킬은 **추출·라우팅·선택**까지만 한다. 그 다음은 위임한다:
+
+- **티켓 생성** → `/ticket-incubate` (workbench repo-local 스킬, 4요소·승인
+  게이트·priority·가드의 단일 출처). 여기서 티켓 규칙을 재구현하지 않는다.
+- **스킬 저작** → 그 티켓이 `/task-start`로 착수된 *뒤* task 안에서, **현재
+  에이전트 환경의 스킬 저작 도구**가 한다 (예: Claude Code의 `skill-creator`·
+  `superpowers:writing-skills`·`harness`). 이들은 repo-local이 아닌 도구 측
+  스킬이라 환경마다 다를 수 있으니 이름을 고정 의존하지 말고, 가용한 저작
+  경로를 쓴다.
+
+왜 직접 안 짓나: "스킬을 만든다"는 것 자체가 ticket → task → PR을 거쳐야 할
+*작업*이다. 회고 세션에서 즉석 저작하면 워크벤치 수명주기를 우회하게 된다.
+이 스킬의 산출물은 **잘 라우팅된 후보 목록**이지 새 파일이 아니다.
+
+## 핵심 신호 — orchestration gap
+
+후보를 고르는 신호는 "이거 반복될까?"라는 *추측*이 아니다. 추측은 헐렁하다 —
+무엇이든 반복될 *가능성*은 있어 노이즈가 폭발한다. 대신 **관찰 가능한 구조**를
+본다:
+
+> **어떤 행동에 (도구 ∨ 문서화된 정책)은 이미 있는데, 그걸 수행하는 스킬
+> 진입점이 없다.**
+
+이게 강한 이유: 누군가 그 행동을 위해 *도구를 만들고 정책을 적은 순간*, 그
+행동은 이미 "의도된 반복 작업"으로 설계에 박힌 것이다. 반복성을 추측하는 대신
+**시스템이 이미 그 반복에 투자했다는 증거**를 읽는다. N=1이어도 반복 의도는
+이미 존재한다. 그리고 이건 워크벤치 원칙 "에이전트의 진입점은 항상 스킬"과
+포개진다 — 배관·정책은 있는데 스킬 진입점이 없는 연산은 정의상 **에이전트
+표면의 구멍**이다.
+
+이 신호는 절제도 공짜로 준다: 도구·정책조차 없으면 갭 자체가 없어, 추측성
+조기 도구화는 애초에 후보로 잡히지 않는다.
+
+## 흐름
+
+### 1. 회고 스캔 — raw 후보 모으기
+
+이번 세션·task에서 한 일을 훑어 "절차"로 보이는 것을 모은다. 무엇을 읽나:
+
+- **`task/log.md`가 1순위.** 항목이 `op·action·path` 타입드 레코드라 사실상
+  "무슨 절차가 어떤 순서로 일어났나"의 기계 추적이다 — 절차 신호의 최적 출처.
+- **브랜치 git diff** — 무엇이 바뀌었나(어떤 파일·도구를 손댔나).
+- **세션 대화 맥락** — log에 안 남은 수동 단계·판단.
+
+여기서 다음 신호를 집는다:
+
+- 내가 **배관(`utils/...`)을 직접·수동으로 호출**한 지점 (스킬 진입점이 없어서).
+- 같은 종류의 단계 묶음을 **한 세션에 두 번 이상** 반복한 곳.
+- CLAUDE.md·docs/ 정책을 참조해 손으로 따라간 절차.
+- 도중에 **실수·되돌림**이 난 절차(진입점이 있었다면 막혔을 것).
+
+아직 거르지 않는다 — 일단 모은다.
+
+### 2. 사전 필터 — 결정 필요한 것만 남긴다
+
+사람에게 보여줄 건 *판단이 필요한 후보*뿐이다. 다음은 **조용히 드롭**한다
+(리스트에 올리지 않는다):
+
+- **이미 기존 skill/lesson/runbook이 소유한 것** — 중복. 이건 *멤버십 확인*일
+  뿐이니 가볍게 본다: `skills/` 디렉토리 목록 + `docs/decisions/index.md`·
+  `docs/lessons/index.md`·`docs/runbooks/index.md`의 앵커 표를 직접 스캔한다.
+  그 index 표가 바로 이 용도(소비 표면)다. `docs-query`(합성·판단까지 하는
+  무거운 스킬)는 여기서 부르지 않는다 — "이미 정했나/망했나"의 깊은 가드는
+  어차피 핸드오프 대상인 `/ticket-incubate`가 내부에서 돌리므로 중복이다.
+- **절차가 아닌 것** — 버그·일회성 사건은 이 스킬의 대상이 아니다. (버그는
+  후속 티켓감, 교훈은 lesson감 — 둘 다 *스킬*이 아니다.)
+
+이 필터가 핵심 가치다. 잘 만든 회고는 "만들 거 5개"가 아니라 "만들 거 0~1개,
+나머지는 이미 있거나 스킬감 아님"을 빠르게 말해준다. 소비(=결정 필요)가
+출력을 카빙한다.
+
+### 3. 갭 유형 라우팅 — 무엇으로 졸업하나
+
+남은 후보마다 갭의 *모양*을 보고 졸업 대상을 정한다:
+
+| 갭의 모양 | 졸업 대상 | 근거 |
+|---|---|---|
+| 배관·정책 있는데 **에이전트 진입점 없음** | **skill** | 진입점이 비었다 |
+| **판단이 무거운 관습**(매번 사람 판단 필요) | **runbook**(산문) | 기계화 불가, 읽고 따르는 글 |
+| 진입점은 있는데 **배관이 없어 매번 손으로** | **utils 스크립트** | 결정성 있는 반복 → 배관 |
+| 일회성·버그·맥락의존 | **드롭 / 후속 티켓** | 졸업 대상 아님 |
+
+skill과 runbook의 경계가 헷갈리면: *기계적으로 같은 단계를 밟나*(→skill) vs
+*매번 판단이 갈리나*(→runbook)를 묻는다.
+
+### 4. 표면화 — 후보와 라우팅을 보여준다
+
+남은 후보를 표로 제시한다. 각 후보에 **갭 증거**(어떤 도구·정책이 있고 어떤
+진입점이 없는지)와 **라우팅 판정**을 단다. 후보가 없으면 그렇다고 정직하게
+말한다 — "이번 세션에선 졸업할 절차 없음"도 가치 있는 결론이다.
+
+후보가 충분하면(여러 개) 사용자에게 **무엇을 만들지 선택**하게 한다.
+
+### 5. 핸드오프 — 선택분을 /ticket-incubate로
+
+선택된 후보마다 `/ticket-incubate`를 **순차 호출**한다 (한 후보 = 한 incubate
+세션). 각 후보의 갭 증거를 incubate의 배경 씨앗으로 넘긴다. 티켓의 4요소·승인
+게이트·priority 제안·가드는 전부 ticket-incubate이 소유하므로, 여기서 다시
+쓰지 않는다.
+
+한 호출에서 여러 후보가 나왔다면, ticket-incubate의 "한 호출 = 한 티켓"을
+존중해 **하나씩** 부화시킨다. 사용자가 첫 후보만 하고 나머지는 나중에 하겠다면,
+나머지는 첫 티켓의 `## 남은 조각` 마커로 보관하도록 ticket-incubate에 맡긴다.
+
+## task-submit 연계
+
+`task-submit`은 **지식 harvest 게이트**(docs/에 무엇이 살아남나)를 가진다.
+이 스킬은 그 옆에 **절차 졸업 게이트**(무엇이 도구로 졸업하나)를 더한다. 즉
+task를 마칠 때 두 축을 같이 점검한다 — *지식*은 `docs/`로, *절차*는 도구로.
+task-submit이 이 점검을 제안으로 부르되, 실행·선택은 사람 게이트를 거친다.
+
+## 예시 — 이 스킬을 만든 세션에 도그푸딩
+
+> 출처: workbench#37 / 2026-06. 예시는 역사적·예시용이다 — "절제가 가치"를
+> 보여주는 구체 사례지 load-bearing 규칙이 아니다.
+
+워크벤치#37(timetree-extractor를 관리 codebase로 등록) 세션을 이 스킬로 회고하면:
+
+- raw 후보 5건이 잡힌다: codebase 등록 / task 전체 lifecycle / lifecycle 버그 /
+  머지 후 처분 / main 오염 복구.
+- **사전 필터**가 4건을 조용히 드롭: lifecycle은 이미 `/task-*` 스킬 소유,
+  main 오염은 이미 `worktree-cwd-contamination` lesson, lifecycle 버그는 절차가
+  아닌 버그, 머지 후 처분은 `task-done` 궤도.
+- **남는 실후보 1건**: "외부 repo를 관리 codebase로 등록". 갭 증거 —
+  배관(`workbench setup`, `codebases.yaml`)·정책(CLAUDE.md 용어집·이름
+  규칙)은 있는데 진입점 스킬 없음, 실제로 수동 수행 중 main 오염. **라우팅:
+  skill**.
+- → `/ticket-incubate`로 넘겨 `codebase-onboard` 스킬 티켓이 된다.
+
+5건 중 4드롭·1실후보. **절제가 곧 가치**임을, 그리고 "전부 스킬로"가 아니라
+**라우팅 판단**이 본질임을 보여준다.

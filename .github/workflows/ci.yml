@@ -1,0 +1,51 @@
+name: CI
+
+# kit-self CI. (scaffold/.github is what generate lays into user repos — different thing.)
+# Authoritative plugin validation is `claude plugin validate`, but that needs the Claude
+# Code CLI + auth, so it stays a local/manual gate. These checks are dependency-light and
+# cover the failure modes we've actually hit.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skill frontmatter lint
+        run: bash tests/check-skill-frontmatter.sh
+
+      - name: Manifests parse as JSON
+        run: |
+          rc=0
+          while IFS= read -r f; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" \
+              || { echo "invalid JSON: $f"; rc=1; }
+          done < <(find . -path ./.git -prune -o \( -name plugin.json -o -name marketplace.json \) -print)
+          exit $rc
+
+      - name: Plugin version sync
+        run: bash scripts/check-version-sync.sh
+
+      - name: ShellCheck
+        run: |
+          files=$(find . -path ./.git -prune -o -name '*.sh' -print)
+          shellcheck -S error $files
+
+      - name: Engine lifecycle test
+        run: bash plugins/workbench/tests/task-lifecycle.sh
+
+      - name: Compose smoke test
+        # generate-workbench's bundled compose.sh self-verifies; a non-zero exit fails CI.
+        run: |
+          mkdir -p /tmp/persona
+          printf '## Language\n- Operational output language: **English**.\n' > /tmp/persona/overlay.md
+          bash plugins/workbench-kit/skills/generate-workbench/scripts/compose.sh \
+            --persona  /tmp/persona \
+            --core     plugins/workbench/AGENTS.core.md \
+            --scaffold scaffold \
+            --out      /tmp/generated-workbench

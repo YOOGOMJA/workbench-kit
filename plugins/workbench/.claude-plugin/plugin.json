@@ -1,0 +1,9 @@
+{
+  "name": "workbench",
+  "description": "Tool-neutral agent workbench engine — worktree/task isolation, incremental knowledge harvest, skill-driven lifecycle. Bring your own rules.",
+  "version": "0.1.0",
+  "author": { "name": "YOOGOMJA" },
+  "homepage": "https://github.com/YOOGOMJA/workbench-kit",
+  "repository": "https://github.com/YOOGOMJA/workbench-kit",
+  "license": "MIT"
+}
