@@ -1,6 +1,7 @@
 ---
 name: codebase-onboard
-description: 외부 git repo를 workbench가 관리하는 codebase로 **온보딩**(등록)할 때 사용. "이 repo를 workbench에서 관리하자/추가하자", "<owner/repo>를 작업 대상으로 등록해줘", "codebases.yaml에 넣고 clone해줘", 또는 이슈 번호 없이 "워크벤치에서 이 프로젝트 다루고 싶다"처럼 *새 codebase를 workbench 관리 대상으로 들이려는* 요청에 발동한다. `codebases.yaml` 매니페스트 등록 → `workbench setup` clone → 검증 → 정책(이름·`role:reference`) 안내를, main 오염 없이 task 브랜치 경유 정본 경로로 오케스트레이션한다. 구분: `/task-start`(이슈 착수)·`workbench task add-repo`(이미 등록된 codebase를 *현재 task에* 워크트리로 붙이기)와 다르다 — 이 스킬은 그 *앞단*, repo를 workbench에 처음 들이는 등록 단계다. 배관(setup·add-repo)은 이미 있으니 새로 만들지 않고 절차만 엮는다.
+description: >-
+  외부 git repo를 workbench가 관리하는 codebase로 **온보딩**(등록)할 때 사용. "이 repo를 workbench에서 관리하자/추가하자", "<owner/repo>를 작업 대상으로 등록해줘", "codebases.yaml에 넣고 clone해줘", 또는 이슈 번호 없이 "워크벤치에서 이 프로젝트 다루고 싶다"처럼 *새 codebase를 workbench 관리 대상으로 들이려는* 요청에 발동한다. `codebases.yaml` 매니페스트 등록 → `workbench setup` clone → 검증 → 정책(이름·`role:reference`) 안내를, main 오염 없이 task 브랜치 경유 정본 경로로 오케스트레이션한다. 구분: `/task-start`(이슈 착수)·`workbench task add-repo`(이미 등록된 codebase를 *현재 task에* 워크트리로 붙이기)와 다르다 — 이 스킬은 그 *앞단*, repo를 workbench에 처음 들이는 등록 단계다. 배관(setup·add-repo)은 이미 있으니 새로 만들지 않고 절차만 엮는다.
 ---
 
 # codebase-onboard
