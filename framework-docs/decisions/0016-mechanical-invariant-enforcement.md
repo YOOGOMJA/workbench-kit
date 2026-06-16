@@ -1,0 +1,11 @@
+## 결정: 기계적 불변식의 강제 방식
+- 상태: 채택
+- 선택: 인지적 가드는 에이전트 판단으로 유지하고, log-커밋 정합성·status 신선도·push 상태 같은 기계적 불변식은 `utils/task commit`과 `utils/task check`가 강제한다.
+- 맥락: task #5에서 log 누락, status stale, 미push 상태가 에이전트 판단에만 맡겨져 이탈했다. 0004의 "훅 없이" 결정은 "이미 정했나/망했나" 같은 인지적 가드에는 맞지만, git과 파일 상태로 판정 가능한 불변식까지 사람·에이전트 기억에 맡길 이유는 없다.
+- 이유: 기계적으로 판정 가능한 규칙은 배관이 한 곳에서 검사해야 수정 지점이 하나가 된다. `utils/task commit`은 log append·commit·push를 한 동작으로 묶어 이중 기입을 줄이고, `utils/task check`는 raw commit 우회, status stale, ahead, index frontmatter, wikilink 문제를 read-only로 검사한다. `task/log.md`는 0012에 따라 추적+union merge를 유지해 실패 교훈과 막다른 길의 서사를 보존한다.
+- 기각한 대안: ① 모든 가드를 훅으로 강제 → 0004의 하네스 중립 경계를 흐리고, 인지적 결정 순간을 정확히 잡지 못한다. ② log를 커밋 트레일러로만 싣고 `task/log.md`를 submit 시 파생 → 파일 변경 없는 탐색·폐기 결정·실패 교훈을 빈 커밋 없이는 잃기 쉽다. ③ 기존 "log append + commit + push"를 절차로만 유지 → #5에서 관측된 이탈을 다시 허용한다.
+- 출처: task#12 / 2026-06-13
+- 관계:
+  - extends [[0004-guard-without-hooks]]
+  - extends [[0012-append-only-log-union-merge]]
+- 참조: [[workbench-knowledge-ecosystem]]

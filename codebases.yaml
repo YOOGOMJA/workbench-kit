@@ -1,0 +1,7 @@
+# 작업 대상 프로젝트 매니페스트
+# 형식: <name>: <git-url>   (name은 codebases/<name>으로 clone됨, 순수 숫자 불가)
+#
+# 예시:
+#   my-app: git@github.com:user/my-app.git
+#
+# 추가 후 `utils/workbench setup`을 실행하면 일괄 clone된다.

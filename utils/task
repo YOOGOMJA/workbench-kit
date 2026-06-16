@@ -1,0 +1,962 @@
+#!/usr/bin/env bash
+# task 생애주기의 배관(plumbing). 규칙과 용어는 CLAUDE.md 참고.
+# 에이전트의 진입점은 스킬(/task-start 등)이며, 이 스크립트는 상태 전이만
+# 한다 — 독자가 읽을 산문(PR 제목·본문 등)은 입력으로만 받는다.
+#
+#   task start <ID> [slug] [--parent N]    task 시작 (워크트리 + 스캐폴드)
+#   task add-repo <name> [--ref <base>] [--role work|reference]
+#   task resume <ID>                       다른 기기에서 task 재구성
+#   task submit --title <t> --body-file <f>   task/ cleanup 커밋 + push + PR
+#   task done <ID> [--force]               워크트리·브랜치 정리 (티켓은 건드리지 않음)
+#   task commit <op> <action> [path] -m <subject> [-m <body>] [--no-push]
+#                                          log append + commit(+#issue) + push
+#   task check                             기계적 불변식 검사 (read-only, 정상 무음)
+#   task status                            모든 task 현황 구조화 출력 (read-only)
+#   task tickets                           열린 workbench 이슈의 task/lifecycle 사실 출력 (read-only)
+#
+# ID: workbench 이슈는 `42`, codebase 이슈는 `my-app#42`
+set -euo pipefail
+
+die() { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+# ── 공통 ──────────────────────────────────────────────────────────────
+
+# workbench main checkout의 절대 경로 (어느 워크트리에서 불려도 동일)
+wb_root() {
+  local common
+  common="$(git rev-parse --git-common-dir)"
+  common="$(cd "$common" && pwd)"
+  dirname "$common"
+}
+
+# 분기·비교의 정본 base. 로컬 main은 다른 task 머지 뒤 자동 갱신되지 않아
+# 낡을 수 있으므로, 원격 추적 ref(origin/main)가 있으면 그걸 base로 쓴다.
+# origin/main은 task-start의 fetch로 갱신되어 로컬 main보다 신선하다.
+# 원격이 없으면(오프라인·fresh clone) 로컬 main으로 폴백한다.
+main_ref() {
+  local dir="$1"
+  if git -C "$dir" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+    echo origin/main
+  else
+    echo main
+  fi
+}
+
+# "repo#42" 또는 "42" → HOME_REPO, ISSUE 전역 변수 설정
+parse_id() {
+  local id="$1"
+  case "$id" in
+    *'#'*) HOME_REPO="${id%%#*}"; ISSUE="${id##*#}" ;;
+    *)     HOME_REPO="";          ISSUE="$id" ;;
+  esac
+  echo "$ISSUE" | grep -Eq '^[0-9]+$' || die "잘못된 ID: $id (이슈 번호가 숫자가 아님)"
+  if [ -n "$HOME_REPO" ]; then
+    if echo "$HOME_REPO" | grep -Eq '^[0-9]+$'; then
+      die "repo 이름은 순수 숫자 불가: $HOME_REPO"
+    fi
+  fi
+}
+
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -d- -f1-4
+}
+
+branch_to_dir() { echo "${1//\//__}"; }
+
+utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+safe_field() {
+  printf '%s' "$1" | tr '[:space:]' '_'
+}
+
+actor_id() {
+  local root="$1" actor
+  actor="$(git -C "$root" config user.email 2>/dev/null || true)"
+  [ -n "$actor" ] || actor="$(git -C "$root" config user.name 2>/dev/null || true)"
+  [ -n "$actor" ] || actor="$(whoami 2>/dev/null || echo unknown)"
+  safe_field "$actor"
+}
+
+lifecycle_issue_dir() {
+  local root="$1" home="$2" wbname
+  # home은 codebase 이슈일 때만 .codebases/<home>로 푼다. workbench 이슈는
+  # 이름 규칙상 home이 비어야 정상이지만, 누군가 home에 워크벤치 자기 이름
+  # (origin repo명)을 채우면 없는 .codebases/<workbench>를 찾아 emit이 실패한다.
+  # 빈 값과 워크벤치 자기 이름을 모두 root로 방어적으로 해석한다.
+  wbname="$(basename "$(git -C "$root" remote get-url origin 2>/dev/null || echo "$root")" .git)"
+  if [ -n "$home" ] && [ "$home" != "$wbname" ]; then
+    printf '%s/.codebases/%s\n' "$root" "$home"
+  else
+    printf '%s\n' "$root"
+  fi
+}
+
+make_claim_id() {
+  local branch="$1"
+  printf '%s-%s-%s\n' "$(branch_to_dir "$branch")" "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
+}
+
+lifecycle_emit() {
+  local root="$1" home="$2" issue="$3" event="$4" claim_id="$5" branch="$6" pr="${7:--}"
+  local dir body_file home_field pr_field
+  dir="$(lifecycle_issue_dir "$root" "$home")"
+  [ -d "$dir" ] || { echo "error: lifecycle issue repo 없음: $dir" >&2; return 1; }
+  home_field="${home:--}"
+  pr_field="${pr:--}"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/workbench-task-lifecycle.XXXXXX")"
+  cat > "$body_file" <<EOF
+<!-- workbench-task-lifecycle:v1 event=$(safe_field "$event") claim_id=$(safe_field "$claim_id") issue=$(safe_field "$issue") home=$(safe_field "$home_field") branch=$(safe_field "$branch") pr=$(safe_field "$pr_field") actor=$(actor_id "$root") tool=utils/task at=$(utc_now) -->
+workbench task lifecycle: $(safe_field "$event") \`$branch\`
+EOF
+  if ! (cd "$dir" && gh issue comment "$issue" --body-file "$body_file") >/dev/null; then
+    rm -f "$body_file"
+    return 1
+  fi
+  rm -f "$body_file"
+}
+
+lifecycle_emit_optional() {
+  local event="$4"
+  if ! lifecycle_emit "$@"; then
+    echo "warn: lifecycle event 기록 실패: $event" >&2
+  fi
+}
+
+lifecycle_markers_for_issue() {
+  local root="$1" home="$2" issue="$3" dir
+  dir="$(lifecycle_issue_dir "$root" "$home")"
+  [ -d "$dir" ] || return 0
+  (cd "$dir" && gh issue view "$issue" --json comments --jq '.comments[].body' 2>/dev/null) \
+    | grep 'workbench-task-lifecycle:v1' || true
+}
+
+lifecycle_field() {
+  local line="$1" key="$2"
+  printf '%s\n' "$line" | tr ' ' '\n' | sed -n "s/^$key=//p" | head -1 | sed 's/-->$//'
+}
+
+lifecycle_latest_for_branch() {
+  local root="$1" home="$2" issue="$3" branch="$4"
+  lifecycle_markers_for_issue "$root" "$home" "$issue" \
+    | awk -v wanted="$branch" '
+        {
+          matched=0
+          n=split($0, fields, /[[:space:]]+/)
+          for (i = 1; i <= n; i++) {
+            if (fields[i] ~ /^branch=/) {
+              value=substr(fields[i], 8)
+              sub(/-->$/, "", value)
+              if (value == wanted) matched=1
+            }
+          }
+          if (matched) line=$0
+        }
+        END { if (line) print line }
+      '
+}
+
+lifecycle_latest_for_issue() {
+  local root="$1" home="$2" issue="$3"
+  lifecycle_markers_for_issue "$root" "$home" "$issue" \
+    | awk '{ line=$0 } END { if (line) print line }'
+}
+
+lifecycle_claim_for_branch() {
+  local root="$1" home="$2" issue="$3" branch="$4" latest claim_id
+  latest="$(lifecycle_latest_for_branch "$root" "$home" "$issue" "$branch")"
+  claim_id="$(lifecycle_field "$latest" claim_id)"
+  printf '%s\n' "${claim_id:-$branch}"
+}
+
+pr_number_from_url() {
+  local pr_url="$1" pr
+  pr="${pr_url##*/}"
+  case "$pr" in
+    ''|*[!0-9]*) printf '%s\n' '-' ;;
+    *) printf '%s\n' "$pr" ;;
+  esac
+}
+
+# 현재 위치가 task 워크트리인지 확인하고 TASK_DIR 설정
+require_task_worktree() {
+  TASK_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || die "git 저장소가 아님"
+  case "$TASK_DIR" in
+    */.worktrees/*) : ;;
+    *) die "task 워크트리 안에서 실행해야 한다 (.worktrees/ 하위가 아님)" ;;
+  esac
+}
+
+index_get() { # index_get <key> — frontmatter에서 값 읽기
+  sed -n '/^---$/,/^---$/p' "$TASK_DIR/task/index.md" | sed -n "s/^$1: *//p" | head -1
+}
+
+repos_block() {
+  [ -f "$TASK_DIR/task/index.md" ] || return 0
+  sed -n '/<!-- repos:begin -->/,/<!-- repos:end -->/p' "$TASK_DIR/task/index.md" | grep '^- ' || true
+}
+
+repos_append() {
+  local line="$1" f="$TASK_DIR/task/index.md"
+  awk -v line="$line" '/<!-- repos:end -->/ { print line } { print }' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+task_remote_branches() {
+  local root="$1" remote_set
+  if remote_set="$(git -C "$root" ls-remote --heads origin 'refs/heads/task/*' 2>/dev/null)"; then
+    printf '%s\n' "$remote_set" | sed 's#.*refs/heads/##'
+  else
+    git -C "$root" for-each-ref --format='%(refname:short)' \
+      refs/remotes/origin/task/ 2>/dev/null | sed 's#^origin/##'
+  fi
+}
+
+task_known_branches() {
+  local root="$1"
+  {
+    git -C "$root" for-each-ref --format='%(refname:short)' \
+      refs/heads/task/ refs/remotes/origin/task/ 2>/dev/null | sed 's#^origin/##'
+    task_remote_branches "$root"
+  } | sed '/^$/d' | sort -u
+}
+
+branch_home_issue() {
+  local branch="$1" issue rest last prefix first seg_home=""
+  case "$branch" in task/*) : ;; *) return 1 ;; esac
+  rest="${branch#task/}"
+  last="${rest##*/}"
+  issue="${last%%-*}"
+  echo "$issue" | grep -Eq '^[0-9]+$' || return 1
+  if [ "$rest" = "$last" ]; then
+    prefix=""
+  else
+    prefix="${rest%/$last}"
+  fi
+  if [ -n "$prefix" ]; then
+    first="${prefix%%/*}"
+    echo "$first" | grep -Eq '^[0-9]+$' || seg_home="$first"
+  fi
+  printf '%s|%s\n' "$seg_home" "$issue"
+}
+
+branch_matches_issue() {
+  local branch="$1" home="$2" issue="$3" parsed seg_home seg_issue
+  parsed="$(branch_home_issue "$branch")" || return 1
+  IFS='|' read -r seg_home seg_issue <<< "$parsed"
+  [ "$seg_home" = "$home" ] && [ "$seg_issue" = "$issue" ]
+}
+
+find_branch_in_list() {
+  local branches="$1" home="$2" issue="$3" branch
+  while IFS= read -r branch; do
+    [ -n "$branch" ] || continue
+    if branch_matches_issue "$branch" "$home" "$issue"; then
+      echo "$branch"
+      return 0
+    fi
+  done <<< "$branches"
+  return 1
+}
+
+# ID로 task 브랜치 찾기 (로컬·tracking·진짜 origin 합집합)
+find_branch() {
+  local home="$1" issue="$2" root branches
+  root="$(wb_root)"
+  branches="$(task_known_branches "$root")"
+  find_branch_in_list "$branches" "$home" "$issue"
+}
+
+# ── start ─────────────────────────────────────────────────────────────
+
+cmd_start() {
+  local id="" slug="" parent=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --parent) parent="$2"; shift 2 ;;
+      *) if [ -z "$id" ]; then id="$1"; else slug="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$id" ] || die "usage: task start <ID> [slug] [--parent N]"
+  parse_id "$id"
+
+  local root; root="$(wb_root)"
+  if find_branch "$HOME_REPO" "$ISSUE" >/dev/null 2>&1; then
+    die "이미 존재하는 task: $(find_branch "$HOME_REPO" "$ISSUE") — task resume $id 를 쓸 것"
+  fi
+
+  # 이슈 원문 조회 (가능하면) — 원본 소스 보존용
+  local lookup_dir="$root" title="" body="" issue_src="workbench#$ISSUE"
+  if [ -n "$HOME_REPO" ]; then
+    lookup_dir="$root/.codebases/$HOME_REPO"
+    issue_src="$HOME_REPO#$ISSUE"
+  fi
+  if [ -d "$lookup_dir" ]; then
+    title="$( (cd "$lookup_dir" && gh issue view "$ISSUE" --json title -q .title) 2>/dev/null || true)"
+    body="$( (cd "$lookup_dir" && gh issue view "$ISSUE" --json body -q .body) 2>/dev/null || true)"
+  fi
+  if [ -z "$slug" ]; then
+    [ -n "$title" ] || die "이슈 제목 조회 실패 — slug를 직접 지정할 것: task start $id <slug>"
+    slug="$(slugify "$title")"
+  fi
+
+  local branch="task/${HOME_REPO:+$HOME_REPO/}${parent:+$parent/}${ISSUE}-${slug}"
+  local dir="$root/.worktrees/$(branch_to_dir "$branch")"
+  local claim_id; claim_id="$(make_claim_id "$branch")"
+
+  lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-claimed "$claim_id" "$branch"
+
+  # 최신 원격 main 기준으로 분기 — 로컬 main은 다른 task 머지 뒤 낡아 있을 수
+  # 있어, 그대로 쓰면 새 워크트리에 직전 증분이 빠지고 수동 rebase를 부른다.
+  git -C "$root" fetch origin --quiet 2>/dev/null || info "fetch 실패(오프라인?) — 로컬 main 기준으로 분기"
+  local base; base="$(main_ref "$root")"
+  info "브랜치 $branch → $dir (base: $base)"
+  git -C "$root" worktree add -b "$branch" "$dir" "$base"
+
+  # task/ 스캐폴드
+  mkdir -p \
+    "$dir/task/docs/researches" \
+    "$dir/task/docs/plans" \
+    "$dir/task/docs/decisions" \
+    "$dir/task/docs/lessons" \
+    "$dir/task/docs/runbooks" \
+    "$dir/task/codebases"
+
+  # WHITE_PAPER.md — 이슈 원문 보존 (immutable)
+  if [ -n "$title" ]; then
+    cat > "$dir/task/WHITE_PAPER.md" <<EOF
+# $title
+
+> source: $issue_src (원문 보존 — 수정하지 않는다)
+
+$body
+EOF
+  else
+    cat > "$dir/task/WHITE_PAPER.md" <<EOF
+# (이슈 제목 미조회)
+
+> source: $issue_src (원문 보존 — 수정하지 않는다)
+
+(이슈 본문을 여기에 붙여넣는다)
+EOF
+  fi
+
+  cat > "$dir/task/index.md" <<EOF
+---
+id: $id
+issue: $ISSUE
+home: $HOME_REPO
+parent: $parent
+slug: $slug
+branch: $branch
+claim_id: $claim_id
+---
+
+# $id — $slug
+
+(티켓 요약과 이 task의 목적을 여기에 적는다 — /task-start 가 채운다)
+
+## Repos
+
+<!-- repos:begin -->
+<!-- repos:end -->
+EOF
+  cat > "$dir/task/status.md" <<EOF
+# Status
+
+상태: 시작됨 ($(date +%Y-%m-%d))
+
+(작업을 멈출 때마다 이 파일 전체를 현재 상태로 덮어쓴다)
+EOF
+  cat > "$dir/task/log.md" <<EOF
+# Log
+
+## [$(date '+%Y-%m-%d %H:%M:%S')] plan · create task | task 시작
+
+$id 에서 task 생성.
+EOF
+
+  # AGENTS.md — 정본 템플릿에서 인스턴스화 (templates/ 는 워크트리 루트)
+  local agents_tmpl="$dir/templates/task-AGENTS.md"
+  if [ -f "$agents_tmpl" ]; then
+    cp "$agents_tmpl" "$dir/task/AGENTS.md"
+  else
+    cat > "$dir/task/AGENTS.md" <<'EOF'
+# AGENTS.md
+
+이 task 안에서 일하는 법. 독립 문서다(루트 AGENTS.md를 상속하지 않는다).
+
+(templates/task-AGENTS.md 템플릿을 찾지 못했다 — 수동으로 채울 것)
+EOF
+  fi
+  ln -s AGENTS.md "$dir/task/CLAUDE.md"
+
+  # docs/ 장르 카탈로그 stub (harvest 장르엔 형식 명세 포인터)
+  for genre in researches plans decisions lessons runbooks; do
+    genre_cap="$(echo "$genre" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+    case "$genre" in
+      decisions) tmpl_hint='<!-- 새 항목 형식: templates/decision.tmpl.md (task/AGENTS.md 참조) -->' ;;
+      lessons)   tmpl_hint='<!-- 새 항목 형식: templates/lesson.tmpl.md (task/AGENTS.md 참조) -->' ;;
+      runbooks)  tmpl_hint='<!-- 새 항목 형식: templates/runbook.tmpl.md (task/AGENTS.md 참조) -->' ;;
+      *)         tmpl_hint='' ;;
+    esac
+    cat > "$dir/task/docs/$genre/index.md" <<EOF
+# $genre_cap
+$tmpl_hint
+
+(카탈로그 — 항목 추가 시 갱신)
+EOF
+  done
+  cat > "$dir/task/docs/index.md" <<EOF
+# Docs
+
+(카탈로그 — 항목 추가 시 갱신)
+
+## 장르
+
+- [researches/](researches/index.md)
+- [plans/](plans/index.md)
+- [decisions/](decisions/index.md)
+- [lessons/](lessons/index.md)
+- [runbooks/](runbooks/index.md)
+EOF
+
+  git -C "$dir" add task && git -C "$dir" commit -q -m "task($id): 스캐폴드"
+
+  # codebase 이슈면 홈 repo 작업 사본 자동 추가
+  if [ -n "$HOME_REPO" ]; then
+    (cd "$dir" && cmd_add_repo "$HOME_REPO")
+  fi
+
+  info "push: $branch"
+  if git -C "$dir" push -u origin "$branch"; then
+    lifecycle_emit_optional "$root" "$HOME_REPO" "$ISSUE" task-active "$claim_id" "$branch"
+  else
+    lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-claim-conflict "$claim_id" "$branch"
+    die "task branch push 실패: $branch"
+  fi
+
+  info "완료. cd $dir"
+}
+
+# ── add-repo ──────────────────────────────────────────────────────────
+
+cmd_add_repo() {
+  local name="" ref="" role="work"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ref)  ref="$2"; shift 2 ;;
+      --role) role="$2"; shift 2 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: task add-repo <name> [--ref <base>] [--role work|reference]"
+  require_task_worktree
+  [ -f "$TASK_DIR/task/index.md" ] || die "task/index.md 없음"
+
+  local root clone issue parent slug
+  root="$(wb_root)"
+  clone="$root/.codebases/$name"
+  [ -d "$clone/.git" ] || die ".codebases/$name 없음 — codebases.yaml에 추가 후 utils/workbench setup 실행"
+
+  if repos_block | grep -q "^- $name |"; then
+    info "$name 은 이미 등록됨"; return 0
+  fi
+
+  issue="$(index_get issue)"; parent="$(index_get parent)"; slug="$(index_get slug)"
+  local cb_branch="task/${parent:+$parent/}${issue}-${slug}"
+  local wt="$TASK_DIR/task/codebases/$name"
+  [ -n "$ref" ] || ref="$(git -C "$clone" symbolic-ref --short HEAD)"
+
+  info "codebase $name: $cb_branch (base: $ref) → task/codebases/$name"
+  if git -C "$clone" show-ref -q "refs/heads/$cb_branch"; then
+    git -C "$clone" worktree add "$wt" "$cb_branch"
+  else
+    git -C "$clone" worktree add -b "$cb_branch" "$wt" "$ref"
+  fi
+
+  repos_append "- $name | $cb_branch | $role"
+  git -C "$TASK_DIR" add task/index.md
+  git -C "$TASK_DIR" commit -q -m "task: add-repo $name ($role)"
+}
+
+# ── resume ────────────────────────────────────────────────────────────
+
+cmd_resume() {
+  local id="${1:-}"; [ -n "$id" ] || die "usage: task resume <ID>"
+  parse_id "$id"
+  local root branch dir
+  root="$(wb_root)"
+
+  git -C "$root" fetch origin 2>/dev/null || true
+  branch="$(find_branch "$HOME_REPO" "$ISSUE")" || die "task 브랜치를 찾을 수 없음: $id"
+  dir="$root/.worktrees/$(branch_to_dir "$branch")"
+
+  if [ ! -d "$dir" ]; then
+    info "워크트리 복원: $branch → $dir"
+    git -C "$root" worktree add "$dir" "$branch"
+  else
+    info "워크트리 이미 존재: $dir"
+  fi
+
+  # index.md 기록 기반으로 codebase 작업 사본 재구성
+  TASK_DIR="$dir"
+  if [ ! -f "$dir/task/index.md" ]; then
+    info "task/ 없음 (submit 이후 상태) — codebase 복원 생략"
+    info "완료. cd $dir"; return 0
+  fi
+  local name cb_branch role clone wt
+  while IFS='|' read -r name cb_branch role; do
+    name="$(echo "$name" | sed -E 's/^- *| *$//g')"
+    cb_branch="$(echo "$cb_branch" | sed -E 's/^ +| +$//g')"
+    [ -n "$name" ] || continue
+    clone="$root/.codebases/$name"
+    wt="$dir/task/codebases/$name"
+    [ -d "$clone/.git" ] || { echo "warn: .codebases/$name 없음 — utils/workbench setup 먼저" >&2; continue; }
+    [ -d "$wt" ] && { info "$name 작업 사본 이미 존재"; continue; }
+    git -C "$clone" fetch origin 2>/dev/null || true
+    if ! git -C "$clone" show-ref -q "refs/heads/$cb_branch"; then
+      git -C "$clone" branch "$cb_branch" "origin/$cb_branch" 2>/dev/null \
+        || { echo "warn: $name 에 브랜치 $cb_branch 없음 (로컬·origin 모두)" >&2; continue; }
+    fi
+    info "codebase $name: $cb_branch 작업 사본 복원"
+    git -C "$clone" worktree add "$wt" "$cb_branch"
+  done <<EOF
+$(repos_block)
+EOF
+
+  info "완료. cd $dir"
+}
+
+# ── submit ────────────────────────────────────────────────────────────
+
+cmd_submit() {
+  local title="" body_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title)     title="$2"; shift 2 ;;
+      --body-file) body_file="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  # 산문은 입력으로만 받는다 — 이 스크립트는 PR 내용을 짓지 않는다
+  [ -n "$title" ] || die "--title 필요 (PR 제목은 판단 레이어가 작성한다)"
+  [ -n "$body_file" ] && [ -f "$body_file" ] || die "--body-file 필요 (PR 본문은 판단 레이어가 작성한다)"
+  require_task_worktree
+
+  [ -z "$(git -C "$TASK_DIR" status --porcelain)" ] \
+    || die "커밋 안 된 변경 있음 — 정리(커밋 또는 폐기) 후 재시도"
+  if [ -f "$TASK_DIR/task/index.md" ]; then
+    cmd_check
+  fi
+
+  local root branch id issue home claim_id
+  root="$(wb_root)"
+  branch="$(git -C "$TASK_DIR" rev-parse --abbrev-ref HEAD)"
+  if [ -f "$TASK_DIR/task/index.md" ]; then
+    id="$(index_get id)"
+    issue="$(index_get issue)"
+    home="$(index_get home)"
+    claim_id="$(index_get claim_id)"
+  else
+    local parsed
+    parsed="$(branch_home_issue "$branch")" || die "task/index.md 없이 issue/home 복원 실패: $branch"
+    IFS='|' read -r home issue <<< "$parsed"
+    id="$issue"
+    [ -n "$home" ] && id="$home#$issue"
+    claim_id="$(lifecycle_claim_for_branch "$root" "$home" "$issue" "$branch")"
+  fi
+  [ -n "$claim_id" ] || claim_id="$branch"
+
+  # cleanup: task/ 의 추적 파일 제거 (task/codebases/ 는 untracked라 디스크에 남음)
+  if [ -f "$TASK_DIR/task/index.md" ]; then
+    info "cleanup: task/ 추적 파일 제거"
+    git -C "$TASK_DIR" rm -r -q task
+    git -C "$TASK_DIR" commit -q -m "task($id): cleanup"
+  else
+    info "task/ 이미 cleanup됨 — 건너뜀"
+  fi
+
+  # 안전망: PR diff에 task/ 가 남아 있으면 거부
+  local mref; mref="$(main_ref "$TASK_DIR")"
+  if git -C "$TASK_DIR" diff "$mref...HEAD" --name-only | grep -q '^task/'; then
+    die "diff에 task/ 잔존 — cleanup 상태를 확인할 것"
+  fi
+  git -C "$TASK_DIR" diff --quiet "$mref...HEAD" && die "main 대비 변경 없음 — 제출할 증분이 없다"
+
+  info "push: $branch"
+  git -C "$TASK_DIR" push -u origin "$branch"
+  info "PR 생성 (squash 머지 전제)"
+  local pr_url pr_number
+  if ! pr_url="$(cd "$TASK_DIR" && gh pr create --base main --head "$branch" --title "$title" --body-file "$body_file")"; then
+    return 1
+  fi
+  printf '%s\n' "$pr_url"
+  pr_number="$(pr_number_from_url "$pr_url")"
+  lifecycle_emit_optional "$root" "$home" "$issue" task-submitted "$claim_id" "$branch" "$pr_number"
+}
+
+# ── commit ────────────────────────────────────────────────────────────
+
+# 에이전트의 유일 커밋 경로. log append + commit + push 를 원자화한다.
+# 커밋 메시지는 사용자 컨벤션(conventional)대로, op·action·path 는 log 메타.
+cmd_commit() {
+  local op="" action="" path="" nopush="" msgs=()
+  # 포지셔널: op action [path] — 옵션(-m, --no-push) 전까지
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m)
+        [ $# -ge 2 ] || die "-m 값 필요"
+        msgs+=("$2")
+        shift 2
+        ;;
+      --no-push)
+        nopush=1
+        shift
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        if [ -z "$op" ]; then
+          op="$1"
+        elif [ -z "$action" ]; then
+          action="$1"
+        elif [ -z "$path" ]; then
+          path="$1"
+        else
+          die "인자 과다: $1 (op action [path] 만 포지셔널)"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  case "$op" in
+    plan|research|decide|lesson|code|review) : ;;
+    "") die "op 필요 (plan|research|decide|lesson|code|review)" ;;
+    *)  die "잘못된 op: $op (plan|research|decide|lesson|code|review)" ;;
+  esac
+  case "$action" in
+    create|update|delete) : ;;
+    "") die "action 필요 (create|update|delete)" ;;
+    *)  die "잘못된 action: $action (create|update|delete)" ;;
+  esac
+  [ "${#msgs[@]}" -gt 0 ] || die "-m \"<subject>\" 필요 (산문은 판단 레이어가 쓴다)"
+
+  require_task_worktree
+  local id; id="$(index_get id)"
+  [ -n "$id" ] || die "task/index.md 에서 id 를 읽을 수 없음"
+
+  local subject="${msgs[0]}"
+  local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  local logpath="${path:--}"
+
+  {
+    printf '\n## [%s] %s · %s %s | %s\n' "$ts" "$op" "$action" "$logpath" "$subject"
+    local i
+    for ((i=1; i<${#msgs[@]}; i++)); do
+      printf '\n%s\n' "${msgs[$i]}"
+    done
+  } >> "$TASK_DIR/task/log.md"
+
+  if [ -n "$path" ]; then
+    git -C "$TASK_DIR" add "$path" "$TASK_DIR/task/log.md"
+  else
+    git -C "$TASK_DIR" add -A
+  fi
+
+  local csubj="$subject"
+  case "$subject" in *"(#$id)"*) : ;; *) csubj="$subject (#$id)" ;; esac
+  local gitargs=(-C "$TASK_DIR" commit -m "$csubj")
+  local i
+  for ((i=1; i<${#msgs[@]}; i++)); do
+    gitargs+=(-m "${msgs[$i]}")
+  done
+  git "${gitargs[@]}"
+
+  if [ -z "$nopush" ]; then
+    local branch; branch="$(git -C "$TASK_DIR" rev-parse --abbrev-ref HEAD)"
+    git -C "$TASK_DIR" push -u origin "$branch"
+  fi
+}
+
+# ── check ─────────────────────────────────────────────────────────────
+
+ref_exists() { # ref_exists <base>
+  local base="$1" genre
+  for genre in decisions lessons runbooks; do
+    compgen -G "$TASK_DIR/task/docs/$genre/$base.md" >/dev/null && return 0
+    compgen -G "$TASK_DIR/task/docs/$genre/$base*.md" >/dev/null && return 0
+    compgen -G "$TASK_DIR/docs/$genre/$base.md" >/dev/null && return 0
+    compgen -G "$TASK_DIR/docs/$genre/$base*.md" >/dev/null && return 0
+  done
+  return 1
+}
+
+# 기계적 불변식 검사. read-only. 정상이면 무음(0), 위반 시 출력(1).
+cmd_check() {
+  require_task_worktree
+  local branch fail=0
+  branch="$(git -C "$TASK_DIR" rev-parse --abbrev-ref HEAD)"
+
+  # 1) log 우회: <base>..HEAD 의 비플럼빙 커밋이 task/log.md 를 안 건드렸나.
+  #    base는 origin/main(신선) — 로컬 main이 낡으면 main의 머지 커밋이 끼어
+  #    false-positive가 났다.
+  local sha subj files cbase
+  cbase="$(main_ref "$TASK_DIR")"
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    subj="$(git -C "$TASK_DIR" log -1 --format='%s' "$sha")"
+    case "$subj" in
+      task\(*\):\ 스캐폴드|task\(*\):\ cleanup|task:\ add-repo\ *) continue ;;
+    esac
+    files="$(git -C "$TASK_DIR" show --name-only --format='' "$sha")"
+    printf '%s\n' "$files" | grep -qx 'task/log.md' && continue
+    echo "✗ log 우회: 커밋 ${sha:0:8} ($subj) 가 task/log.md 미갱신 — utils/task commit 사용" >&2
+    fail=1
+  done < <(git -C "$TASK_DIR" rev-list "$cbase..$branch" 2>/dev/null)
+
+  # 2) status 신선도: status.md 갱신 이후 커밋 수 > 0.
+  local sc cas
+  sc="$(git -C "$TASK_DIR" log -1 --format=%H "$branch" -- task/status.md 2>/dev/null || true)"
+  if [ -n "$sc" ]; then
+    cas="$(git -C "$TASK_DIR" rev-list --count "$sc..$branch" 2>/dev/null || echo 0)"
+    if [ "$cas" -gt 0 ]; then
+      echo "✗ status 낡음: status.md 갱신 이후 커밋 $cas 개 — status.md 덮어쓸 것" >&2
+      fail=1
+    fi
+  fi
+
+  # 3) push 상태: 미push 커밋(ahead) 또는 origin tracking ref 없음.
+  if git -C "$TASK_DIR" remote get-url origin >/dev/null 2>&1; then
+    local ahead
+    if git -C "$TASK_DIR" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      ahead="$(git -C "$TASK_DIR" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 0)"
+      if [ "$ahead" -gt 0 ]; then
+        echo "✗ 미push: ahead $ahead — git push 또는 utils/task commit 사용" >&2
+        fail=1
+      fi
+    else
+      echo "✗ 미push: origin/$branch 없음 — git push -u origin $branch 또는 utils/task commit 사용" >&2
+      fail=1
+    fi
+  fi
+
+  # 4) index frontmatter: 필수 키 비어있지 않음.
+  local k
+  for k in id issue slug branch; do
+    if [ -z "$(index_get "$k")" ]; then
+      echo "✗ index frontmatter: '$k' 비어있음" >&2
+      fail=1
+    fi
+  done
+
+  # 5) 깨진 [[ref]]: task-local 또는 root docs harvest 장르에 없으면 경고.
+  local f ref base
+  while IFS= read -r f; do
+    while IFS= read -r ref; do
+      base="${ref#[[}"; base="${base%]]}"
+      ref_exists "$base" || echo "⚠ 깨진 ref: [[$base]] in ${f#$TASK_DIR/}" >&2
+    done < <(
+      awk 'BEGIN { fenced=0 } /^```/ { fenced=!fenced; next } !fenced { print }' "$f" \
+        | sed -E 's/`[^`]*`//g' \
+        | grep -oE '\[\[[^]]+\]\]' || true
+    )
+  done < <(find "$TASK_DIR/task/docs" -name '*.md' 2>/dev/null)
+
+  return "$fail"
+}
+
+# ── done ──────────────────────────────────────────────────────────────
+
+cmd_done() {
+  local id="" force=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --force) force=1; shift ;; *) id="$1"; shift ;; esac
+  done
+  [ -n "$id" ] || die "usage: task done <ID> [--force]"
+  parse_id "$id"
+  local root branch dir
+  root="$(wb_root)"
+  branch="$(find_branch "$HOME_REPO" "$ISSUE")" || die "task 브랜치를 찾을 수 없음: $id"
+  dir="$root/.worktrees/$(branch_to_dir "$branch")"
+
+  # codebase 작업 사본 먼저 정리 (디스크 기준 — index.md 는 cleanup으로 없을 수 있음)
+  if [ -d "$dir" ]; then
+    local wt common clone
+    for wt in "$dir"/task/codebases/*/; do
+      [ -d "$wt" ] || continue
+      common="$(cd "$wt" && git rev-parse --git-common-dir)"
+      clone="$(dirname "$(cd "$common" && pwd)")"
+      info "codebase 작업 사본 제거: $wt"
+      git -C "$clone" worktree remove ${force:+--force} "$wt" \
+        || die "작업 사본에 커밋 안 된 변경 있음 — 정리 후 재시도하거나 --force"
+    done
+    info "task 작업 공간 제거: $dir"
+    git -C "$root" worktree remove ${force:+--force} "$dir" \
+      || die "task 작업 공간에 커밋 안 된 변경 있음 — push 후 재시도하거나 --force"
+  fi
+
+  info "브랜치 삭제: $branch"
+  git -C "$root" branch -D "$branch" 2>/dev/null || true
+  local claim_id; claim_id="$(lifecycle_claim_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")"
+  lifecycle_emit_optional "$root" "$HOME_REPO" "$ISSUE" task-cleaned "$claim_id" "$branch"
+  if git -C "$root" remote get-url origin >/dev/null 2>&1; then
+    echo "note: origin의 $branch 는 남아 있음 — PR 머지 시 GitHub이 지우거나, 직접: git push origin :$branch"
+  fi
+  echo "note: 티켓 처분(닫기/유지/후속)은 이 스크립트가 하지 않는다 — /task-done 절차가 묻는다"
+  info "완료"
+}
+
+# ── status ────────────────────────────────────────────────────────────
+
+# 모든 task의 현황을 구조화 출력한다 (read-only — 변경 0).
+# 산문·분류는 하지 않는다. 사실 필드만 — 진단·분류는 /task-status 스킬의 몫.
+# task 작업 공간으로 cd 하지 않는다 (git -C·절대경로만 — #19 cd 오염 교훈).
+cmd_status() {
+  local root; root="$(wb_root)"
+
+  # 진짜 origin 의 task 브랜치 (ls-remote — ref 변경 없는 순수 read).
+  # 오프라인이면 로컬 추적 ref로 폴백한다 (낡았을 수 있음 → remote_source: cached).
+  local remote_set remote_src
+  if remote_set="$(git -C "$root" ls-remote --heads origin 'refs/heads/task/*' 2>/dev/null)"; then
+    remote_set="$(printf '%s\n' "$remote_set" | sed 's#.*refs/heads/##')"
+    remote_src=live
+  else
+    remote_set="$(git -C "$root" for-each-ref --format='%(refname:short)' \
+                    refs/remotes/origin/task/ 2>/dev/null | sed 's#^origin/##')"
+    remote_src=cached
+  fi
+
+  # 메타 줄: 첫 레코드 앞 (스킬이 먼저 읽는다)
+  printf 'remote_source: %s\n\n' "$remote_src"
+
+  # task 브랜치 합집합: 로컬 head ∪ 로컬 추적 ref ∪ 진짜 origin(resume 케이스)
+  local branches
+  branches="$( { git -C "$root" for-each-ref --format='%(refname:short)' \
+                   refs/heads/task/ refs/remotes/origin/task/ 2>/dev/null \
+                   | sed 's#^origin/##'; printf '%s\n' "$remote_set"; } \
+               | grep -v '^$' | sort -u)"
+
+  local first=1 branch
+  while IFS= read -r branch; do
+    [ -n "$branch" ] || continue
+    [ "$first" = 1 ] && first=0 || echo
+
+    local dir issue rest last local_p remote_p ref tip ahead behind pr sf status_line sc cas
+    dir="$root/.worktrees/$(branch_to_dir "$branch")"
+    rest="${branch#task/}"; last="${rest##*/}"; issue="${last%%-*}"
+
+    [ -d "$dir" ] && local_p=yes || local_p=no
+    printf '%s\n' "$remote_set" | grep -qx "$branch" && remote_p=yes || remote_p=no
+
+    # 브랜치 tip ref — 로컬 우선, 없으면 origin
+    ref="refs/heads/$branch"
+    git -C "$root" show-ref --verify --quiet "$ref" || ref="refs/remotes/origin/$branch"
+    tip="$(git -C "$root" log -1 --format=%cI "$ref" 2>/dev/null || true)"
+
+    # ahead/behind — 로컬·원격 ref 둘 다 있을 때만 (미push 감지)
+    ahead=0; behind=0
+    if git -C "$root" show-ref --verify --quiet "refs/heads/$branch" \
+       && git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      set -- $(git -C "$root" rev-list --left-right --count \
+                 "refs/remotes/origin/$branch...refs/heads/$branch" 2>/dev/null || echo "0 0")
+      behind="${1:-0}"; ahead="${2:-0}"
+    fi
+
+    # PR (브랜치당 1콜) — gh는 -C 없음, established 패턴인 subshell cd 사용
+    pr="$( (cd "$root" && gh pr list --head "$branch" --state all \
+              --json number,state --jq '.[0] // empty | "#\(.number) \(.state)"') 2>/dev/null || true)"
+    [ -n "$pr" ] || pr=none
+
+    # status.md — 로컬 디스크에서만 (cleanup으로 휘발 가능)
+    status_line=""
+    sf="$dir/task/status.md"
+    [ -f "$sf" ] && status_line="$(grep -m1 '^상태:' "$sf" 2>/dev/null || true)"
+
+    # status.md 갱신 커밋 이후 커밋 수 — status 낡음 진단용
+    cas=0
+    sc="$(git -C "$root" log -1 --format=%H "$ref" -- task/status.md 2>/dev/null || true)"
+    [ -n "$sc" ] && cas="$(git -C "$root" rev-list --count "$sc..$ref" 2>/dev/null || echo 0)"
+
+    printf 'branch: %s\n'   "$branch"
+    printf 'issue: %s\n'    "$issue"
+    printf 'local: %s\n'    "$local_p"
+    printf 'remote: %s\n'   "$remote_p"
+    printf 'pr: %s\n'       "$pr"
+    printf 'ahead: %s\n'    "$ahead"
+    printf 'behind: %s\n'   "$behind"
+    printf 'last_commit: %s\n' "$tip"
+    printf 'status_line: %s\n' "$status_line"
+    printf 'commits_after_status: %s\n' "$cas"
+  done <<< "$branches"
+}
+
+# 열린 workbench 이슈별 task/lifecycle 사실을 구조화 출력한다 (read-only).
+# 판단 문구는 만들지 않는다. 분류는 스킬 레이어의 몫이다.
+cmd_tickets() {
+  local root; root="$(wb_root)"
+  local rows branches remote_set
+  branches="$(task_known_branches "$root")"
+  remote_set="$(task_remote_branches "$root" | sed '/^$/d' | sort -u)"
+  rows="$(cd "$root" && gh issue list --state open --limit 100 \
+            --json number,title,state,url \
+            --jq '.[] | "\(.number)\t\(.title)\t\(.state)\t\(.url)"')"
+
+  local first=1 issue title issue_state url
+  while IFS=$'\t' read -r issue title issue_state url; do
+    [ -n "$issue" ] || continue
+    [ "$first" = 1 ] && first=0 || echo
+
+    local branch local_p remote_p pr latest event claim_id lifecycle_branch lifecycle_pr
+    branch="$(find_branch_in_list "$branches" "" "$issue" 2>/dev/null || true)"
+    local_p=no
+    remote_p=no
+    pr=none
+
+    if [ -n "$branch" ]; then
+      git -C "$root" show-ref --verify --quiet "refs/heads/$branch" && local_p=yes
+      printf '%s\n' "$remote_set" | grep -qx "$branch" && remote_p=yes
+      pr="$( (cd "$root" && gh pr list --head "$branch" --state all \
+                --json number,state --jq '.[0] // empty | "#\(.number) \(.state)"') 2>/dev/null || true)"
+      [ -n "$pr" ] || pr=none
+    fi
+
+    latest=""
+    [ -n "$branch" ] && latest="$(lifecycle_latest_for_branch "$root" "" "$issue" "$branch")"
+    [ -n "$latest" ] || latest="$(lifecycle_latest_for_issue "$root" "" "$issue")"
+    event="$(lifecycle_field "$latest" event)"
+    claim_id="$(lifecycle_field "$latest" claim_id)"
+    lifecycle_branch="$(lifecycle_field "$latest" branch)"
+    lifecycle_pr="$(lifecycle_field "$latest" pr)"
+
+    printf 'issue: %s\n' "$issue"
+    printf 'title: %s\n' "$title"
+    printf 'issue_state: %s\n' "$issue_state"
+    printf 'url: %s\n' "$url"
+    printf 'branch: %s\n' "$branch"
+    printf 'branch_local: %s\n' "$local_p"
+    printf 'branch_remote: %s\n' "$remote_p"
+    printf 'pr: %s\n' "$pr"
+    printf 'lifecycle_event: %s\n' "$event"
+    printf 'lifecycle_claim_id: %s\n' "$claim_id"
+    printf 'lifecycle_branch: %s\n' "$lifecycle_branch"
+    printf 'lifecycle_pr: %s\n' "$lifecycle_pr"
+  done <<< "$rows"
+}
+
+# ── 디스패치 ──────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  start)    shift; cmd_start "$@" ;;
+  add-repo) shift; cmd_add_repo "$@" ;;
+  resume)   shift; cmd_resume "$@" ;;
+  submit)   shift; cmd_submit "$@" ;;
+  done)     shift; cmd_done "$@" ;;
+  commit)   shift; cmd_commit "$@" ;;
+  check)    shift; cmd_check "$@" ;;
+  status)   shift; cmd_status "$@" ;;
+  tickets)  shift; cmd_tickets "$@" ;;
+  *) sed -n '6,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

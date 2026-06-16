@@ -1,0 +1,13 @@
+# 점(.) 디렉토리 = workbench 인프라 (CLAUDE.md 용어집의 점 규칙)
+
+# clone 캐시 — codebases.yaml이 진실의 원천
+.codebases/
+
+# 진행 중인 task들의 작업 공간 (workbench 워크트리)
+.worktrees/
+
+# task로 가져온 codebase 작업 사본 (별도 git repo라 커밋 불가)
+task/codebases/
+
+# Claude Code 런타임 락 파일
+.claude/scheduled_tasks.lock

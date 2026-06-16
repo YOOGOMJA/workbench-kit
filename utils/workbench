@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# workbench 저장소 수준 도구. 사용법: utils/workbench setup
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MANIFEST="$ROOT/codebases.yaml"
+
+cmd_setup() {
+  [ -f "$MANIFEST" ] || { echo "error: codebases.yaml 없음" >&2; exit 1; }
+  mkdir -p "$ROOT/.codebases"
+  local count=0
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    local name url
+    name="$(echo "$line" | cut -d: -f1 | sed -E 's/^ +| +$//g')"
+    url="$(echo "$line" | sed -E 's/^[^:]+: *//')"
+    [ -n "$name" ] && [ -n "$url" ] || continue
+    if [ -d "$ROOT/.codebases/$name/.git" ]; then
+      echo "skip: $name (이미 존재)"
+    else
+      echo "clone: $name <- $url"
+      git clone "$url" "$ROOT/.codebases/$name"
+    fi
+    count=$((count + 1))
+  done < "$MANIFEST"
+  [ "$count" -gt 0 ] || echo "codebases.yaml에 등록된 repo가 없다"
+}
+
+case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
+  *) echo "usage: utils/workbench setup" >&2; exit 1 ;;
+esac
