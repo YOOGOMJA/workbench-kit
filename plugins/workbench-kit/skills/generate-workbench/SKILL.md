@@ -30,18 +30,17 @@ If `.persona/` is absent, run `interview-for-personalizing` first — don't inve
      anything remote — repo creation is outward-facing.
    - `path: …` → use that local directory (init git if empty).
 
-2. **Locate the framework core.** `compose.sh` needs the engine plugin's
-   `AGENTS.core.md`. It ships in the **`workbench` plugin** (sibling of this one). Find
-   it at the workbench plugin's root (e.g., `${CLAUDE_PLUGIN_ROOT}/../workbench/AGENTS.core.md`
-   when installed side-by-side, or wherever the `workbench` plugin is installed). If you
-   can't resolve it, ask the user where the `workbench` plugin lives rather than guessing.
+2. **Locate the inputs — both bundled in this plugin** (so it works when installed).
+   `scaffold/` (with `AGENTS.core.md`, `AGENTS.overlay.md`, templates, empty docs,
+   codebases.yaml) ships inside this bootstrap plugin at `${CLAUDE_PLUGIN_ROOT}/scaffold/`.
+   No cross-plugin lookup is needed.
 
 3. **Run the compose script:**
    ```bash
-   "$SKILL_DIR/scripts/compose.sh" \
+   "${CLAUDE_PLUGIN_ROOT}/skills/generate-workbench/scripts/compose.sh" \
      --persona  <.persona dir> \
-     --core     <workbench plugin>/AGENTS.core.md \
-     --scaffold <this plugin>/../../scaffold   # the bootstrap plugin bundles scaffold/ at its root via the marketplace; use the kit's scaffold/ \
+     --core     "${CLAUDE_PLUGIN_ROOT}/scaffold/AGENTS.core.md" \
+     --scaffold "${CLAUDE_PLUGIN_ROOT}/scaffold" \
      --out      <target repo>
    ```
    It lays `templates/ .github/ docs/(empty) codebases.yaml`, writes `AGENTS.overlay.md`

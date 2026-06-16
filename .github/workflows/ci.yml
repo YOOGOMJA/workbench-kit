@@ -46,6 +46,6 @@ jobs:
           printf '## Language\n- Operational output language: **English**.\n' > /tmp/persona/overlay.md
           bash plugins/workbench-kit/skills/generate-workbench/scripts/compose.sh \
             --persona  /tmp/persona \
-            --core     plugins/workbench/AGENTS.core.md \
-            --scaffold scaffold \
+            --core     plugins/workbench-kit/scaffold/AGENTS.core.md \
+            --scaffold plugins/workbench-kit/scaffold \
             --out      /tmp/generated-workbench

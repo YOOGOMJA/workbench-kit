@@ -4,7 +4,7 @@ set -euo pipefail
 # ROOT = the workbench engine plugin (holds utils/). SCAFFOLD_TEMPLATES = the kit's
 # scaffold/templates (profile defaults live there, not under the plugin).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCAFFOLD_TEMPLATES="$(cd "$ROOT/../.." && pwd)/scaffold/templates"
+SCAFFOLD_TEMPLATES="$(cd "$ROOT/../workbench-kit/scaffold/templates" && pwd)"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/workbench-task-lifecycle.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
 
