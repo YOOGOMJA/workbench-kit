@@ -1,16 +1,18 @@
 {
   "name": "workbench-kit",
-  "owner": { "name": "YOOGOMJA" },
-  "description": "Tool-neutral agent workbench — engine + bootstrap. Bring your own rules.",
   "plugins": [
     {
       "name": "workbench",
-      "source": { "path": "./plugins/workbench" },
+      "source": { "source": "local", "path": "./plugins/workbench" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Development",
       "description": "Engine — worktree/task isolation, incremental knowledge harvest, skill-driven lifecycle (@workbench:task-start …)."
     },
     {
       "name": "workbench-kit",
-      "source": { "path": "./plugins/workbench-kit" },
+      "source": { "source": "local", "path": "./plugins/workbench-kit" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Development",
       "description": "Bootstrap — interview for persona, then generate a minimal personalized workbench (@workbench-kit:generate-workbench)."
     }
   ]
