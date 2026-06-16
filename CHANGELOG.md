@@ -36,8 +36,12 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
 - **CI** (`.github/workflows/ci.yml`) — frontmatter lint, JSON manifest parse, version
   sync, ShellCheck, engine lifecycle test, install-model test, compose smoke.
 - **Release tooling** — `AGENTS.md` (repo/dev guide), `RELEASING.md`, this changelog,
-  `scripts/release.sh` (one-shot), `scripts/bump-version.sh`, `scripts/check-version-sync.sh`,
-  and `.github/workflows/release.yml` (tag → GitHub Release from the changelog).
+  `scripts/release.sh` (one-shot), `scripts/bump-version.sh`, `scripts/check-version-sync.sh`.
+- **Auto-deploy** — `.github/workflows/release.yml` cuts the tag + GitHub Release
+  automatically when a version bump (matching a `CHANGELOG` section) lands on `main`. No
+  manual tagging.
+- **README** — generated-workbench structure diagram (EN/KO) and repo layout reflecting
+  scaffold bundled inside the bootstrap plugin; Codex install uses `codex plugin add`.
 
 ### Fixed
 

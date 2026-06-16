@@ -58,8 +58,8 @@ Codex. "Bring your own rules" — the mechanism is fixed, your conventions are n
 
 ```
 codex plugin marketplace add https://github.com/YOOGOMJA/workbench-kit
-codex plugin install workbench
-codex plugin install workbench-kit
+codex plugin add workbench
+codex plugin add workbench-kit
 ```
 
 Requirements: Claude Code **or** Codex, `git` (with worktree support), and the
@@ -73,6 +73,21 @@ then scaffolds a minimal repo personalized to your conventions:
 ```
 /workbench-kit:interview-for-personalizing   # draws out your persona
 /workbench-kit:generate-workbench            # scaffolds the repo, then discards the draft
+```
+
+What it produces is **minimal by design** — only your stuff. The engine
+(skills, `utils/`, `bin/`) stays in the installed plugin, never copied in:
+
+```
+my-workbench/
+├── AGENTS.md          # composed: framework core + your persona (don't edit directly)
+├── AGENTS.overlay.md  # your rules — edit here, then recompose
+├── codebases.yaml     # your target repos
+├── docs/              # knowledge wiki, starts empty, fills as you work
+│   ├── decisions/  lessons/  runbooks/   # anchor tables ("did we already decide?")
+│   └── index.md  log.md
+├── templates/         # harvest entry + task-AGENTS formats (yours to tune)
+└── .github/           # issue (4-element) + PR templates
 ```
 
 **2. Work, from inside your new workbench.** The engine plugin drives the task
@@ -110,13 +125,17 @@ the design decisions themselves are recorded as ADRs under
 
 ```
 plugins/
-  workbench/        engine — skills, utils/, bin/workbench, AGENTS.core.md
-  workbench-kit/    bootstrap — interview + generate-workbench skills
-scaffold/           what generate-workbench lays into a user repo
+  workbench/        engine — skills, utils/, bin/workbench, tests/
+  workbench-kit/    bootstrap — interview + generate-workbench skills, and
+                    scaffold/ (incl. AGENTS.core.md) it lays into a user repo
 framework-docs/     design decisions, lessons, runbooks, synthesis
-scripts/            release tooling (version bump/sync)
-tests/              frontmatter lint and CI checks
+scripts/            release tooling (bump / version-sync / release)
+tests/              frontmatter, install-model, CI checks
+AGENTS.md           repo/dev guide (for working ON the kit)
 ```
+
+scaffold lives **inside** the bootstrap plugin so a marketplace install ships it;
+the engine reads it via `${CLAUDE_PLUGIN_ROOT}`.
 
 ## Status & known gaps
 

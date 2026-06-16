@@ -16,22 +16,22 @@ land on `main` → bump version → tag → write notes.
 
 ## Cut a release
 
-1. **Land the work on `main`.** Install resolves against the default branch, so unmerged
-   branches aren't installable. Merge via PR.
-2. **Bump:** `scripts/bump-version.sh X.Y.Z` (syncs all 4 manifests).
-3. **Notes:** in `CHANGELOG.md`, rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`
-   and start a fresh empty `## [Unreleased]` above it.
-4. **Verify:** `claude plugin validate plugins/workbench` and `… plugins/workbench-kit`,
-   and `tests/check-skill-frontmatter.sh`.
-5. **Commit:** `chore(release): vX.Y.Z` on `main`.
-6. **Tag** (per plugin — Claude Code's convention is `{name}--v{version}`, validated
-   against the manifest):
-   ```
-   claude plugin tag plugins/workbench      --push -m "workbench %s"
-   claude plugin tag plugins/workbench-kit  --push -m "workbench-kit %s"
-   ```
-7. **GitHub Release:** create a release for the tag(s) and paste the CHANGELOG section as
-   the body. This is the human-facing release note; the CHANGELOG is the source of truth.
+Releasing is **GitOps**: the release happens automatically when a version bump lands on
+`main`. You never tag by hand.
+
+1. **Prep on a branch:** `scripts/release.sh X.Y.Z` — bumps all 4 manifests and runs the
+   checks. Then edit `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`
+   and add a fresh empty `## [Unreleased]` above it.
+2. **(optional) Verify locally:** `claude plugin validate plugins/workbench` and
+   `… plugins/workbench-kit` (CI runs the full battery on the PR anyway).
+3. **Commit + PR + merge to `main`** (`chore(release): vX.Y.Z`). Install resolves against
+   the default branch, so the work must be on `main` to be installable.
+4. **Automatic.** On that push to `main`, `.github/workflows/release.yml` sees the new
+   version (matching `CHANGELOG [X.Y.Z]`, no `vX.Y.Z` tag yet) and **cuts the tag +
+   GitHub Release** from the CHANGELOG section. Nothing else to do.
+
+Non-release pushes to `main` are no-ops for the workflow (version already tagged, or no
+matching CHANGELOG section).
 
 ## How users get the update
 

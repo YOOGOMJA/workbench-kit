@@ -20,9 +20,9 @@ bash plugins/workbench/tests/task-lifecycle.sh >/dev/null && echo "✔ lifecycle
 
 cat <<NEXT
 
-next (manual, on main):
+next:
   1) CHANGELOG.md: rename '## [Unreleased]' -> '## [$V] - $(date +%F)', add a fresh [Unreleased]
-  2) git commit -am "chore(release): v$V"
-  3) git tag v$V && git push origin v$V
-     (.github/workflows/release.yml cuts the GitHub Release from the CHANGELOG section)
+  2) commit, open a PR, and merge to main
+     -> .github/workflows/release.yml auto-tags v$V and cuts the GitHub Release
+        from the CHANGELOG section. No manual tagging.
 NEXT

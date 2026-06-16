@@ -23,9 +23,10 @@ workbench has its own composed AGENTS.md; this file is for hacking on the kit.)
 ## Release & versioning (self-contained — keep it this way)
 
 - **One semver across both plugins**, living in 4 manifests. Never hand-edit — use the scripts.
-- Cut a release: **`scripts/release.sh X.Y.Z`** (bumps all manifests, runs checks, prints the
-  remaining manual steps). Then push the `vX.Y.Z` tag — `.github/workflows/release.yml` cuts
-  the GitHub Release from the CHANGELOG section.
+- Cut a release (**GitOps — no manual tagging**): `scripts/release.sh X.Y.Z` (bumps all
+  manifests, runs checks), update `CHANGELOG.md`, then merge to `main`. The push to `main`
+  triggers `.github/workflows/release.yml`, which auto-tags `vX.Y.Z` and cuts the GitHub
+  Release from the CHANGELOG section.
 - Full procedure and rationale: **[RELEASING.md](RELEASING.md)**. Changelog: **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## Language
