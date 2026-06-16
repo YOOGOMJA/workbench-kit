@@ -23,33 +23,24 @@
 
 ---
 
-You can become anything. So you start from nothing, every time.
+Every new idea, you spin up another repo. Write another AGENTS.md. Lay out the
+folders again, and stall on where to even start.
 
-An idea shows up and you spin up another repo. Write another AGENTS.md. Lay out
-the folders again. By the time you reach the thing you actually wanted to do,
-you're spent. A shapeshifter can be anything — it just has no shape of its own.
+You're a shapeshifter. You can become anything — so you begin as nothing, every
+single time.
 
-workbench-kit hands that shapeshifter a bench. A place that's already set up, so
-you don't have to lay it out again.
+That setup tax? Hand it to the bench.
 
-## How it goes here
+Bring anything and just work. Every task gets its own corner to wreck; when it's
+done, the one piece worth keeping — a decision, a lesson, a fix — stays, and the
+rest is swept out. Your main history only ever sees clean increments.
 
-Bring anything and get to work. Every task gets its own corner to make a mess
-in; when it's done, one piece worth keeping — a decision, a lesson, a fix —
-stays, and the rest is swept away. Your main history stays clean, and only the
-keepers pile up.
+Need a whole new repo? That's just one more thing you set on the bench.
 
-The fixed parts, the bench keeps for you. Your rules (how you name things, your
-templates) and the knowledge that builds up, you fill in. No starting from
-scratch every time.
-
-Need a new repo? That's just one more thing you set on the bench. No more
-starting from a bare floor.
-
-## Status
-
-🚧 Still building the bench. What's fixed and what you fill in is being settled
-first — expect things to move.
+> **Straight up: the bench is still being built.** What's fixed and what you
+> fill in is being settled first. No install, no feature table, no testimonials
+> yet — when there's something to brag about, I'll brag. If you're a shapeshifter
+> tired of the setup tax, watch this space.
 
 ## License
 
