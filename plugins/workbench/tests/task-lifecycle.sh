@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ROOT = the workbench engine plugin (holds utils/). SCAFFOLD_TEMPLATES = the kit's
+# scaffold/templates (profile defaults live there, not under the plugin).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCAFFOLD_TEMPLATES="$(cd "$ROOT/../.." && pwd)/scaffold/templates"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/workbench-task-lifecycle.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -106,7 +109,7 @@ setup_workbench() {
   mkdir -p "$repo/utils" "$repo/templates"
   cp "$ROOT/utils/task" "$repo/utils/task"
   chmod +x "$repo/utils/task"
-  cp "$ROOT/templates/task-AGENTS.md" "$repo/templates/task-AGENTS.md"
+  cp "$SCAFFOLD_TEMPLATES/task-AGENTS.md" "$repo/templates/task-AGENTS.md"
   git -C "$repo" config user.name "Test User"
   git -C "$repo" config user.email "test@example.invalid"
   git -C "$repo" add utils/task templates/task-AGENTS.md
@@ -326,7 +329,7 @@ test_tickets_detects_remote_only_task_branch_without_fetch() {
   mkdir -p "$fresh/utils" "$fresh/templates"
   cp "$ROOT/utils/task" "$fresh/utils/task"
   chmod +x "$fresh/utils/task"
-  cp "$ROOT/templates/task-AGENTS.md" "$fresh/templates/task-AGENTS.md"
+  cp "$SCAFFOLD_TEMPLATES/task-AGENTS.md" "$fresh/templates/task-AGENTS.md"
 
   out="$TMPDIR/tickets_remote_only/tickets.out"
   run_task_in_dir tickets_remote_only "$fresh" tickets > "$out"

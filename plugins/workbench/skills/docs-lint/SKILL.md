@@ -1,6 +1,7 @@
 ---
 name: docs-lint
-description: docs/ 위키의 모순·낡음·고아 페이지·깨진 상호참조·supersede 누적을 점검·정리할 때 사용. 유지보수 task나 ingest 중 기회적으로.
+description: >-
+  Use to check and groom the docs/ wiki: contradictions, staleness, orphan pages, broken cross-references, accumulated supersedes. During maintenance tasks or opportunistically during ingest.
 ---
 
 # docs-lint

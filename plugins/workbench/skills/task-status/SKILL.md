@@ -1,6 +1,7 @@
 ---
 name: task-status
-description: 로컬·원격 task 현황을 한눈에 조회하고 어긋남(미push·낡은 status·정리 누락)을 진단할 때 사용. 시작·제출 전이나 멀티디바이스 핸드오프 후 "지금 뭐가 어디까지 갔나"를 알고 싶을 때.
+description: >-
+  Use to see local and remote task status at a glance and diagnose drift (unpushed, stale status, missed cleanup). When you want to know where everything stands before starting or submitting, or after a multi-device handoff.
 ---
 
 # task 현황

@@ -32,11 +32,12 @@ jobs:
         run: bash scripts/check-version-sync.sh
 
       - name: ShellCheck
-        # task-lifecycle.sh is inherited from workbench and still assumes the flat
-        # layout — excluded until adapted to the kit's plugins/* layout.
         run: |
-          files=$(find . -path ./.git -prune -o -name '*.sh' -not -name task-lifecycle.sh -print)
+          files=$(find . -path ./.git -prune -o -name '*.sh' -print)
           shellcheck -S error $files
+
+      - name: Engine lifecycle test
+        run: bash plugins/workbench/tests/task-lifecycle.sh
 
       - name: Compose smoke test
         # generate-workbench's bundled compose.sh self-verifies; a non-zero exit fails CI.

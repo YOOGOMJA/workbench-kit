@@ -1,8 +1,8 @@
 # Lessons
 
-실패 교훈 카탈로그 = 앵커 표(소비 표면).
-새 task는 접근 직전 이 표를 스캔한다("이미 망했나?").
+Catalog of failure lessons = anchor table (the consumption surface).
+A new task scans this before an approach ("did we already fail at this?").
 
-| 접근(앵커) | 무엇이 망했나 | 페이지 |
+| Approach (anchor) | What failed | Page |
 |---|---|---|
-| _(아직 없음 — 망한 실험의 교훈이 여기 쌓인다)_ | | |
+| _(none yet — lessons from failed experiments accumulate here)_ | | |

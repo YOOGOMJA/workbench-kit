@@ -1,6 +1,7 @@
 ---
 name: task-start
-description: 사용자가 task 시작·이슈 착수·새 시도를 요청하거나, 이슈 번호를 주며 작업을 시작하자고 할 때 사용.
+description: >-
+  Use when the user asks to start a task, pick up an issue, or begin a new attempt, or hands over an issue number to start work.
 ---
 
 # task 시작

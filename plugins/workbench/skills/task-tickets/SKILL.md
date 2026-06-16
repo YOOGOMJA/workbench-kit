@@ -1,6 +1,7 @@
 ---
 name: task-tickets
-description: 열린 workbench 티켓을 task branch와 lifecycle event까지 조인해 미착수·착수 시도·진행·PR 대기·정리됨 상태로 훑어볼 때 사용. read-only.
+description: >-
+  Use to scan open workbench tickets joined with task branches and lifecycle events into unstarted / claim-attempted / in-progress / awaiting-PR / cleaned-up states. Read-only.
 ---
 
 # task 티켓 현황

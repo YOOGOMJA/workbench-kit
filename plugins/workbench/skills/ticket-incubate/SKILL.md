@@ -1,7 +1,7 @@
 ---
 name: ticket-incubate
 description: >-
-  아직 이슈·티켓이 없는 아이디어를 착수 가능한 GitHub 이슈로 만들 때 사용. 막연한 구상을 발산으로 키우고, 부족한 부분만 결손 기반 인터뷰로 좁혀, 티켓 필수 4요소(배경·목표·완료 기준·이번에 하지 않을 것)를 갖추면 이슈를 생성한다. "아이디어가 있는데", "이거 티켓으로 만들자", "이슈 만들어줘", "인터뷰해줘", 혹은 이슈 번호 없이 만들거나 고치거나 개선할 무언가를 설명할 때 — 사용자가 '티켓'이라는 말을 쓰지 않아도 — 발동한다. 워크벤치 수명주기의 맨 앞단이다(아이디어 → /ticket-incubate → 이슈 → /task-start). brainstorming·설계 스킬과 구분: 그쪽은 지금 구현할 것의 '어떻게'를 짜고, 이 스킬은 나중에 할 일의 '무엇'을 잘 벼린 티켓으로 포착한다.
+  Use to turn an idea that has no issue/ticket yet into an actionable GitHub issue. Grow a vague notion by divergence, narrow only the gaps via a deficit-based interview, and create the issue once the four required elements (background, goal, done criteria, out-of-scope) are filled. Triggers on "I have an idea", "let's make this a ticket", "create an issue", "interview me", or describing something to make/fix/improve without an issue number, even if the user never says the word "ticket". It is the front of the workbench lifecycle (idea -> ticket-incubate -> issue -> task-start). Distinct from brainstorming/design skills: those work out the how of what to build now; this captures the what of later work as a well-honed ticket.
 ---
 
 # ticket-incubate — 아이디어를 티켓으로 부화

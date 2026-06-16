@@ -1,6 +1,7 @@
 ---
 name: task-done
-description: 사용자가 task 정리·폐기를 요청하거나, PR 머지 후 작업 공간을 치울 때 사용.
+description: >-
+  Use when the user asks to clean up or discard a task, or to clear the workspace after a PR is merged.
 ---
 
 # task 정리

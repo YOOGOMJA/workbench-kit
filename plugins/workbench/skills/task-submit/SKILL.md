@@ -1,6 +1,7 @@
 ---
 name: task-submit
-description: 사용자가 task 제출·마무리·추출을 요청하거나, 작업이 일단락되어 PR을 올릴 때가 됐을 때 사용.
+description: >-
+  Use when the user asks to submit, wrap up, or extract from a task, or when work has reached a point to open a PR.
 ---
 
 # task 제출

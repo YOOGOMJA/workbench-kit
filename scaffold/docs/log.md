@@ -1,4 +1,4 @@
-# docs/ 변경 이력
+# docs/ change history
 
-append-only. 형식: `## [YYYY-MM-DD HH:MM:SS] <op> · <action> <path> | <요약>`
+Append-only. Format: `## [YYYY-MM-DD HH:MM:SS] <op> · <action> <path> | <summary>`
 (op: extract·lint·edit / action: create·update·delete)

@@ -31,5 +31,15 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
   templates, `.github`, empty `docs/`, `codebases.yaml`).
 - **`tests/check-skill-frontmatter.sh`** — lint guarding against malformed SKILL.md
   YAML frontmatter.
+- **CI** (`.github/workflows/ci.yml`) — frontmatter lint, JSON manifest parse, version
+  sync, ShellCheck, engine lifecycle test, and a compose smoke test.
+- **Release tooling** — `RELEASING.md`, this changelog, `scripts/bump-version.sh`,
+  `scripts/check-version-sync.sh`.
+
+### Known gaps
+
+- **Translation in progress.** Framework-facing content (README, `AGENTS.core`, scaffold,
+  bootstrap skills) and all skill *descriptions* are English. The engine skill *bodies*
+  and `framework-docs/` are still Korean — to be translated incrementally.
 
 [Unreleased]: https://github.com/YOOGOMJA/workbench-kit/commits/main

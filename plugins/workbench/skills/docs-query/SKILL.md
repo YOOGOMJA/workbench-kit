@@ -1,6 +1,7 @@
 ---
 name: docs-query
-description: docs/ 위키에 질문하거나 새 task 선행 조회를 할 때, 그리고 결정·접근 직전 "이미 정했나/망했나" 가드가 필요할 때 사용.
+description: >-
+  Use to ask the docs/ wiki a question, run a new task's preflight lookup, or guard right before a decision or approach ("did we already decide / already fail at this?").
 ---
 
 # docs-query

@@ -1,6 +1,7 @@
 ---
 name: docs-ingest
-description: task harvest(decisions/lessons/runbooks/researches)를 워크벤치 docs/에 짜 넣을 때 사용. task-submit이 호출하거나, 작업 중 살아남을 지식을 docs/에 반영할 때.
+description: >-
+  Use to weave task harvest (decisions/lessons/runbooks/researches) into the workbench docs/ wiki. Called by task-submit, or whenever knowledge that should survive the task needs to land in docs/.
 ---
 
 # docs-ingest

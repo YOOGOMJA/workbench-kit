@@ -1,9 +1,9 @@
 # Decisions
 
-재사용 가능한 결정 카탈로그 = 앵커 표(소비 표면).
-새 task는 결정 직전 이 표를 주제로 스캔한다("이미 정했나?").
-항목 추가/대체 시 이 표를 갱신한다.
+Catalog of reusable decisions = anchor table (the consumption surface).
+A new task scans this by topic before deciding ("did we already decide?").
+Update this table when you add or supersede an entry.
 
-| 주제(앵커) | 선택 | 상태 | 페이지 |
+| Topic (anchor) | Choice | Status | Page |
 |---|---|---|---|
-| _(아직 없음 — 당신의 첫 결정이 여기 들어간다)_ | | | |
+| _(none yet — your first decision goes here)_ | | | |

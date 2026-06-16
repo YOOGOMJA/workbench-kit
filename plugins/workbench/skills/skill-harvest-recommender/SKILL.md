@@ -1,7 +1,7 @@
 ---
 name: skill-harvest-recommender
 description: >-
-  방금 끝낸(또는 끝나가는) 세션·task를 **회고**해서, 손으로 반복한 절차 중 스킬·runbook·utils 스크립트로 *졸업*시킬 후보를 찾아내고 추천할 때 사용. 트리거 의도: "방금 한 작업 중 스킬/자동화로 만들 만한 거 있어?", "이번 task에서 도구화·절차 졸업시킬 거 점검해줘", "제출·마무리 전에 남길 자동화 후보 뽑아줘", "이번 세션 회고하자 — 반복한 절차 중 뭘 도구로 만들까?", "여러 repo를 손으로 설정·반복했는데 스킬이나 스크립트로 만들 게 있을까?" 같은, *이미 일어난 작업을 돌아보며* 반복 패턴을 발견하려는 요청. task-submit의 지식 harvest 게이트 옆에서 절차 졸업 점검으로도 발동. 후보 *발견·라우팅·선택*까지만 한다 — 실제 스킬 저작은 skill-creator/writing-skills에, 티켓 생성은 /ticket-incubate에 위임. 구분: 무엇을 만들지 이미 정한 저작 단계(skill-creator)나 코드베이스 정적 스캔으로 자동화를 추천하는 것(claude-automation-recommender)이 아니라, **방금 한 작업을 회고적으로 보는 앞단**이다.
+  Use to retrospect a just-finished (or finishing) session/task and surface procedures repeated by hand that could graduate into a skill, runbook, or utils script. Triggers on "anything from this work worth turning into a skill/automation?", "check what to graduate into tooling", "pull out automation candidates before submit", "let's retro this session", and similar requests that look back at work already done to find repeated patterns. Also fires alongside task-submit's knowledge-harvest gate. It only discovers, routes, and selects candidates; actual skill authoring is delegated to skill-creator/writing-skills and ticket creation to ticket-incubate. Distinct from the authoring stage (you already decided what to build) and from static-scan automation recommenders: this is the retrospective front-end.
 ---
 
 # skill-harvest-recommender

@@ -1,8 +1,8 @@
 # Runbooks
 
-반복 루틴/방법 카탈로그 = 앵커 표.
-task/AGENTS.md가 상황별로 `@`로 지연 참조한다(점진적 공개).
+Catalog of repeatable routines/methods = anchor table.
+task/AGENTS.md lazy-references these by context (`@`, progressive disclosure).
 
-| 작업(앵커) | 언제 쓰나 | 페이지 |
+| Task (anchor) | When to use | Page |
 |---|---|---|
-| _(아직 없음 — 당신의 반복 루틴이 여기 들어간다)_ | | |
+| _(none yet — your repeatable routines go here)_ | | |
