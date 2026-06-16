@@ -28,7 +28,112 @@
 그 셋업, 작업대에 맡기세요. 뭐든 올려놓고 일하면, 끝났을 때 쓸 만한 한 조각만
 남고 나머지는 치워집니다. 새 레포가 필요해도 그냥 또 하나의 작업입니다.
 
-> 🚧 아직 작업대를 짜는 중입니다. 지켜봐 주세요.
+> 🚧 **초기 단계.** 프레임워크는 동작하지만 API와 문서는 아직 다듬는 중입니다.
+> 거친 부분이 있으니 [알려진 한계](#상태--알려진-한계)를 읽어 주세요.
+
+## 무엇을 얻나
+
+workbench-kit은 함께 동작하는 두 플러그인의 **마켓플레이스**입니다. 둘 다 설치하세요.
+
+| 플러그인 | 역할 | 이걸로… |
+|---|---|---|
+| **`workbench`** | **엔진.** 워크트리/task 격리, 점진적 지식 수확, 스킬 기반 task 수명주기. | 일상 작업을 굴립니다 — task 시작·제출, 남길 것 수확. |
+| **`workbench-kit`** | **부트스트랩.** 당신의 컨벤션을 인터뷰한 뒤, 개인화된 최소 워크벤치 레포를 생성. | *새* 워크벤치를 취향에 맞춰 한 번 세팅합니다. |
+
+**도구 중립적**입니다 — 같은 `skills/` 소스가 Claude Code와 Codex 양쪽에 설치됩니다.
+"Bring your own rules" — 메커니즘은 고정, 당신의 컨벤션은 자유입니다.
+
+## 설치
+
+**Claude Code**
+
+```
+/plugin marketplace add YOOGOMJA/workbench-kit
+/plugin install workbench@workbench-kit
+/plugin install workbench-kit@workbench-kit
+```
+
+**Codex**
+
+```
+codex plugin marketplace add https://github.com/YOOGOMJA/workbench-kit
+codex plugin install workbench
+codex plugin install workbench-kit
+```
+
+요구사항: Claude Code **또는** Codex, `git`(워크트리 지원), 이슈·PR 배관용 `gh` CLI.
+
+## 빠르게 시작하기
+
+**1. 워크벤치 만들기 (한 번).** 부트스트랩 플러그인이 짧은 인터뷰를 거쳐,
+당신의 컨벤션에 맞춘 최소 레포를 생성합니다:
+
+```
+/workbench-kit:interview-for-personalizing   # 당신의 persona를 끌어냄
+/workbench-kit:generate-workbench            # 레포를 생성하고 초안은 버림
+```
+
+**2. 새 워크벤치 안에서 작업하기.** 엔진 플러그인이 task 수명주기를 굴립니다 —
+각 task는 자기 브랜치·워크트리에 살고, 정제된 증분만 `main`에 남습니다:
+
+```
+/workbench:task-start <issue>     # 브랜치 + 워크트리 + task/ 작업 공간
+# … 작업 …
+/workbench:task-submit            # task/ 정리, squash PR 생성
+/workbench:task-done <issue>      # 머지 후 작업 공간 정리
+```
+
+그 밖의 진입점: `/workbench:ticket-incubate`(아이디어 → 이슈),
+`/workbench:task-status` · `/workbench:task-tickets`(읽기 전용 현황),
+지식 위키용 `docs-query` · `docs-ingest` · `docs-lint` 스킬.
+
+## 어떻게 동작하나
+
+- **작업은 휘발, 지식은 축적.** 모든 일은 task 브랜치에서 일어나고, 끝나면 `task/`를
+  정리한 뒤 **squash 머지**합니다. `main`엔 정제된 증분 하나만 남고, 탐색 과정은
+  치워집니다.
+- **두 레이어.** *판단*(무엇을 추출할지, 산문)은 에이전트가, *배관*(git 상태 전이)은
+  `utils/`가 합니다. 에이전트의 진입점은 항상 스킬입니다.
+- **`AGENTS.core` + `AGENTS.overlay` → `AGENTS.md`.** 프레임워크 코어는 고정·영어이며
+  (업그레이드가 덮어씀), 당신의 persona — 언어, slug 스타일, 이슈·PR 형태, 라벨,
+  게이트 — 는 overlay에 둡니다. 부트스트랩이 둘을 합성합니다.
+
+배경과 설계 이유는
+[`framework-docs/workbench-knowledge-ecosystem.md`](framework-docs/workbench-knowledge-ecosystem.md)에,
+개별 설계 결정은 [`framework-docs/decisions/`](framework-docs/decisions/) 아래 ADR로
+기록되어 있습니다.
+
+## 레포 구조
+
+```
+plugins/
+  workbench/        엔진 — skills, utils/, bin/workbench, AGENTS.core.md
+  workbench-kit/    부트스트랩 — interview + generate-workbench 스킬
+scaffold/           generate-workbench이 사용자 레포에 까는 것
+framework-docs/     설계 결정·교훈·런북·종합
+scripts/            릴리스 툴링 (버전 bump/sync)
+tests/              frontmatter 린트와 CI 검사
+```
+
+## 상태 & 알려진 한계
+
+- **초기 단계**, 첫 릴리스(`0.1.0`) 진행 중. [CHANGELOG.md](CHANGELOG.md) 참고.
+- **번역 진행 중.** 프레임워크 표면(이 README, `AGENTS.core`, scaffold, 부트스트랩
+  스킬)과 모든 스킬 *설명*은 영어입니다. 엔진 스킬 *본문*과 `framework-docs/`는 아직
+  한국어이며, 점진적으로 번역됩니다.
+
+## 문서
+
+- [CHANGELOG.md](CHANGELOG.md) — 릴리스별 변경 내역
+- [RELEASING.md](RELEASING.md) — 릴리스 컷 방법 (메인테이너용)
+- [framework-docs/](framework-docs/) — 설계 결정·교훈·런북
+
+## 기여
+
+PR 환영합니다. 동작에 영향을 주는 변경은 [CHANGELOG.md](CHANGELOG.md)의
+`## [Unreleased]` 아래에 한 줄을 추가합니다. CI는 frontmatter 린트, 매니페스트 파싱,
+버전 sync, ShellCheck, 수명주기/compose 스모크 테스트를 돌립니다 —
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) 참고.
 
 ## 라이선스
 
