@@ -5,7 +5,8 @@
 <h1 align="center">workbench-kit</h1>
 
 <p align="center">
-  <em>You make the mess. It keeps the one thing worth keeping.</em>
+  <em>A workbench for shapeshifters — the ones who never know where to start,
+  and are tired of spinning up one more repo and writing one more AGENTS.md.</em>
 </p>
 
 <p align="center">
@@ -22,56 +23,33 @@
 
 ---
 
-You know the bench. Corner of the shop, older than the building, so bolted down
-nobody remembers wheeling it in. You make your mess on it, finish, walk off. It
-keeps the one jig worth keeping and bins the rest. Next time, it's already set.
+You can become anything. So you start from nothing, every time.
 
-workbench-kit puts that bench inside your AI agent.
+An idea shows up and you spin up another repo. Write another AGENTS.md. Lay out
+the folders again. By the time you reach the thing you actually wanted to do,
+you're spent. A shapeshifter can be anything — it just has no shape of its own.
 
-## How a job goes
+workbench-kit hands that shapeshifter a bench. A place that's already set up, so
+you don't have to lay it out again.
 
-Every task stops at the same four marks:
+## How it goes here
 
-```
-1. A task arrives   → it gets its own corner to wreck
-2. Work happens     → a branch, a workspace, scratch notes
-3. The job lands    → keep the one thing worth keeping
-4. Sweep the bench  → main only ever sees the keeper
-```
+Bring anything and get to work. Every task gets its own corner to make a mess
+in; when it's done, one piece worth keeping — a decision, a lesson, a fix —
+stays, and the rest is swept away. Your main history stays clean, and only the
+keepers pile up.
 
-Disposable, not careless: the keepers — a decision, a lesson, a fix — get filed.
-Only the scratch work goes in the bin.
+The fixed parts, the bench keeps for you. Your rules (how you name things, your
+templates) and the knowledge that builds up, you fill in. No starting from
+scratch every time.
 
-## The drawers
-
-Three of them. You fill two; the bench owns the first.
-
-| Drawer | What's in it |
-|--------|--------------|
-| **framework** | The bench itself — the parts that never change |
-| **profile** | Your rules — how you name things, your templates |
-| **knowledge** | What every job leaves behind — decisions, lessons, runbooks |
-
-## Need a new workshop?
-
-Starting a whole new repo is just another job you hand it. No fresh setup, no
-ceremony. You were tired of doing that part anyway.
+Need a new repo? That's just one more thing you set on the bench. No more
+starting from a bare floor.
 
 ## Status
 
-🚧 Still setting up the shop. The bench's blueprint is being settled before the
-tools go in — expect things to move.
-
-## FAQ
-
-**Can I install it yet?**
-No. It's still bolting the bench down.
-
-**What if a task leaves nothing worth keeping?**
-Then nothing survives, and that's correct. The bench doesn't hoard.
-
-**Why a toolbox for a logo?**
-You make things on a bench, you keep them in a box. Same idea, smaller.
+🚧 Still building the bench. What's fixed and what you fill in is being settled
+first — expect things to move.
 
 ## License
 
