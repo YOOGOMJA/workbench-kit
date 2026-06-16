@@ -14,6 +14,13 @@
   <a href="README.ko.md">한국어</a>
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/status-early%20stage-orange" alt="status" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license" /></a>
+  <img src="https://img.shields.io/github/last-commit/YOOGOMJA/workbench-kit" alt="last commit" />
+  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome" />
+</p>
+
 ---
 
 ## What is this?
@@ -43,4 +50,4 @@ before extraction. Expect things to move.
 
 ## License
 
-TBD
+[MIT](LICENSE)

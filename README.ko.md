@@ -14,6 +14,13 @@
   <a href="README.ko.md">한국어</a>
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/status-early%20stage-orange" alt="status" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license" /></a>
+  <img src="https://img.shields.io/github/last-commit/YOOGOMJA/workbench-kit" alt="last commit" />
+  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome" />
+</p>
+
 ---
 
 ## 이게 뭔가요?
@@ -42,4 +49,4 @@ AI 코딩 에이전트가 main 이력을 더럽히지 않고 실제 작업을 �
 
 ## 라이선스
 
-미정
+[MIT](LICENSE)
