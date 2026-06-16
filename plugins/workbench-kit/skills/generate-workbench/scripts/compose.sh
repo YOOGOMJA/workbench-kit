@@ -26,6 +26,12 @@ done
 [ -d "$SCAFFOLD" ]              || { echo "scaffold not found: $SCAFFOLD" >&2; exit 1; }
 [ -f "$PERSONA/overlay.md" ]    || { echo "persona overlay not found: $PERSONA/overlay.md" >&2; exit 1; }
 
+# Pre-check: the persona contract. Catch a half-filled .persona/ before we scaffold,
+# so failures point at the interview output rather than a malformed workbench.
+[ -s "$PERSONA/overlay.md" ]    || { echo "persona overlay is empty: $PERSONA/overlay.md" >&2; exit 1; }
+grep -qi '^#\+ *Language' "$PERSONA/overlay.md" \
+  || echo "warning: overlay has no Language section — output language may default to English" >&2
+
 mkdir -p "$OUT"
 
 # 1) Lay the scaffold (profile defaults + empty knowledge). Engine (utils/skills/bin)
@@ -66,8 +72,22 @@ HDR
 # 5) CLAUDE.md compatibility symlink.
 ln -sfn AGENTS.md "$OUT/CLAUDE.md"
 
-echo "composed workbench at: $OUT"
-echo "  AGENTS.md            ($(wc -l < "$OUT/AGENTS.md") lines, core+overlay)"
-echo "  AGENTS.overlay.md    (your editable rules)"
-[ -e "$OUT/docs" ] && echo "  docs/                (empty knowledge skeleton)"
-[ -e "$OUT/codebases.yaml" ] && echo "  codebases.yaml"
+# 6) Post-check: verify the workbench is well-formed. The skill no longer eyeballs the
+#    result — the script asserts its own post-conditions and fails loudly if any miss,
+#    so a bad compose can't slip through to the user.
+fail=0
+check() { # <description> <test-result(0=ok)>
+  if [ "$2" -eq 0 ]; then echo "  ok   $1"; else echo "  FAIL $1" >&2; fail=1; fi
+}
+echo "verifying $OUT:"
+check "AGENTS.md exists"                  "$([ -f "$OUT/AGENTS.md" ]; echo $?)"
+check "AGENTS.md has framework core"      "$(grep -q 'FRAMEWORK CORE' "$OUT/AGENTS.md" 2>/dev/null; echo $?)"
+check "AGENTS.md has persona overlay"     "$(grep -q 'YOUR PERSONA' "$OUT/AGENTS.md" 2>/dev/null; echo $?)"
+check "AGENTS.overlay.md exists"          "$([ -f "$OUT/AGENTS.overlay.md" ]; echo $?)"
+check "CLAUDE.md → AGENTS.md"             "$([ "$(readlink "$OUT/CLAUDE.md" 2>/dev/null)" = AGENTS.md ]; echo $?)"
+check "docs/ skeleton (index.md)"         "$([ -f "$OUT/docs/index.md" ]; echo $?)"
+check "codebases.yaml present"            "$([ -f "$OUT/codebases.yaml" ]; echo $?)"
+check "engine NOT copied (no utils/)"     "$([ ! -e "$OUT/utils" ]; echo $?)"
+if [ "$fail" -ne 0 ]; then echo "compose verification FAILED" >&2; exit 1; fi
+
+echo "composed workbench at: $OUT ($(wc -l < "$OUT/AGENTS.md" | tr -d ' ') lines AGENTS.md, engine via plugin)"

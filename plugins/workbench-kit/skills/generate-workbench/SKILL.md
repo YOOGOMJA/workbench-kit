@@ -48,6 +48,12 @@ If `.persona/` is absent, run `interview-for-personalizing` first — don't inve
    from the persona, and composes `AGENTS.md` = core + overlay (inline). It does **not**
    copy the engine — that's the plugin's job.
 
+   The script **self-checks**: it rejects an empty/half-filled `.persona/` up front, and
+   after composing it asserts post-conditions (AGENTS.md has both core+overlay markers,
+   overlay/docs/codebases present, engine *not* copied, CLAUDE.md symlink) — failing
+   loudly. So you don't eyeball the result; if `compose.sh` exits 0, the workbench is
+   well-formed. If it exits non-zero, read the `FAIL` lines and fix the input.
+
 4. **Discard `.persona/`** — it's temporary scratch; its content now lives in the repo.
 
 5. **Commit and hand off.** Make the initial commit (in the user's output language per
