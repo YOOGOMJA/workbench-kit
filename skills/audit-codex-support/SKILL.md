@@ -74,7 +74,7 @@ Prefer tracked, canonical files over generated or ignored state. Do not treat `.
 ### 6. Docs Links and Drift
 
 - Check README and docs for links to removed pages.
-- Use `utils/docs check` for deterministic docs markdown link and `[[wikilink]]` integrity when available.
+- Use `workbench docs check` for deterministic docs markdown link and `[[wikilink]]` integrity when available.
 - Check remaining `[[wikilinks]]` against existing pages when the link is meant to be resolved now.
 - Distinguish intentional future-page markers from stale links.
 - Flag docs that conflict with adopted decisions in `docs/decisions/index.md`.
@@ -84,7 +84,7 @@ Prefer tracked, canonical files over generated or ignored state. Do not treat `.
 - Check whether there is a deterministic command for the thing being claimed.
 - If validation remains manual, confirm the boundary is explicit.
 - For skills, run `skill-creator` validation when available.
-- For docs, prefer `utils/docs check`; if unavailable, run stale-link searches that match the audited drift.
+- For docs, prefer `workbench docs check`; if unavailable, run stale-link searches that match the audited drift.
 - Report commands actually run and commands not available.
 
 ## Output

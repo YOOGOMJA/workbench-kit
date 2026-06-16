@@ -8,7 +8,7 @@ description: 로컬·원격 task 현황을 한눈에 조회하고 어긋남(미p
 사용: `/task-status` — read-only. 어떤 후속 행동도 실행하지 않는다(제안만).
 AGENTS.md의 "진실의 원천은 기록" 원칙을 따른다. 절차:
 
-1. **배관 실행**: `utils/task status`
+1. **배관 실행**: `workbench task status`
    - 첫 줄 `remote_source: live|cached` 를 읽는다. `cached` 면 오프라인이라
      원격 판정이 낡았을 수 있다 — 보고 끝에 "⚠️ 오프라인(원격 캐시 기준)"을
      덧붙인다.

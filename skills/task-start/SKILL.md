@@ -9,9 +9,9 @@ description: 사용자가 task 시작·이슈 착수·새 시도를 요청하거
 
 AGENTS.md의 규칙을 따른다. 절차:
 
-1. **배관 실행**: `utils/task start <ID>`
+1. **배관 실행**: `workbench task start <ID>`
    - 이슈 제목 조회가 실패하면 이슈 내용을 보고 slug를 직접 지어 재시도한다
-     (`utils/task start <ID> <slug>`)
+     (`workbench task start <ID> <slug>`)
    - 배관은 `task-claimed` lifecycle event를 남기고, scaffold commit을 즉시 push한
      뒤 `task-active` event를 남긴다. 이 덕분에 다른 기기에서 바로 resume 가능하다.
 2. 생성된 작업 공간(`.worktrees/task__...`)으로 이동한다.

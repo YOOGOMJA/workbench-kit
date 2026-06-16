@@ -17,7 +17,7 @@ description: 사용자가 task 정리·폐기를 요청하거나, PR 머지 후 
      무엇이 사라지는지 모른 채 말했을 수 있다.
    - 예외: 스캐폴드 외 아무 작업 내용이 없음을 검증한 경우(잃을 것이 0)에는
      그 사실을 보고하고 진행해도 된다.
-2. **배관 실행**: `utils/task done <ID>`
+2. **배관 실행**: `workbench task done <ID>`
    - 커밋 안 된 변경 때문에 실패하면, 무엇이 남아 있는지 보여주고 폐기해도
      되는지 물은 뒤에만 `--force`를 쓴다.
    - 정리가 성공하면 `task-cleaned` lifecycle event를 남긴다. 이 event는 issue

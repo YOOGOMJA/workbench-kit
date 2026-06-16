@@ -14,7 +14,7 @@
 
 - `decision.tmpl.md` · `lesson.tmpl.md` · `runbook.tmpl.md` — harvest entry 형식 명세.
   각 파일 상단 주석에 `docs/<genre>/index.md` 앵커 표 컬럼과의 매핑이 고정돼 있다.
-- `task-AGENTS.md` — task 안 in-task 룰셋 정본. `utils/task` 스캐폴드가 인스턴스화한다.
+- `task-AGENTS.md` — task 안 in-task 룰셋 정본. `workbench task` 스캐폴드가 인스턴스화한다.
 
 ## 범위 밖 (템플릿 불필요 — 의도적)
 
@@ -23,5 +23,5 @@
 
 ## 후속 (미결)
 
-`utils/task`의 inline heredoc 시드(index/status/log/genre-index)는 아직 스크립트 안에 있다.
+`workbench task`의 inline heredoc 시드(index/status/log/genre-index)는 아직 스크립트 안에 있다.
 단일 정책("모든 정본 doc 템플릿은 templates/에 파일로 산다")으로 통합하는 것은 후속 task로 둔다.

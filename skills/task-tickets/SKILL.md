@@ -9,7 +9,7 @@ description: 열린 workbench 티켓을 task branch와 lifecycle event까지 조
 
 절차:
 
-1. **배관 실행**: `utils/task tickets`
+1. **배관 실행**: `workbench task tickets`
    - 빈 줄 구분 레코드를 issue별로 파싱한다. 필드:
      `issue title issue_state url branch branch_local branch_remote pr lifecycle_event
      lifecycle_claim_id lifecycle_branch lifecycle_pr`.

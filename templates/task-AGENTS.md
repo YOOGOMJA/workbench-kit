@@ -8,7 +8,7 @@
 
 모든 기록은 고정 형식·순서를 따르며, AI가 작성·관리한다.
 
-1. **파일 변경 → `utils/task commit <op> <action> [path] -m "<subject>"`**
+1. **파일 변경 → `workbench task commit <op> <action> [path] -m "<subject>"`**
    log append·commit·push를 한 동작으로 한다(이중 기입 제거).
    op ∈ plan·research·decide·lesson·code·review, action ∈ create·update·delete.
    커밋 subject는 컨벤션대로, 이슈 ref `(#N)`는 자동 주입된다.

@@ -11,14 +11,14 @@ Lint 연산 — `docs/` 위키의 정합성과 스캔 가능성을 유지한다.
 - **기회적(local)**: docs-ingest 중 건드린 영역에 한해 즉시 점검.
 - **전용(global)**: 유지보수 task에서 위키 전체를 대상으로 점검.
 
-기계적으로 판정 가능한 링크 무결성은 먼저 `utils/docs check`로 확인한다.
+기계적으로 판정 가능한 링크 무결성은 먼저 `workbench docs check`로 확인한다.
 이 명령은 read-only 배관이며 `docs/index.md`와 장르 index의 markdown link,
 inline code 밖 `[[wikilink]]` 대상 존재만 검사한다. 모순 판단, supersede 의미,
 provenance, 템플릿 conformance, 로그 그루밍은 여전히 이 스킬의 판단 영역이다.
 
 AGENTS.md의 docs/ 위키 규칙을 따른다. 절차:
 
-1. **기계 링크 check**: `utils/docs check`를 실행해 깨진 markdown link와
+1. **기계 링크 check**: `workbench docs check`를 실행해 깨진 markdown link와
    현재 존재해야 하는 `[[wikilink]]`를 먼저 잡는다. 실패하면 출력의
    `ERROR path:line ...`를 따라 고친 뒤 다시 실행한다.
 
@@ -28,7 +28,7 @@ AGENTS.md의 docs/ 위키 규칙을 따른다. 절차:
 
 3. **고아·깨진 링크 점검·수정**: 각 폴더의 `index.md`에 없는 고아 페이지,
    `index.md`에는 있으나 파일이 없는 항목, `[[파일명]]` 참조 대상이 실제로
-   존재하지 않는 깨진 상호참조를 찾아 고친다. `utils/docs check`가 잡지 않는
+   존재하지 않는 깨진 상호참조를 찾아 고친다. `workbench docs check`가 잡지 않는
    고아 페이지·의도적 미래 링크 여부는 여기서 판단한다.
 
 4. **entry 형식 점검 (conformance)**: `docs/decisions/`·`lessons/`·`runbooks/`의

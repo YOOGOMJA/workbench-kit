@@ -8,7 +8,7 @@ description: 사용자가 task 제출·마무리·추출을 요청하거나, 작
 사용: `/task-submit` — **반드시 task 작업 공간(`.worktrees/` 하위) 안에서
 실행돼야 한다.** AGENTS.md의 추출 기준과 위키 규칙을 따른다. 절차:
 
-0. **불변식 검사 (백스톱)**: `utils/task check` 를 실행한다. 위반(exit 1)이면
+0. **불변식 검사 (백스톱)**: `workbench task check` 를 실행한다. 위반(exit 1)이면
    먼저 해소한 뒤 제출을 진행한다 — 훅이 다 없어도 제출은 검사를 통과해야 한다.
 1. **task 전체를 읽는다**: `task/index.md`, `task/log.md`, `task/status.md`,
    `task/docs/*` — 이 task가 무엇을 했고 무엇을 배웠는지 파악한다.
@@ -46,8 +46,8 @@ description: 사용자가 task 제출·마무리·추출을 요청하거나, 작
    범위로 한정하게 한다. 경로 B(직접 커밋)는 이미 task 브랜치에 있으니
    docs-ingest를 거치지 않는다. 승인되지 않은 후보는 반영하지 않는다.
 5. 추출 결과를 task 브랜치에 커밋한다.
-6. **불변식 재검사 (최종 백스톱)**: 추출 커밋 뒤 `utils/task check` 를 다시
-   실행한다. 위반(exit 1)이면 먼저 해소한다. `utils/task submit`도 cleanup 직전
+6. **불변식 재검사 (최종 백스톱)**: 추출 커밋 뒤 `workbench task check` 를 다시
+   실행한다. 위반(exit 1)이면 먼저 해소한다. `workbench task submit`도 cleanup 직전
    같은 검사를 실행하므로, skill 절차와 배관이 같은 최종 경계를 공유한다.
 7. **PR 산문 작성** (판단): 제목과 본문을 작성한다. 본문은
    `.github/PULL_REQUEST_TEMPLATE.md`의 5섹션 골격을 따른다 (`--body-file`로
@@ -61,7 +61,7 @@ description: 사용자가 task 제출·마무리·추출을 요청하거나, 작
    - 맨 위에 AI 작성 callout을 둔다 (템플릿 첫 줄과 동일, 작성 에이전트·모델
      기입). 빈 섹션은 지운다.
    - 본문을 임시 파일로 저장한다 (예: `/tmp/pr-body-<ID>.md`).
-8. **배관 실행**: `utils/task submit --title "<제목>" --body-file <파일>`
+8. **배관 실행**: `workbench task submit --title "<제목>" --body-file <파일>`
    - 이 명령이 task/ cleanup 커밋 → push → PR 생성까지 한다.
    - PR 생성이 성공하면 `task-submitted` lifecycle event를 남긴다. PR 생성 실패
      시에는 submitted event를 남기지 않는다.

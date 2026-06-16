@@ -19,7 +19,7 @@
     직접 호출은 스킬 절차 안에서만 한다.
   - **스크립트는 산문을 짓지 않는다.** PR 제목·본문 등 독자가 읽을 글은
     판단 레이어가 작성해 입력으로 넘긴다.
-  - `utils/task`가 issue에 쓰는 lifecycle comment는 고정 marker schema의 machine
+  - `workbench task`가 issue에 쓰는 lifecycle comment는 고정 marker schema의 machine
     event다 — 티켓 처분·상태 분류·독자용 산문은 스킬/사람 게이트의 몫이다.
 - **진실의 원천은 기록, 이름은 기본값.** 브랜치/디렉토리 이름을 역파싱하지
   말고 `task/index.md`의 기록을 읽는다.
@@ -53,7 +53,7 @@
 - 세그먼트 해석: 순수 숫자 = 이슈 번호, 비숫자 = home. repo 이름은 순수 숫자 불가.
 - **slug 스타일**(단어 수·케이스·언어)은 persona → `AGENTS.overlay.md` 참조.
 
-## task/ 메타 파일 규칙 (고정 — `utils/task check`가 강제)
+## task/ 메타 파일 규칙 (고정 — `workbench task check`가 강제)
 
 | 파일 | 성격 | 갱신 |
 |---|---|---|
@@ -68,7 +68,7 @@
 
 - log 항목 형식(고정): `## [YYYY-MM-DD HH:MM:SS] <op> · <action> <path> | <요약>`
   (op: plan·research·decide·lesson·code·review / action: create·update·delete)
-- **변경 → `utils/task commit <op> <action> [path] -m …`** (log+commit+push 원자화).
+- **변경 → `workbench task commit <op> <action> [path] -m …`** (log+commit+push 원자화).
 - **세션 멈춤 → status 덮어쓰기 + push** (멀티디바이스 핸드오프).
 - `task/codebases/`는 gitignore. 코드 동기화는 각 codebase 브랜치 push로.
 
@@ -102,12 +102,12 @@ docs/  index.md  log.md
 | 단계 | 진입점 | 배관 |
 |---|---|---|
 | 발상 | `workbench:ticket-incubate` | `gh issue create` |
-| 시작 | `workbench:task-start <ID>` | `utils/task start`, `add-repo` |
-| 현황 | `workbench:task-status` / `task-tickets` | `utils/task status`/`tickets` (read-only) |
-| 기록 | (변경마다) | `utils/task commit …` |
-| 검사 | (언제든) | `utils/task check` (정상 무음) |
-| 제출 | `workbench:task-submit` | `utils/task submit` |
-| 정리 | `workbench:task-done <ID>` | `utils/task done` |
+| 시작 | `workbench:task-start <ID>` | `workbench task start`, `add-repo` |
+| 현황 | `workbench:task-status` / `task-tickets` | `workbench task status`/`tickets` (read-only) |
+| 기록 | (변경마다) | `workbench task commit …` |
+| 검사 | (언제든) | `workbench task check` (정상 무음) |
+| 제출 | `workbench:task-submit` | `workbench task submit` |
+| 정리 | `workbench:task-done <ID>` | `workbench task done` |
 
 - **머지는 squash만** (repo 설정으로 강제). 일반 merge는 중간 커밋을 main에 남긴다.
 - **사람 게이트(존재는 고정)**: PR 후 "머지 vs 정리", 정리 후 "티켓 처분", 증분
