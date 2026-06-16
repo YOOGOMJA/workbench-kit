@@ -39,6 +39,9 @@ jobs:
       - name: Engine lifecycle test
         run: bash plugins/workbench/tests/task-lifecycle.sh
 
+      - name: Install-model test
+        run: bash tests/check-install-model.sh
+
       - name: Compose smoke test
         # generate-workbench's bundled compose.sh self-verifies; a non-zero exit fails CI.
         run: |
