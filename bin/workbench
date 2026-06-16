@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# workbench — 플러그인이 PATH에 올리는 단일 진입점. utils/* 로 디스패치한다.
+# 플러그인 설치 시 CLAUDE_PLUGIN_ROOT가 set됨; 로컬 실행 시 스크립트 위치로 폴백.
+set -euo pipefail
+ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+sub="${1:-}"; [ $# -gt 0 ] && shift || true
+case "$sub" in
+  task)  exec "$ROOT/utils/task" "$@" ;;
+  docs)  exec "$ROOT/utils/docs" "$@" ;;
+  setup) exec "$ROOT/utils/workbench" setup "$@" ;;
+  ""|-h|--help|help)
+    echo "usage: workbench {task|docs|setup} ..." >&2
+    echo "  엔진 진입점 — 사용자 repo가 아닌 플러그인 번들의 utils/* 를 실행" >&2
+    exit 0 ;;
+  *) echo "workbench: unknown subcommand '$sub' (task|docs|setup)" >&2; exit 2 ;;
+esac
