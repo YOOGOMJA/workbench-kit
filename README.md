@@ -81,14 +81,20 @@ What it produces is **minimal by design** — only your stuff. The engine
 ```
 my-workbench/
 ├── AGENTS.md          # composed: framework core + your persona (don't edit directly)
+├── CLAUDE.md          # same content (Claude Code reads it); regenerated on recompose
 ├── AGENTS.overlay.md  # your rules — edit here, then recompose
 ├── codebases.yaml     # your target repos
 ├── docs/              # knowledge wiki, starts empty, fills as you work
 │   ├── decisions/  lessons/  runbooks/   # anchor tables ("did we already decide?")
 │   └── index.md  log.md
 ├── templates/         # harvest entry + task-AGENTS formats (yours to tune)
-└── .github/           # issue (4-element) + PR templates
+├── .github/           # issue (4-element) + PR templates
+└── .claude/settings.json  # enables the workbench engine plugin on trust (no manual install)
 ```
+
+When you open the generated repo in Claude Code and trust the folder, it registers the
+marketplace and enables the `workbench` engine plugin automatically. (Codex: add the
+marketplace once — see Install.)
 
 **2. Work, from inside your new workbench.** The engine plugin drives the task
 lifecycle — each task lives on its own branch and worktree, and only the refined
