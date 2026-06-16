@@ -1,7 +1,7 @@
 ---
 name: interview-for-personalizing
 description: >-
-  First step of bootstrapping a new workbench. Through a divergence-first, gap-based interview, draw out the user's persona (language, slug style, required issue elements, PR skeleton, label scheme, harvest fields, gate toggles) and draft it into a temporary .persona/ scratch. Trigger when the user wants to create or personalize a workbench. Precedes generate-workbench; together they are the bootstrap flow.
+  First step of bootstrapping a new workbench. Through a divergence-first, gap-based interview, draw out the user's persona (language, slug style, required issue elements, PR skeleton, label scheme, harvest fields, gate toggles) and draft it into a temporary .persona/ scratch that generate-workbench consumes. Use this whenever the user wants to set up, create, or personalize a workbench, or talks about "their own rules / conventions" for one — even if they don't say the word "interview". Precedes generate-workbench; together they are the bootstrap flow.
 ---
 
 # interview-for-personalizing
@@ -14,24 +14,17 @@ then discards it.
 > (disposable/accumulate, task meta rules, log format, docs wiki structure, …) is
 > framework-fixed (`AGENTS.core.md`), so **don't ask about it.** Ask only persona cells.
 
-## `.persona/` schema (the contract with generate)
+## Where the defaults come from
 
-The interview output is **temporary** (dot rule — infra scratch; generate consumes
-then deletes it):
-
-```
-.persona/
-  overlay.md       # filled AGENTS.overlay.md (7 cells below) — generate uses as-is
-  codebases.yaml   # (optional) initial work targets — may be empty
-  meta.yaml        # repo location/URL preference, language — generate uses to place/shape
-```
-
-`overlay.md` has the **same sections** as the default `scaffold/AGENTS.overlay.md` —
-show that file as the starting point and let the user override only what they want.
+This skill runs from the installed `workbench-kit` plugin, *before* a user workbench
+exists — so don't look for defaults in the cwd. Read the bundled starting point at
+`${CLAUDE_PLUGIN_ROOT}/scaffold/AGENTS.overlay.md` (Codex: the plugin's
+`scaffold/AGENTS.overlay.md`). Show it as "here's the default — keep it?" and let the
+user override only what they care about.
 
 ## persona cells (= what to ask)
 
-| Cell | What to ask | Default (scaffold) |
+| Cell | What to ask | Default |
 |---|---|---|
 | language | language of operational output (prose, commits, issue/PR, your docs) | English |
 | slug style | word count, case, separator | lowercase kebab, 2–4 words |
@@ -42,31 +35,82 @@ show that file as the starting point and let the user override only what they wa
 | gate toggles | where to stop and ask | PR / cleanup / absorption all on |
 
 > **language** governs only operational output. The framework (skills, AGENTS.core)
-> stays English; filenames/identifiers stay stable. Capture the user's choice here
-> (e.g., `ko`, `ja`); default is English.
+> stays English; filenames/identifiers stay stable. Default is English; capture the
+> user's choice (e.g., `ko`, `ja`).
 
-## Flow (reuses the ticket-incubate interview discipline)
+## Flow
 
-1. **Diverge — explore together.** Learn how the user works (tools, taste). Don't
-   interrogate the 7 cells up front. Show the default profile
-   (`scaffold/AGENTS.overlay.md`) and ask "this is the default — good as-is?"
+The discipline is the same as ticket-incubate's: **don't interrogate — diverge first,
+then ask only what's missing.** Asking all 7 cells up front makes the user feel
+processed and produces shallow answers; letting them talk surfaces most cells for free.
 
-2. **Transition signal.** When the conversation lets you draft 2+ cells, or the user
-   signals "let's build it / wrap up," move to the gap interview.
+1. **Diverge.** Learn how the user works (tools, taste, what their projects are). Show
+   the default profile and ask "this is the default — good as-is, or anything off?"
 
-3. **Gap interview — empty cells only, one at a time.** Don't re-ask cells already
-   surfaced; just confirm. Skip cells the default covers. One question at a time.
+2. **Fast path — all defaults.** If the user says "just use the defaults" (or clearly
+   has no strong preferences), skip the interview: copy the defaults into `.persona/`,
+   confirm once, and hand off. Don't manufacture questions.
 
-4. **Draft `.persona/`.** Write the filled cells to `.persona/overlay.md`, any initial
-   targets to `.persona/codebases.yaml`, and repo location/language preference to
-   `.persona/meta.yaml`.
+3. **Transition signal.** Otherwise, once you can draft 2+ cells from the conversation,
+   or the user signals "let's build it," move to the gap interview.
 
-5. **Hand off to generate.** When the persona is full, move to `generate-workbench` —
-   don't dig further. Details can be refined after the workbench exists.
+4. **Gap interview — empty cells only, one at a time.** Don't re-ask cells already
+   surfaced; just confirm ("so, Korean for output — right?"). Skip cells the default
+   covers. One question per turn.
+
+5. **Confirm.** Show the assembled persona (the 7 cells, defaults + overrides) and get
+   an explicit OK before writing — the user should see what they're about to generate
+   from, just like ticket-incubate shows the ticket before creating it.
+
+6. **Write `.persona/`** (see schema/examples below), then hand off to
+   `generate-workbench`. Don't keep digging — details can be refined after the
+   workbench exists.
+
+## `.persona/` schema + examples (the contract with generate)
+
+Output is **temporary** (dot rule — infra scratch; generate consumes then deletes it):
+
+```
+.persona/
+  overlay.md       # filled AGENTS.overlay.md — same sections as scaffold default
+  codebases.yaml   # (optional) initial work targets — may be omitted
+  meta.yaml        # where/how generate should place the workbench
+```
+
+**`.persona/overlay.md`** — the scaffold default with the user's overrides applied.
+Only the changed cells need differ; keep the rest as default. Example (a Korean-output
+user who otherwise took defaults):
+
+```markdown
+## Language
+- Operational output language: **Korean** (ko). Framework stays English; filenames stable.
+
+## slug style
+- lowercase kebab, 2–4 words.
+
+## Required issue elements
+- Background · Goal · Done criteria · Out of scope.
+  ... (remaining sections unchanged from default) ...
+```
+
+**`.persona/meta.yaml`** — tells generate where to create the workbench:
+
+```yaml
+# exactly one of `repo` or `path`
+repo: owner/my-workbench      # create/use this GitHub repo
+# path: ~/dev/my-workbench    # or a local path
+language: ko                  # mirrors overlay Language (generate reads it directly)
+```
+
+**`.persona/codebases.yaml`** (optional) — initial targets, same format as the
+framework's `codebases.yaml`:
+
+```yaml
+my-app: https://github.com/owner/my-app.git
+```
 
 ## Boundaries
 
 - Don't ask about the mechanism (core) — only taste (overlay).
-- Interview output goes only to the disposable `.persona/` — no user repo is created
-  yet (that's generate).
+- Output goes only to the disposable `.persona/` — no user repo is created yet (that's generate).
 - Leaving mid-way is fine — re-invoke to resume from defaults.
