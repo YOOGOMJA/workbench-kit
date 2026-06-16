@@ -5,8 +5,7 @@
 <h1 align="center">workbench-kit</h1>
 
 <p align="center">
-  A tool-neutral framework for agent workbenches.<br/>
-  <em>Disposable tasks, durable knowledge. Bring your own rules.</em>
+  <em>You do the work. It keeps the one part worth keeping, and throws out the rest.</em>
 </p>
 
 <p align="center">
@@ -23,31 +22,37 @@
 
 ---
 
-## What is this?
+Every workshop has one. The bench in the corner that's older than the building.
+You finish a job and walk off; it stays behind, wipes itself down, hangs the one
+jig worth keeping on the wall, and bins the scrap. Next time, the bench is
+already set.
 
-**workbench-kit** is the reusable mechanism behind an agent "workbench" —
-a way for AI coding agents to do real work without polluting your main history.
+workbench-kit puts that bench inside your AI agent.
 
-- **Tasks are disposable, knowledge accumulates.** Every task lives on its own
-  branch and workspace, then collapses into a single squash-merged increment.
-- **Two layers.** Judgment stays with the agent; plumbing (git state
-  transitions) is handled by scripts.
-- **Bring your own rules.** The framework ships the *mechanism* — you fill in
-  your own naming rules, policies, and knowledge base.
+## How a job goes
 
-## Three layers
+You hand it a task — any task. It gets its own corner to make a mess in: a
+branch, a workspace, scratch notes nobody else has to see. When the work is
+done, one clean thing survives — a decision, a lesson, a fix — and the mess is
+swept out. Your main history only ever sees the keepers.
 
-| Layer | What it holds |
-|-------|---------------|
-| **framework** | The fixed mechanism: worktree/task/codebases, increments, skills |
-| **profile** | Your rules and data: naming conventions, templates, manifests |
-| **knowledge** | What your work leaves behind: decisions, lessons, runbooks |
+Need a whole new workshop? Spinning up a new repo is just another job you hand it.
+
+## Under the hood
+
+The bench has three drawers. You only ever fill two of them.
+
+| Drawer | What's in it |
+|--------|--------------|
+| **framework** | The bench itself — the parts that never change |
+| **profile** | Your rules — how you name things, your templates |
+| **knowledge** | What every job leaves behind — decisions, lessons, runbooks |
 
 ## Status
 
-🚧 Early / design stage. The separation architecture is being settled in an ADR
-before extraction. Expect things to move.
+🚧 It's still setting up the shop. The blueprint for the bench is being settled
+before the tools go in — expect things to move.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE).
