@@ -48,10 +48,38 @@ The bench has three drawers. You only ever fill two of them.
 | **profile** | Your rules — how you name things, your templates |
 | **knowledge** | What every job leaves behind — decisions, lessons, runbooks |
 
+## Install
+
+This repo is a marketplace shipping two plugins:
+
+- **`workbench`** — the engine (task lifecycle, knowledge harvest). Use it inside a workbench.
+- **`workbench-kit`** — the bootstrap (interview → generate a personalized workbench). Use it once to set one up.
+
+**Claude Code**
+
+```
+/plugin marketplace add YOOGOMJA/workbench-kit
+/plugin install workbench-kit@workbench-kit   # bootstrap
+/plugin install workbench@workbench-kit        # engine
+```
+
+**Codex**
+
+```
+codex plugin marketplace add YOOGOMJA/workbench-kit
+codex plugin add workbench-kit@workbench-kit
+codex plugin add workbench@workbench-kit
+```
+
+Then set up your bench: run `workbench-kit:interview-for-personalizing` (Claude Code:
+`/…`, Codex: `@…`) and it walks you through your persona, then `generate-workbench`
+creates a minimal workbench repo. From there, `workbench:task-start <issue>` begins work.
+
 ## Status
 
 🚧 It's still setting up the shop. The blueprint for the bench is being settled
-before the tools go in — expect things to move.
+before the tools go in — expect things to move. (Install above works once a release
+lands on the default branch — see [RELEASING.md](RELEASING.md).)
 
 ## License
 
