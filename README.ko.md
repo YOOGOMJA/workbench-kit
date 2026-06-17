@@ -119,7 +119,7 @@ my-workbench/
   게이트 — 는 overlay에 둡니다. 부트스트랩이 둘을 합성합니다.
 
 배경과 설계 이유는
-[`framework-docs/workbench-knowledge-ecosystem.md`](framework-docs/workbench-knowledge-ecosystem.md)에,
+[`framework-docs/workbench-knowledge-ecosystem.ko.md`](framework-docs/workbench-knowledge-ecosystem.ko.md)에,
 개별 설계 결정은 [`framework-docs/decisions/`](framework-docs/decisions/) 아래 ADR로
 기록되어 있습니다.
 
