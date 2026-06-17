@@ -14,6 +14,11 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
 
 ### Added
 
+- **README demo GIFs** — `demo/` holds two recorded walkthroughs (a real Claude Code
+  agent driving the skills, offline): `workbench-engine.gif` (`/workbench:task-start`) and
+  `workbench-kit-bootstrap.gif` (`/workbench-kit:interview-for-personalizing` →
+  `generate-workbench`), embedded in the README, with the `.tape`/setup scripts for
+  regeneration (part of #9).
 - **CHANGELOG enforcement at PR time, by semver** — a CI `changelog` job fails any
   pull request that ships without a `## [Unreleased]` entry (`scripts/check-changelog.sh`),
   bypassable with the `skip-changelog` label. A new `CONTRIBUTING.md` documents the
