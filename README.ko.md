@@ -79,14 +79,19 @@ codex plugin add workbench-kit
 ```
 my-workbench/
 ├── AGENTS.md          # 합성본: 프레임워크 core + 당신의 persona (직접 편집 금지)
+├── CLAUDE.md          # 동일 내용 (Claude Code가 읽음); 재합성 시 함께 갱신
 ├── AGENTS.overlay.md  # 당신의 규칙 — 여기서 편집 후 재합성
 ├── codebases.yaml     # 작업 대상 repo
 ├── docs/              # 지식 위키, 빈 채로 시작해 작업하며 채워짐
 │   ├── decisions/  lessons/  runbooks/   # 앵커 표 ("이미 정했나?")
 │   └── index.md  log.md
 ├── templates/         # harvest 항목 + task-AGENTS 형식 (당신이 조정)
-└── .github/           # 이슈(4요소) + PR 템플릿
+├── .github/           # 이슈(4요소) + PR 템플릿
+└── .claude/settings.json  # 폴더 신뢰 시 workbench 엔진 플러그인 자동 활성 (수동 설치 불필요)
 ```
+
+생성된 repo를 Claude Code에서 열고 폴더를 신뢰하면 마켓플레이스가 등록되고 `workbench`
+엔진 플러그인이 자동 활성됩니다. (Codex는 마켓플레이스를 한 번 추가 — Install 참고.)
 
 **2. 새 워크벤치 안에서 작업하기.** 엔진 플러그인이 task 수명주기를 굴립니다 —
 각 task는 자기 브랜치·워크트리에 살고, 정제된 증분만 `main`에 남습니다:

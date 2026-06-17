@@ -69,10 +69,26 @@ HDR
   cat "$PERSONA/overlay.md"
 } > "$OUT/AGENTS.md"
 
-# 5) CLAUDE.md compatibility symlink.
-ln -sfn AGENTS.md "$OUT/CLAUDE.md"
+# 5) CLAUDE.md — a real file (not a symlink), so it survives on every platform and any
+#    tool that doesn't follow symlinks. Recompose rewrites both; they stay in sync.
+cp "$OUT/AGENTS.md" "$OUT/CLAUDE.md"
 
-# 6) Post-check: verify the workbench is well-formed. The skill no longer eyeballs the
+# 6) Auto-enable the engine: ship .claude/settings.json so that when the user trusts this
+#    repo, Claude Code registers the marketplace and enables the `workbench` engine plugin
+#    — no manual install. (Codex: add the marketplace once; see README.)
+mkdir -p "$OUT/.claude"
+cat > "$OUT/.claude/settings.json" <<'JSON'
+{
+  "extraKnownMarketplaces": {
+    "workbench-kit": { "source": { "source": "github", "repo": "YOOGOMJA/workbench-kit" } }
+  },
+  "enabledPlugins": {
+    "workbench@workbench-kit": true
+  }
+}
+JSON
+
+# 7) Post-check: verify the workbench is well-formed. The skill no longer eyeballs the
 #    result — the script asserts its own post-conditions and fails loudly if any miss,
 #    so a bad compose can't slip through to the user.
 fail=0
@@ -84,7 +100,9 @@ check "AGENTS.md exists"                  "$([ -f "$OUT/AGENTS.md" ]; echo $?)"
 check "AGENTS.md has framework core"      "$(grep -q 'FRAMEWORK CORE' "$OUT/AGENTS.md" 2>/dev/null; echo $?)"
 check "AGENTS.md has persona overlay"     "$(grep -q 'YOUR PERSONA' "$OUT/AGENTS.md" 2>/dev/null; echo $?)"
 check "AGENTS.overlay.md exists"          "$([ -f "$OUT/AGENTS.overlay.md" ]; echo $?)"
-check "CLAUDE.md → AGENTS.md"             "$([ "$(readlink "$OUT/CLAUDE.md" 2>/dev/null)" = AGENTS.md ]; echo $?)"
+check "CLAUDE.md is a real file"          "$([ -f "$OUT/CLAUDE.md" ] && [ ! -L "$OUT/CLAUDE.md" ]; echo $?)"
+check "CLAUDE.md matches AGENTS.md"       "$(cmp -s "$OUT/CLAUDE.md" "$OUT/AGENTS.md"; echo $?)"
+check ".claude/settings.json enables engine" "$(grep -q '"workbench@workbench-kit"' "$OUT/.claude/settings.json" 2>/dev/null; echo $?)"
 check "docs/ skeleton (index.md)"         "$([ -f "$OUT/docs/index.md" ]; echo $?)"
 check "codebases.yaml present"            "$([ -f "$OUT/codebases.yaml" ]; echo $?)"
 check "engine NOT copied (no utils/)"     "$([ ! -e "$OUT/utils" ]; echo $?)"
