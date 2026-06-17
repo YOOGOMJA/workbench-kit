@@ -36,7 +36,7 @@ mkdir -p "$OUT"
 
 # 1) Lay the scaffold (profile defaults + empty knowledge). Engine (utils/skills/bin)
 #    is NOT copied — it comes from the installed plugin, so the repo stays minimal.
-for item in templates .github docs; do
+for item in templates .github docs .gitignore .gitattributes; do
   [ -e "$SCAFFOLD/$item" ] && cp -R "$SCAFFOLD/$item" "$OUT/$item"
 done
 

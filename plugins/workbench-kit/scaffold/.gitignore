@@ -1,0 +1,13 @@
+# Dot-prefixed directories are workbench infrastructure.
+
+# Clone cache. codebases.yaml is the source of truth.
+.codebases/
+
+# Active task workspaces.
+.worktrees/
+
+# Codebase working copies inside a task. Each is its own git repository.
+task/codebases/
+
+# Claude Code runtime lock file.
+.claude/scheduled_tasks.lock

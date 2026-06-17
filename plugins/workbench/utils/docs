@@ -131,6 +131,6 @@ PY
 }
 
 case "${1:-}" in
-  check) shift; [ $# -eq 0 ] || die "usage: utils/docs check"; cmd_check ;;
-  *) echo "usage: utils/docs check" >&2; exit 1 ;;
+  check) shift; [ $# -eq 0 ] || die "usage: workbench docs check"; cmd_check ;;
+  *) echo "usage: workbench docs check" >&2; exit 1 ;;
 esac

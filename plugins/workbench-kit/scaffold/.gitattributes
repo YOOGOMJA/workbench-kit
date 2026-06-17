@@ -1,0 +1,4 @@
+# Append-only logs use union merge. Parallel tasks may append at the same end of
+# a file; git keeps both sides. Sorting and deduplication are left to docs-lint.
+docs/log.md merge=union
+task/log.md merge=union
