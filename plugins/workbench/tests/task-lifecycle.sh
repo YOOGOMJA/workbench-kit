@@ -300,6 +300,31 @@ test_done_succeeds_when_cleaned_comment_fails_after_cleanup() {
   assert_file_not_contains "$TMPDIR/done_comment_failure/comments/29.comments" "event=task-cleaned"
 }
 
+test_done_ambiguous_parent_requires_disambiguation() {
+  local repo
+  repo="$(setup_workbench done_ambiguous_parent)"
+  # two sub-tasks of the SAME issue (34) under different parents
+  git -C "$repo" branch task/12/34-alpha main
+  git -C "$repo" branch task/56/34-beta main
+
+  # bare `done 34` is ambiguous → must fail without touching either branch
+  if run_task done_ambiguous_parent "$repo" done 34; then
+    fail "expected ambiguous 'done 34' to fail"
+  fi
+  git -C "$repo" show-ref --verify --quiet refs/heads/task/12/34-alpha \
+    || fail "ambiguous done must not delete task/12/34-alpha"
+  git -C "$repo" show-ref --verify --quiet refs/heads/task/56/34-beta \
+    || fail "ambiguous done must not delete task/56/34-beta"
+
+  # --parent narrows to exactly one
+  run_task done_ambiguous_parent "$repo" done 34 --parent 12
+  if git -C "$repo" show-ref --verify --quiet refs/heads/task/12/34-alpha; then
+    fail "expected task/12/34-alpha removed by 'done 34 --parent 12'"
+  fi
+  git -C "$repo" show-ref --verify --quiet refs/heads/task/56/34-beta \
+    || fail "expected task/56/34-beta untouched by 'done 34 --parent 12'"
+}
+
 test_tickets_reports_lifecycle_facts_read_only() {
   local repo out
   repo="$(setup_workbench tickets_readonly)"
@@ -369,6 +394,7 @@ test_submit_succeeds_when_submitted_comment_fails_after_pr_create
 test_submit_retry_after_cleanup_preserves_codebase_home
 test_done_emits_cleaned_without_closing_issue
 test_done_succeeds_when_cleaned_comment_fails_after_cleanup
+test_done_ambiguous_parent_requires_disambiguation
 test_tickets_reports_lifecycle_facts_read_only
 test_tickets_detects_remote_only_task_branch_without_fetch
 test_lifecycle_latest_for_branch_uses_exact_branch_match

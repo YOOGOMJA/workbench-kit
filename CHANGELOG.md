@@ -45,6 +45,11 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
 
 ### Fixed
 
+- **`task` branch resolution now respects `parent`** (`workbench` plugin). `find_branches`
+  matches on `(home, issue)` and, when given, `parent`, so two sub-tasks of the same issue
+  under different parents no longer alias each other. `start`/`resume`/`done` take
+  `--parent`; an ambiguous ID fails loudly with the candidates instead of silently acting
+  on the first match (#6).
 - **Generated workbench self-bootstraps.** `generate-workbench` now writes a real
   `CLAUDE.md` (not a symlink, so it survives every platform) and a `.claude/settings.json`
   that registers the marketplace and enables the `workbench` engine plugin on folder trust
