@@ -72,10 +72,17 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
   `workbench docs` resolve their root from the current repo (git) instead of the script's
   own path.
 
+### Changed
+
+- **Flagship design doc translated to English** — `framework-docs/workbench-knowledge-ecosystem.md`
+  is now English (the page the README links curious readers to); the Korean original is
+  preserved as `workbench-knowledge-ecosystem.ko.md`, and the two cross-link (#9).
+
 ### Known gaps
 
 - **Translation in progress.** Framework-facing content (README, `AGENTS.core`, scaffold,
-  bootstrap skills) and all skill *descriptions* are English. The engine skill *bodies*
-  and `framework-docs/` are still Korean — to be translated incrementally.
+  bootstrap skills, the knowledge-ecosystem design doc) and all skill *descriptions* are
+  English. The engine skill *bodies* and the rest of `framework-docs/` are still Korean —
+  to be translated incrementally.
 
 [Unreleased]: https://github.com/YOOGOMJA/workbench-kit/commits/main
