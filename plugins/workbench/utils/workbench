@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# workbench 저장소 수준 도구. 사용법: utils/workbench setup
+# workbench 저장소 수준 도구. 사용법: workbench setup
 set -euo pipefail
 
 # Resolve from the CALLER's worktree (where `workbench setup` is run), not the script's
@@ -68,5 +68,5 @@ cmd_setup() {
 
 case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
-  *) echo "usage: utils/workbench setup" >&2; exit 1 ;;
+  *) echo "usage: workbench setup" >&2; exit 1 ;;
 esac

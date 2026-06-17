@@ -18,6 +18,7 @@ workbench has its own composed AGENTS.md; this file is for hacking on the kit.)
 - Tests (also run by CI on PRs):
   - `bash tests/check-skill-frontmatter.sh`
   - `bash tests/check-install-model.sh`   (engine utils target the caller repo, not the bundle)
+  - `bash tests/check-generated-scaffold-hygiene.sh`
   - `bash plugins/workbench/tests/task-lifecycle.sh`
 
 ## Release & versioning (self-contained — keep it this way)

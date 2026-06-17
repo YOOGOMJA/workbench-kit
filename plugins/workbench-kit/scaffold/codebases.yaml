@@ -4,4 +4,4 @@
 # 예시:
 #   my-app: git@github.com:user/my-app.git
 #
-# 추가 후 `utils/workbench setup`을 실행하면 일괄 clone된다.
+# 추가 후 `workbench setup`을 실행하면 일괄 clone된다.

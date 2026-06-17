@@ -3,16 +3,16 @@
 # 에이전트의 진입점은 스킬(/task-start 등)이며, 이 스크립트는 상태 전이만
 # 한다 — 독자가 읽을 산문(PR 제목·본문 등)은 입력으로만 받는다.
 #
-#   task start <ID> [slug] [--parent N]    task 시작 (워크트리 + 스캐폴드)
-#   task add-repo <name> [--ref <base>] [--role work|reference]
-#   task resume <ID>                       다른 기기에서 task 재구성
-#   task submit --title <t> --body-file <f>   task/ cleanup 커밋 + push + PR
-#   task done <ID> [--force]               워크트리·브랜치 정리 (티켓은 건드리지 않음)
-#   task commit <op> <action> [path] -m <subject> [-m <body>] [--no-push]
+#   workbench task start <ID> [slug] [--parent N]    task 시작 (워크트리 + 스캐폴드)
+#   workbench task add-repo <name> [--ref <base>] [--role work|reference]
+#   workbench task resume <ID> [--parent N]          다른 기기에서 task 재구성
+#   workbench task submit --title <t> --body-file <f>   task/ cleanup 커밋 + push + PR
+#   workbench task done <ID> [--parent N] [--force]  워크트리·브랜치 정리 (티켓은 건드리지 않음)
+#   workbench task commit <op> <action> [path] -m <subject> [-m <body>] [--no-push]
 #                                          log append + commit(+#issue) + push
-#   task check                             기계적 불변식 검사 (read-only, 정상 무음)
-#   task status                            모든 task 현황 구조화 출력 (read-only)
-#   task tickets                           열린 workbench 이슈의 task/lifecycle 사실 출력 (read-only)
+#   workbench task check                             기계적 불변식 검사 (read-only, 정상 무음)
+#   workbench task status                            모든 task 현황 구조화 출력 (read-only)
+#   workbench task tickets                           열린 workbench 이슈의 task/lifecycle 사실 출력 (read-only)
 #
 # ID: workbench 이슈는 `42`, codebase 이슈는 `my-app#42`
 set -euo pipefail
@@ -312,7 +312,7 @@ cmd_start() {
       *) if [ -z "$id" ]; then id="$1"; else slug="$1"; fi; shift ;;
     esac
   done
-  [ -n "$id" ] || die "usage: task start <ID> [slug] [--parent N]"
+  [ -n "$id" ] || die "usage: workbench task start <ID> [slug] [--parent N]"
   parse_id "$id"
 
   local root; root="$(wb_root)"
@@ -485,14 +485,14 @@ cmd_add_repo() {
       *) name="$1"; shift ;;
     esac
   done
-  [ -n "$name" ] || die "usage: task add-repo <name> [--ref <base>] [--role work|reference]"
+  [ -n "$name" ] || die "usage: workbench task add-repo <name> [--ref <base>] [--role work|reference]"
   require_task_worktree
   [ -f "$TASK_DIR/task/index.md" ] || die "task/index.md 없음"
 
   local root clone issue parent slug
   root="$(wb_root)"
   clone="$root/.codebases/$name"
-  [ -d "$clone/.git" ] || die ".codebases/$name 없음 — codebases.yaml에 추가 후 utils/workbench setup 실행"
+  [ -d "$clone/.git" ] || die ".codebases/$name 없음 — codebases.yaml에 추가 후 workbench setup 실행"
 
   if repos_block | grep -q "^- $name |"; then
     info "$name 은 이미 등록됨"; return 0
@@ -525,7 +525,7 @@ cmd_resume() {
       *) [ -n "$id" ] || id="$1"; shift ;;
     esac
   done
-  [ -n "$id" ] || die "usage: task resume <ID> [--parent N]"
+  [ -n "$id" ] || die "usage: workbench task resume <ID> [--parent N]"
   parse_id "$id"
   local root branch dir
   root="$(wb_root)"
@@ -554,7 +554,7 @@ cmd_resume() {
     [ -n "$name" ] || continue
     clone="$root/.codebases/$name"
     wt="$dir/task/codebases/$name"
-    [ -d "$clone/.git" ] || { echo "warn: .codebases/$name 없음 — utils/workbench setup 먼저" >&2; continue; }
+    [ -d "$clone/.git" ] || { echo "warn: .codebases/$name 없음 — workbench setup 먼저" >&2; continue; }
     [ -d "$wt" ] && { info "$name 작업 사본 이미 존재"; continue; }
     git -C "$clone" fetch origin 2>/dev/null || true
     if ! git -C "$clone" show-ref -q "refs/heads/$cb_branch"; then
@@ -755,7 +755,7 @@ cmd_check() {
     esac
     files="$(git -C "$TASK_DIR" show --name-only --format='' "$sha")"
     printf '%s\n' "$files" | grep -qx 'task/log.md' && continue
-    echo "✗ log 우회: 커밋 ${sha:0:8} ($subj) 가 task/log.md 미갱신 — utils/task commit 사용" >&2
+    echo "✗ log 우회: 커밋 ${sha:0:8} ($subj) 가 task/log.md 미갱신 — workbench task commit 사용" >&2
     fail=1
   done < <(git -C "$TASK_DIR" rev-list "$cbase..$branch" 2>/dev/null)
 
@@ -776,11 +776,11 @@ cmd_check() {
     if git -C "$TASK_DIR" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
       ahead="$(git -C "$TASK_DIR" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 0)"
       if [ "$ahead" -gt 0 ]; then
-        echo "✗ 미push: ahead $ahead — git push 또는 utils/task commit 사용" >&2
+        echo "✗ 미push: ahead $ahead — git push 또는 workbench task commit 사용" >&2
         fail=1
       fi
     else
-      echo "✗ 미push: origin/$branch 없음 — git push -u origin $branch 또는 utils/task commit 사용" >&2
+      echo "✗ 미push: origin/$branch 없음 — git push -u origin $branch 또는 workbench task commit 사용" >&2
       fail=1
     fi
   fi
@@ -831,7 +831,7 @@ cmd_done() {
       *) id="$1"; shift ;;
     esac
   done
-  [ -n "$id" ] || die "usage: task done <ID> [--parent N] [--force]"
+  [ -n "$id" ] || die "usage: workbench task done <ID> [--parent N] [--force]"
   parse_id "$id"
   local root branch dir
   root="$(wb_root)"
