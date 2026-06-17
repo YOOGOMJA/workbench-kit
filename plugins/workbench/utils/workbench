@@ -9,21 +9,57 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "error: run inside a workbench git repo" >&2; exit 1; }
 MANIFEST="$ROOT/codebases.yaml"
 
+# codebases.yaml은 의도적으로 단순한 `<name>: <git-url>` 한 줄 형식만 지원한다
+# (주석·빈 줄 허용). 줄 기반 파서라 따옴표·중첩 매핑·리스트·인라인 주석 같은 일반
+# YAML은 다룰 수 없으므로, 그런 입력은 조용히 오파싱하지 않고 줄 번호와 함께
+# 분명히 거부한다.
+parse_manifest_line() {
+  # 입력: 원본 줄, 줄 번호. 출력(전역): ML_NAME, ML_URL. 건너뛸 줄이면 1을 반환.
+  local line="$1" lineno="$2" trimmed rest
+  ML_NAME=""; ML_URL=""
+  line="${line%$'\r'}"                                   # CRLF 방어
+  trimmed="${line#"${line%%[![:space:]]*}"}"             # 왼쪽 공백 제거
+  [ -n "$trimmed" ] || return 1                          # 빈 줄
+  case "$trimmed" in '#'*) return 1 ;; esac              # 주석(들여쓰기 허용)
+  if [ "$line" != "$trimmed" ]; then
+    echo "error: codebases.yaml:$lineno — 들여쓰기된 줄(중첩 매핑/리스트)은 지원하지 않음: '$line'" >&2; exit 1
+  fi
+  case "$trimmed" in '-'*)
+    echo "error: codebases.yaml:$lineno — 리스트 문법('- ...')은 지원하지 않음: '$line'" >&2; exit 1 ;;
+  esac
+  case "$trimmed" in *\"*|*\'*)
+    echo "error: codebases.yaml:$lineno — 따옴표는 지원하지 않음(name·url을 그대로 적을 것): '$line'" >&2; exit 1 ;;
+  esac
+  case "$trimmed" in *:*) : ;; *)
+    echo "error: codebases.yaml:$lineno — 'name: <git-url>' 형식이 아님: '$line'" >&2; exit 1 ;;
+  esac
+  ML_NAME="${trimmed%%:*}"
+  ML_NAME="${ML_NAME%"${ML_NAME##*[![:space:]]}"}"       # name 오른쪽 공백 제거
+  rest="${trimmed#*:}"
+  ML_URL="${rest#"${rest%%[![:space:]]*}"}"              # 값 왼쪽 공백 제거
+  [ -n "$ML_NAME" ] || { echo "error: codebases.yaml:$lineno — name이 비어 있음: '$line'" >&2; exit 1; }
+  case "$ML_NAME" in *[!0-9]*) : ;; *)
+    echo "error: codebases.yaml:$lineno — name은 순수 숫자 불가: '$ML_NAME'" >&2; exit 1 ;;
+  esac
+  [ -n "$ML_URL" ] || { echo "error: codebases.yaml:$lineno — '$ML_NAME'의 git-url이 비어 있음(값 없는 키/중첩 매핑?): '$line'" >&2; exit 1; }
+  case "$ML_URL" in *' #'*)
+    echo "error: codebases.yaml:$lineno — 값 뒤 인라인 주석(' #')은 지원하지 않음: '$line'" >&2; exit 1 ;;
+  esac
+  return 0
+}
+
 cmd_setup() {
   [ -f "$MANIFEST" ] || { echo "error: codebases.yaml 없음" >&2; exit 1; }
   mkdir -p "$ROOT/.codebases"
-  local count=0
-  while IFS= read -r line; do
-    case "$line" in ''|'#'*) continue ;; esac
-    local name url
-    name="$(echo "$line" | cut -d: -f1 | sed -E 's/^ +| +$//g')"
-    url="$(echo "$line" | sed -E 's/^[^:]+: *//')"
-    [ -n "$name" ] && [ -n "$url" ] || continue
-    if [ -d "$ROOT/.codebases/$name/.git" ]; then
-      echo "skip: $name (이미 존재)"
+  local count=0 lineno=0 line
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    parse_manifest_line "$line" "$lineno" || continue
+    if [ -d "$ROOT/.codebases/$ML_NAME/.git" ]; then
+      echo "skip: $ML_NAME (이미 존재)"
     else
-      echo "clone: $name <- $url"
-      git clone "$url" "$ROOT/.codebases/$name"
+      echo "clone: $ML_NAME <- $ML_URL"
+      git clone "$ML_URL" "$ROOT/.codebases/$ML_NAME"
     fi
     count=$((count + 1))
   done < "$MANIFEST"

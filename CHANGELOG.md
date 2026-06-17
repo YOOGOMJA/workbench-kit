@@ -45,6 +45,11 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
 
 ### Fixed
 
+- **`workbench setup` validates `codebases.yaml` instead of silently misparsing**
+  (`workbench` plugin). The line-based parser now rejects unsupported shapes — quotes,
+  nested mappings, list syntax, inline comments, numeric names, value-less keys — with a
+  clear, line-numbered error, while the supported `name: <git-url>` form (comments/blank
+  lines allowed) still clones. Adds `tests/check-codebases-yaml.sh` to CI (#8).
 - **`task done` no longer silently force-deletes an unmerged branch** (`workbench`
   plugin). It deleted the local branch with `branch -D ... 2>/dev/null || true`
   regardless of merge state, swallowing errors. It now deletes only when a **merged PR**
