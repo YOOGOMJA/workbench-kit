@@ -8,6 +8,13 @@ land on `main` → bump version → tag → write notes.
 
 - One version for the whole marketplace; both plugins share it (simpler than tracking
   two cadences for one repo). Semantic versioning.
+- **Fixed (lockstep) versioning, on purpose.** Both plugins always release at the same
+  version, even when a change touched only one — `workbench-kit` and `workbench` are a
+  coupled set (the bootstrap generates repos the engine runs), so they ship together and
+  there's no cross-plugin compatibility matrix to reason about. The no-op bump for the
+  unchanged plugin is an accepted cost. **Revisit only if they decouple** — if one plugin
+  starts iterating on its own cadence and lockstep bumps become noise, split to
+  independent per-plugin versions + `{name}--v{version}` tags.
 - The version is **explicit** in each plugin manifest. Both tools fall back to the git
   commit SHA when `version` is omitted (every commit becomes a "new version") — we don't
   want that for a framework, so we set it and bump deliberately.
