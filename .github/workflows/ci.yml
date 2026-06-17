@@ -25,6 +25,20 @@ jobs:
           git fetch --no-tags --quiet origin "${{ github.event.pull_request.base.sha }}"
           bash scripts/check-changelog.sh "${{ github.event.pull_request.base.sha }}"
 
+  changelog-frozen:
+    # Released CHANGELOG sections are frozen — an in-flight PR must not drop an entry
+    # into an already-published `## [X.Y.Z]`. Runs on every PR (even skip-changelog ones).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Released sections are frozen
+        run: |
+          git fetch --no-tags --quiet origin "${{ github.event.pull_request.base.sha }}"
+          bash scripts/check-changelog-section.sh "${{ github.event.pull_request.base.sha }}"
+
   checks:
     runs-on: ubuntu-latest
     steps:
@@ -58,6 +72,9 @@ jobs:
 
       - name: codebases.yaml parsing test
         run: bash tests/check-codebases-yaml.sh
+
+      - name: CHANGELOG frozen-section guard test
+        run: bash tests/check-changelog-section-guard.sh
 
       - name: Generated scaffold hygiene test
         run: bash tests/check-generated-scaffold-hygiene.sh
