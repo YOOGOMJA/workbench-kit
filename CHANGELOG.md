@@ -10,7 +10,13 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Frozen released-section guard** — a CI `changelog-frozen` job
+  (`scripts/check-changelog-section.sh`) fails any PR that adds a CHANGELOG entry under an
+  already-released `## [X.Y.Z]` section instead of `## [Unreleased]`, so an in-flight PR
+  can't pollute a published version's notes. `RELEASING.md` documents the hazard; covered
+  by `tests/check-changelog-section-guard.sh` (#21).
 
 ## [0.1.1] - 2026-06-17
 

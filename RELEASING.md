@@ -40,6 +40,20 @@ Releasing is **GitOps**: the release happens automatically when a version bump l
 Non-release pushes to `main` are no-ops for the workflow (version already tagged, or no
 matching CHANGELOG section).
 
+### Released sections are frozen (in-flight PRs)
+
+Once a `## [X.Y.Z]` section lands on `main`, `release.yml` publishes it — so that section
+is **frozen**. A PR branched *before* a release cut still targets the old `## [Unreleased]`;
+if it merges *after* the cut, its entry can drop into the now-published `## [X.Y.Z]`,
+making the changelog claim a version shipped something its tag never had (this happened
+once — see #21). So:
+
+- New entries always go under `## [Unreleased]`, never a dated section.
+- If your branch predates a release cut, **rebase onto `main`** before merging so your
+  entry re-targets `## [Unreleased]`.
+- CI enforces this: the `changelog-frozen` job (`scripts/check-changelog-section.sh`)
+  fails any PR that adds a bullet to an already-released section.
+
 ## How users get the update
 
 - **Claude Code:** `/plugin marketplace update workbench-kit`, then `/plugin update workbench`
