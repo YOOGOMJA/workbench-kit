@@ -32,6 +32,12 @@ one more thing on the bench.
 > 🚧 **Early stage.** The framework runs, but APIs and docs are still settling.
 > Expect rough edges and read the [known gaps](#status--known-gaps).
 
+<p align="center">
+  <img src="demo/workbench-engine.gif" width="900" alt="A real agent runs /workbench:task-start — loads the skill, runs the plumbing, does the docs-query preflight, writes the task summary, commits" />
+  <br/>
+  <em>A real Claude Code agent driving the task lifecycle via <code>/workbench:task-start</code> (offline demo).</em>
+</p>
+
 ## What you get
 
 workbench-kit is a **marketplace** of two plugins that work together. Install both.
@@ -74,6 +80,10 @@ then scaffolds a minimal repo personalized to your conventions:
 /workbench-kit:interview-for-personalizing   # draws out your persona
 /workbench-kit:generate-workbench            # scaffolds the repo, then discards the draft
 ```
+
+<p align="center">
+  <img src="demo/workbench-kit-bootstrap.gif" width="820" alt="A real agent runs the interview then generate-workbench, composing a fresh minimal workbench repo" />
+</p>
 
 What it produces is **minimal by design** — only your stuff. The engine
 (skills, `utils/`, `bin/`) stays in the installed plugin, never copied in:

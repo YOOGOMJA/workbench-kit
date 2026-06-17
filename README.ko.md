@@ -31,6 +31,12 @@
 > 🚧 **초기 단계.** 프레임워크는 동작하지만 API와 문서는 아직 다듬는 중입니다.
 > 거친 부분이 있으니 [알려진 한계](#상태--알려진-한계)를 읽어 주세요.
 
+<p align="center">
+  <img src="demo/workbench-engine.gif" width="900" alt="실제 에이전트가 /workbench:task-start 로 스킬을 로드하고 배관·docs-query preflight·요약·커밋까지 수행" />
+  <br/>
+  <em>실제 Claude Code 에이전트가 <code>/workbench:task-start</code>로 task 수명주기를 구동 (오프라인 데모).</em>
+</p>
+
 ## 무엇을 얻나
 
 workbench-kit은 함께 동작하는 두 플러그인의 **마켓플레이스**입니다. 둘 다 설치하세요.
@@ -72,6 +78,10 @@ codex plugin add workbench-kit
 /workbench-kit:interview-for-personalizing   # 당신의 persona를 끌어냄
 /workbench-kit:generate-workbench            # 레포를 생성하고 초안은 버림
 ```
+
+<p align="center">
+  <img src="demo/workbench-kit-bootstrap.gif" width="820" alt="실제 에이전트가 인터뷰 후 generate-workbench로 최소 워크벤치 레포를 합성" />
+</p>
 
 생성물은 **의도적으로 최소**입니다 — 당신 것만. 엔진(skills·`utils/`·`bin/`)은
 설치된 플러그인에 남고 복사되지 않습니다:
