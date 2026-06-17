@@ -14,6 +14,11 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
 
 ### Added
 
+- **CHANGELOG enforcement at PR time, by semver** — a CI `changelog` job fails any
+  pull request that ships without a `## [Unreleased]` entry (`scripts/check-changelog.sh`),
+  bypassable with the `skip-changelog` label. A new `CONTRIBUTING.md` documents the
+  Keep-a-Changelog buckets and their semantic-versioning impact, so the next version bump
+  is derivable rather than guessed (#4).
 - **`workbench` plugin (engine)** — task lifecycle skills (start/submit/done,
   docs query/ingest/lint, ticket-incubate, status/tickets, codebase-onboard, …),
   the `utils/` plumbing, and `bin/workbench` (on PATH when the plugin is enabled).
