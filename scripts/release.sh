@@ -16,7 +16,10 @@ echo "== checks =="
 bash scripts/check-version-sync.sh
 bash tests/check-skill-frontmatter.sh
 bash tests/check-install-model.sh
-bash plugins/workbench/tests/task-lifecycle.sh >/dev/null && echo "✔ lifecycle test"
+# Own line, not `cmd && echo`: under `set -e` the left side of `&&` is exempt, so a
+# failing test wouldn't stop the release prep. On its own line, a failure aborts.
+bash plugins/workbench/tests/task-lifecycle.sh >/dev/null
+echo "✔ lifecycle test"
 
 cat <<NEXT
 

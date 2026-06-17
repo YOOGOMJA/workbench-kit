@@ -49,7 +49,7 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
   `CLAUDE.md` (not a symlink, so it survives every platform) and a `.claude/settings.json`
   that registers the marketplace and enables the `workbench` engine plugin on folder trust
   — no manual install. `workbench docs check` now resolves the caller's worktree
-  (`--show-toplevel`) so checks on a task branch aren't skipped (PR #3 review).
+  (`--show-toplevel`) so checks on a task branch aren't skipped (PR #3 review). `workbench setup` likewise reads the caller's worktree manifest, and `release.sh` runs the lifecycle test on its own line so a failure aborts the release (PR #5 review).
 - **Installed-plugin execution model** (PR #1 review). The engine now operates on the
   caller's workbench repo, not the plugin bundle: `scaffold/` (with `AGENTS.core.md`) moved
   inside the `workbench-kit` plugin so it's packaged on install; `workbench setup` and
