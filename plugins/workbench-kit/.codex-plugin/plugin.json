@@ -1,6 +1,6 @@
 {
   "name": "workbench-kit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bootstrap a personalized workbench — interview for your persona, then generate the minimal repo (AGENTS + codebases + empty docs).",
   "author": { "name": "YOOGOMJA" },
   "homepage": "https://github.com/YOOGOMJA/workbench-kit",

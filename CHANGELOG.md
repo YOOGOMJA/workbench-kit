@@ -12,6 +12,17 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 _Nothing yet._
 
+## [0.1.1] - 2026-06-17
+
+### Fixed
+
+- **Generated workbench git hygiene.** `generate-workbench` now carries scaffold
+  `.gitignore` / `.gitattributes` into user repos, keeping `.codebases/`, `.worktrees/`,
+  task codebase copies, and Claude runtime locks out of commits while preserving
+  append-only logs with `merge=union` (#16).
+- **Engine messages reference the plugin CLI** (`workbench …`) instead of repo-local
+  `utils/…` paths, matching how users actually invoke the engine (#16).
+
 ## [0.1.0] - 2026-06-17
 
 First release. Everything below is the initial set.
@@ -80,10 +91,6 @@ First release. Everything below is the initial set.
   that registers the marketplace and enables the `workbench` engine plugin on folder trust
   — no manual install. `workbench docs check` now resolves the caller's worktree
   (`--show-toplevel`) so checks on a task branch aren't skipped (PR #3 review). `workbench setup` likewise reads the caller's worktree manifest, and `release.sh` runs the lifecycle test on its own line so a failure aborts the release (PR #5 review).
-- **Generated workbench git hygiene.** `generate-workbench` now carries scaffold
-  `.gitignore` / `.gitattributes` into user repos, keeping `.codebases/`, `.worktrees/`,
-  task codebase copies, and Claude runtime locks out of commits while preserving
-  append-only logs with `merge=union`.
 - **Installed-plugin execution model** (PR #1 review). The engine now operates on the
   caller's workbench repo, not the plugin bundle: `scaffold/` (with `AGENTS.core.md`) moved
   inside the `workbench-kit` plugin so it's packaged on install; `workbench setup` and
@@ -103,5 +110,6 @@ First release. Everything below is the initial set.
   English. The engine skill *bodies* and the rest of `framework-docs/` are still Korean —
   to be translated incrementally.
 
-[Unreleased]: https://github.com/YOOGOMJA/workbench-kit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/YOOGOMJA/workbench-kit/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/YOOGOMJA/workbench-kit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/YOOGOMJA/workbench-kit/releases/tag/v0.1.0
