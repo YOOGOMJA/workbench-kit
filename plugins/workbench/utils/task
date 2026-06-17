@@ -222,7 +222,9 @@ task_known_branches() {
 }
 
 branch_home_issue() {
-  local branch="$1" issue rest last prefix first seg_home=""
+  # Parse a task branch into "home|parent|issue".
+  # Grammar: task/[home/][parent/]<issue>-<slug>  (home non-numeric, parent numeric)
+  local branch="$1" issue rest last prefix first second seg_home="" seg_parent=""
   case "$branch" in task/*) : ;; *) return 1 ;; esac
   rest="${branch#task/}"
   last="${rest##*/}"
@@ -235,16 +237,28 @@ branch_home_issue() {
   fi
   if [ -n "$prefix" ]; then
     first="${prefix%%/*}"
-    echo "$first" | grep -Eq '^[0-9]+$' || seg_home="$first"
+    if echo "$first" | grep -Eq '^[0-9]+$'; then
+      seg_parent="$first"
+    else
+      seg_home="$first"
+      if [ "$prefix" != "$first" ]; then
+        second="${prefix#*/}"; second="${second%%/*}"
+        echo "$second" | grep -Eq '^[0-9]+$' && seg_parent="$second"
+      fi
+    fi
   fi
-  printf '%s|%s\n' "$seg_home" "$issue"
+  printf '%s|%s|%s\n' "$seg_home" "$seg_parent" "$issue"
 }
 
 branch_matches_issue() {
-  local branch="$1" home="$2" issue="$3" parsed seg_home seg_issue
+  # Match on (home, issue); if a parent is given it must match too. A task ID
+  # carries no parent, so same-issue tasks under different parents are
+  # distinguished only when the caller supplies --parent (see find_branches).
+  local branch="$1" home="$2" issue="$3" parent="${4:-}" parsed seg_home seg_parent seg_issue
   parsed="$(branch_home_issue "$branch")" || return 1
-  IFS='|' read -r seg_home seg_issue <<< "$parsed"
-  [ "$seg_home" = "$home" ] && [ "$seg_issue" = "$issue" ]
+  IFS='|' read -r seg_home seg_parent seg_issue <<< "$parsed"
+  [ "$seg_home" = "$home" ] && [ "$seg_issue" = "$issue" ] || return 1
+  [ -z "$parent" ] || [ "$seg_parent" = "$parent" ]
 }
 
 find_branch_in_list() {
@@ -259,12 +273,33 @@ find_branch_in_list() {
   return 1
 }
 
-# ID로 task 브랜치 찾기 (로컬·tracking·진짜 origin 합집합)
-find_branch() {
-  local home="$1" issue="$2" root branches
+# ID(+선택적 parent)에 매칭되는 모든 task 브랜치 (로컬·tracking·진짜 origin 합집합).
+# 한 줄에 하나씩 출력. parent를 주면 같은 이슈의 다른 parent task와 구분된다.
+find_branches() {
+  local home="$1" issue="$2" parent="${3:-}" root branches branch found=1
   root="$(wb_root)"
   branches="$(task_known_branches "$root")"
-  find_branch_in_list "$branches" "$home" "$issue"
+  while IFS= read -r branch; do
+    [ -n "$branch" ] || continue
+    if branch_matches_issue "$branch" "$home" "$issue" "$parent"; then
+      echo "$branch"; found=0
+    fi
+  done <<< "$branches"
+  return $found
+}
+
+# ID를 정확히 하나의 task 브랜치로 해석. 없으면 1을 반환하고, 같은 이슈가 여러
+# parent에 걸쳐 모호하면(그리고 parent로 좁혀지지 않으면) die한다.
+resolve_branch() {
+  local home="$1" issue="$2" parent="${3:-}" id="$4" matches
+  matches="$(find_branches "$home" "$issue" "$parent")" \
+    || die "task 브랜치를 찾을 수 없음: $id"
+  if [ "$(printf '%s\n' "$matches" | wc -l | tr -d ' ')" -gt 1 ]; then
+    die "이슈 ${home:+$home#}$issue 에 매칭되는 task가 여럿 (parent가 다름):
+$matches
+--parent <N> 로 구분할 것"
+  fi
+  printf '%s\n' "$matches"
 }
 
 # ── start ─────────────────────────────────────────────────────────────
@@ -281,8 +316,8 @@ cmd_start() {
   parse_id "$id"
 
   local root; root="$(wb_root)"
-  if find_branch "$HOME_REPO" "$ISSUE" >/dev/null 2>&1; then
-    die "이미 존재하는 task: $(find_branch "$HOME_REPO" "$ISSUE") — task resume $id 를 쓸 것"
+  if find_branches "$HOME_REPO" "$ISSUE" "$parent" >/dev/null 2>&1; then
+    die "이미 존재하는 task: $(find_branches "$HOME_REPO" "$ISSUE" "$parent" | head -1) — task resume $id 를 쓸 것"
   fi
 
   # 이슈 원문 조회 (가능하면) — 원본 소스 보존용
@@ -483,13 +518,20 @@ cmd_add_repo() {
 # ── resume ────────────────────────────────────────────────────────────
 
 cmd_resume() {
-  local id="${1:-}"; [ -n "$id" ] || die "usage: task resume <ID>"
+  local id="" parent=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --parent) parent="$2"; shift 2 ;;
+      *) [ -n "$id" ] || id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || die "usage: task resume <ID> [--parent N]"
   parse_id "$id"
   local root branch dir
   root="$(wb_root)"
 
   git -C "$root" fetch origin 2>/dev/null || true
-  branch="$(find_branch "$HOME_REPO" "$ISSUE")" || die "task 브랜치를 찾을 수 없음: $id"
+  branch="$(resolve_branch "$HOME_REPO" "$ISSUE" "$parent" "$id")" || exit 1
   dir="$root/.worktrees/$(branch_to_dir "$branch")"
 
   if [ ! -d "$dir" ]; then
@@ -561,7 +603,7 @@ cmd_submit() {
   else
     local parsed
     parsed="$(branch_home_issue "$branch")" || die "task/index.md 없이 issue/home 복원 실패: $branch"
-    IFS='|' read -r home issue <<< "$parsed"
+    IFS='|' read -r home _ issue <<< "$parsed"
     id="$issue"
     [ -n "$home" ] && id="$home#$issue"
     claim_id="$(lifecycle_claim_for_branch "$root" "$home" "$issue" "$branch")"
@@ -771,15 +813,19 @@ cmd_check() {
 # ── done ──────────────────────────────────────────────────────────────
 
 cmd_done() {
-  local id="" force=""
+  local id="" force="" parent=""
   while [ $# -gt 0 ]; do
-    case "$1" in --force) force=1; shift ;; *) id="$1"; shift ;; esac
+    case "$1" in
+      --force) force=1; shift ;;
+      --parent) parent="$2"; shift 2 ;;
+      *) id="$1"; shift ;;
+    esac
   done
-  [ -n "$id" ] || die "usage: task done <ID> [--force]"
+  [ -n "$id" ] || die "usage: task done <ID> [--parent N] [--force]"
   parse_id "$id"
   local root branch dir
   root="$(wb_root)"
-  branch="$(find_branch "$HOME_REPO" "$ISSUE")" || die "task 브랜치를 찾을 수 없음: $id"
+  branch="$(resolve_branch "$HOME_REPO" "$ISSUE" "$parent" "$id")" || exit 1
   dir="$root/.worktrees/$(branch_to_dir "$branch")"
 
   # codebase 작업 사본 먼저 정리 (디스크 기준 — index.md 는 cleanup으로 없을 수 있음)
