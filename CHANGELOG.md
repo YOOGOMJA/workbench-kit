@@ -45,6 +45,12 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
 
 ### Fixed
 
+- **`task done` no longer silently force-deletes an unmerged branch** (`workbench`
+  plugin). It deleted the local branch with `branch -D ... 2>/dev/null || true`
+  regardless of merge state, swallowing errors. It now deletes only when a **merged PR**
+  is found (the right signal under squash-merge, where `git branch -d` misjudges pushed
+  branches) or when `--force` is given; otherwise it refuses loudly and preserves the
+  branch and its commits (#7).
 - **`task` branch resolution now respects `parent`** (`workbench` plugin). `find_branches`
   matches on `(home, issue)` and, when given, `parent`, so two sub-tasks of the same issue
   under different parents no longer alias each other. `start`/`resume`/`done` take

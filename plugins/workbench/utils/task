@@ -812,6 +812,16 @@ cmd_check() {
 
 # ── done ──────────────────────────────────────────────────────────────
 
+# 이 브랜치에 대응하는 머지된 PR이 origin에 있는가? squash 머지(=새 커밋)는
+# git이 브랜치를 merged로 인식하지 못하므로, done이 안전 삭제 여부를 판단할 때
+# 쓴다. origin/gh가 없으면(오프라인 등) 1을 반환해 --force 를 요구하게 한다.
+branch_is_merged_pr() {
+  local root="$1" branch="$2" out
+  git -C "$root" remote get-url origin >/dev/null 2>&1 || return 1
+  out="$( (cd "$root" && gh pr list --head "$branch" --state merged --json number -q '.[].number') 2>/dev/null )" || return 1
+  [ -n "$out" ]
+}
+
 cmd_done() {
   local id="" force="" parent=""
   while [ $# -gt 0 ]; do
@@ -844,8 +854,21 @@ cmd_done() {
       || die "task 작업 공간에 커밋 안 된 변경 있음 — push 후 재시도하거나 --force"
   fi
 
-  info "브랜치 삭제: $branch"
-  git -C "$root" branch -D "$branch" 2>/dev/null || true
+  # 브랜치 삭제 — 머지 안 된 로컬 작업을 조용히 날리지 않는다. 워크벤치는
+  # squash 머지(=새 커밋)라 git은 task 브랜치를 merged로 못 본다(게다가 push된
+  # 브랜치는 upstream이 자기 자신이라 `git branch -d`가 오판한다). 따라서
+  # "머지된 PR이 있는가"로 판단하고, 없으면 --force 를 요구한다.
+  if [ -n "$force" ]; then
+    info "브랜치 강제 삭제: $branch (--force)"
+    git -C "$root" branch -D "$branch" || die "브랜치 삭제 실패: $branch"
+  elif branch_is_merged_pr "$root" "$branch"; then
+    info "브랜치 삭제: $branch (머지된 PR 확인됨)"
+    git -C "$root" branch -D "$branch" || die "브랜치 삭제 실패: $branch"
+  else
+    die "브랜치 '$branch' 에 머지되지 않은 로컬 커밋이 있고 머지된 PR도 찾지 못함 —
+push 하거나 PR을 머지한 뒤 다시 실행하거나, 폐기해도 된다면 --force 로 실행할 것
+(워크트리는 이미 제거됨; 로컬 브랜치와 커밋은 보존됨)"
+  fi
   local claim_id; claim_id="$(lifecycle_claim_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")"
   lifecycle_emit_optional "$root" "$HOME_REPO" "$ISSUE" task-cleaned "$claim_id" "$branch"
   if git -C "$root" remote get-url origin >/dev/null 2>&1; then

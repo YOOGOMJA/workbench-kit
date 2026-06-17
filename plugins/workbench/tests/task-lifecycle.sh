@@ -77,7 +77,20 @@ case "${1:-} ${2:-}" in
     printf '30\tunstarted ticket\tOPEN\thttps://github.com/example/workbench/issues/30\n'
     ;;
   "pr list")
-    printf '\n'
+    # `task done` merged-PR check: gh pr list --head <b> --state merged --json number -q ...
+    head=""; state=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --head) head="$2"; shift 2 ;;
+        --state) state="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ "$state" = "merged" ] && [ -n "${GH_MERGED_HEAD:-}" ] && [ "$head" = "$GH_MERGED_HEAD" ]; then
+      printf '44\n'
+    else
+      printf '\n'
+    fi
     ;;
   "pr create")
     if [ "${GH_PR_CREATE_FAIL:-}" = "1" ]; then
@@ -134,6 +147,7 @@ run_task_in_dir() {
   GH_COMMENTS_DIR="$TMPDIR/$case_name/comments" \
   GH_ISSUE_COMMENT_FAIL_EVENT="${GH_ISSUE_COMMENT_FAIL_EVENT:-}" \
   GH_PR_CREATE_FAIL="${GH_PR_CREATE_FAIL:-}" \
+  GH_MERGED_HEAD="${GH_MERGED_HEAD:-}" \
   HOME="$TMPDIR/$case_name/home" \
   PATH="$TMPDIR/$case_name/bin:$PATH" \
     bash -c 'dir="$1"; shift; cd "$dir"; "$dir/utils/task" "$@"' bash "$dir" "$@"
@@ -280,7 +294,9 @@ test_done_emits_cleaned_without_closing_issue() {
   repo="$(setup_workbench done_success)"
   run_task done_success "$repo" start 29
 
-  run_task done_success "$repo" done 29
+  # done after a (squash-)merged PR: the branch isn't merged in git's view, so
+  # done relies on the merged-PR check to delete it cleanly.
+  GH_MERGED_HEAD=task/29-task-start-claim-lifecycle run_task done_success "$repo" done 29
 
   assert_file_contains "$TMPDIR/done_success/comments/29.comments" "event=task-cleaned"
   assert_file_not_contains "$TMPDIR/done_success/gh.log" "issue close"
@@ -292,12 +308,42 @@ test_done_succeeds_when_cleaned_comment_fails_after_cleanup() {
   run_task done_comment_failure "$repo" start 29
   branch="task/29-task-start-claim-lifecycle"
 
-  GH_ISSUE_COMMENT_FAIL_EVENT=task-cleaned run_task done_comment_failure "$repo" done 29
+  GH_ISSUE_COMMENT_FAIL_EVENT=task-cleaned GH_MERGED_HEAD=task/29-task-start-claim-lifecycle \
+    run_task done_comment_failure "$repo" done 29
 
   [ ! -d "$(task_dir_for "$repo")" ] || fail "expected task worktree to be removed"
   ! git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" \
     || fail "expected local task branch to be removed"
   assert_file_not_contains "$TMPDIR/done_comment_failure/comments/29.comments" "event=task-cleaned"
+}
+
+test_done_refuses_unmerged_branch_without_force() {
+  local repo branch
+  repo="$(setup_workbench done_unmerged_refuse)"
+  run_task done_unmerged_refuse "$repo" start 29
+  branch="task/29-task-start-claim-lifecycle"
+
+  # no merged PR (GH_MERGED_HEAD unset) and no --force → must refuse
+  if run_task done_unmerged_refuse "$repo" done 29; then
+    fail "expected 'done 29' to refuse deleting an unmerged branch without --force"
+  fi
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "unmerged branch must be preserved when done refuses"
+  assert_file_not_contains "$TMPDIR/done_unmerged_refuse/comments/29.comments" "event=task-cleaned"
+}
+
+test_done_force_deletes_unmerged_branch() {
+  local repo branch
+  repo="$(setup_workbench done_unmerged_force)"
+  run_task done_unmerged_force "$repo" start 29
+  branch="task/29-task-start-claim-lifecycle"
+
+  run_task done_unmerged_force "$repo" done 29 --force
+
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+    fail "expected --force to delete the unmerged branch"
+  fi
+  assert_file_contains "$TMPDIR/done_unmerged_force/comments/29.comments" "event=task-cleaned"
 }
 
 test_done_ambiguous_parent_requires_disambiguation() {
@@ -316,8 +362,8 @@ test_done_ambiguous_parent_requires_disambiguation() {
   git -C "$repo" show-ref --verify --quiet refs/heads/task/56/34-beta \
     || fail "ambiguous done must not delete task/56/34-beta"
 
-  # --parent narrows to exactly one
-  run_task done_ambiguous_parent "$repo" done 34 --parent 12
+  # --parent narrows to exactly one (--force: these throwaway branches have no merged PR)
+  run_task done_ambiguous_parent "$repo" done 34 --parent 12 --force
   if git -C "$repo" show-ref --verify --quiet refs/heads/task/12/34-alpha; then
     fail "expected task/12/34-alpha removed by 'done 34 --parent 12'"
   fi
@@ -394,6 +440,8 @@ test_submit_succeeds_when_submitted_comment_fails_after_pr_create
 test_submit_retry_after_cleanup_preserves_codebase_home
 test_done_emits_cleaned_without_closing_issue
 test_done_succeeds_when_cleaned_comment_fails_after_cleanup
+test_done_refuses_unmerged_branch_without_force
+test_done_force_deletes_unmerged_branch
 test_done_ambiguous_parent_requires_disambiguation
 test_tickets_reports_lifecycle_facts_read_only
 test_tickets_detects_remote_only_task_branch_without_fetch
