@@ -11,6 +11,20 @@ on:
     branches: [main]
 
 jobs:
+  changelog:
+    # Behavior changes must record a semver-classified CHANGELOG entry at PR time
+    # (see CONTRIBUTING.md). Bypass with the 'skip-changelog' label.
+    if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'skip-changelog')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: CHANGELOG entry present
+        run: |
+          git fetch --no-tags --quiet origin "${{ github.event.pull_request.base.sha }}"
+          bash scripts/check-changelog.sh "${{ github.event.pull_request.base.sha }}"
+
   checks:
     runs-on: ubuntu-latest
     steps:
