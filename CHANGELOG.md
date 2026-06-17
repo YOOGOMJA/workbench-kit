@@ -10,7 +10,11 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ## [Unreleased]
 
-First release in progress (target: **0.1.0**). Everything below is the initial set.
+_Nothing yet._
+
+## [0.1.0] - 2026-06-17
+
+First release. Everything below is the initial set.
 
 ### Added
 
@@ -95,4 +99,5 @@ First release in progress (target: **0.1.0**). Everything below is the initial s
   English. The engine skill *bodies* and the rest of `framework-docs/` are still Korean —
   to be translated incrementally.
 
-[Unreleased]: https://github.com/YOOGOMJA/workbench-kit/commits/main
+[Unreleased]: https://github.com/YOOGOMJA/workbench-kit/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/YOOGOMJA/workbench-kit/releases/tag/v0.1.0
