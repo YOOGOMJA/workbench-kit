@@ -32,7 +32,7 @@ if ! out="$(
     --plugin-dir "$ENGINE" \
     --permission-mode bypassPermissions \
     --allowedTools "Bash(plugins/workbench/bin/workbench --help)" \
-    --max-budget-usd "${CLAUDE_PRINT_MAX_BUDGET_USD:-0.25}" \
+    --max-budget-usd "${CLAUDE_PRINT_MAX_BUDGET_USD:-1.00}" \
     "$prompt" 2>&1
 )"; then
   echo "FAIL: claude -p command failed:" >&2
