@@ -638,6 +638,44 @@ cmd_submit() {
   lifecycle_emit_optional "$root" "$home" "$issue" task-submitted "$claim_id" "$branch" "$pr_number"
 }
 
+# ── commit subject policy ─────────────────────────────────────────────
+
+# Phase 1 default: match current workbench behavior. The policy functions are
+# intentionally grouped so a later profile/persona config can replace the source
+# without changing cmd_commit and cmd_check call sites.
+COMMIT_TYPES='feat|fix|docs|refactor|chore|test|build|ci|perf|style|revert'
+
+commit_subject_policy_name() {
+  printf '%s\n' conventional
+}
+
+commit_subject_policy_hint() {
+  printf '형식: <type>(scope)?!?: <설명>   허용 type: %s   예: feat: add X, fix(task): handle Y, docs!: rewrite Z' "$COMMIT_TYPES"
+}
+
+# 배관 자신이 만드는 커밋(스캐폴드·cleanup·add-repo)은 subject policy 면제.
+is_plumbing_subject() {
+  case "$1" in
+    'task('*'): 스캐폴드'|'task('*'): cleanup'|'task: add-repo '*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_valid_commit_subject() {
+  printf '%s' "$1" | grep -qE "^($COMMIT_TYPES)(\([^)]+\))?!?: .+"
+}
+
+require_valid_commit_subject() {
+  local subject="$1"
+  is_valid_commit_subject "$subject" || die "commit subject policy ($(commit_subject_policy_name)) 위반: '$subject'
+       $(commit_subject_policy_hint)"
+}
+
+report_invalid_commit_subject() {
+  local sha="$1" subject="$2"
+  echo "✗ commit subject policy ($(commit_subject_policy_name)): 커밋 ${sha:0:8} ($subject) — $(commit_subject_policy_hint)" >&2
+}
+
 # ── commit ────────────────────────────────────────────────────────────
 
 # 에이전트의 유일 커밋 경로. log append + commit + push 를 원자화한다.
@@ -691,6 +729,7 @@ cmd_commit() {
   [ -n "$id" ] || die "task/index.md 에서 id 를 읽을 수 없음"
 
   local subject="${msgs[0]}"
+  require_valid_commit_subject "$subject"
   local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"
   local logpath="${path:--}"
 
@@ -742,7 +781,7 @@ cmd_check() {
   local branch fail=0
   branch="$(git -C "$TASK_DIR" rev-parse --abbrev-ref HEAD)"
 
-  # 1) log 우회: <base>..HEAD 의 비플럼빙 커밋이 task/log.md 를 안 건드렸나.
+  # 1) log 우회 + subject policy: <base>..HEAD 의 비플럼빙 커밋을 순회한다.
   #    base는 origin/main(신선) — 로컬 main이 낡으면 main의 머지 커밋이 끼어
   #    false-positive가 났다.
   local sha subj files cbase
@@ -750,9 +789,11 @@ cmd_check() {
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     subj="$(git -C "$TASK_DIR" log -1 --format='%s' "$sha")"
-    case "$subj" in
-      task\(*\):\ 스캐폴드|task\(*\):\ cleanup|task:\ add-repo\ *) continue ;;
-    esac
+    is_plumbing_subject "$subj" && continue
+    if ! is_valid_commit_subject "$subj"; then
+      report_invalid_commit_subject "$sha" "$subj"
+      fail=1
+    fi
     files="$(git -C "$TASK_DIR" show --name-only --format='' "$sha")"
     printf '%s\n' "$files" | grep -qx 'task/log.md' && continue
     echo "✗ log 우회: 커밋 ${sha:0:8} ($subj) 가 task/log.md 미갱신 — workbench task commit 사용" >&2
