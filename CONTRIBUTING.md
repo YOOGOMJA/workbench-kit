@@ -40,6 +40,13 @@ bash tests/check-codebases-yaml.sh
 bash tests/check-install-model.sh
 ```
 
+There is also an optional Claude Code print-mode smoke test for local plugin-load
+diagnostics. It calls the model, so it is not part of deterministic CI:
+
+```
+RUN_CLAUDE_PRINT=1 bash tests/check-claude-print-smoke.sh
+```
+
 Authoritative plugin validation (`claude plugin validate`) needs the Claude Code
 CLI, so it stays a local/manual gate.
 

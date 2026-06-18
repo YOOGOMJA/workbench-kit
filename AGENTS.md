@@ -20,6 +20,7 @@ workbench has its own composed AGENTS.md; this file is for hacking on the kit.)
   - `bash tests/check-install-model.sh`   (engine utils target the caller repo, not the bundle)
   - `bash tests/check-generated-scaffold-hygiene.sh`
   - `bash plugins/workbench/tests/task-lifecycle.sh`
+  - `RUN_CLAUDE_PRINT=1 bash tests/check-claude-print-smoke.sh` (optional/manual; calls the model)
 
 ## Release & versioning (self-contained — keep it this way)
 

@@ -17,6 +17,10 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   already-released `## [X.Y.Z]` section instead of `## [Unreleased]`, so an in-flight PR
   can't pollute a published version's notes. `RELEASING.md` documents the hazard; covered
   by `tests/check-changelog-section-guard.sh` (#21).
+- **Optional Claude print-mode smoke test** — `tests/check-claude-print-smoke.sh` can be
+  run with `RUN_CLAUDE_PRINT=1` to verify the `workbench` plugin loads under
+  non-interactive `claude -p`. It is skipped by default because it depends on model access,
+  auth, network, and budget.
 
 ## [0.1.1] - 2026-06-17
 
