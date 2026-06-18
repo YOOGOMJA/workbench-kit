@@ -22,6 +22,13 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   non-interactive `claude -p`. It is skipped by default because it depends on model access,
   auth, network, and budget.
 
+### Fixed
+
+- **Task commit subject policy enforcement** — the `workbench` plugin now rejects
+  invalid `workbench task commit` subjects and audits raw/bypassed task commits in
+  `workbench task check`, restoring current workbench Conventional Commits behavior while
+  keeping the policy logic in one extension point (#22).
+
 ## [0.1.1] - 2026-06-17
 
 ### Fixed

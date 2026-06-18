@@ -431,6 +431,43 @@ EOF
   assert_file_contains "$out" "lifecycle_claim_id: right"
 }
 
+test_commit_rejects_invalid_subject() {
+  local repo task_dir out
+  repo="$(setup_workbench commit_invalid_subject)"
+  run_task commit_invalid_subject "$repo" start 29
+  task_dir="$(task_dir_for "$repo")"
+  out="$TMPDIR/commit_invalid_subject/commit.out"
+  printf 'bad subject\n' > "$task_dir/README.md"
+
+  if run_task_in_dir commit_invalid_subject "$task_dir" commit code update README.md -m "bad subject" > "$out" 2>&1; then
+    fail "expected commit to reject an invalid subject"
+  fi
+
+  assert_file_contains "$out" "commit subject policy"
+  assert_file_not_contains "$task_dir/task/log.md" "bad subject"
+  if git -C "$task_dir" log --format=%s | grep -Fxq "bad subject (#29)"; then
+    fail "invalid subject must not reach git history"
+  fi
+}
+
+test_check_audits_raw_invalid_subject() {
+  local repo task_dir out
+  repo="$(setup_workbench check_invalid_subject)"
+  run_task check_invalid_subject "$repo" start 29
+  task_dir="$(task_dir_for "$repo")"
+  out="$TMPDIR/check_invalid_subject/check.out"
+  printf 'raw bypass\n' > "$task_dir/README.md"
+  git -C "$task_dir" add README.md
+  git -C "$task_dir" commit -q -m "bad subject"
+
+  if run_task_in_dir check_invalid_subject "$task_dir" check > "$out" 2>&1; then
+    fail "expected check to reject a raw invalid subject"
+  fi
+
+  assert_file_contains "$out" "commit subject policy"
+  assert_file_contains "$out" "bad subject"
+}
+
 test_start_emits_claim_and_active
 test_start_validation_failure_writes_no_lifecycle_comment
 test_start_succeeds_when_active_comment_fails_after_push
@@ -446,5 +483,7 @@ test_done_ambiguous_parent_requires_disambiguation
 test_tickets_reports_lifecycle_facts_read_only
 test_tickets_detects_remote_only_task_branch_without_fetch
 test_lifecycle_latest_for_branch_uses_exact_branch_match
+test_check_audits_raw_invalid_subject
+test_commit_rejects_invalid_subject
 
 echo "PASS task lifecycle tests"
