@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refine a Scenario"
+  short_description: "Refine product intent into a ready scenario"
+  default_prompt: "Use -refine to turn product intent into a testable toolbox scenario."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Evolve the Design System"
+  short_description: "Design scenario states in the owning codebase"
+  default_prompt: "Use -system to evolve the owning codebase design system for one scenario."
