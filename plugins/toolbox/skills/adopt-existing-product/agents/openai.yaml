@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adopt an Existing Product"
+  short_description: "Register an existing product without rewriting it"
+  default_prompt: "Use -existing-product to bring an existing codebase into governed toolbox state."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review a Release"
+  short_description: "Review scenario delivery evidence and acceptance"
+  default_prompt: "Use -review to assess whether a toolbox scenario is ready for human adoption."
