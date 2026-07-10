@@ -1,0 +1,10 @@
+{
+  "name": "toolbox",
+  "version": "0.1.1",
+  "description": "Optional product delivery capability pack for workbench: versioned product state, deterministic portfolio plumbing, and agent-led workflows.",
+  "author": { "name": "YOOGOMJA" },
+  "homepage": "https://github.com/YOOGOMJA/workbench-kit",
+  "repository": "https://github.com/YOOGOMJA/workbench-kit",
+  "license": "MIT",
+  "skills": "./skills/"
+}
