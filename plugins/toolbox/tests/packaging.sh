@@ -28,6 +28,15 @@ for name, manifest in (("Claude", claude), ("Codex", codex)):
     assert manifest["version"] == "0.1.1", f"{name} manifest must join lockstep 0.1.1"
 
 assert codex["skills"] == "./skills/", "Codex manifest must expose toolbox skills"
+assert codex["interface"] == {
+    "displayName": "Toolbox",
+    "shortDescription": "Governed product state and delivery workflows",
+    "longDescription": "Optional workbench capability pack for product, scenario, and portfolio workflows.",
+    "developerName": "YOOGOMJA",
+    "category": "Developer Tools",
+    "capabilities": ["Product state", "Portfolio inspection", "Workflow skills"],
+    "defaultPrompt": "Use $product-start to initialize governed product state in this workbench.",
+}
 PY
 
 [ -x "$ROOT/bin/toolbox" ] || fail "bin/toolbox is missing or not executable"
