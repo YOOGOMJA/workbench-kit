@@ -2,6 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/toolbox/scenario-v1",
   "title": "Toolbox scenario state v1",
+  "x-workbench": {
+    "capability_pack_contract": "workbench-capability-pack/v1",
+    "workspace_schemas": ["workbench/v2"],
+    "capabilities": ["workspace.schema/v1"]
+  },
   "type": "object",
   "additionalProperties": false,
   "required": [

@@ -28,6 +28,7 @@ from toolbox_state import (
 WORKBENCH_CONTRACT = "workbench-contract/v1"
 WORKSPACE_SCHEMA = "workbench/v2"
 CAPABILITY_PACK_CONTRACT = "workbench-capability-pack/v1"
+REQUIRED_CAPABILITIES = ("workspace.schema/v1",)
 
 
 class ToolboxError(Exception):
@@ -131,6 +132,12 @@ def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
         raise ToolboxError(
             f"workbench does not support '{CAPABILITY_PACK_CONTRACT}'"
         )
+
+    capabilities = require_string_list(document.get("capabilities"), "capabilities")
+    available_capabilities = set(capabilities)
+    for capability in REQUIRED_CAPABILITIES:
+        if capability not in available_capabilities:
+            raise ToolboxError(f"workbench is missing required capability '{capability}'")
 
     return {
         "compatible": True,
