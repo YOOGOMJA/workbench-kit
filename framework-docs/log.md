@@ -88,3 +88,5 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-07-11 02:49:13] edit · update workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Closed reviewed gaps in task legacy detection, lifecycle serialization, multi-context boundaries, profile discovery, and compound applicability
 
 ## [2026-07-11 03:13:03] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Removed the action-revision metadata cycle and specified strict JSON input, governed cleanup, sealed harvest disposition, and repeatable context policy provenance
+
+## [2026-07-11 08:18:03] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Bound actions to complete canonical policy manifests, sealed owner context, authority-backed acceptance, terminal content freeze, revision-safe evidence, durable cleanup recovery, and enforced writer claims
