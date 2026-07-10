@@ -17,6 +17,7 @@ from toolbox_json import DuplicateJsonMember, InvalidJsonConstant, strict_json_l
 from toolbox_language import is_language_tag
 from toolbox_state import (
     StateError,
+    apply_scenario,
     candidate_scenarios,
     check_portfolio,
     check_product,
@@ -24,6 +25,9 @@ from toolbox_state import (
     initialize_product,
     load_portfolio,
     load_product,
+    set_autonomy,
+    set_quality_check,
+    set_repository,
 )
 
 
@@ -216,6 +220,14 @@ def write_json(document: Any) -> None:
     sys.stdout.write("\n")
 
 
+def parse_boolean(value: str) -> bool:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="toolbox",
@@ -242,6 +254,50 @@ def build_parser() -> argparse.ArgumentParser:
     product_inspect.add_argument("product_id")
     product_check = product_commands.add_parser("check", help="Validate one product bundle")
     product_check.add_argument("product_id")
+    product_repository = product_commands.add_parser(
+        "repository", help="Mutate a product repository record"
+    )
+    repository_commands = product_repository.add_subparsers(
+        dest="repository_command", required=True
+    )
+    repository_set = repository_commands.add_parser("set", help="Set a repository record")
+    repository_set.add_argument("product_id")
+    repository_set.add_argument("--id", required=True, dest="repository_id")
+    repository_set.add_argument("--path", required=True)
+    repository_set.add_argument("--role", choices=("owner", "work", "reference"), required=True)
+    product_autonomy = product_commands.add_parser(
+        "autonomy", help="Mutate a product autonomy policy"
+    )
+    autonomy_commands = product_autonomy.add_subparsers(
+        dest="autonomy_command", required=True
+    )
+    autonomy_set = autonomy_commands.add_parser("set", help="Set an action decision")
+    autonomy_set.add_argument("product_id")
+    autonomy_set.add_argument("--action", required=True, dest="action_id")
+    autonomy_set.add_argument("--decision", choices=("allow", "ask", "deny"), required=True)
+    product_quality = product_commands.add_parser(
+        "quality", help="Mutate product quality policy"
+    )
+    quality_commands = product_quality.add_subparsers(dest="quality_command", required=True)
+    quality_check = quality_commands.add_parser("check", help="Mutate a quality check")
+    quality_check_commands = quality_check.add_subparsers(
+        dest="quality_check_command", required=True
+    )
+    quality_check_set = quality_check_commands.add_parser("set", help="Set a quality check")
+    quality_check_set.add_argument("product_id")
+    quality_check_set.add_argument("--id", required=True, dest="check_id")
+    quality_check_set.add_argument(
+        "--kind",
+        choices=(
+            "test", "lint", "typecheck", "build", "integration", "e2e",
+            "accessibility", "visual", "performance", "security",
+        ),
+        required=True,
+    )
+    quality_check_set.add_argument("--required", required=True, type=parse_boolean)
+    quality_check_set.add_argument(
+        "--command-part", required=True, action="append", dest="command_parts"
+    )
     scenario = commands.add_parser(
         "scenario", help="Inspect, validate, or list scenario candidates"
     )
@@ -254,6 +310,9 @@ def build_parser() -> argparse.ArgumentParser:
         "candidates", help="List dependency-ready scenarios"
     )
     scenario_candidates.add_argument("--product", dest="product_filter")
+    scenario_apply = scenario_commands.add_parser("apply", help="Atomically apply a scenario")
+    scenario_apply.add_argument("--product", required=True, dest="product_id")
+    scenario_apply.add_argument("--file", required=True, type=pathlib.Path)
 
     portfolio = commands.add_parser(
         "portfolio", help="Inspect or validate the joined portfolio"
@@ -314,6 +373,52 @@ def main(argv: Sequence[str] | None = None) -> int:
                 check_product(workspace, parsed.product_id)
                 write_json({"product_id": parsed.product_id, "valid": True})
                 return 0
+            if parsed.product_command == "repository":
+                changed, repository = set_repository(
+                    workspace,
+                    parsed.product_id,
+                    parsed.repository_id,
+                    parsed.path,
+                    parsed.role,
+                )
+                write_json(
+                    {
+                        "changed": changed,
+                        "product_id": parsed.product_id,
+                        "repository": repository,
+                    }
+                )
+                return 0
+            if parsed.product_command == "autonomy":
+                changed = set_autonomy(
+                    workspace, parsed.product_id, parsed.action_id, parsed.decision
+                )
+                write_json(
+                    {
+                        "action_id": parsed.action_id,
+                        "changed": changed,
+                        "decision": parsed.decision,
+                        "product_id": parsed.product_id,
+                    }
+                )
+                return 0
+            if parsed.product_command == "quality":
+                changed, quality_check = set_quality_check(
+                    workspace,
+                    parsed.product_id,
+                    parsed.check_id,
+                    parsed.kind,
+                    parsed.required,
+                    parsed.command_parts,
+                )
+                write_json(
+                    {
+                        "changed": changed,
+                        "product_id": parsed.product_id,
+                        "quality_check": quality_check,
+                    }
+                )
+                return 0
         if parsed.command == "scenario":
             inspect_workbench_contract(workspace)
             if parsed.scenario_command == "inspect":
@@ -333,6 +438,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             if parsed.scenario_command == "candidates":
                 write_json(
                     {"candidates": candidate_scenarios(workspace, parsed.product_filter)}
+                )
+                return 0
+            if parsed.scenario_command == "apply":
+                changed, scenario_document = apply_scenario(
+                    workspace, parsed.product_id, parsed.file
+                )
+                write_json(
+                    {
+                        "changed": changed,
+                        "product_id": parsed.product_id,
+                        "scenario": scenario_document,
+                        "scenario_ref": f"toolbox:scenario/{scenario_document['id']}",
+                    }
                 )
                 return 0
         if parsed.command == "portfolio":

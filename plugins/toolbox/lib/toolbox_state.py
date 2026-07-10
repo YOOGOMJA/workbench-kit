@@ -163,6 +163,52 @@ def write_json(path: pathlib.Path, document: dict[str, Any]) -> None:
         raise StateError(f"unable to write state document {path}: {diagnostic}") from error
 
 
+def atomic_replace_json(
+    workspace: pathlib.Path, path: pathlib.Path, document: dict[str, Any]
+) -> None:
+    """Replace one caller-owned JSON document without exposing a partial write."""
+    target = safe_state_path(workspace, path, "state document")
+    parent = safe_state_path(workspace, target.parent, "state document directory")
+    if not parent.is_dir():
+        raise StateError(f"state document directory does not exist: {parent}")
+
+    descriptor = -1
+    temporary: pathlib.Path | None = None
+    try:
+        descriptor, raw_temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=parent
+        )
+        temporary = pathlib.Path(raw_temporary)
+        safe_state_path(workspace, temporary, "temporary state document")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(document, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        if hasattr(os, "O_DIRECTORY"):
+            directory_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(f"unable to replace state document {target}: {diagnostic}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
 def product_root(workspace: pathlib.Path, product_id: str) -> pathlib.Path:
     validate_product_id(product_id)
     return workspace / "products" / product_id
@@ -348,19 +394,24 @@ def load_product(workspace: pathlib.Path, product_id: str) -> dict[str, Any]:
 
 def check_product(workspace: pathlib.Path, product_id: str) -> None:
     bundle = load_product(workspace, product_id)
-    product = bundle["product"]
-    validate_document("product", product)
-    validate_language(product["language"])
-    validate_document("autonomy", bundle["autonomy"])
-    validate_document("quality", bundle["quality"])
+    validate_product_bundle(product_id, bundle)
     paths = scenario_paths(workspace, product_id)
     for path, scenario in zip(paths, bundle["scenarios"]):
-        validate_document("scenario", scenario)
         expected_name = f"{scenario['id']}.json"
         if path.name != expected_name:
             raise StateError(
                 f"scenario file '{path.name}' must be named '{expected_name}'"
             )
+
+
+def validate_product_bundle(product_id: str, bundle: dict[str, Any]) -> None:
+    product = bundle["product"]
+    validate_document("product", product)
+    validate_language(product["language"])
+    validate_document("autonomy", bundle["autonomy"])
+    validate_document("quality", bundle["quality"])
+    for scenario in bundle["scenarios"]:
+        validate_document("scenario", scenario)
 
     if product.get("id") != product_id:
         raise StateError(
@@ -384,6 +435,149 @@ def check_product(workspace: pathlib.Path, product_id: str) -> None:
         if scenario["id"] in local_scenario_ids:
             raise StateError(f"duplicate scenario ID '{scenario['id']}'")
         local_scenario_ids.add(scenario["id"])
+
+
+def validate_repository_path(path: str) -> None:
+    candidate = pathlib.PurePosixPath(path)
+    if (
+        not path
+        or candidate.is_absolute()
+        or ".." in candidate.parts
+        or "." in candidate.parts
+        or str(candidate) != path
+    ):
+        raise StateError("repository path must be workspace-relative and normalized")
+
+
+def set_repository(
+    workspace: pathlib.Path,
+    product_id: str,
+    repository_id: str,
+    path: str,
+    role: str,
+) -> tuple[bool, dict[str, Any]]:
+    validate_product_id(repository_id)
+    validate_repository_path(path)
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    repository = {"id": repository_id, "path": path, "role": role}
+    repositories = bundle["product"]["repositories"]
+    for existing in repositories:
+        if existing["path"] == path and existing["id"] != repository_id:
+            raise StateError(
+                f"repository path '{path}' already belongs to repository '{existing['id']}'"
+            )
+    existing = next(
+        (item for item in repositories if item["id"] == repository_id), None
+    )
+    if existing == repository:
+        return False, repository
+    proposed = dict(bundle["product"])
+    proposed["repositories"] = sorted(
+        [item for item in repositories if item["id"] != repository_id] + [repository],
+        key=lambda item: item["id"],
+    )
+    proposed_bundle = dict(bundle)
+    proposed_bundle["product"] = proposed
+    validate_product_bundle(product_id, proposed_bundle)
+    atomic_replace_json(
+        workspace, product_root(workspace, product_id) / "product.json", proposed
+    )
+    return True, repository
+
+
+def set_autonomy(
+    workspace: pathlib.Path, product_id: str, action_id: str, decision: str
+) -> bool:
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    proposed = dict(bundle["autonomy"])
+    proposed["actions"] = dict(proposed["actions"])
+    if proposed["actions"].get(action_id) == decision:
+        return False
+    proposed["actions"][action_id] = decision
+    proposed["actions"] = dict(sorted(proposed["actions"].items()))
+    proposed_bundle = dict(bundle)
+    proposed_bundle["autonomy"] = proposed
+    validate_product_bundle(product_id, proposed_bundle)
+    atomic_replace_json(
+        workspace, product_root(workspace, product_id) / "autonomy.json", proposed
+    )
+    return True
+
+
+def set_quality_check(
+    workspace: pathlib.Path,
+    product_id: str,
+    check_id: str,
+    kind: str,
+    required: bool,
+    command: list[str],
+) -> tuple[bool, dict[str, Any]]:
+    validate_product_id(check_id)
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    quality_check = {
+        "id": check_id,
+        "kind": kind,
+        "command": command,
+        "required": required,
+    }
+    checks = bundle["quality"]["checks"]
+    existing = next((item for item in checks if item["id"] == check_id), None)
+    if existing == quality_check:
+        return False, quality_check
+    proposed = dict(bundle["quality"])
+    proposed["checks"] = sorted(
+        [item for item in checks if item["id"] != check_id] + [quality_check],
+        key=lambda item: item["id"],
+    )
+    proposed_bundle = dict(bundle)
+    proposed_bundle["quality"] = proposed
+    validate_product_bundle(product_id, proposed_bundle)
+    atomic_replace_json(
+        workspace, product_root(workspace, product_id) / "quality.json", proposed
+    )
+    return True, quality_check
+
+
+def apply_scenario(
+    workspace: pathlib.Path, product_id: str, source: pathlib.Path
+) -> tuple[bool, dict[str, Any]]:
+    scenario = read_json(source)
+    validate_document("scenario", scenario)
+    if scenario["productId"] != product_id:
+        raise StateError(
+            f"scenario '{scenario['id']}' belongs to product '{scenario['productId']}', not '{product_id}'"
+        )
+
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    existing = next(
+        (item for item in bundle["scenarios"] if item["id"] == scenario["id"]), None
+    )
+    if existing == scenario:
+        return False, scenario
+
+    proposed_bundle = dict(bundle)
+    proposed_bundle["scenarios"] = sorted(
+        [item for item in bundle["scenarios"] if item["id"] != scenario["id"]]
+        + [scenario],
+        key=lambda item: item["id"],
+    )
+    validate_product_bundle(product_id, proposed_bundle)
+
+    portfolio = load_portfolio(workspace)
+    portfolio["products"] = [
+        proposed_bundle if item["product"]["id"] == product_id else item
+        for item in portfolio["products"]
+    ]
+    index = scenario_index(portfolio)
+    check_dependency_graph(index)
+
+    target = product_root(workspace, product_id) / "scenarios" / f"{scenario['id']}.json"
+    atomic_replace_json(workspace, target, scenario)
+    return True, scenario
 
 
 def load_portfolio(workspace: pathlib.Path) -> dict[str, Any]:
