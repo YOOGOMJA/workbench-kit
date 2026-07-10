@@ -172,6 +172,25 @@ EOF
 expect_failure "$.default must be one of: allow, ask, deny" \
   toolbox "$wb_semantic" product check semantic
 
+# Product document IDs cannot alias another product directory.
+wb_duplicate_product="$tmp/duplicate-product"
+make_workspace "$wb_duplicate_product"
+init_product "$wb_duplicate_product" one
+init_product "$wb_duplicate_product" two
+cat >"$wb_duplicate_product/products/two/product.json" <<'EOF'
+{
+  "schema": "toolbox-product/v1",
+  "id": "one",
+  "name": "Duplicate one",
+  "language": "en",
+  "status": "draft",
+  "objective": "Duplicate product identity",
+  "repositories": []
+}
+EOF
+expect_failure "duplicate product ID 'one'" \
+  toolbox "$wb_duplicate_product" portfolio check
+
 # Scenario references are globally unique across products.
 wb_duplicate="$tmp/duplicate"
 make_workspace "$wb_duplicate"
