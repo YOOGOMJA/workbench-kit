@@ -18,6 +18,14 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   can't pollute a published version's notes. `RELEASING.md` documents the hazard; covered
   by `tests/check-changelog-section-guard.sh` (#21).
 
+### Changed
+
+- **Workbench v2 governance contract** - framework documentation now defines the generic
+  multi-deliverable lifecycle, revision-bound evidence, policy resolution, living-state and
+  compound-knowledge boundaries, capability-pack rules, and machine-readable compatibility
+  probe shared by the engine, migration flow, and optional packs (#25). This change defines
+  the contract only; CLI and migration implementation remain in follow-up issues.
+
 ## [0.1.1] - 2026-06-17
 
 ### Fixed

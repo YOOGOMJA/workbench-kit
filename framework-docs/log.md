@@ -76,3 +76,9 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-06-13 12:15:18] lint · update skills/docs-query/SKILL.md | extends 표면화를 outgoing/incoming 양방향으로 정정
 ## [2026-06-13 12:15:18] lint · update docs/runbooks/autonomous-session-loop.md | 자동 진행 가능 범위를 제출 전 준비로 제한
 ## [2026-06-17 09:40:00] edit · update workbench-knowledge-ecosystem.md | 영문화(정본 EN), 한국어 원문은 .ko.md로 보존·상호링크
+
+## [2026-07-11 02:25:00] extract · create workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Published the normative v2 lifecycle, policy, state, capability-pack, compound-knowledge, compatibility, and migration contracts
+
+## [2026-07-11 02:25:00] extract · update index.md, decisions/index.md | Added the v2 governance contract and decision to framework consumption surfaces
+
+## [2026-07-11 02:31:00] extract · create decisions/0018-separation-architecture.md | Preserved the historical separation decision in English and recorded its explicit supersession by ADR 0024
