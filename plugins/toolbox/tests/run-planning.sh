@@ -26,7 +26,7 @@ toolbox() {
   TOOLBOX_WORKBENCH_BIN="$tmp/workbench" "$TOOLBOX" --workspace "$wb" "$@"
 }
 
-for product in alpha beta gamma delta; do
+for product in alpha beta gamma delta epsilon; do
   toolbox product init --id "$product" --name "$product" --language en \
     --objective "Plan $product" >/dev/null
   toolbox product repository set "$product" --id "$product-web" \
@@ -52,6 +52,7 @@ scenario beta SCN-BETA-ACTIVE active 1 '[]'
 scenario beta SCN-BETA-READY ready 2 '[]'
 scenario gamma SCN-GAMMA-BLOCKED blocked 1 '[]'
 scenario delta SCN-DELTA-WAIT ready 1 '["SCN-GAMMA-BLOCKED"]'
+scenario epsilon SCN-EPSILON-READY ready 30 '[]'
 
 before="$(find "$wb/products" -type f -print0 | sort -z | xargs -0 shasum | shasum)"
 
@@ -107,6 +108,7 @@ assert json.loads(sys.argv[1]) == {
     "contract_version": "toolbox-run-plan/v1",
     "product_ref": "toolbox:product/alpha",
     "repository_owners": ["alpha-web"],
+    "remaining_candidates": [],
     "required_quality_checks": [{
         "command": ["npm", "test"],
         "id": "unit",
@@ -154,6 +156,7 @@ assert actual["repository_owners"] == ["alpha-web"]
 assert [item["product_ref"] for item in actual["skipped_products"]] == [
     "toolbox:product/beta",
     "toolbox:product/delta",
+    "toolbox:product/epsilon",
     "toolbox:product/gamma",
 ]
 assert actual["skipped_products"][0]["reasons"] == [{
@@ -165,8 +168,17 @@ assert actual["skipped_products"][1]["reasons"] == [{
     "ref": "toolbox:scenario/SCN-DELTA-WAIT",
 }]
 assert actual["skipped_products"][2]["reasons"] == [{
+    "code": "lower-priority-candidate",
+    "ref": "toolbox:scenario/SCN-EPSILON-READY",
+}]
+assert actual["skipped_products"][3]["reasons"] == [{
     "code": "scenario-blocked",
     "ref": "toolbox:scenario/SCN-GAMMA-BLOCKED",
+}]
+assert actual["remaining_candidates"] == [{
+    "priority": 30,
+    "product_ref": "toolbox:product/epsilon",
+    "scenario_ref": "toolbox:scenario/SCN-EPSILON-READY",
 }]
 PY
 

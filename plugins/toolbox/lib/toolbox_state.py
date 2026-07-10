@@ -906,6 +906,7 @@ def build_run_plan(
     scenario: dict[str, Any],
     selection_scope: str,
     skipped_products: list[dict[str, Any]],
+    remaining_candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
     repositories = sorted(
         item["id"]
@@ -927,6 +928,7 @@ def build_run_plan(
         "scenario_ref": f"toolbox:scenario/{scenario['id']}",
         "repository_owners": repositories,
         "required_quality_checks": checks,
+        "remaining_candidates": remaining_candidates,
         "skipped_products": skipped_products,
     }
 
@@ -976,7 +978,7 @@ def product_run_plan(
                 raise StateError(f"{blocker['code']}: {blocker['ref']}")
             raise StateError(f"no-ready-scenario: {product_ref}")
         candidate = index[candidates[0]["scenario_id"]][1]
-    return build_run_plan(bundle, candidate, "product", [])
+    return build_run_plan(bundle, candidate, "product", [], [])
 
 
 def portfolio_run_plan(workspace: pathlib.Path) -> dict[str, Any]:
@@ -1039,4 +1041,16 @@ def portfolio_run_plan(workspace: pathlib.Path) -> dict[str, Any]:
     )
     bundle = get_product_bundle(portfolio, selected["product_id"])
     scenario = index[selected["scenario_id"]][1]
-    return build_run_plan(bundle, scenario, "portfolio", skipped)
+    remaining = [
+        {
+            "priority": candidate["priority"],
+            "product_ref": candidate["product_ref"],
+            "scenario_ref": candidate["scenario_ref"],
+        }
+        for candidate in sorted(
+            eligible,
+            key=lambda item: (item["priority"], item["product_id"], item["scenario_id"]),
+        )
+        if candidate["scenario_ref"] != selected["scenario_ref"]
+    ]
+    return build_run_plan(bundle, scenario, "portfolio", skipped, remaining)
