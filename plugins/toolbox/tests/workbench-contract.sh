@@ -40,6 +40,8 @@ expect_failure() {
   set -e
   [ "$status" -eq 1 ] || fail "expected exit 1, got $status: $out"
   grep -Fq "$expected" <<<"$out" || fail "missing diagnostic '$expected': $out"
+  ! grep -Fq "Traceback (most recent call last)" <<<"$out" \
+    || fail "failure leaked a Python traceback: $out"
 }
 
 expect_usage() {
@@ -91,6 +93,13 @@ assert actual == {
 }
 PY
 
+make_fake_workbench "$tmp/workbench-utf8-locale-independent" \
+  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"profile":{"contract_version":"workbench-profile/v1","language":"ko","source":"workspace"},"supported":{"workspace_schemas":{"read":["workbench/v2"],"write":["workbench/v2"]},"profile_contracts":["workbench-profile/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1","profile.language/v1"],"note":"검증"}\n'\'' "$PWD"'
+LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 \
+  TOOLBOX_WORKBENCH_BIN="$tmp/workbench-utf8-locale-independent" \
+  "$TOOLBOX" --workspace "$wb" workbench check >/dev/null \
+  || fail "valid UTF-8 probe output depended on the process locale"
+
 mkdir -p "$wb/nested/caller"
 nested_default_out="$(cd "$wb/nested/caller" && \
   TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
@@ -133,6 +142,31 @@ make_fake_workbench "$tmp/workbench-malformed" 'printf '\''not-json\n'\'''
 expect_failure "returned malformed JSON" \
   env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-malformed" \
   "$TOOLBOX" --workspace "$wb_malformed" workbench check
+
+make_fake_workbench "$tmp/workbench-duplicate-member" \
+  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"profile":{"contract_version":"workbench-profile/v1","language":"ko","language":"en","source":"workspace"},"supported":{"workspace_schemas":{"read":["workbench/v2"],"write":["workbench/v2"]},"profile_contracts":["workbench-profile/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1","profile.language/v1"]}\n'\'' "$PWD"'
+expect_failure "duplicate JSON member 'language'" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-duplicate-member" \
+  "$TOOLBOX" --workspace "$wb" workbench check
+
+make_fake_workbench "$tmp/workbench-non-finite" \
+  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"profile":{"contract_version":"workbench-profile/v1","language":"ko","source":"workspace"},"supported":{"workspace_schemas":{"read":["workbench/v2"],"write":["workbench/v2"]},"profile_contracts":["workbench-profile/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1","profile.language/v1"],"nonFinite":NaN}\n'\'' "$PWD"'
+expect_failure "invalid JSON constant 'NaN'" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-non-finite" \
+  "$TOOLBOX" --workspace "$wb" workbench check
+
+make_fake_workbench "$tmp/workbench-invalid-utf8" 'printf '\''\377'\'''
+expect_failure "returned non-UTF-8 output" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-invalid-utf8" \
+  "$TOOLBOX" --workspace "$wb" workbench check
+
+cat >"$tmp/workbench-broken-interpreter" <<'EOF'
+#!/definitely/missing/toolbox-interpreter
+EOF
+chmod +x "$tmp/workbench-broken-interpreter"
+expect_failure "could not execute" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-broken-interpreter" \
+  "$TOOLBOX" --workspace "$wb" workbench check
 
 expect_failure "workbench CLI is unavailable" \
   env TOOLBOX_WORKBENCH_BIN="$tmp/does-not-exist" \

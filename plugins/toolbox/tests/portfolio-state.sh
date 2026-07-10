@@ -68,6 +68,8 @@ expect_failure() {
   set -e
   [ "$status" -eq 1 ] || fail "expected exit 1, got $status: $out"
   grep -Fq "$expected" <<<"$out" || fail "missing diagnostic '$expected': $out"
+  ! grep -Fq "Traceback (most recent call last)" <<<"$out" \
+    || fail "failure leaked a Python traceback: $out"
 }
 
 # Valid two-product portfolio with a cross-product dependency.
@@ -179,6 +181,44 @@ cat >"$wb_semantic/products/semantic/autonomy.json" <<'EOF'
 EOF
 expect_failure "$.default must be one of: allow, ask, deny" \
   toolbox "$wb_semantic" product check semantic
+
+# Duplicate JSON members are rejected recursively instead of using the last value.
+wb_duplicate_member="$tmp/duplicate-member"
+make_workspace "$wb_duplicate_member"
+init_product "$wb_duplicate_member" duplicate-member
+cat >"$wb_duplicate_member/products/duplicate-member/quality.json" <<'EOF'
+{
+  "schema": "toolbox-quality/v1",
+  "development": {
+    "tdd": "required",
+    "tdd": "recommended",
+    "designSystem": "required"
+  },
+  "checks": []
+}
+EOF
+expect_failure "duplicate JSON member 'tdd'" \
+  toolbox "$wb_duplicate_member" product check duplicate-member
+
+wb_non_finite="$tmp/non-finite"
+make_workspace "$wb_non_finite"
+init_product "$wb_non_finite" non-finite
+cat >"$wb_non_finite/products/non-finite/scenarios/SCN-NON-FINITE.json" <<'EOF'
+{
+  "schema": "toolbox-scenario/v1",
+  "id": "SCN-NON-FINITE",
+  "productId": "non-finite",
+  "title": "Reject non-finite JSON numbers",
+  "status": "ready",
+  "priority": NaN,
+  "dependsOn": [],
+  "acceptanceCriteria": [],
+  "designRefs": [],
+  "verificationRefs": []
+}
+EOF
+expect_failure "invalid JSON constant 'NaN'" \
+  toolbox "$wb_non_finite" product check non-finite
 
 # Scenario document identity includes the canonical <scenario-id>.json filename.
 wb_filename="$tmp/scenario-filename"

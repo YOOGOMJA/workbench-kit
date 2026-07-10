@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 - "$ROOT" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 root = pathlib.Path(sys.argv[1])
@@ -43,6 +44,9 @@ product = json.loads((root / "templates/product.json").read_text())
 assert product["language"] == "en"
 assert product["status"] == "draft"
 assert product["repositories"] == []
+product_schema = json.loads((root / "schemas/product.schema.json").read_text())
+language_pattern = product_schema["properties"]["language"]["pattern"]
+assert re.fullmatch(language_pattern, "en-US-u-ca-gregory")
 
 scenario = json.loads((root / "templates/scenario.json").read_text())
 assert scenario["id"] == "SCN-001"

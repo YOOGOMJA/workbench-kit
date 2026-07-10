@@ -15,6 +15,7 @@ for manifest in \
 done
 
 python3 - "$ROOT" <<'PY'
+import ast
 import json
 import pathlib
 import sys
@@ -37,6 +38,9 @@ assert codex["interface"] == {
     "capabilities": ["Product state", "Portfolio inspection", "Workflow skills"],
     "defaultPrompt": "Use $product-start to initialize governed product state in this workbench.",
 }
+
+for path in sorted((root / "lib").glob("*.py")):
+    ast.parse(path.read_text(), filename=str(path), feature_version=(3, 9))
 PY
 
 [ -x "$ROOT/bin/toolbox" ] || fail "bin/toolbox is missing or not executable"

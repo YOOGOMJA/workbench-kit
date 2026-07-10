@@ -7,12 +7,15 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import tempfile
 from typing import Any
 
+from toolbox_json import DuplicateJsonMember, InvalidJsonConstant, strict_json_loads
+from toolbox_language import is_language_tag
+
 
 PRODUCT_ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
-LANGUAGE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
 
 class StateError(Exception):
@@ -27,7 +30,7 @@ def validate_product_id(product_id: str) -> None:
 
 
 def validate_language(language: str) -> None:
-    if not LANGUAGE.fullmatch(language):
+    if not is_language_tag(language):
         raise StateError(f"invalid operational language tag '{language}'")
 
 
@@ -40,11 +43,15 @@ def plugin_root() -> pathlib.Path:
 
 def read_json(path: pathlib.Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = strict_json_loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
         raise StateError(f"missing state document: {path}") from error
     except UnicodeDecodeError as error:
         raise StateError(f"state document is not valid UTF-8: {path}") from error
+    except DuplicateJsonMember as error:
+        raise StateError(f"duplicate JSON member '{error.member}' in {path}") from error
+    except InvalidJsonConstant as error:
+        raise StateError(f"invalid JSON constant '{error.constant}' in {path}") from error
     except json.JSONDecodeError as error:
         raise StateError(f"malformed JSON in {path}: {error.msg}") from error
     except OSError as error:
@@ -146,10 +153,14 @@ def validate_document(kind: str, document: dict[str, Any]) -> None:
 
 
 def write_json(path: pathlib.Path, document: dict[str, Any]) -> None:
-    path.write_text(
-        json.dumps(document, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    try:
+        path.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(f"unable to write state document {path}: {diagnostic}") from error
 
 
 def product_root(workspace: pathlib.Path, product_id: str) -> pathlib.Path:
@@ -157,17 +168,62 @@ def product_root(workspace: pathlib.Path, product_id: str) -> pathlib.Path:
     return workspace / "products" / product_id
 
 
-def safe_products_root(workspace: pathlib.Path) -> pathlib.Path:
-    root = workspace / "products"
-    if root.is_symlink():
-        raise StateError("product state root must not be a symbolic link")
+def safe_state_path(
+    workspace: pathlib.Path,
+    path: pathlib.Path,
+    label: str = "state path",
+) -> pathlib.Path:
     try:
-        resolved = root.resolve(strict=False)
+        workspace_root = workspace.resolve(strict=True)
     except (OSError, RuntimeError) as error:
-        raise StateError(f"unable to resolve product state root: {root}") from error
-    if resolved != workspace.resolve() / "products":
-        raise StateError(f"product state root escapes caller workspace: {root}")
+        raise StateError(f"unable to resolve caller workspace: {workspace}") from error
+
+    try:
+        relative = path.relative_to(workspace_root)
+    except ValueError as error:
+        raise StateError(f"{label} escapes caller workspace: {path}") from error
+
+    current = workspace_root
+    for component in relative.parts:
+        current = current / component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            diagnostic = error.strerror or type(error).__name__
+            raise StateError(f"unable to inspect {label} {current}: {diagnostic}") from error
+        if stat.S_ISLNK(mode):
+            raise StateError(f"{label} must not be a symbolic link: {current}")
+
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise StateError(f"unable to resolve {label}: {path}") from error
+    if resolved != workspace_root and workspace_root not in resolved.parents:
+        raise StateError(f"{label} escapes caller workspace: {path}")
+    return path
+
+
+def safe_products_root(workspace: pathlib.Path) -> pathlib.Path:
+    root = safe_state_path(workspace, workspace / "products", "product state root")
     return root
+
+
+def scenario_paths(workspace: pathlib.Path, product_id: str) -> list[pathlib.Path]:
+    scenarios_root = safe_state_path(
+        workspace,
+        product_root(workspace, product_id) / "scenarios",
+        "scenario state directory",
+    )
+    try:
+        paths = sorted(scenarios_root.glob("*.json"))
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(
+            f"unable to traverse scenario state directory {scenarios_root}: {diagnostic}"
+        ) from error
+    return [safe_state_path(workspace, path, "scenario state document") for path in paths]
 
 
 def initialize_product(
@@ -183,9 +239,9 @@ def initialize_product(
         raise StateError("product name must not be empty")
 
     products_root = safe_products_root(workspace)
-    target = products_root / product_id
-    if target.is_symlink():
-        raise StateError(f"product state path must not be a symbolic link: {target}")
+    target = safe_state_path(
+        workspace, products_root / product_id, "product state directory"
+    )
     if target.exists():
         raise StateError(f"product '{product_id}' already exists")
 
@@ -204,34 +260,81 @@ def initialize_product(
     validate_document("autonomy", autonomy)
     validate_document("quality", quality)
 
-    products_root.mkdir(parents=True, exist_ok=True)
-    temporary = pathlib.Path(tempfile.mkdtemp(prefix=f".{product_id}.", dir=products_root))
+    temporary = None
     try:
-        write_json(temporary / "product.json", product)
-        write_json(temporary / "autonomy.json", autonomy)
-        write_json(temporary / "quality.json", quality)
-        (temporary / "scenarios").mkdir()
+        products_root.mkdir(parents=True, exist_ok=True)
+        safe_products_root(workspace)
+        temporary = pathlib.Path(
+            tempfile.mkdtemp(prefix=f".{product_id}.", dir=products_root)
+        )
+        safe_state_path(workspace, temporary, "temporary product state directory")
+        product_path = safe_state_path(
+            workspace, temporary / "product.json", "product state document"
+        )
+        autonomy_path = safe_state_path(
+            workspace, temporary / "autonomy.json", "autonomy state document"
+        )
+        quality_path = safe_state_path(
+            workspace, temporary / "quality.json", "quality state document"
+        )
+        scenarios_root = safe_state_path(
+            workspace, temporary / "scenarios", "scenario state directory"
+        )
+        write_json(product_path, product)
+        write_json(autonomy_path, autonomy)
+        write_json(quality_path, quality)
+        scenarios_root.mkdir()
+        safe_state_path(workspace, scenarios_root, "scenario state directory")
+        safe_state_path(workspace, target, "product state directory")
         temporary.rename(target)
+    except StateError:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    except OSError as error:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(
+            f"unable to initialize product state '{product_id}': {diagnostic}"
+        ) from error
     except Exception:
-        shutil.rmtree(temporary, ignore_errors=True)
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
         raise
     return target
 
 
 def load_product(workspace: pathlib.Path, product_id: str) -> dict[str, Any]:
-    root = product_root(workspace, product_id)
+    safe_products_root(workspace)
+    root = safe_state_path(
+        workspace, product_root(workspace, product_id), "product state directory"
+    )
     if not root.is_dir():
         raise StateError(f"product '{product_id}' does not exist")
 
-    scenarios_root = root / "scenarios"
+    scenarios_root = safe_state_path(
+        workspace, root / "scenarios", "scenario state directory"
+    )
     if not scenarios_root.is_dir():
         raise StateError(f"missing scenarios directory: {scenarios_root}")
 
+    product_path = safe_state_path(
+        workspace, root / "product.json", "product state document"
+    )
+    autonomy_path = safe_state_path(
+        workspace, root / "autonomy.json", "autonomy state document"
+    )
+    quality_path = safe_state_path(
+        workspace, root / "quality.json", "quality state document"
+    )
+    scenarios = scenario_paths(workspace, product_id)
+
     return {
-        "product": read_json(root / "product.json"),
-        "autonomy": read_json(root / "autonomy.json"),
-        "quality": read_json(root / "quality.json"),
-        "scenarios": [read_json(path) for path in sorted(scenarios_root.glob("*.json"))],
+        "product": read_json(product_path),
+        "autonomy": read_json(autonomy_path),
+        "quality": read_json(quality_path),
+        "scenarios": [read_json(path) for path in scenarios],
     }
 
 
@@ -239,12 +342,11 @@ def check_product(workspace: pathlib.Path, product_id: str) -> None:
     bundle = load_product(workspace, product_id)
     product = bundle["product"]
     validate_document("product", product)
+    validate_language(product["language"])
     validate_document("autonomy", bundle["autonomy"])
     validate_document("quality", bundle["quality"])
-    scenario_paths = sorted(
-        (product_root(workspace, product_id) / "scenarios").glob("*.json")
-    )
-    for path, scenario in zip(scenario_paths, bundle["scenarios"]):
+    paths = scenario_paths(workspace, product_id)
+    for path, scenario in zip(paths, bundle["scenarios"]):
         validate_document("scenario", scenario)
         expected_name = f"{scenario['id']}.json"
         if path.name != expected_name:
@@ -277,7 +379,7 @@ def check_product(workspace: pathlib.Path, product_id: str) -> None:
 
 
 def load_portfolio(workspace: pathlib.Path) -> dict[str, Any]:
-    products_root = workspace / "products"
+    products_root = safe_products_root(workspace)
     if not products_root.exists():
         return {"products": []}
     if not products_root.is_dir():
@@ -285,9 +387,17 @@ def load_portfolio(workspace: pathlib.Path) -> dict[str, Any]:
 
     products = []
     product_ids: set[str] = set()
-    for path in sorted(products_root.iterdir(), key=lambda item: item.name):
+    try:
+        product_paths = sorted(products_root.iterdir(), key=lambda item: item.name)
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(
+            f"unable to traverse product state root {products_root}: {diagnostic}"
+        ) from error
+    for path in product_paths:
         if path.name.startswith("."):
             continue
+        safe_state_path(workspace, path, "product state directory")
         if not path.is_dir():
             raise StateError(f"unexpected file in product state root: {path}")
         bundle = load_product(workspace, path.name)

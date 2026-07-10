@@ -7,13 +7,14 @@ import argparse
 import json
 import os
 import pathlib
-import re
 import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
 from typing import Any
 
+from toolbox_json import DuplicateJsonMember, InvalidJsonConstant, strict_json_loads
+from toolbox_language import is_language_tag
 from toolbox_state import (
     StateError,
     candidate_scenarios,
@@ -30,7 +31,6 @@ WORKBENCH_CONTRACT = "workbench-contract/v1"
 WORKSPACE_SCHEMA = "workbench/v2"
 CAPABILITY_PACK_CONTRACT = "workbench-capability-pack/v1"
 PROFILE_CONTRACT = "workbench-profile/v1"
-PROFILE_LANGUAGE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 REQUIRED_CAPABILITIES = ("workspace.schema/v1", "profile.language/v1")
 
 
@@ -38,14 +38,31 @@ class ToolboxError(Exception):
     """An expected, user-actionable toolbox failure."""
 
 
-def resolve_workspace(raw: str | None) -> pathlib.Path:
-    if raw is None:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=pathlib.Path.cwd(),
+def run_text_probe(
+    command: Sequence[str], cwd: pathlib.Path, label: str
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
             capture_output=True,
             check=False,
-            text=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except UnicodeDecodeError as error:
+        raise ToolboxError(f"{label} returned non-UTF-8 output") from error
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise ToolboxError(f"{label} could not execute: {diagnostic}") from error
+
+
+def resolve_workspace(raw: str | None) -> pathlib.Path:
+    if raw is None:
+        result = run_text_probe(
+            ["git", "rev-parse", "--show-toplevel"],
+            pathlib.Path.cwd(),
+            "Git workspace probe",
         )
         if result.returncode != 0:
             raise ToolboxError(
@@ -93,19 +110,25 @@ def require_string_list(value: Any, field: str) -> list[str]:
 
 def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
     binary = resolve_workbench_binary()
-    result = subprocess.run(
+    result = run_text_probe(
         [binary, "contract", "show", "--format", "json"],
-        cwd=workspace,
-        capture_output=True,
-        check=False,
-        text=True,
+        workspace,
+        "workbench compatibility probe",
     )
     if result.returncode != 0:
         diagnostic = result.stderr.strip() or f"exit {result.returncode}"
         raise ToolboxError(f"workbench compatibility probe failed: {diagnostic}")
 
     try:
-        document = json.loads(result.stdout)
+        document = strict_json_loads(result.stdout)
+    except DuplicateJsonMember as error:
+        raise ToolboxError(
+            f"workbench compatibility probe returned duplicate JSON member '{error.member}'"
+        ) from error
+    except InvalidJsonConstant as error:
+        raise ToolboxError(
+            f"workbench compatibility probe returned invalid JSON constant '{error.constant}'"
+        ) from error
     except json.JSONDecodeError as error:
         raise ToolboxError(f"workbench compatibility probe returned malformed JSON: {error.msg}") from error
     document = require_mapping(document, "root")
@@ -168,7 +191,7 @@ def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
         rendered = profile_contract if isinstance(profile_contract, str) else "missing"
         raise ToolboxError(f"unsupported workbench profile contract '{rendered}'")
     profile_language = profile.get("language")
-    if not isinstance(profile_language, str) or PROFILE_LANGUAGE.fullmatch(profile_language) is None:
+    if not is_language_tag(profile_language):
         raise ToolboxError("workbench profile language must be a valid language tag")
     profile_source = profile.get("source")
     if profile_source != "workspace":
@@ -260,8 +283,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_json(inspect_workbench_contract(workspace))
             return 0
         if parsed.command == "product":
-            inspect_workbench_contract(workspace)
+            workbench_contract = inspect_workbench_contract(workspace)
             if parsed.product_command == "init":
+                profile_language = workbench_contract["profile"]["language"]
+                if parsed.language != profile_language:
+                    raise ToolboxError(
+                        f"product language '{parsed.language}' does not match "
+                        f"workbench profile language '{profile_language}'"
+                    )
                 root = initialize_product(
                     workspace,
                     parsed.product_id,
@@ -327,6 +356,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("a command action is required")
     except (StateError, ToolboxError) as error:
         print(f"toolbox: {error}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        diagnostic = getattr(error, "strerror", None) or type(error).__name__
+        print(f"toolbox: filesystem operation failed: {diagnostic}", file=sys.stderr)
         return 1
     return 2
 

@@ -46,6 +46,8 @@ expect_failure() {
   set -e
   [ "$status" -eq 1 ] || fail "expected exit 1, got $status: $out"
   grep -Fq "$expected" <<<"$out" || fail "missing diagnostic '$expected': $out"
+  ! grep -Fq "Traceback (most recent call last)" <<<"$out" \
+    || fail "failure leaked a Python traceback: $out"
 }
 
 supported='{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"WORKSPACE_ROOT","schema":"workbench/v2","source":"marker"},"profile":{"contract_version":"workbench-profile/v1","language":"ko","source":"workspace"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"profile_contracts":["workbench-profile/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1","profile.language/v1"]}'
@@ -56,20 +58,118 @@ make_workspace "$wb"
 make_fake_workbench "$tmp/workbench-supported" "$supported"
 make_fake_workbench "$tmp/workbench-future" "$future"
 
+extended_supported="$(python3 - "$supported" <<'PY'
+import json
+import sys
+
+document = json.loads(sys.argv[1])
+document["profile"]["language"] = "en-US-u-ca-gregory"
+print(json.dumps(document, separators=(",", ":")))
+PY
+)"
+make_fake_workbench "$tmp/workbench-extended-language" "$extended_supported"
+wb_extended_language="$tmp/extended-language"
+make_workspace "$wb_extended_language"
+TOOLBOX_WORKBENCH_BIN="$tmp/workbench-extended-language" \
+  "$TOOLBOX" --workspace "$wb_extended_language" product init \
+    --id extended --name "Extended" --language en-US-u-ca-gregory \
+    --objective "accept a well-formed BCP 47 extension" >/dev/null \
+  || fail "extended BCP 47 language tag was rejected"
+python3 - "$wb_extended_language/products/extended/product.json" <<'PY'
+import json
+import pathlib
+import sys
+
+document = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert document["language"] == "en-US-u-ca-gregory"
+PY
+
+wb_read_source="$tmp/read-source"
+make_workspace "$wb_read_source"
+TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_read_source" product init \
+    --id source --name "Source" --language ko --objective "safe source" >/dev/null
+
+wb_products_link="$tmp/read-products-link"
+make_workspace "$wb_products_link"
+ln -s "$wb_read_source/products" "$wb_products_link/products"
+expect_failure "must not be a symbolic link" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_products_link" product inspect source
+
+wb_product_link="$tmp/read-product-link"
+make_workspace "$wb_product_link"
+mkdir "$wb_product_link/products"
+ln -s "$wb_read_source/products/source" "$wb_product_link/products/source"
+expect_failure "must not be a symbolic link" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_product_link" product inspect source
+
+wb_scenarios_link="$tmp/read-scenarios-link"
+make_workspace "$wb_scenarios_link"
+mkdir "$wb_scenarios_link/products"
+cp -R "$wb_read_source/products/source" "$wb_scenarios_link/products/source"
+rm -rf "$wb_scenarios_link/products/source/scenarios"
+ln -s "$wb_read_source/products/source/scenarios" \
+  "$wb_scenarios_link/products/source/scenarios"
+expect_failure "must not be a symbolic link" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_scenarios_link" product inspect source
+
+wb_json_link="$tmp/read-json-link"
+outside_product_json="$tmp/outside-product.json"
+make_workspace "$wb_json_link"
+mkdir "$wb_json_link/products"
+cp -R "$wb_read_source/products/source" "$wb_json_link/products/source"
+mv "$wb_json_link/products/source/product.json" "$outside_product_json"
+ln -s "$outside_product_json" "$wb_json_link/products/source/product.json"
+expect_failure "must not be a symbolic link" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_json_link" product inspect source
+
+wb_language_mismatch="$tmp/language-mismatch"
+make_workspace "$wb_language_mismatch"
+expect_failure "does not match workbench profile language 'ko'" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_language_mismatch" product init \
+    --id mismatch --name "Mismatch" --language en \
+    --objective "must use the governed profile language"
+[ ! -e "$wb_language_mismatch/products" ] \
+  || fail "language mismatch mutated product state"
+
+wb_write_failure="$tmp/write-failure"
+make_workspace "$wb_write_failure"
+mkdir "$wb_write_failure/products"
+chmod 500 "$wb_write_failure/products"
+set +e
+write_failure_out="$(TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_write_failure" product init \
+    --id unwritable --name "Unwritable" --language ko \
+    --objective "normalize state mutation failures" 2>&1)"
+write_failure_status=$?
+set -e
+chmod 700 "$wb_write_failure/products"
+[ "$write_failure_status" -eq 1 ] \
+  || fail "expected write failure exit 1, got $write_failure_status: $write_failure_out"
+grep -Fq "unable to initialize product state" <<<"$write_failure_out" \
+  || fail "missing normalized write diagnostic: $write_failure_out"
+! grep -Fq "Traceback (most recent call last)" <<<"$write_failure_out" \
+  || fail "write failure leaked a Python traceback: $write_failure_out"
+
 wb_invalid="$tmp/invalid-product"
 make_workspace "$wb_invalid"
 overlong_name="$(printf '%121s' '' | tr ' ' x)"
 expect_failure "$.name must be at most 120 character(s)" \
   env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
   "$TOOLBOX" --workspace "$wb_invalid" product init \
-    --id retryable --name "$overlong_name" --language en \
+    --id retryable --name "$overlong_name" --language ko \
     --objective "must be rejected before mutation"
 [ ! -e "$wb_invalid/products" ] \
   || fail "invalid product init left a products directory behind"
 
 TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
   "$TOOLBOX" --workspace "$wb_invalid" product init \
-    --id retryable --name "Retryable" --language en \
+    --id retryable --name "Retryable" --language ko \
     --objective "valid retry after rejected materialization" >/dev/null \
   || fail "valid retry after rejected product init failed"
 [ -d "$wb_invalid/products/retryable/scenarios" ] \
@@ -83,7 +183,7 @@ ln -s "$outside_products" "$wb_symlink/products"
 expect_failure "product state root must not be a symbolic link" \
   env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
   "$TOOLBOX" --workspace "$wb_symlink" product init \
-    --id escaped --name "Escaped" --language en \
+    --id escaped --name "Escaped" --language ko \
     --objective "must not cross the caller workspace boundary"
 [ -z "$(find "$outside_products" -mindepth 1 -print -quit)" ] \
   || fail "symlinked product init wrote outside the caller workspace"
@@ -136,7 +236,7 @@ after_digest="$(plugin_digest)"
 expect_failure "product 'alpha' already exists" \
   env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
   "$TOOLBOX" --workspace "$wb" product init \
-    --id alpha --name "Replacement" --language en --objective "overwrite"
+    --id alpha --name "Replacement" --language ko --objective "overwrite"
 
 inspect="$(TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
   "$TOOLBOX" --workspace "$wb" product inspect alpha)" \
