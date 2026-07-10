@@ -56,6 +56,25 @@ make_workspace "$wb"
 make_fake_workbench "$tmp/workbench-supported" "$supported"
 make_fake_workbench "$tmp/workbench-future" "$future"
 
+wb_invalid="$tmp/invalid-product"
+make_workspace "$wb_invalid"
+overlong_name="$(printf '%121s' '' | tr ' ' x)"
+expect_failure "$.name must be at most 120 character(s)" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_invalid" product init \
+    --id retryable --name "$overlong_name" --language en \
+    --objective "must be rejected before mutation"
+[ ! -e "$wb_invalid/products" ] \
+  || fail "invalid product init left a products directory behind"
+
+TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_invalid" product init \
+    --id retryable --name "Retryable" --language en \
+    --objective "valid retry after rejected materialization" >/dev/null \
+  || fail "valid retry after rejected product init failed"
+[ -d "$wb_invalid/products/retryable/scenarios" ] \
+  || fail "valid retry did not create the product bundle"
+
 [ ! -e "$wb/products" ] || fail "fixture unexpectedly has product state"
 before_digest="$(plugin_digest)"
 

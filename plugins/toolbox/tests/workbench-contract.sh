@@ -68,6 +68,34 @@ assert actual == {
 }
 PY
 
+mkdir -p "$wb/nested/caller"
+nested_default_out="$(cd "$wb/nested/caller" && \
+  TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" workbench check)" \
+  || fail "default workspace did not resolve the current Git worktree root"
+python3 - "$nested_default_out" "$wb" <<'PY'
+import json
+import pathlib
+import sys
+
+actual = json.loads(sys.argv[1])
+expected_root = str(pathlib.Path(sys.argv[2]).resolve())
+assert actual["workspace_root"] == expected_root
+PY
+
+nested_explicit_out="$(TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb/nested/caller" workbench check)" \
+  || fail "explicit nested workspace was not preserved"
+python3 - "$nested_explicit_out" "$wb/nested/caller" <<'PY'
+import json
+import pathlib
+import sys
+
+actual = json.loads(sys.argv[1])
+expected_root = str(pathlib.Path(sys.argv[2]).resolve())
+assert actual["workspace_root"] == expected_root
+PY
+
 wb_legacy="$tmp/legacy"
 make_workspace "$wb_legacy"
 make_fake_workbench "$tmp/workbench-legacy" \

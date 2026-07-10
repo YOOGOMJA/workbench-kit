@@ -172,6 +172,16 @@ EOF
 expect_failure "$.default must be one of: allow, ask, deny" \
   toolbox "$wb_semantic" product check semantic
 
+# Scenario document identity includes the canonical <scenario-id>.json filename.
+wb_filename="$tmp/scenario-filename"
+make_workspace "$wb_filename"
+init_product "$wb_filename" filename
+write_scenario "$wb_filename" filename SCN-CANONICAL ready 1 '[]' "Canonical filename"
+mv "$wb_filename/products/filename/scenarios/SCN-CANONICAL.json" \
+  "$wb_filename/products/filename/scenarios/SCN-WRONG.json"
+expect_failure "scenario file 'SCN-WRONG.json' must be named 'SCN-CANONICAL.json'" \
+  toolbox "$wb_filename" product check filename
+
 # Product document IDs cannot alias another product directory.
 wb_duplicate_product="$tmp/duplicate-product"
 make_workspace "$wb_duplicate_product"

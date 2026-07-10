@@ -179,6 +179,9 @@ def initialize_product(
     )
     autonomy = read_template("autonomy")
     quality = read_template("quality")
+    validate_document("product", product)
+    validate_document("autonomy", autonomy)
+    validate_document("quality", quality)
 
     products_root = target.parent
     products_root.mkdir(parents=True, exist_ok=True)
@@ -218,8 +221,16 @@ def check_product(workspace: pathlib.Path, product_id: str) -> None:
     validate_document("product", product)
     validate_document("autonomy", bundle["autonomy"])
     validate_document("quality", bundle["quality"])
-    for scenario in bundle["scenarios"]:
+    scenario_paths = sorted(
+        (product_root(workspace, product_id) / "scenarios").glob("*.json")
+    )
+    for path, scenario in zip(scenario_paths, bundle["scenarios"]):
         validate_document("scenario", scenario)
+        expected_name = f"{scenario['id']}.json"
+        if path.name != expected_name:
+            raise StateError(
+                f"scenario file '{path.name}' must be named '{expected_name}'"
+            )
 
     if product.get("id") != product_id:
         raise StateError(

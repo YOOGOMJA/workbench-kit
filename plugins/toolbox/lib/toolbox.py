@@ -35,8 +35,22 @@ class ToolboxError(Exception):
     """An expected, user-actionable toolbox failure."""
 
 
-def resolve_workspace(raw: str) -> pathlib.Path:
-    workspace = pathlib.Path(raw).expanduser().resolve()
+def resolve_workspace(raw: str | None) -> pathlib.Path:
+    if raw is None:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=pathlib.Path.cwd(),
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise ToolboxError(
+                "default workspace requires the current directory to be inside a Git worktree"
+            )
+        workspace = pathlib.Path(result.stdout.strip()).resolve()
+    else:
+        workspace = pathlib.Path(raw).expanduser().resolve()
     if not workspace.is_dir():
         raise ToolboxError(f"caller workspace is not a directory: {workspace}")
 
@@ -159,8 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--workspace",
-        default=".",
-        help="Caller workbench root (default: current directory)",
+        default=None,
+        help="Caller workbench root (default: current Git worktree root)",
     )
     commands = parser.add_subparsers(dest="command", metavar="{product,scenario,portfolio,workbench}")
     product = commands.add_parser("product", help="Initialize, inspect, or validate a product")
