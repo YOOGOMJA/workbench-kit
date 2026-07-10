@@ -82,3 +82,7 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-07-11 02:25:00] extract · update index.md, decisions/index.md | Added the v2 governance contract and decision to framework consumption surfaces
 
 ## [2026-07-11 02:31:00] extract · create decisions/0018-separation-architecture.md | Preserved the historical separation decision in English and recorded its explicit supersession by ADR 0024
+
+## [2026-07-11 02:49:13] edit · create workbench-v2-cli-contract.md | Added exact public commands, records, authorization binding, and exit semantics after specification review
+
+## [2026-07-11 02:49:13] edit · update workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Closed reviewed gaps in task legacy detection, lifecycle serialization, multi-context boundaries, profile discovery, and compound applicability

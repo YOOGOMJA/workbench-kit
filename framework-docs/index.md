@@ -11,6 +11,8 @@ docs/ 전체의 카탈로그. 페이지를 추가·변경하면 반드시 이 �
 - [Workbench v2 governance contract](workbench-v2-governance.md) - normative lifecycle,
   policy, evidence, compatibility, capability-pack, compound-knowledge, and migration
   boundaries.
+- [Workbench v2 public CLI contract](workbench-v2-cli-contract.md) - exact commands,
+  arguments, JSON records, action-instance authorization, and exit semantics.
 
 ## Knowledge (harvest)
 

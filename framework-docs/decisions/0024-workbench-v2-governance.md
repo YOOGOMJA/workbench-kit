@@ -5,7 +5,8 @@
   Separate distribution responsibility (`kernel / capability pack / profile`) from
   caller-data lifetime (`task work / living state / knowledge`). Make multi-deliverable
   completion, revision-bound evidence, `allow | ask | deny` policy resolution, generic
-  namespaced references, and capability discovery kernel contracts. Keep product semantics
+  namespaced references, replay-safe action instances, task-level contract selection, exact
+  public CLI/JSON records, and capability discovery kernel contracts. Keep product semantics
   in an optional pack.
 - **Context:** V1 isolates task work and accumulates knowledge, but it treats a workbench
   increment pull request as the normal delivery path and describes human gates only in
@@ -21,7 +22,8 @@
   Codex, and future adapters. A model receives structured facts for authorization,
   compatibility, deliverables, and evidence, while human reviewers receive rationale and
   Mermaid diagrams. Unknown actions default to `ask`, unsupported capabilities block
-  mutation, and verification is tied to immutable revisions.
+  mutation, authorization is bound to action/task/target/revision, and verification is tied
+  to immutable revisions.
 - **Rejected alternatives:**
   1. Put product, portfolio, scenario, design, and TDD semantics in the kernel. This would
      burden every non-product workbench and collapse the generic engine/domain boundary.
@@ -34,9 +36,15 @@
   5. Keep prompting at every gate. This prevents standing authorization and low-intervention
      operation; policy evaluation retains the gate without requiring every result to be
      `ask`.
+  6. Treat a workspace v2 marker as proof that every active task is v2. This would silently
+     apply new completion and cleanup rules to legacy tasks after workspace migration.
+  7. Accept an opaque authorization reference without binding fields or consumption. That
+     reference could be replayed for a different target or revision.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
-  markers. New v2 workspaces carry `.workbench/schema`; active v1 tasks can finish without
-  forced conversion. Workspace, lifecycle, policy, evidence, pack, and domain schemas are
+  markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
+  only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing
+  task contract is always v1, so active tasks can finish without forced conversion.
+  Workspace, task, lifecycle, profile, policy, evidence, pack, and domain schemas are
   versioned separately from plugin SemVer. Migration is a governed task and pull request,
   not an install-time rewrite.
 - **Source:** workbench-kit#25 / 2026-07-11
@@ -48,4 +56,4 @@
     [0019](https://github.com/YOOGOMJA/workbench/blob/main/docs/decisions/0019-framework-distribution-cli-first.md)
     through
     [0023](https://github.com/YOOGOMJA/workbench/blob/main/docs/decisions/0023-kit-english-persona-language.md)
-- **Reference:** [[workbench-v2-governance]]
+- **Reference:** [[workbench-v2-governance]] [[workbench-v2-cli-contract]]

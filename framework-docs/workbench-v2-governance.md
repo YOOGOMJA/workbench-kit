@@ -94,6 +94,10 @@ state in any lifetime category.
 ### Identity and generic references
 
 Existing task identity remains rooted in the issue and recorded in `task/index.md`.
+Every new v2 task records `task_contract: workbench-task/v2` in that file. A missing field
+means `workbench-task/v1` regardless of the enclosing workspace schema. This task-level
+discriminator lets an active legacy task finish after its workbench migrates.
+
 V2 adds two optional, opaque references:
 
 - `context_ref`: the longer-lived context under which the task is governed.
@@ -111,6 +115,29 @@ digits, dots, underscores, or hyphens. Examples are `toolbox:product/acme` and
 duplicate active `work_ref` values, and reports the references. Only the namespace owner
 interprets the value. Missing references have no product meaning and remain valid.
 
+### Work-item and multi-context boundary
+
+One task has one primary work item, represented by at most one `work_ref`, and zero or more
+deliverables. The task owns one independent lifecycle, policy evaluation, verification set,
+terminal outcome, and cleanup event. Workbench-wide or portfolio-wide state never replaces
+these per-task facts.
+
+Independent work in different products uses separate tasks even when one agent runs them in
+the same session. One product work item may still produce several repository deliverables.
+The kernel reports simultaneous `role: work` writers for the same codebase as
+`writer_conflicts`, listing the owner, task claims, and branches. A report is an observation,
+not a lock; policy decides whether another writer may proceed, with missing policy resolving
+to `ask`.
+
+A cross-product initiative normally uses an umbrella work item with independent child tasks.
+Each child can verify, complete, abandon, and clean without pretending that every repository
+merged atomically. A single atomic multi-context task is reserved for a result whose partial
+adoption is invalid. It still has one primary `work_ref`; its singular `context_ref` points
+to a pack-owned cross-context record that enumerates participants. All participating context
+policies apply and the most restrictive result wins. Every atomic deliverable is required,
+and the pack must define rollback because the kernel does not provide cross-repository
+transactions.
+
 ### Deliverables
 
 A task declares zero or more deliverables. Each deliverable has, at minimum:
@@ -122,7 +149,7 @@ A task declares zero or more deliverables. Each deliverable has, at minimum:
 | `kind` | Kernel-defined kind or a namespaced pack kind |
 | `required` | Boolean; defaults to `true` |
 | `external_ref` | Optional pull request, artifact, or other delivery reference |
-| `revision` | Immutable revision accepted or currently under verification |
+| `revision` | Immutable revision; optional only while state is `declared` |
 | `state` | `declared`, `submitted`, `accepted`, `waived`, or `rejected` |
 
 The kernel understands the mechanics of its own kinds, such as a codebase pull request or
@@ -130,6 +157,12 @@ a workbench increment. It does not infer product semantics from a deliverable. A
 deliverable can be `waived` only through a governed action with a recorded reason. An open
 or unmerged pull request is `submitted`, not `accepted`. A task with no workbench increment
 must not create an empty workbench pull request merely to reach completion.
+
+`submitted` and `accepted` require a non-null revision. A changed revision returns the
+deliverable to a non-accepted state and makes its prior evidence stale. Required checks are
+declared independently from evidence, so completion can distinguish "no check was required"
+from "required evidence is missing". Exact commands and records are defined in
+[[workbench-v2-cli-contract]].
 
 ### Verification evidence
 
@@ -164,29 +197,52 @@ stateDiagram-v2
     [*] --> Claimed
     Claimed --> Active
     Active --> Verified
+    Active --> Submitted: pull request opened before remote checks
     Verified --> Active: governed result changes
     Verified --> Submitted: optional workbench increment
     Submitted --> Active: review change
+    Submitted --> Verified: remote checks pass
     Verified --> Completed: all completion predicates hold
-    Submitted --> Completed: all completion predicates hold
     Claimed --> Abandoned: result will not be adopted
     Active --> Abandoned: result will not be adopted
+    Verified --> Abandoned: verified result will not be adopted
     Submitted --> Abandoned: result will not be adopted
     Completed --> Cleaned
     Abandoned --> Cleaned
 ```
 
-The v2 marker ID is `workbench-task-lifecycle:v2`. It adds the facts
-`task-verified`, `task-completed`, and `task-abandoned` to the existing claim, active,
-submitted, conflict, and cleaned family. A writer correlates events with the task's
-`claim_id` and branch. Marker details remain machine facts; issue disposition, labels,
-and explanatory prose remain outside the marker.
+The exact event IDs are `task-claimed`, `task-claim-conflict`, `task-active`,
+`task-verified`, `task-submitted`, `task-completed`, `task-abandoned`, and `task-cleaned`.
+A writer correlates them with `claim_id` and branch.
 
-V2 retains the v1 marker fields exactly: `event`, `claim_id`, `issue`, `home`, `branch`,
-`pr`, `actor`, `tool`, and `at`. Detailed deliverable, evidence, and policy facts remain
-available through their public CLI records rather than being duplicated into a lifecycle
-comment. This lets v1 parsers ignore a v2 marker without teaching lifecycle comments to be
-a state database.
+The canonical v2 marker is UTF-8 JSON inside a versioned HTML comment:
+
+```html
+<!-- workbench-task-lifecycle:v2
+{"task_contract":"workbench-task/v2","event":"task-completed","claim_id":"task__example__42-20260711T030000Z-1234","issue":42,"home":null,"branch":"task/42-example","pr":null,"revision":"sha256:0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","actor":"human@example.com","tool":"workbench","at":"2026-07-11T03:02:00Z"}
+-->
+```
+
+The opening line, one minified JSON line, and closing line are exact. Keys are serialized in
+the shown order. Strings use RFC 8259 escaping. Missing `home`, `pr`, `revision`, and
+`action_instance_id` values are JSON `null`, never `-`, an empty string, or an omitted key.
+`issue` and `pr` are JSON integers when present; `at` is RFC 3339 UTC. `task-verified`
+requires the verified revision-set digest. Completion and abandonment require both revision
+and action instance. A human-readable comment line may follow the marker but is not part of
+the contract.
+
+| Event | `pr` | `revision` | `action_instance_id` |
+|---|---|---|---|
+| `task-claimed`, `task-claim-conflict`, `task-active` | null | null | null |
+| `task-verified` | null | required | null |
+| `task-submitted` | required | required | null |
+| `task-completed`, `task-abandoned` | null or related workbench PR | required | required |
+| `task-cleaned` | null | terminal revision | cleanup action instance |
+
+V1 key/value markers remain readable and are never rewritten. Detailed deliverable,
+evidence, and policy facts remain available through public CLI records instead of being
+duplicated into the comment. Marker details remain machine facts; issue disposition, labels,
+and explanatory prose remain outside the marker.
 
 The meanings are distinct:
 
@@ -261,12 +317,27 @@ Human approval resolves that action instance; it does not silently rewrite stand
 policy. Policy evaluation records the action ID, applicable policy sources, result, and
 authorization reference without asking shell plumbing to invent explanatory prose.
 
+The kernel mints a unique action instance bound to `action_id`, `task_claim_id`,
+`target_ref`, and a revision-set digest. An authorization input repeats every binding field.
+The resolver rejects mismatches, reuse of an authorization ID, a changed revision, and a
+consumed or denied instance. A successful governed mutation consumes the instance only after
+the state change and lifecycle observation succeed. These rules prevent approval for one
+task, target, or revision from authorizing another. The higher-authority platform remains
+responsible for authenticating the approving actor.
+
 The public `workbench-policy/v1` resolution object is:
 
 ```json
 {
   "contract_version": "workbench-policy/v1",
-  "action_id": "task.complete",
+  "action_instance": {
+    "id": "act_01J00000000000000000000000",
+    "action_id": "task.complete",
+    "task_claim_id": "task__example__42-20260711T030000Z-1234",
+    "target_ref": "toolbox:scenario/SCN-001",
+    "revision": "sha256:0123456789abcdef",
+    "status": "pending"
+  },
   "decision": "ask",
   "sources": [
     {
@@ -280,10 +351,9 @@ The public `workbench-policy/v1` resolution object is:
 ```
 
 `sources[].layer` is one of `platform`, `workspace`, `context`, or `task`; `ref` identifies
-the policy source without requiring prose interpretation. `authorization_ref` is absent or
-null until an explicit authorization is recorded for that action instance. Storage file
-names are not part of the public contract; consumers use the CLI object rather than reading
-engine-private files.
+the policy source without requiring prose interpretation. `authorization_ref` is null until
+an explicit, matching authorization is recorded. Exact policy and authorization schemas,
+commands, replay rules, and output status are in [[workbench-v2-cli-contract]].
 
 ## Public capability discovery
 
@@ -313,27 +383,44 @@ The canonical v1 shape is:
     "schema": "workbench/v2",
     "source": "marker"
   },
+  "profile": {
+    "contract_version": "workbench-profile/v1",
+    "language": "ko",
+    "source": "workspace"
+  },
   "supported": {
     "workspace_schemas": {
       "read": ["workbench/v1", "workbench/v2"],
       "write": ["workbench/v2"]
     },
+    "task_contracts": {
+      "read": ["workbench-task/v1", "workbench-task/v2"],
+      "write": ["workbench-task/v2"]
+    },
     "lifecycle_markers": {
       "read": ["workbench-task-lifecycle:v1", "workbench-task-lifecycle:v2"],
       "write": ["workbench-task-lifecycle:v2"]
     },
+    "profile_contracts": ["workbench-profile/v1"],
     "policy_contracts": ["workbench-policy/v1"],
+    "authorization_contracts": ["workbench-authorization/v1"],
     "evidence_contracts": ["workbench-evidence/v1"],
     "capability_pack_contracts": ["workbench-capability-pack/v1"]
   },
   "capabilities": [
     "workspace.schema/v1",
+    "profile.language/v1",
+    "task.contract/v2",
     "task.refs/v1",
     "task.deliverables/v1",
+    "task.required-checks/v1",
     "task.lifecycle/v2",
     "task.evidence/v1",
     "task.completion/v1",
-    "policy.resolve/v1"
+    "task.writer-conflicts/v1",
+    "policy.resolve/v1",
+    "policy.authorization/v1",
+    "knowledge.applicability/v1"
   ]
 }
 ```
@@ -357,6 +444,12 @@ mutations without migration. A v2 engine can read an implicit v1 workspace and r
 flows, but a capability pack requiring v2 state must stop with an actionable migration
 message.
 
+`profile` is the same public object returned by `workbench profile show --format json`.
+V2 reads the tracked `.workbench/profile.conf`; an implicit v1 workspace without a machine
+profile reports `language: null` and `source: "unavailable"`. The engine does not parse
+`AGENTS.md`. The exact file grammar and CLI behavior are in
+[[workbench-v2-cli-contract]].
+
 ## Capability-pack contract
 
 The public pack contract ID is `workbench-capability-pack/v1`. A conforming pack:
@@ -371,8 +464,9 @@ The public pack contract ID is `workbench-capability-pack/v1`. A conforming pack
 5. uses explicit skill orchestration instead of implicit lifecycle hooks;
 6. does not source private engine shell files, import undocumented internals, patch generated
    core files, or infer facts from narrative documents;
-7. emits reader-facing prose in `persona.language` while preserving canonical English
-   identifiers;
+7. reads `profile.language/v1` and emits reader-facing prose in that language while
+   preserving canonical English identifiers; if language is unavailable, it asks or uses an
+   explicitly pack-owned default and never parses `AGENTS.md`;
 8. leaves the generated workbench empty of pack state until the user invokes the pack's
    initialization workflow.
 
@@ -410,17 +504,40 @@ it `confirmed`. Confidence never broadens scope or overrides an exclusion. The k
 transport these facts, but agents decide whether a finding is reusable and whether new
 evidence changes its applicability.
 
+The optional machine mapping is `workbench-knowledge-applicability/v1`, embedded after the
+existing entry template fields so decisions, lessons, and runbooks keep their current
+human-readable shape:
+
+```html
+<!-- workbench-knowledge-applicability:v1
+{"contract_version":"workbench-knowledge-applicability/v1","scope":{"kind":"context","ref":"toolbox:product/acme"},"applies_when":["OIDC browser sign-in"],"does_not_apply_when":["machine-to-machine credentials"],"evidence":[{"task_ref":"workbench:task/task__acme__42","deliverable_ref":"toolbox:deliverable/auth-pr","revision":"0123456789abcdef"}],"last_verified":"2026-07-11T03:00:00Z","confidence":"provisional"}
+-->
+```
+
+`scope.kind` is `workspace`, `context`, or `codebase`; `scope.ref` is null only for workspace
+scope. Conditions are arrays of concise prose in the caller's profile language. Evidence
+contains exact task, deliverable, and immutable revision references. `last_verified` is RFC
+3339 or null. `confidence` is `provisional` or `confirmed`.
+
+The existing template `Source` field remains the human-readable provenance summary and
+`Relations` remains the typed-edge surface. The embedded record is additional structured
+applicability, not a replacement. Absence means applicability is unspecified, not universal.
+Existing entries need no bulk migration; Query treats them conservatively until a later task
+adds evidence.
+
 ## Backward compatibility
 
 Workbench v2 follows these rules:
 
 - The engine reads v1 `task/index.md` files without `context_ref`, `work_ref`, deliverables,
-  or evidence. Missing fields mean unknown or undeclared, never implicitly satisfied.
+  or evidence. Missing `task_contract` means `workbench-task/v1`, even inside a v2 workspace;
+  missing other fields mean unknown or undeclared, never implicitly satisfied.
 - The engine reads `workbench-task-lifecycle:v1` observations and does not rewrite them.
 - Active v1 tasks may resume, submit, and clean using v1 behavior. They are not forced to
   convert mid-task.
 - New v2 events are written only where the workspace schema and engine capabilities allow
-  them. V1-only readers may ignore unknown v2 observations.
+  them and the task declares `workbench-task/v2`. V1-only readers may ignore unknown v2
+  observations.
 - Adding an optional discovery field or a new capability is backward compatible. Removing
   a field, changing defined semantics, or making optional state mandatory requires a new
   contract or workspace schema version.
@@ -447,7 +564,9 @@ flowchart TD
   state, and refuses unsafe writes.
 - **workbench-kit bootstrap/migration** diagnoses generated-minimal and embedded-legacy
   workbenches, preserves user overlays and accumulated knowledge, and writes the schema
-  marker only through a migration task and accepted pull request.
+  marker and `.workbench/profile.conf` only through a migration task and accepted pull
+  request. It does not add `task_contract` to active legacy tasks; only newly created v2
+  tasks receive it.
 - A **capability pack** adopts or migrates only its own domain state after the generic
   workbench contract is compatible. Installing a pack never implies adoption.
 - The **user or resolved policy** controls merge, destructive cleanup, production effects,
@@ -491,4 +610,5 @@ This contract:
   [0023](https://github.com/YOOGOMJA/workbench/blob/main/docs/decisions/0023-kit-english-persona-language.md).
 
 The architectural choice and rejected alternatives are recorded in
-[[0024-workbench-v2-governance]].
+[[0024-workbench-v2-governance]]. Exact commands, record schemas, and exit behavior are in
+[[workbench-v2-cli-contract]].
