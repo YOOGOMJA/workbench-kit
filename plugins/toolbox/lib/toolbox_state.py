@@ -815,3 +815,228 @@ def candidate_scenarios(
         candidates,
         key=lambda item: (item["priority"], item["product_id"], item["scenario_id"]),
     )
+
+
+def get_product_bundle(portfolio: dict[str, Any], product_id: str) -> dict[str, Any]:
+    validate_product_id(product_id)
+    for bundle in portfolio["products"]:
+        if bundle["product"]["id"] == product_id:
+            return bundle
+    raise StateError(f"product '{product_id}' does not exist")
+
+
+def scenario_blockers(
+    bundle: dict[str, Any], index: dict[str, tuple[str, dict[str, Any]]]
+) -> list[dict[str, str]]:
+    product = bundle["product"]
+    product_ref = f"toolbox:product/{product['id']}"
+    if product["status"] == "paused":
+        return [{"code": "product-paused", "ref": product_ref}]
+    if product["status"] in ("completed", "archived"):
+        return [{"code": "product-terminal", "ref": product_ref}]
+
+    active = sorted(
+        (item for item in bundle["scenarios"] if item["status"] == "active"),
+        key=lambda item: item["id"],
+    )
+    if len(active) > 1:
+        return [{"code": "multiple-active-scenarios", "ref": product_ref}]
+
+    blockers: list[dict[str, str]] = []
+    for scenario in sorted(bundle["scenarios"], key=lambda item: item["id"]):
+        scenario_ref = f"toolbox:scenario/{scenario['id']}"
+        if scenario["status"] == "blocked":
+            blockers.append({"code": "scenario-blocked", "ref": scenario_ref})
+        elif scenario["status"] == "ready" and not all(
+            index[dependency][1]["status"] == "completed"
+            for dependency in scenario["dependsOn"]
+        ):
+            blockers.append(
+                {"code": "scenario-dependency-incomplete", "ref": scenario_ref}
+            )
+    return blockers
+
+
+def product_status(workspace: pathlib.Path, product_id: str) -> dict[str, Any]:
+    portfolio, index = check_portfolio(workspace)
+    bundle = get_product_bundle(portfolio, product_id)
+    scenarios = bundle["scenarios"]
+    counts = {
+        status: sum(1 for scenario in scenarios if scenario["status"] == status)
+        for status in ("abandoned", "active", "blocked", "completed", "draft", "ready")
+    }
+    active = sorted(
+        (item for item in scenarios if item["status"] == "active"),
+        key=lambda item: item["id"],
+    )
+    candidates = [
+        {
+            "priority": item["priority"],
+            "scenario_ref": item["scenario_ref"],
+            "title": item["title"],
+        }
+        for item in candidate_scenarios(workspace, product_id)
+    ]
+    blockers = scenario_blockers(bundle, index)
+    if len(active) == 1:
+        next_action = "continue-active-scenario"
+    elif candidates:
+        next_action = "start-ready-scenario"
+    elif blockers:
+        next_action = "resolve-blocker"
+    else:
+        next_action = "none"
+    return {
+        "contract_version": "toolbox-product-status/v1",
+        "product_id": product_id,
+        "product_ref": f"toolbox:product/{product_id}",
+        "product_status": bundle["product"]["status"],
+        "scenario_counts": counts,
+        "active_scenario_ref": (
+            f"toolbox:scenario/{active[0]['id']}" if len(active) == 1 else None
+        ),
+        "ready_candidates": candidates,
+        "blockers": blockers,
+        "next_action": next_action,
+    }
+
+
+def build_run_plan(
+    bundle: dict[str, Any],
+    scenario: dict[str, Any],
+    selection_scope: str,
+    skipped_products: list[dict[str, Any]],
+) -> dict[str, Any]:
+    repositories = sorted(
+        item["id"]
+        for item in bundle["product"]["repositories"]
+        if item["role"] in ("owner", "work")
+    )
+    checks = sorted(
+        (
+            {"id": item["id"], "kind": item["kind"], "command": item["command"]}
+            for item in bundle["quality"]["checks"]
+            if item["required"]
+        ),
+        key=lambda item: item["id"],
+    )
+    return {
+        "contract_version": "toolbox-run-plan/v1",
+        "selection_scope": selection_scope,
+        "product_ref": f"toolbox:product/{bundle['product']['id']}",
+        "scenario_ref": f"toolbox:scenario/{scenario['id']}",
+        "repository_owners": repositories,
+        "required_quality_checks": checks,
+        "skipped_products": skipped_products,
+    }
+
+
+def product_run_plan(
+    workspace: pathlib.Path, product_id: str, scenario_id: str | None = None
+) -> dict[str, Any]:
+    portfolio, index = check_portfolio(workspace)
+    bundle = get_product_bundle(portfolio, product_id)
+    product_ref = f"toolbox:product/{product_id}"
+    active = sorted(
+        (item for item in bundle["scenarios"] if item["status"] == "active"),
+        key=lambda item: item["id"],
+    )
+    if active:
+        raise StateError(
+            f"active-scenario-exists: toolbox:scenario/{active[0]['id']}"
+        )
+    if bundle["product"]["status"] == "paused":
+        raise StateError(f"product-paused: {product_ref}")
+    if bundle["product"]["status"] in ("completed", "archived"):
+        raise StateError(f"product-terminal: {product_ref}")
+
+    if scenario_id is not None:
+        candidate = next(
+            (item for item in bundle["scenarios"] if item["id"] == scenario_id), None
+        )
+        if candidate is None:
+            raise StateError(f"scenario '{scenario_id}' does not exist in product '{product_id}'")
+        if candidate["status"] != "ready":
+            raise StateError(
+                f"scenario-not-ready: toolbox:scenario/{candidate['id']}"
+            )
+        if not all(
+            index[dependency][1]["status"] == "completed"
+            for dependency in candidate["dependsOn"]
+        ):
+            raise StateError(
+                f"scenario-dependency-incomplete: toolbox:scenario/{candidate['id']}"
+            )
+    else:
+        candidates = candidate_scenarios(workspace, product_id)
+        if not candidates:
+            blockers = scenario_blockers(bundle, index)
+            if blockers:
+                blocker = blockers[0]
+                raise StateError(f"{blocker['code']}: {blocker['ref']}")
+            raise StateError(f"no-ready-scenario: {product_ref}")
+        candidate = index[candidates[0]["scenario_id"]][1]
+    return build_run_plan(bundle, candidate, "product", [])
+
+
+def portfolio_run_plan(workspace: pathlib.Path) -> dict[str, Any]:
+    portfolio, index = check_portfolio(workspace)
+    candidates = candidate_scenarios(workspace)
+    candidates_by_product: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        candidates_by_product.setdefault(candidate["product_id"], []).append(candidate)
+
+    eligible: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for bundle in portfolio["products"]:
+        product_id = bundle["product"]["id"]
+        product_ref = f"toolbox:product/{product_id}"
+        active = sorted(
+            (item for item in bundle["scenarios"] if item["status"] == "active"),
+            key=lambda item: item["id"],
+        )
+        if active:
+            reasons = [{
+                "code": "active-scenario-exists",
+                "ref": f"toolbox:scenario/{active[0]['id']}",
+            }]
+        elif bundle["product"]["status"] == "paused":
+            reasons = [{"code": "product-paused", "ref": product_ref}]
+        elif bundle["product"]["status"] in ("completed", "archived"):
+            reasons = [{"code": "product-terminal", "ref": product_ref}]
+        elif candidates_by_product.get(product_id):
+            eligible.extend(candidates_by_product[product_id])
+            continue
+        else:
+            reasons = scenario_blockers(bundle, index)
+            if not reasons:
+                reasons = [{"code": "no-ready-scenario", "ref": product_ref}]
+        skipped.append({"product_ref": product_ref, "reasons": reasons[:1]})
+
+    if not eligible:
+        raise StateError("no-ready-scenario: toolbox:portfolio")
+    selected = sorted(
+        eligible,
+        key=lambda item: (item["priority"], item["product_id"], item["scenario_id"]),
+    )[0]
+    for candidate in eligible:
+        if candidate["product_id"] != selected["product_id"]:
+            if not any(
+                item["product_ref"] == candidate["product_ref"] for item in skipped
+            ):
+                skipped.append(
+                    {
+                        "product_ref": candidate["product_ref"],
+                        "reasons": [{
+                            "code": "lower-priority-candidate",
+                            "ref": candidate["scenario_ref"],
+                        }],
+                    }
+                )
+    skipped = sorted(
+        {item["product_ref"]: item for item in skipped}.values(),
+        key=lambda item: item["product_ref"],
+    )
+    bundle = get_product_bundle(portfolio, selected["product_id"])
+    scenario = index[selected["scenario_id"]][1]
+    return build_run_plan(bundle, scenario, "portfolio", skipped)

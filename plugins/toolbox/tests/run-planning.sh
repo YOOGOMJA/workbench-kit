@@ -46,6 +46,7 @@ EOF
 }
 
 scenario alpha SCN-ALPHA-DONE completed 1 '[]'
+scenario alpha SCN-ALPHA-DRAFT draft 0 '[]'
 scenario alpha SCN-ALPHA-READY ready 20 '["SCN-ALPHA-DONE"]'
 scenario beta SCN-BETA-ACTIVE active 1 '[]'
 scenario beta SCN-BETA-READY ready 2 '[]'
@@ -76,10 +77,26 @@ assert json.loads(sys.argv[1]) == {
         "active": 0,
         "blocked": 0,
         "completed": 1,
-        "draft": 0,
+        "draft": 1,
         "ready": 1,
     },
 }
+PY
+
+beta_status="$(toolbox product status beta)" || fail "active product status failed"
+gamma_status="$(toolbox product status gamma)" || fail "blocked product status failed"
+python3 - "$beta_status" "$gamma_status" <<'PY'
+import json
+import sys
+beta = json.loads(sys.argv[1])
+gamma = json.loads(sys.argv[2])
+assert beta["active_scenario_ref"] == "toolbox:scenario/SCN-BETA-ACTIVE"
+assert beta["next_action"] == "continue-active-scenario"
+assert gamma["blockers"] == [{
+    "code": "scenario-blocked",
+    "ref": "toolbox:scenario/SCN-GAMMA-BLOCKED",
+}]
+assert gamma["next_action"] == "resolve-blocker"
 PY
 
 plan="$(toolbox product run-plan alpha)" || fail "product run-plan failed"

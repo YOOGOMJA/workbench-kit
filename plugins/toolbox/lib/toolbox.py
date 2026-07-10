@@ -26,6 +26,9 @@ from toolbox_state import (
     initialize_product,
     load_portfolio,
     load_product,
+    portfolio_run_plan,
+    product_run_plan,
+    product_status,
     set_autonomy,
     set_quality_check,
     set_repository,
@@ -326,6 +329,15 @@ def build_parser() -> argparse.ArgumentParser:
     product_registration.add_argument("--actor", required=True)
     product_registration.add_argument("--authority-ref", required=True)
     product_registration.add_argument("--registered-at", required=True)
+    product_status_parser = product_commands.add_parser(
+        "status", help="Derive product workflow status"
+    )
+    product_status_parser.add_argument("product_id")
+    product_run_plan_parser = product_commands.add_parser(
+        "run-plan", help="Derive one primary scenario run plan"
+    )
+    product_run_plan_parser.add_argument("product_id")
+    product_run_plan_parser.add_argument("--scenario", dest="scenario_id")
     scenario = commands.add_parser(
         "scenario", help="Inspect, validate, or list scenario candidates"
     )
@@ -349,6 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_commands.add_parser("inspect", help="Read the joined portfolio")
     portfolio_commands.add_parser("check", help="Validate the joined portfolio")
     portfolio_commands.add_parser("candidates", help="List portfolio-wide candidates")
+    portfolio_commands.add_parser("run-plan", help="Select one portfolio run plan")
     workbench = commands.add_parser(
         "workbench", help="Check the public workbench compatibility contract"
     )
@@ -403,6 +416,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "product_ref": f"toolbox:product/{parsed.product_id}",
                         "state_root": str(root),
                     }
+                )
+                return 0
+            if parsed.product_command == "status":
+                write_json(product_status(workspace, parsed.product_id))
+                return 0
+            if parsed.product_command == "run-plan":
+                write_json(
+                    product_run_plan(workspace, parsed.product_id, parsed.scenario_id)
                 )
                 return 0
             if parsed.product_command == "inspect":
@@ -531,6 +552,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             if parsed.portfolio_command == "candidates":
                 write_json({"candidates": candidate_scenarios(workspace)})
+                return 0
+            if parsed.portfolio_command == "run-plan":
+                write_json(portfolio_run_plan(workspace))
                 return 0
         parser.error("a command action is required")
     except (StateError, ToolboxError) as error:
