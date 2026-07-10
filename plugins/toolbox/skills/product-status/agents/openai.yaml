@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inspect Product Status"
+  short_description: "Report derived product workflow status"
+  default_prompt: "Use -status to report the governed status of a toolbox product."
