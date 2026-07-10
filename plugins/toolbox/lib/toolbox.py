@@ -13,6 +13,13 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
+from toolbox_state import (
+    StateError,
+    check_product,
+    initialize_product,
+    load_product,
+)
+
 
 WORKBENCH_CONTRACT = "workbench-contract/v1"
 WORKSPACE_SCHEMA = "workbench/v2"
@@ -145,7 +152,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Caller workbench root (default: current directory)",
     )
     commands = parser.add_subparsers(dest="command", metavar="{product,scenario,portfolio,workbench}")
-    commands.add_parser("product", help="Initialize, inspect, or validate a product")
+    product = commands.add_parser("product", help="Initialize, inspect, or validate a product")
+    product_commands = product.add_subparsers(dest="product_command")
+    product_init = product_commands.add_parser("init", help="Create versioned product state")
+    product_init.add_argument("--id", required=True, dest="product_id")
+    product_init.add_argument("--name", required=True)
+    product_init.add_argument("--language", required=True)
+    product_init.add_argument("--objective", required=True)
+    product_inspect = product_commands.add_parser("inspect", help="Read one product bundle")
+    product_inspect.add_argument("product_id")
+    product_check = product_commands.add_parser("check", help="Validate one product bundle")
+    product_check.add_argument("product_id")
     commands.add_parser("scenario", help="Inspect, validate, or list scenario candidates")
     commands.add_parser("portfolio", help="Inspect or validate the joined portfolio")
     workbench = commands.add_parser(
@@ -168,8 +185,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         if parsed.command == "workbench" and parsed.workbench_command == "check":
             write_json(inspect_workbench_contract(workspace))
             return 0
+        if parsed.command == "product":
+            inspect_workbench_contract(workspace)
+            if parsed.product_command == "init":
+                root = initialize_product(
+                    workspace,
+                    parsed.product_id,
+                    parsed.name,
+                    parsed.language,
+                    parsed.objective,
+                )
+                write_json(
+                    {
+                        "created": True,
+                        "product_id": parsed.product_id,
+                        "product_ref": f"toolbox:product/{parsed.product_id}",
+                        "state_root": str(root),
+                    }
+                )
+                return 0
+            if parsed.product_command == "inspect":
+                write_json(load_product(workspace, parsed.product_id))
+                return 0
+            if parsed.product_command == "check":
+                check_product(workspace, parsed.product_id)
+                write_json({"product_id": parsed.product_id, "valid": True})
+                return 0
         parser.error("a command action is required")
-    except ToolboxError as error:
+    except (StateError, ToolboxError) as error:
         print(f"toolbox: {error}", file=sys.stderr)
         return 1
     return 2
