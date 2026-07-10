@@ -219,7 +219,7 @@ The canonical v2 marker is UTF-8 JSON inside a versioned HTML comment:
 
 ```html
 <!-- workbench-task-lifecycle:v2
-{"task_contract":"workbench-task/v2","event":"task-completed","claim_id":"task__example__42-20260711T030000Z-1234","issue":42,"home":null,"branch":"task/42-example","pr":null,"revision":"sha256:0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","actor":"human@example.com","tool":"workbench","at":"2026-07-11T03:02:00Z"}
+{"task_contract":"workbench-task/v2","event":"task-completed","claim_id":"task__example__42-20260711T030000Z-1234","issue":42,"home":null,"branch":"task/42-example","pr":null,"revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","actor":"human@example.com","tool":"workbench","at":"2026-07-11T03:02:00Z"}
 -->
 ```
 
@@ -268,14 +268,17 @@ A v2 task is complete only when all applicable conditions hold:
    merely opening the pull request is insufficient.
 4. If the task contains a workbench increment, its normal submit and acceptance path is
    satisfied. If it contains none, no workbench pull request is required.
-5. Harvest candidates have a recorded disposition. Product-specific current state is not
-   mislabeled as workbench knowledge to satisfy this condition.
+5. The `workbench-harvest/v1` inventory is sealed and every candidate has a recorded
+   disposition. A sealed empty inventory explicitly means no candidates. Product-specific
+   current state is not mislabeled as workbench knowledge to satisfy this condition.
 6. No applicable policy resolves to `deny`, and no required action remains unresolved at
    `ask`.
 
 Cleanup is never a completion predicate. Destructive cleanup before completion or
 abandonment is invalid for v2 tasks. Existing v1 force-cleanup behavior remains a legacy
-compatibility path until migration policy removes it in a future major contract.
+compatibility path until migration policy removes it in a future major contract. V2 cleanup
+is the governed `task.cleanup` action and has its own revision-bound receipt, blockers, and
+retry semantics in [[workbench-v2-cli-contract]].
 
 ## Policy contract
 
@@ -335,14 +338,16 @@ The public `workbench-policy/v1` resolution object is:
     "action_id": "task.complete",
     "task_claim_id": "task__example__42-20260711T030000Z-1234",
     "target_ref": "toolbox:scenario/SCN-001",
-    "revision": "sha256:0123456789abcdef",
+    "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "status": "pending"
   },
   "decision": "ask",
   "sources": [
     {
       "layer": "workspace",
-      "ref": "workspace:policy/default",
+      "context_ref": null,
+      "policy_ref": "file:/absolute/workbench/.workbench/policy.conf",
+      "policy_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "decision": "ask"
     }
   ],
@@ -350,10 +355,12 @@ The public `workbench-policy/v1` resolution object is:
 }
 ```
 
-`sources[].layer` is one of `platform`, `workspace`, `context`, or `task`; `ref` identifies
-the policy source without requiring prose interpretation. `authorization_ref` is null until
-an explicit, matching authorization is recorded. Exact policy and authorization schemas,
-commands, replay rules, and output status are in [[workbench-v2-cli-contract]].
+`sources[].layer` is one of `platform`, `workspace`, `context`, or `task`. Each source keeps
+an absolute policy reference and content digest; context sources also keep their context
+ref. Context sources are repeatable, and the strictest result across every participating
+context applies. `authorization_ref` is null until an explicit, matching authorization is
+recorded. Exact policy and authorization schemas, commands, replay rules, and output status
+are in [[workbench-v2-cli-contract]].
 
 ## Public capability discovery
 
@@ -417,6 +424,7 @@ The canonical v1 shape is:
     "task.lifecycle/v2",
     "task.evidence/v1",
     "task.completion/v1",
+    "task.harvest/v1",
     "task.writer-conflicts/v1",
     "policy.resolve/v1",
     "policy.authorization/v1",
@@ -496,6 +504,11 @@ Knowledge is promoted by reuse value, not by volume. The following ownership rul
 | Product-specific architecture or operating rule | Owning codebase |
 | Cross-task decision, failed approach, or runbook | Workbench `docs/` |
 | Framework behavior useful to every installation | A workbench-kit change candidate |
+
+Each task maintains a `workbench-harvest/v1` ledger. Skills declare candidates and their
+judgment-driven dispositions; plumbing stores facts without inventing prose. The inventory
+must be sealed, including an explicitly empty inventory, and every candidate disposed before
+completion. Exact commands and disposition records are in [[workbench-v2-cli-contract]].
 
 A reusable finding records enough context to avoid unsafe cargo-cult reuse: scope,
 applicability, known exclusions, provenance to task and delivered revision, last verification,

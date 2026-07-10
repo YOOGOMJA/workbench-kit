@@ -21,10 +21,15 @@ means `workbench-task/v1`, even when the enclosing workspace uses `workbench/v2`
   not make object-member ordering semantic.
 - Arrays that represent sets are sorted by their stable ID for deterministic fixtures.
 - Optional record fields are present with JSON `null`; they are not omitted.
+- Every versioned JSON input object has unique member names at every nesting level. A parser
+  must detect duplicates before converting pairs to a map; duplicate keys are invalid even
+  when their values are equal and exit at `2` with no stdout.
 - Successful machine commands write no stderr. Diagnostics never share stdout with a JSON
   object except for the defined policy or blocker results below.
-- Mutations are atomic. A failed mutation changes no task data, except that policy
-  resolution deliberately persists a `pending` or `denied` action instance.
+- Caller-owned record mutations are atomic. Policy resolution deliberately persists a
+  `pending` or `denied` action instance. Git and GitHub side effects use the explicit
+  reconciliation behavior documented by their command; no command reports a partial effect
+  as success.
 
 ### Exit status
 
@@ -69,8 +74,8 @@ The exact `workbench-contract/v1` shape is defined in
 ```
 
 Capabilities add `task.contract/v2`, `profile.language/v1`,
-`task.required-checks/v1`, `task.writer-conflicts/v1`, `policy.authorization/v1`, and
-`knowledge.applicability/v1`. Supported records add
+`task.required-checks/v1`, `task.harvest/v1`, `task.writer-conflicts/v1`,
+`policy.authorization/v1`, and `knowledge.applicability/v1`. Supported records add
 `authorization_contracts: ["workbench-authorization/v1"]`.
 
 ### Profile language
@@ -359,6 +364,7 @@ The kernel-defined action IDs in this contract are:
 | `task.deliverable.reject` | Reject a declared deliverable |
 | `task.deliverable.weaken` | Change `required` from true to false |
 | `task.required-check.waive` | Waive a required check |
+| `task.harvest.dispose` | Record the disposition of one harvest candidate |
 | `task.concurrent-write` | Proceed while a writer conflict is reported |
 | `task.cleanup` | Remove a terminal v2 task workspace |
 
@@ -371,7 +377,7 @@ and consumption behavior defined below for completion and abandonment.
 ```text
 workbench policy resolve \
   --action-id ID --task-claim-id ID --target-ref REF --revision REV \
-  [--platform FILE] [--workspace FILE] [--context FILE] [--task FILE] \
+  [--platform FILE] [--workspace FILE] [--context CONTEXT_REF=FILE]... [--task FILE] \
   [--action-instance-id ID] [--authorization-file FILE] \
   --format json|decision
 ```
@@ -390,14 +396,30 @@ JSON output is:
     "action_id": "task.complete",
     "task_claim_id": "task__example__42-20260711T030000Z-1234",
     "target_ref": "toolbox:scenario/SCN-001",
-    "revision": "sha256:0123456789abcdef",
+    "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "status": "pending"
   },
   "decision": "ask",
   "sources": [
     {
       "layer": "workspace",
-      "ref": ".workbench/policy.conf",
+      "context_ref": null,
+      "policy_ref": "file:/absolute/workbench/.workbench/policy.conf",
+      "policy_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "decision": "allow"
+    },
+    {
+      "layer": "context",
+      "context_ref": "toolbox:product/acme-web",
+      "policy_ref": "file:/absolute/workbench/products/acme-web/policy.conf",
+      "policy_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "decision": "allow"
+    },
+    {
+      "layer": "context",
+      "context_ref": "toolbox:product/acme-api",
+      "policy_ref": "file:/absolute/workbench/products/acme-api/policy.conf",
+      "policy_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "decision": "ask"
     }
   ],
@@ -407,6 +429,15 @@ JSON output is:
 
 `status` is `pending`, `authorized`, `consumed`, or `denied`. `--format decision` prints
 only `allow`, `ask`, or `deny` plus LF and uses the same exit status.
+
+`--context` is repeatable. It splits on the first `=`; duplicate context refs are invalid.
+An atomic multi-context caller supplies one source for every participant named by its
+pack-owned cross-context record. Resolution evaluates every source and applies
+`deny > ask > allow` across the complete set. `sources` preserves provenance with the
+context ref, absolute `file:` policy reference, and SHA-256 of the exact policy bytes.
+Platform, workspace, and task sources use `context_ref: null`. Sources are sorted by layer
+authority, then context ref. Omitting a known participant is a pack validation error and
+must not be treated as implicit `allow`.
 
 ### Authorization input
 
@@ -420,7 +451,7 @@ only `allow`, `ask`, or `deny` plus LF and uses the same exit status.
   "action_id": "task.complete",
   "task_claim_id": "task__example__42-20260711T030000Z-1234",
   "target_ref": "toolbox:scenario/SCN-001",
-  "revision": "sha256:0123456789abcdef",
+  "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "decision": "allow",
   "actor": "human@example.com",
   "authorized_at": "2026-07-11T03:01:00Z",
@@ -437,8 +468,9 @@ The kernel persists action status in tracked, disposable task state. The storage
 private, but the record survives session handoff when the task state is committed. A
 governed mutation marks an authorized instance `consumed` only after the mutation and its
 lifecycle observation succeed. A failed precondition leaves the instance reusable only for
-the identical binding. If committing pending state changes the task revision digest, the
-caller must mint a new instance.
+the identical binding. Action, log, status, and other disposable bookkeeping records are
+excluded structurally from the task revision digest, so persisting a pending instance cannot
+change its own binding.
 
 The binding prevents accidental or cross-target replay; authenticity of `actor` and
 `source_ref` remains the responsibility of the higher-authority platform or human-gate
@@ -451,23 +483,98 @@ authorization ID may be retried only with its same, unconsumed action instance.
 ## Task revision set
 
 Verification and governed outcomes bind to a revision-set digest, not only the workbench
-branch SHA. The kernel creates an LF-terminated, TAB-separated manifest:
+branch SHA. The kernel creates an LF-terminated, TAB-separated content manifest:
 
 ```text
 workbench-task-revision/v1
-task_head<TAB>SHA
+task_contract<TAB>workbench-task/v2
 context_ref<TAB>REF_OR_null
 work_ref<TAB>REF_OR_null
 deliverable<TAB>ID<TAB>OWNER<TAB>KIND<TAB>REQUIRED<TAB>EXTERNAL_REF_OR_null<TAB>REVISION_OR_null<TAB>STATE
 required_check<TAB>ID<TAB>OWNER<TAB>DELIVERABLE_OR_null<TAB>STATE
 evidence<TAB>CHECK_ID<TAB>EVIDENCE_ID_OR_null<TAB>REVISION_OR_null<TAB>RESULT_OR_null<TAB>STALE
+harvest<TAB>SEALED
+harvest_candidate<TAB>ID<TAB>KIND<TAB>SOURCE_REF<TAB>STATE<TAB>DECISION_OR_null<TAB>TARGET_REF_OR_null<TAB>REASON_CODE_OR_null
 ```
 
 Deliverable and required-check rows are sorted by ID. Each evidence row is the selected
-latest record for one required check and follows required-check order. Contract values must
-not contain TAB or LF. SHA-256 over the exact UTF-8 bytes is represented as
-`sha256:<lowercase-hex>`. Action and policy private records are excluded, avoiding a hash
-cycle; changing task HEAD or any relevant task fact invalidates the digest.
+latest record for one required check and follows required-check order. "Latest" is greatest
+`recorded_at`, with lexicographically greatest `evidence_id` as the tie-breaker. Harvest candidates
+are sorted by ID. Contract values must not contain TAB or LF. SHA-256 over the exact UTF-8
+bytes is represented as
+`sha256:<lowercase-hex>`. Action, policy, status, log, and other task-bookkeeping records are
+never inputs. A durable workbench increment is declared as a deliverable with its own
+revision, so result changes still invalidate the digest without coupling it to metadata
+commits. Changing refs, a deliverable, required-check state, selected evidence, or harvest
+ledger changes the digest; storing an action instance cannot.
+
+## Harvest ledger
+
+Completion uses a sealed, versioned ledger rather than inferring harvest work from prose.
+
+### Declare a candidate
+
+```text
+workbench task harvest candidate declare \
+  --id ID --kind decision|lesson|runbook|framework-change --source-ref REF \
+  --format json
+```
+
+### Record a disposition
+
+```text
+workbench task harvest dispose \
+  --id ID --decision absorb|codebase|follow-up|discard \
+  --reason-code CODE [--target-ref REF] \
+  [--action-instance-id ID] [--authorization-file FILE] --format json
+```
+
+Disposition uses governed action `task.harvest.dispose`. `target-ref` is required for
+`absorb`, `codebase`, and `follow-up`, and must be null for `discard`. The skill or agent
+supplies candidate identity, kind, decision, and reason; plumbing does not generate prose or
+decide reuse value.
+
+### Seal or show the inventory
+
+```text
+workbench task harvest seal --format json
+workbench task harvest show --format json
+```
+
+`seal` states that candidate discovery is complete. Sealing an empty inventory is the
+explicit "no harvest candidates" result. Declaring another candidate after sealing sets
+`sealed` back to false. Records are never deleted.
+
+All four commands return the complete ledger:
+
+```json
+{
+  "contract_version": "workbench-harvest/v1",
+  "task_contract": "workbench-task/v2",
+  "sealed": true,
+  "changed": false,
+  "candidates": [
+    {
+      "candidate_id": "auth-testing-runbook",
+      "kind": "runbook",
+      "source_ref": "task:document/auth-research",
+      "state": "disposed",
+      "disposition": {
+        "decision": "absorb",
+        "target_ref": "workbench:docs/auth-testing",
+        "reason_code": "cross-project-reuse",
+        "authorization_ref": "conversation:message/msg-123"
+      }
+    }
+  ]
+}
+```
+
+`show` always reports `changed: false`; mutations report whether the ledger changed.
+Candidates are sorted by ID. A pending candidate has `state: "pending"` and
+`disposition: null`. Repeating an identical declaration or disposition is idempotent;
+conflicting data fails. Completion emits `harvest-unsealed` when the inventory is open and
+`harvest-undisposed` for each pending candidate.
 
 ## Verify
 
@@ -481,7 +588,7 @@ Output is:
 {
   "contract_version": "workbench-verification/v1",
   "task_contract": "workbench-task/v2",
-  "revision": "sha256:0123456789abcdef",
+  "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "verified": true,
   "required_checks": [
     {
@@ -504,8 +611,9 @@ records produce `verified: false`, JSON stdout, and exit `1`. Success appends
 
 Canonical blocker codes are `missing-deliverable-revision`, `unaccepted-deliverable`,
 `missing-evidence`, `failed-evidence`, `stale-evidence`, `workbench-increment-unaccepted`,
-`harvest-undisposed`, `terminal-outcome-conflict`, and `action-binding-stale`. Packs may add
-namespaced blocker codes; consumers ignore unknown codes but still treat them as blockers.
+`harvest-unsealed`, `harvest-undisposed`, `terminal-outcome-conflict`, and
+`action-binding-stale`. Packs may add namespaced blocker codes; consumers ignore unknown
+codes but still treat them as blockers.
 
 ## Complete and abandon
 
@@ -547,7 +655,7 @@ Successful outcome output is:
   "outcome": "completed",
   "changed": true,
   "action_instance_id": "act_01J00000000000000000000000",
-  "revision": "sha256:0123456789abcdef",
+  "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "reason_code": null,
   "reason_ref": null,
   "blockers": []
@@ -559,9 +667,65 @@ precondition failure returns the same shape with `outcome: null`, `changed: fals
 blocker objects at exit `1`; it does not consume the instance. Repeating an already-recorded
 terminal outcome is idempotent with `changed: false`. A conflicting terminal outcome fails.
 
-Completion emits `task-completed`; abandonment emits `task-abandoned`. `workbench task done`
-requires one of these terminal outcomes for a v2 task and emits only `task-cleaned`. Legacy
-v1 tasks retain their existing completion and force-cleanup behavior.
+Completion emits `task-completed`; abandonment emits `task-abandoned`.
+
+## Governed cleanup
+
+```text
+workbench task done ID [--parent N] \
+  [--action-instance-id ID] [--authorization-file FILE] --format json
+```
+
+`ID` is the existing workbench issue number or `codebase#issue`. `--parent` disambiguates a
+recorded child-task identity. Selection reads task metadata and lifecycle claim facts; it
+does not reverse-parse a branch name. More than one live matching claim without a unique
+parent produces blocker `ambiguous-task-selection` at exit `1`.
+
+For `workbench-task/v2`, `--force` is invalid at exit `2`. The selected task must have a
+`task-completed` or `task-abandoned` outcome, clean task and nested codebase worktrees, and a
+pushed task branch. Preflight blockers are `missing-terminal-outcome`,
+`dirty-task-worktree`, `dirty-codebase-worktree`, `unpushed-task-branch`,
+`ambiguous-task-selection`, and `action-binding-stale`.
+
+Cleanup uses action `task.cleanup`, target `workbench:task/<claim_id>`, and the terminal
+outcome revision. Its first-call, `ask`, `deny`, retry, and authorization behavior is the
+same as completion. Preflight blockers are computed before minting. An authorized cleanup
+removes nested codebase worktrees, the task workspace, and the local task branch; it does not
+close the issue, change labels, or delete the remote branch. It then emits `task-cleaned`
+with the cleanup action instance and terminal revision.
+
+Success or a computed blocker returns:
+
+```json
+{
+  "contract_version": "workbench-task-cleanup/v1",
+  "task_contract": "workbench-task/v2",
+  "task_id": "workbench-kit#25",
+  "claim_id": "task__workbench-kit__25-20260711T030000Z-1234",
+  "branch": "task/25-example",
+  "outcome": "cleaned",
+  "changed": true,
+  "action_instance_id": "act_01J00000000000000000000000",
+  "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "removed": {
+    "task_workspace": true,
+    "codebase_worktrees": ["web-app"],
+    "local_branch": true
+  },
+  "blockers": []
+}
+```
+
+Blocked preflight sets `outcome: null`, `changed: false`, `action_instance_id: null`, and
+lists blockers at exit `1`. Policy `ask` and `deny` return the policy object at exit `3` and
+`4`. A prior `task-cleaned` marker makes retry idempotent with `changed: false`. If local
+removal succeeds but marker delivery fails, the command exits `1` with
+`lifecycle-write-failed`; retry with the same action instance and authorization reconciles
+the marker without repeating destructive work. The marker is the durable consumption
+receipt after task-local action storage disappears.
+
+Legacy `workbench-task/v1` tasks retain the existing `done ID [--parent N] [--force]`
+behavior and do not accept the v2 JSON contract by implication.
 
 ## Public versus private data
 

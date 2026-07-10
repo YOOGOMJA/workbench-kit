@@ -86,3 +86,5 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-07-11 02:49:13] edit · create workbench-v2-cli-contract.md | Added exact public commands, records, authorization binding, and exit semantics after specification review
 
 ## [2026-07-11 02:49:13] edit · update workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Closed reviewed gaps in task legacy detection, lifecycle serialization, multi-context boundaries, profile discovery, and compound applicability
+
+## [2026-07-11 03:13:03] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Removed the action-revision metadata cycle and specified strict JSON input, governed cleanup, sealed harvest disposition, and repeatable context policy provenance

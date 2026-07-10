@@ -6,8 +6,9 @@
   caller-data lifetime (`task work / living state / knowledge`). Make multi-deliverable
   completion, revision-bound evidence, `allow | ask | deny` policy resolution, generic
   namespaced references, replay-safe action instances, task-level contract selection, exact
-  public CLI/JSON records, and capability discovery kernel contracts. Keep product semantics
-  in an optional pack.
+  public CLI/JSON records, a sealed harvest ledger, governed cleanup, repeatable context
+  policy provenance, and capability discovery kernel contracts. Keep product semantics in
+  an optional pack.
 - **Context:** V1 isolates task work and accumulates knowledge, but it treats a workbench
   increment pull request as the normal delivery path and describes human gates only in
   prose. It has no durable category for current intent and no supported way for an optional
@@ -40,6 +41,12 @@
      apply new completion and cleanup rules to legacy tasks after workspace migration.
   7. Accept an opaque authorization reference without binding fields or consumption. That
      reference could be replayed for a different target or revision.
+  8. Include task branch HEAD in an action revision while storing pending action state on the
+     same branch. Bookkeeping commits would invalidate their own authorization binding.
+  9. Treat harvest disposition as prose. Completion could not distinguish an unfinished
+     assessment from an explicit zero-candidate result.
+  10. Accept one anonymous context policy file. Atomic multi-context work could omit a more
+      restrictive participant without leaving provenance.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing
