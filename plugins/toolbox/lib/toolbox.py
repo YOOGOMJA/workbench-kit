@@ -21,6 +21,7 @@ from toolbox_state import (
     candidate_scenarios,
     check_portfolio,
     check_product,
+    context_registration,
     find_scenario,
     initialize_product,
     load_portfolio,
@@ -28,6 +29,7 @@ from toolbox_state import (
     set_autonomy,
     set_quality_check,
     set_repository,
+    sync_policy,
 )
 
 
@@ -112,7 +114,11 @@ def require_string_list(value: Any, field: str) -> list[str]:
     return value
 
 
-def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
+def inspect_workbench_contract(
+    workspace: pathlib.Path,
+    required_capabilities: Sequence[str] = (),
+    required_supported: dict[str, str] | None = None,
+) -> dict[str, Any]:
     binary = resolve_workbench_binary()
     result = run_text_probe(
         [binary, "contract", "show", "--format", "json"],
@@ -182,6 +188,14 @@ def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
     for capability in REQUIRED_CAPABILITIES:
         if capability not in available_capabilities:
             raise ToolboxError(f"workbench is missing required capability '{capability}'")
+    for capability in required_capabilities:
+        if capability not in available_capabilities:
+            raise ToolboxError(f"workbench is missing required capability '{capability}'")
+
+    for field, contract in (required_supported or {}).items():
+        contracts = require_string_list(supported.get(field), f"supported.{field}")
+        if contract not in contracts:
+            raise ToolboxError(f"workbench does not support '{contract}'")
 
     profile_contracts = require_string_list(
         supported.get("profile_contracts"), "supported.profile_contracts"
@@ -298,6 +312,20 @@ def build_parser() -> argparse.ArgumentParser:
     quality_check_set.add_argument(
         "--command-part", required=True, action="append", dest="command_parts"
     )
+    product_policy = product_commands.add_parser(
+        "policy", help="Materialize a canonical product policy source"
+    )
+    policy_commands = product_policy.add_subparsers(dest="policy_command", required=True)
+    policy_sync = policy_commands.add_parser("sync", help="Synchronize product policy")
+    policy_sync.add_argument("product_id")
+    product_registration = product_commands.add_parser(
+        "context-registration", help="Emit a strict workbench context registration"
+    )
+    product_registration.add_argument("product_id")
+    product_registration.add_argument("--task-claim-id", required=True)
+    product_registration.add_argument("--actor", required=True)
+    product_registration.add_argument("--authority-ref", required=True)
+    product_registration.add_argument("--registered-at", required=True)
     scenario = commands.add_parser(
         "scenario", help="Inspect, validate, or list scenario candidates"
     )
@@ -342,7 +370,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_json(inspect_workbench_contract(workspace))
             return 0
         if parsed.command == "product":
-            workbench_contract = inspect_workbench_contract(workspace)
+            required_capabilities: tuple[str, ...] = ()
+            required_supported: dict[str, str] = {}
+            if parsed.product_command == "policy":
+                required_supported["policy_contracts"] = "workbench-policy/v1"
+            if parsed.product_command == "context-registration":
+                required_capabilities = ("policy.context-set/v1",)
+                required_supported[
+                    "context_policy_contracts"
+                ] = "workbench-context-policy-registration/v1"
+            workbench_contract = inspect_workbench_contract(
+                workspace, required_capabilities, required_supported
+            )
             if parsed.product_command == "init":
                 profile_language = workbench_contract["profile"]["language"]
                 if parsed.language != profile_language:
@@ -417,6 +456,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "product_id": parsed.product_id,
                         "quality_check": quality_check,
                     }
+                )
+                return 0
+            if parsed.product_command == "policy":
+                changed, policy_ref = sync_policy(workspace, parsed.product_id)
+                write_json(
+                    {
+                        "changed": changed,
+                        "policy_ref": policy_ref,
+                        "product_id": parsed.product_id,
+                    }
+                )
+                return 0
+            if parsed.product_command == "context-registration":
+                write_json(
+                    context_registration(
+                        workspace,
+                        parsed.product_id,
+                        parsed.task_claim_id,
+                        parsed.actor,
+                        parsed.authority_ref,
+                        parsed.registered_at,
+                    )
                 )
                 return 0
         if parsed.command == "scenario":

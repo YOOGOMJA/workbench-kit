@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import pathlib
@@ -16,6 +17,24 @@ from toolbox_language import is_language_tag
 
 
 PRODUCT_ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+RFC3339_UTC = re.compile(
+    r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+    r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+)
+KERNEL_ACTION_IDS = (
+    "task.abandon",
+    "task.cleanup",
+    "task.complete",
+    "task.concurrent-write",
+    "task.deliverable.accept",
+    "task.deliverable.reject",
+    "task.deliverable.waive",
+    "task.deliverable.weaken",
+    "task.harvest.dispose",
+    "task.policy-context.register",
+    "task.policy-context.seal",
+    "task.required-check.waive",
+)
 
 
 class StateError(Exception):
@@ -163,10 +182,10 @@ def write_json(path: pathlib.Path, document: dict[str, Any]) -> None:
         raise StateError(f"unable to write state document {path}: {diagnostic}") from error
 
 
-def atomic_replace_json(
-    workspace: pathlib.Path, path: pathlib.Path, document: dict[str, Any]
+def atomic_replace_text(
+    workspace: pathlib.Path, path: pathlib.Path, content: str
 ) -> None:
-    """Replace one caller-owned JSON document without exposing a partial write."""
+    """Replace one caller-owned text document without exposing a partial write."""
     target = safe_state_path(workspace, path, "state document")
     parent = safe_state_path(workspace, target.parent, "state document directory")
     if not parent.is_dir():
@@ -182,8 +201,7 @@ def atomic_replace_json(
         safe_state_path(workspace, temporary, "temporary state document")
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             descriptor = -1
-            json.dump(document, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, target)
@@ -207,6 +225,14 @@ def atomic_replace_json(
                 pass
             except OSError:
                 pass
+
+
+def atomic_replace_json(
+    workspace: pathlib.Path, path: pathlib.Path, document: dict[str, Any]
+) -> None:
+    atomic_replace_text(
+        workspace, path, json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    )
 
 
 def product_root(workspace: pathlib.Path, product_id: str) -> pathlib.Path:
@@ -489,6 +515,8 @@ def set_repository(
 def set_autonomy(
     workspace: pathlib.Path, product_id: str, action_id: str, decision: str
 ) -> bool:
+    if action_id not in KERNEL_ACTION_IDS:
+        raise StateError(f"unsupported workbench action '{action_id}'")
     bundle = load_product(workspace, product_id)
     validate_product_bundle(product_id, bundle)
     proposed = dict(bundle["autonomy"])
@@ -504,6 +532,86 @@ def set_autonomy(
         workspace, product_root(workspace, product_id) / "autonomy.json", proposed
     )
     return True
+
+
+def render_policy(bundle: dict[str, Any]) -> str:
+    autonomy = bundle["autonomy"]
+    unknown = sorted(set(autonomy["actions"]) - set(KERNEL_ACTION_IDS))
+    if unknown:
+        raise StateError(f"unsupported workbench action '{unknown[0]}'")
+    lines = ["schema=workbench-policy/v1"]
+    for action_id in KERNEL_ACTION_IDS:
+        decision = autonomy["actions"].get(action_id, autonomy["default"])
+        lines.append(f"action.{action_id}={decision}")
+    return "\n".join(lines) + "\n"
+
+
+def sync_policy(workspace: pathlib.Path, product_id: str) -> tuple[bool, str]:
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    content = render_policy(bundle)
+    policy_ref = f"products/{product_id}/policy.conf"
+    path = safe_state_path(workspace, workspace / policy_ref, "product policy")
+    try:
+        current = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        current = None
+    except UnicodeDecodeError as error:
+        raise StateError(f"product policy is not valid UTF-8: {path}") from error
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(f"unable to read product policy {path}: {diagnostic}") from error
+    if current == content:
+        return False, policy_ref
+    atomic_replace_text(workspace, path, content)
+    return True, policy_ref
+
+
+def context_registration(
+    workspace: pathlib.Path,
+    product_id: str,
+    task_claim_id: str,
+    actor: str,
+    authority_ref: str,
+    registered_at: str,
+) -> dict[str, Any]:
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    if not task_claim_id:
+        raise StateError("task-claim-id must not be empty")
+    if not actor:
+        raise StateError("actor must not be empty")
+    if not authority_ref:
+        raise StateError("authority-ref must not be empty")
+    if RFC3339_UTC.fullmatch(registered_at) is None:
+        raise StateError("registered-at must be an RFC 3339 UTC timestamp")
+    try:
+        datetime.datetime.strptime(registered_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise StateError("registered-at must be an RFC 3339 UTC timestamp") from error
+
+    policy_ref = f"products/{product_id}/policy.conf"
+    policy_path = safe_state_path(workspace, workspace / policy_ref, "product policy")
+    try:
+        policy = policy_path.read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise StateError("product policy must be synchronized before registration") from error
+    except (OSError, UnicodeError) as error:
+        raise StateError("product policy must be readable before registration") from error
+    if policy != render_policy(bundle):
+        raise StateError("product policy must be synchronized before registration")
+
+    product_ref = f"toolbox:product/{product_id}"
+    return {
+        "contract_version": "workbench-context-policy-registration/v1",
+        "registration_id": f"ctxreg-toolbox-{product_id}",
+        "task_claim_id": task_claim_id,
+        "task_context_ref": product_ref,
+        "participants": [{"context_ref": product_ref, "policy_ref": policy_ref}],
+        "authority_ref": authority_ref,
+        "actor": actor,
+        "registered_at": registered_at,
+    }
 
 
 def set_quality_check(

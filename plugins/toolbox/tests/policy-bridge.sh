@@ -123,5 +123,10 @@ expect_failure "registered-at must be an RFC 3339 UTC timestamp" \
   toolbox product context-registration alpha \
     --task-claim-id claim --actor owner@example.com \
     --authority-ref toolbox:authority/product-owner --registered-at yesterday
+expect_failure "registered-at must be an RFC 3339 UTC timestamp" \
+  toolbox product context-registration alpha \
+    --task-claim-id claim --actor owner@example.com \
+    --authority-ref toolbox:authority/product-owner \
+    --registered-at 2026-02-31T03:20:00Z
 
 echo "PASS: canonical workbench policy bridge"
