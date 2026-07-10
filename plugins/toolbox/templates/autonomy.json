@@ -1,0 +1,5 @@
+{
+  "schema": "toolbox-autonomy/v1",
+  "default": "ask",
+  "actions": {}
+}

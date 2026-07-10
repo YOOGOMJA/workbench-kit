@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/toolbox/quality-v1",
+  "title": "Toolbox quality policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "development", "checks"],
+  "properties": {
+    "schema": { "const": "toolbox-quality/v1" },
+    "development": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tdd", "designSystem"],
+      "properties": {
+        "tdd": { "enum": ["required", "recommended", "off"] },
+        "designSystem": { "enum": ["required", "recommended", "off"] }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "command", "required"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          },
+          "kind": {
+            "enum": [
+              "test",
+              "lint",
+              "typecheck",
+              "build",
+              "integration",
+              "e2e",
+              "accessibility",
+              "visual",
+              "performance",
+              "security"
+            ]
+          },
+          "command": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "minItems": 1
+          },
+          "required": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}
