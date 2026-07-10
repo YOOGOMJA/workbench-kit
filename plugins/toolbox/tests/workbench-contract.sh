@@ -100,9 +100,15 @@ expect_failure "does not allow toolbox state mutation for 'workbench/v2'" \
   "$TOOLBOX" --workspace "$wb" workbench check
 
 make_fake_workbench "$tmp/workbench-no-pack-contract" \
-  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":[]}}\n'\'' "$PWD"'
+  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":[]},"capabilities":["workspace.schema/v1"]}\n'\'' "$PWD"'
 expect_failure "does not support 'workbench-capability-pack/v1'" \
   env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-no-pack-contract" \
+  "$TOOLBOX" --workspace "$wb" workbench check
+
+make_fake_workbench "$tmp/workbench-no-workspace-capability" \
+  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":[]}\n'\'' "$PWD"'
+expect_failure "missing required capability 'workspace.schema/v1'" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-no-workspace-capability" \
   "$TOOLBOX" --workspace "$wb" workbench check
 
 echo "PASS: public workbench compatibility contract"

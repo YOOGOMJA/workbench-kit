@@ -48,7 +48,7 @@ expect_failure() {
   grep -Fq "$expected" <<<"$out" || fail "missing diagnostic '$expected': $out"
 }
 
-supported='{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"WORKSPACE_ROOT","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":["workbench-capability-pack/v1"]}}'
+supported='{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"WORKSPACE_ROOT","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1"]}'
 future='{"contract_version":"workbench-contract/v9","workspace":{"root":"WORKSPACE_ROOT","schema":"workbench/v2","source":"marker"}}'
 
 wb="$tmp/workbench"

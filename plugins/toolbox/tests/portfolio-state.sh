@@ -22,7 +22,7 @@ cat >"$fake_workbench" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [ "$*" = "contract show --format json" ] || exit 92
-printf '{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":["workbench-capability-pack/v1"]}}\n' "$PWD"
+printf '{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1"]}\n' "$PWD"
 EOF
 chmod +x "$fake_workbench"
 
