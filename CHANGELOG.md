@@ -12,6 +12,10 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ### Added
 
+- **Optional `toolbox` foundation** — adds cross-tool plugin manifests, a public
+  workbench/profile compatibility adapter, versioned caller-owned product state, and
+  deterministic product, scenario, and portfolio validation (#28). Marketplace
+  registration and full product-delivery workflows remain follow-up work.
 - **Frozen released-section guard** — a CI `changelog-frozen` job
   (`scripts/check-changelog-section.sh`) fails any PR that adds a CHANGELOG entry under an
   already-released `## [X.Y.Z]` section instead of `## [Unreleased]`, so an in-flight PR

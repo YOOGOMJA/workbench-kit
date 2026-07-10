@@ -42,10 +42,28 @@ expect_failure() {
   grep -Fq "$expected" <<<"$out" || fail "missing diagnostic '$expected': $out"
 }
 
+expect_usage() {
+  local out status
+  set +e
+  out="$("$@" 2>&1)"
+  status=$?
+  set -e
+  [ "$status" -eq 2 ] || fail "expected usage exit 2, got $status: $out"
+  grep -Fq "usage: toolbox" <<<"$out" || fail "missing usage diagnostic: $out"
+  ! grep -Fq "workbench CLI is unavailable" <<<"$out" \
+    || fail "incomplete command probed the workbench CLI: $out"
+}
+
+expect_usage "$TOOLBOX"
+for incomplete_command in product scenario portfolio workbench; do
+  expect_usage env TOOLBOX_WORKBENCH_BIN="$tmp/does-not-exist" \
+    "$TOOLBOX" --workspace "$tmp" "$incomplete_command"
+done
+
 wb="$tmp/supported"
 make_workspace "$wb"
 make_fake_workbench "$tmp/workbench-supported" \
-  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"lifecycle_markers":{"read":["workbench-task-lifecycle:v1","workbench-task-lifecycle:v2"],"write":["workbench-task-lifecycle:v2"]},"policy_contracts":["workbench-policy/v1"],"evidence_contracts":["workbench-evidence/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1","task.refs/v1","task.deliverables/v1","task.lifecycle/v2","task.evidence/v1","task.completion/v1","policy.resolve/v1"]}\n'\'' "$PWD"'
+  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"profile":{"contract_version":"workbench-profile/v1","language":"ko","source":"workspace"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"profile_contracts":["workbench-profile/v1"],"lifecycle_markers":{"read":["workbench-task-lifecycle:v1","workbench-task-lifecycle:v2"],"write":["workbench-task-lifecycle:v2"]},"policy_contracts":["workbench-policy/v1"],"evidence_contracts":["workbench-evidence/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1","profile.language/v1","task.refs/v1","task.deliverables/v1","task.lifecycle/v2","task.evidence/v1","task.completion/v1","policy.resolve/v1"]}\n'\'' "$PWD"'
 
 out="$(TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
   "$TOOLBOX" --workspace "$wb" workbench check)" \
@@ -63,6 +81,11 @@ expected_root = str(pathlib.Path(sys.argv[2]).resolve())
 assert actual == {
     "compatible": True,
     "contract_version": "workbench-contract/v1",
+    "profile": {
+        "contract_version": "workbench-profile/v1",
+        "language": "ko",
+        "source": "workspace",
+    },
     "workspace_root": expected_root,
     "workspace_schema": "workbench/v2",
 }
@@ -137,6 +160,12 @@ make_fake_workbench "$tmp/workbench-no-workspace-capability" \
   'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":[]}\n'\'' "$PWD"'
 expect_failure "missing required capability 'workspace.schema/v1'" \
   env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-no-workspace-capability" \
+  "$TOOLBOX" --workspace "$wb" workbench check
+
+make_fake_workbench "$tmp/workbench-no-profile-capability" \
+  'printf '\''{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"profile":{"contract_version":"workbench-profile/v1","language":"ko","source":"workspace"},"supported":{"workspace_schemas":{"read":["workbench/v2"],"write":["workbench/v2"]},"profile_contracts":["workbench-profile/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1"]}\n'\'' "$PWD"'
+expect_failure "missing required capability 'profile.language/v1'" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-no-profile-capability" \
   "$TOOLBOX" --workspace "$wb" workbench check
 
 echo "PASS: public workbench compatibility contract"

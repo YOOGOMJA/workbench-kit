@@ -43,8 +43,13 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
         raise StateError(f"missing state document: {path}") from error
+    except UnicodeDecodeError as error:
+        raise StateError(f"state document is not valid UTF-8: {path}") from error
     except json.JSONDecodeError as error:
         raise StateError(f"malformed JSON in {path}: {error.msg}") from error
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(f"unable to read state document {path}: {diagnostic}") from error
     if not isinstance(value, dict):
         raise StateError(f"state document must contain an object: {path}")
     return value
@@ -152,6 +157,19 @@ def product_root(workspace: pathlib.Path, product_id: str) -> pathlib.Path:
     return workspace / "products" / product_id
 
 
+def safe_products_root(workspace: pathlib.Path) -> pathlib.Path:
+    root = workspace / "products"
+    if root.is_symlink():
+        raise StateError("product state root must not be a symbolic link")
+    try:
+        resolved = root.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise StateError(f"unable to resolve product state root: {root}") from error
+    if resolved != workspace.resolve() / "products":
+        raise StateError(f"product state root escapes caller workspace: {root}")
+    return root
+
+
 def initialize_product(
     workspace: pathlib.Path,
     product_id: str,
@@ -164,7 +182,10 @@ def initialize_product(
     if not name.strip():
         raise StateError("product name must not be empty")
 
-    target = product_root(workspace, product_id)
+    products_root = safe_products_root(workspace)
+    target = products_root / product_id
+    if target.is_symlink():
+        raise StateError(f"product state path must not be a symbolic link: {target}")
     if target.exists():
         raise StateError(f"product '{product_id}' already exists")
 
@@ -183,7 +204,6 @@ def initialize_product(
     validate_document("autonomy", autonomy)
     validate_document("quality", quality)
 
-    products_root = target.parent
     products_root.mkdir(parents=True, exist_ok=True)
     temporary = pathlib.Path(tempfile.mkdtemp(prefix=f".{product_id}.", dir=products_root))
     try:

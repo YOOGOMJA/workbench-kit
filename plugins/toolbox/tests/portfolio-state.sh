@@ -22,7 +22,7 @@ cat >"$fake_workbench" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [ "$*" = "contract show --format json" ] || exit 92
-printf '{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1"]}\n' "$PWD"
+printf '{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"workbench/v2","source":"marker"},"profile":{"contract_version":"workbench-profile/v1","language":"en","source":"workspace"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"profile_contracts":["workbench-profile/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1","profile.language/v1"]}\n' "$PWD"
 EOF
 chmod +x "$fake_workbench"
 
@@ -161,6 +161,14 @@ make_workspace "$wb_malformed"
 init_product "$wb_malformed" malformed
 printf '{broken\n' >"$wb_malformed/products/malformed/product.json"
 expect_failure "malformed JSON" toolbox "$wb_malformed" product check malformed
+
+# State read failures are normalized instead of leaking Python tracebacks.
+wb_invalid_utf8="$tmp/invalid-utf8"
+make_workspace "$wb_invalid_utf8"
+init_product "$wb_invalid_utf8" invalid-utf8
+printf '\377' >"$wb_invalid_utf8/products/invalid-utf8/product.json"
+expect_failure "state document is not valid UTF-8" \
+  toolbox "$wb_invalid_utf8" product check invalid-utf8
 
 # Semantically malformed state is checked against the shipped v1 schema.
 wb_semantic="$tmp/semantic"

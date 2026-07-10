@@ -48,7 +48,7 @@ expect_failure() {
   grep -Fq "$expected" <<<"$out" || fail "missing diagnostic '$expected': $out"
 }
 
-supported='{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"WORKSPACE_ROOT","schema":"workbench/v2","source":"marker"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1"]}'
+supported='{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"WORKSPACE_ROOT","schema":"workbench/v2","source":"marker"},"profile":{"contract_version":"workbench-profile/v1","language":"ko","source":"workspace"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"profile_contracts":["workbench-profile/v1"],"capability_pack_contracts":["workbench-capability-pack/v1"]},"capabilities":["workspace.schema/v1","profile.language/v1"]}'
 future='{"contract_version":"workbench-contract/v9","workspace":{"root":"WORKSPACE_ROOT","schema":"workbench/v2","source":"marker"}}'
 
 wb="$tmp/workbench"
@@ -74,6 +74,19 @@ TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
   || fail "valid retry after rejected product init failed"
 [ -d "$wb_invalid/products/retryable/scenarios" ] \
   || fail "valid retry did not create the product bundle"
+
+wb_symlink="$tmp/symlink-product"
+outside_products="$tmp/outside-products"
+make_workspace "$wb_symlink"
+mkdir -p "$outside_products"
+ln -s "$outside_products" "$wb_symlink/products"
+expect_failure "product state root must not be a symbolic link" \
+  env TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_symlink" product init \
+    --id escaped --name "Escaped" --language en \
+    --objective "must not cross the caller workspace boundary"
+[ -z "$(find "$outside_products" -mindepth 1 -print -quit)" ] \
+  || fail "symlinked product init wrote outside the caller workspace"
 
 [ ! -e "$wb/products" ] || fail "fixture unexpectedly has product state"
 before_digest="$(plugin_digest)"

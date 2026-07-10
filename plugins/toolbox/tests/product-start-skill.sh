@@ -30,7 +30,8 @@ assert frontmatter[0] == "name: product-start"
 assert frontmatter[1].startswith("description: Use when ")
 
 required = [
-    "persona.language",
+    "profile.language/v1",
+    ".profile.language",
     "toolbox workbench check",
     "toolbox product init",
     "toolbox product check",
@@ -42,6 +43,8 @@ required = [
 for phrase in required:
     assert phrase in text, f"skill is missing required contract phrase: {phrase}"
 
+assert "persona.language" not in text
+assert "established working language" not in text
 assert "[TODO" not in text
 assert len(text.split()) < 500
 

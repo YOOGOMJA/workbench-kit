@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -28,7 +29,9 @@ from toolbox_state import (
 WORKBENCH_CONTRACT = "workbench-contract/v1"
 WORKSPACE_SCHEMA = "workbench/v2"
 CAPABILITY_PACK_CONTRACT = "workbench-capability-pack/v1"
-REQUIRED_CAPABILITIES = ("workspace.schema/v1",)
+PROFILE_CONTRACT = "workbench-profile/v1"
+PROFILE_LANGUAGE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+REQUIRED_CAPABILITIES = ("workspace.schema/v1", "profile.language/v1")
 
 
 class ToolboxError(Exception):
@@ -153,9 +156,33 @@ def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
         if capability not in available_capabilities:
             raise ToolboxError(f"workbench is missing required capability '{capability}'")
 
+    profile_contracts = require_string_list(
+        supported.get("profile_contracts"), "supported.profile_contracts"
+    )
+    if PROFILE_CONTRACT not in profile_contracts:
+        raise ToolboxError(f"workbench does not support '{PROFILE_CONTRACT}'")
+
+    profile = require_mapping(document.get("profile"), "profile")
+    profile_contract = profile.get("contract_version")
+    if profile_contract != PROFILE_CONTRACT:
+        rendered = profile_contract if isinstance(profile_contract, str) else "missing"
+        raise ToolboxError(f"unsupported workbench profile contract '{rendered}'")
+    profile_language = profile.get("language")
+    if not isinstance(profile_language, str) or PROFILE_LANGUAGE.fullmatch(profile_language) is None:
+        raise ToolboxError("workbench profile language must be a valid language tag")
+    profile_source = profile.get("source")
+    if profile_source != "workspace":
+        rendered = profile_source if isinstance(profile_source, str) else "missing"
+        raise ToolboxError(f"unsupported workbench profile source '{rendered}'")
+
     return {
         "compatible": True,
         "contract_version": contract_version,
+        "profile": {
+            "contract_version": profile_contract,
+            "language": profile_language,
+            "source": profile_source,
+        },
         "workspace_root": str(workspace),
         "workspace_schema": workspace_schema,
     }
@@ -176,9 +203,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Caller workbench root (default: current Git worktree root)",
     )
-    commands = parser.add_subparsers(dest="command", metavar="{product,scenario,portfolio,workbench}")
+    commands = parser.add_subparsers(
+        dest="command",
+        metavar="{product,scenario,portfolio,workbench}",
+        required=True,
+    )
     product = commands.add_parser("product", help="Initialize, inspect, or validate a product")
-    product_commands = product.add_subparsers(dest="product_command")
+    product_commands = product.add_subparsers(dest="product_command", required=True)
     product_init = product_commands.add_parser("init", help="Create versioned product state")
     product_init.add_argument("--id", required=True, dest="product_id")
     product_init.add_argument("--name", required=True)
@@ -191,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     scenario = commands.add_parser(
         "scenario", help="Inspect, validate, or list scenario candidates"
     )
-    scenario_commands = scenario.add_subparsers(dest="scenario_command")
+    scenario_commands = scenario.add_subparsers(dest="scenario_command", required=True)
     scenario_inspect = scenario_commands.add_parser("inspect", help="Read one scenario")
     scenario_inspect.add_argument("scenario_id")
     scenario_check = scenario_commands.add_parser("check", help="Validate one scenario")
@@ -204,14 +235,14 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio = commands.add_parser(
         "portfolio", help="Inspect or validate the joined portfolio"
     )
-    portfolio_commands = portfolio.add_subparsers(dest="portfolio_command")
+    portfolio_commands = portfolio.add_subparsers(dest="portfolio_command", required=True)
     portfolio_commands.add_parser("inspect", help="Read the joined portfolio")
     portfolio_commands.add_parser("check", help="Validate the joined portfolio")
     portfolio_commands.add_parser("candidates", help="List portfolio-wide candidates")
     workbench = commands.add_parser(
         "workbench", help="Check the public workbench compatibility contract"
     )
-    workbench_commands = workbench.add_subparsers(dest="workbench_command")
+    workbench_commands = workbench.add_subparsers(dest="workbench_command", required=True)
     workbench_commands.add_parser("check", help="Validate the caller workbench contract")
     return parser
 
@@ -219,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = list(sys.argv[1:] if argv is None else argv)
-    if not args or args == ["help"]:
+    if args == ["help"]:
         parser.print_help()
         return 0
     parsed = parser.parse_args(args)

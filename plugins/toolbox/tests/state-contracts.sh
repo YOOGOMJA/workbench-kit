@@ -34,7 +34,7 @@ for kind, discriminator in contracts.items():
     assert schema["x-workbench"] == {
         "capability_pack_contract": "workbench-capability-pack/v1",
         "workspace_schemas": ["workbench/v2"],
-        "capabilities": ["workspace.schema/v1"],
+        "capabilities": ["workspace.schema/v1", "profile.language/v1"],
     }
 
 assert not (root / "products").exists(), "plugin bundle must not contain caller product state"
