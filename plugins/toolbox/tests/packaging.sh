@@ -35,6 +35,7 @@ PY
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/toolbox-packaging.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 git -C "$tmp" init -q
+rm -rf "$ROOT/lib/__pycache__"
 
 out="$(cd "$tmp" && CLAUDE_PLUGIN_ROOT="$ROOT" "$ROOT/bin/toolbox" help)" \
   || fail "dispatcher help failed"
@@ -43,5 +44,6 @@ grep -q '^usage: toolbox ' <<<"$out" || fail "dispatcher did not print toolbox u
 grep -q 'product' <<<"$out" || fail "dispatcher help omitted product commands"
 grep -q 'scenario' <<<"$out" || fail "dispatcher help omitted scenario commands"
 grep -q 'portfolio' <<<"$out" || fail "dispatcher help omitted portfolio commands"
+[ ! -e "$ROOT/lib/__pycache__" ] || fail "dispatcher wrote Python bytecode into the plugin bundle"
 
 echo "PASS: toolbox packaging and dispatcher"
