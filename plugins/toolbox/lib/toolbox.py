@@ -15,8 +15,12 @@ from typing import Any
 
 from toolbox_state import (
     StateError,
+    candidate_scenarios,
+    check_portfolio,
     check_product,
+    find_scenario,
     initialize_product,
+    load_portfolio,
     load_product,
 )
 
@@ -163,8 +167,26 @@ def build_parser() -> argparse.ArgumentParser:
     product_inspect.add_argument("product_id")
     product_check = product_commands.add_parser("check", help="Validate one product bundle")
     product_check.add_argument("product_id")
-    commands.add_parser("scenario", help="Inspect, validate, or list scenario candidates")
-    commands.add_parser("portfolio", help="Inspect or validate the joined portfolio")
+    scenario = commands.add_parser(
+        "scenario", help="Inspect, validate, or list scenario candidates"
+    )
+    scenario_commands = scenario.add_subparsers(dest="scenario_command")
+    scenario_inspect = scenario_commands.add_parser("inspect", help="Read one scenario")
+    scenario_inspect.add_argument("scenario_id")
+    scenario_check = scenario_commands.add_parser("check", help="Validate one scenario")
+    scenario_check.add_argument("scenario_id")
+    scenario_candidates = scenario_commands.add_parser(
+        "candidates", help="List dependency-ready scenarios"
+    )
+    scenario_candidates.add_argument("--product", dest="product_filter")
+
+    portfolio = commands.add_parser(
+        "portfolio", help="Inspect or validate the joined portfolio"
+    )
+    portfolio_commands = portfolio.add_subparsers(dest="portfolio_command")
+    portfolio_commands.add_parser("inspect", help="Read the joined portfolio")
+    portfolio_commands.add_parser("check", help="Validate the joined portfolio")
+    portfolio_commands.add_parser("candidates", help="List portfolio-wide candidates")
     workbench = commands.add_parser(
         "workbench", help="Check the public workbench compatibility contract"
     )
@@ -210,6 +232,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             if parsed.product_command == "check":
                 check_product(workspace, parsed.product_id)
                 write_json({"product_id": parsed.product_id, "valid": True})
+                return 0
+        if parsed.command == "scenario":
+            inspect_workbench_contract(workspace)
+            if parsed.scenario_command == "inspect":
+                product_id, scenario_document = find_scenario(workspace, parsed.scenario_id)
+                write_json(
+                    {
+                        "product_id": product_id,
+                        "scenario": scenario_document,
+                        "scenario_ref": f"toolbox:scenario/{parsed.scenario_id}",
+                    }
+                )
+                return 0
+            if parsed.scenario_command == "check":
+                find_scenario(workspace, parsed.scenario_id)
+                write_json({"scenario_id": parsed.scenario_id, "valid": True})
+                return 0
+            if parsed.scenario_command == "candidates":
+                write_json(
+                    {"candidates": candidate_scenarios(workspace, parsed.product_filter)}
+                )
+                return 0
+        if parsed.command == "portfolio":
+            inspect_workbench_contract(workspace)
+            if parsed.portfolio_command == "inspect":
+                write_json(load_portfolio(workspace))
+                return 0
+            if parsed.portfolio_command == "check":
+                portfolio_document, index = check_portfolio(workspace)
+                write_json(
+                    {
+                        "products": len(portfolio_document["products"]),
+                        "scenarios": len(index),
+                        "valid": True,
+                    }
+                )
+                return 0
+            if parsed.portfolio_command == "candidates":
+                write_json({"candidates": candidate_scenarios(workspace)})
                 return 0
         parser.error("a command action is required")
     except (StateError, ToolboxError) as error:
