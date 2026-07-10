@@ -156,6 +156,40 @@ grep -Fq "unable to initialize product state" <<<"$write_failure_out" \
 ! grep -Fq "Traceback (most recent call last)" <<<"$write_failure_out" \
   || fail "write failure leaked a Python traceback: $write_failure_out"
 
+wb_scan_failure="$tmp/scan-failure"
+make_workspace "$wb_scan_failure"
+TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_scan_failure" product init \
+    --id unreadable --name "Unreadable" --language ko \
+    --objective "surface scenario scan failures" >/dev/null
+cat >"$wb_scan_failure/products/unreadable/scenarios/SCN-UNREADABLE.json" <<'EOF'
+{
+  "schema": "toolbox-scenario/v1",
+  "id": "SCN-UNREADABLE",
+  "productId": "unreadable",
+  "title": "Unreadable scenario directory",
+  "status": "ready",
+  "priority": 1,
+  "dependsOn": [],
+  "acceptanceCriteria": [],
+  "designRefs": [],
+  "verificationRefs": []
+}
+EOF
+chmod 000 "$wb_scan_failure/products/unreadable/scenarios"
+set +e
+scan_failure_out="$(TOOLBOX_WORKBENCH_BIN="$tmp/workbench-supported" \
+  "$TOOLBOX" --workspace "$wb_scan_failure" product check unreadable 2>&1)"
+scan_failure_status=$?
+set -e
+chmod 700 "$wb_scan_failure/products/unreadable/scenarios"
+[ "$scan_failure_status" -eq 1 ] \
+  || fail "expected scenario scan exit 1, got $scan_failure_status: $scan_failure_out"
+grep -Fq "unable to traverse scenario state directory" <<<"$scan_failure_out" \
+  || fail "missing normalized scenario scan diagnostic: $scan_failure_out"
+! grep -Fq "Traceback (most recent call last)" <<<"$scan_failure_out" \
+  || fail "scenario scan failure leaked a Python traceback: $scan_failure_out"
+
 wb_invalid="$tmp/invalid-product"
 make_workspace "$wb_invalid"
 overlong_name="$(printf '%121s' '' | tr ' ' x)"

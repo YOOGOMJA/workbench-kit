@@ -217,7 +217,15 @@ def scenario_paths(workspace: pathlib.Path, product_id: str) -> list[pathlib.Pat
         "scenario state directory",
     )
     try:
-        paths = sorted(scenarios_root.glob("*.json"))
+        with os.scandir(scenarios_root) as entries:
+            paths = sorted(
+                (
+                    scenarios_root / entry.name
+                    for entry in entries
+                    if entry.name.endswith(".json")
+                ),
+                key=lambda path: path.name,
+            )
     except OSError as error:
         diagnostic = error.strerror or type(error).__name__
         raise StateError(
