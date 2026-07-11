@@ -900,6 +900,19 @@ journal = {
 }
 assert validate_journal(journal) == journal
 assert validate_journal(journal, changed) == journal
+fractional_journal = copy.deepcopy(journal)
+fractional_journal["created_at"] = "2024-02-29T00:00:00.123Z"
+fractional_journal["updated_at"] = "2024-02-29T00:00:00.456Z"
+assert validate_journal(fractional_journal, changed) == fractional_journal
+for field, invalid_timestamp in (
+    ("created_at", "2026-02-29T00:00:00Z"),
+    ("created_at", "2026-02-31T00:00:00Z"),
+    ("updated_at", "2026-07-11T24:00:00Z"),
+    ("updated_at", "2026-07-11T00:00:00.Z"),
+):
+    bad = copy.deepcopy(journal)
+    bad[field] = invalid_timestamp
+    rejected(lambda bad=bad: validate_journal(bad, changed))
 bad = copy.deepcopy(journal)
 bad["cursor"] = 1
 rejected(lambda: validate_journal(bad))

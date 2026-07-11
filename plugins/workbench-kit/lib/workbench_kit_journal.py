@@ -21,6 +21,7 @@ from workbench_kit_contracts import (
     canonical_digest,
     decode_artifact,
     node_digest,
+    rfc3339_utc_valid,
     strict_load,
     validate_journal,
     validate_plan,
@@ -962,72 +963,7 @@ def _direct_journal_successor(
 
 
 def _timestamp_prefix_valid(raw: bytes) -> bool:
-    template = b"0000-00-00T00:00:00"
-    fixed = raw[: len(template)]
-    if not all(
-        (48 <= observed <= 57) if expected == 48 else observed == expected
-        for observed, expected in zip(fixed, template)
-    ):
-        return False
-
-    def feasible_component(
-        start: int, stop: int, minimum: int, maximum: int
-    ) -> bool:
-        observed = fixed[start : min(len(fixed), stop)]
-        if not observed:
-            return True
-        width = stop - start
-        return any(
-            f"{value:0{width}d}".encode("ascii").startswith(observed)
-            for value in range(minimum, maximum + 1)
-        )
-
-    def feasible_day() -> bool:
-        observed = fixed[8 : min(len(fixed), 10)]
-        if not observed:
-            return True
-        if len(fixed) < 7:
-            maximum = 31
-        else:
-            year = int(fixed[:4])
-            month = int(fixed[5:7])
-            leap_year = year % 4 == 0 and (
-                year % 100 != 0 or year % 400 == 0
-            )
-            if month == 2:
-                maximum = 29 if leap_year else 28
-            elif month in (4, 6, 9, 11):
-                maximum = 30
-            else:
-                maximum = 31
-        return any(
-            f"{value:02d}".encode("ascii").startswith(observed)
-            for value in range(1, maximum + 1)
-        )
-
-    if not all((
-        feasible_component(5, 7, 1, 12),
-        feasible_day(),
-        feasible_component(11, 13, 0, 23),
-        feasible_component(14, 16, 0, 59),
-        feasible_component(17, 19, 0, 59),
-    )):
-        return False
-    if len(raw) <= len(template):
-        return True
-    suffix = raw[len(template) :]
-    if suffix == b"Z":
-        return True
-    if not suffix.startswith(b"."):
-        return False
-    fractional = suffix[1:]
-    if not fractional:
-        return True
-    if fractional.endswith(b"Z"):
-        fractional = fractional[:-1]
-        if not fractional:
-            return False
-    return all(48 <= character <= 57 for character in fractional)
+    return rfc3339_utc_valid(raw, prefix=True)
 
 
 def _replacement_prefix_matches(

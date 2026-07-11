@@ -33,6 +33,90 @@ UPGRADE_ID = re.compile(r"^upgrade-[0-9a-f]{64}$")
 WORKSPACE_ID = re.compile(r"^ws-[0-9a-f]{64}$")
 EFFECT_ID = re.compile(r"^effect-[0-9]{4}$")
 
+
+def rfc3339_utc_valid(value: Any, *, prefix: bool = False) -> bool:
+    """Validate a UTC timestamp or a byte prefix with a valid completion."""
+    if prefix:
+        if not isinstance(value, bytes):
+            return False
+        try:
+            raw = value.decode("ascii", errors="strict")
+        except UnicodeDecodeError:
+            return False
+    else:
+        if not isinstance(value, str) or RFC3339_UTC.fullmatch(value) is None:
+            return False
+        raw = value
+
+    template = "0000-00-00T00:00:00"
+    fixed = raw[: len(template)]
+    if any(
+        (not observed.isdigit()) if expected == "0" else observed != expected
+        for observed, expected in zip(fixed, template)
+    ):
+        return False
+
+    def feasible_component(
+        start: int, stop: int, minimum: int, maximum: int
+    ) -> bool:
+        observed = fixed[start : min(len(fixed), stop)]
+        if not observed:
+            return True
+        width = stop - start
+        return any(
+            f"{candidate:0{width}d}".startswith(observed)
+            for candidate in range(minimum, maximum + 1)
+        )
+
+    if len(fixed) >= 4 and int(fixed[:4]) == 0:
+        return False
+    if not feasible_component(5, 7, 1, 12):
+        return False
+
+    observed_day = fixed[8 : min(len(fixed), 10)]
+    if observed_day:
+        year = int(fixed[:4])
+        month = int(fixed[5:7])
+        leap_year = year % 4 == 0 and (
+            year % 100 != 0 or year % 400 == 0
+        )
+        if month == 2:
+            maximum_day = 29 if leap_year else 28
+        elif month in (4, 6, 9, 11):
+            maximum_day = 30
+        else:
+            maximum_day = 31
+        if not any(
+            f"{candidate:02d}".startswith(observed_day)
+            for candidate in range(1, maximum_day + 1)
+        ):
+            return False
+
+    if not all((
+        feasible_component(11, 13, 0, 23),
+        feasible_component(14, 16, 0, 59),
+        feasible_component(17, 19, 0, 59),
+    )):
+        return False
+    if len(raw) <= len(template):
+        return prefix
+
+    suffix = raw[len(template) :]
+    if suffix == "Z":
+        return True
+    if not suffix.startswith("."):
+        return False
+    fractional = suffix[1:]
+    if not fractional:
+        return prefix
+    if fractional.endswith("Z"):
+        fractional = fractional[:-1]
+        if not fractional:
+            return False
+    elif not prefix:
+        return False
+    return all(character.isdigit() for character in fractional)
+
 AUTHORITY_FIELDS = (
     "contract_version", "approval_id", "proposed_descriptor", "default_revision",
     "protection", "actor", "approved_at", "source_ref",
@@ -1989,7 +2073,7 @@ def validate_journal(
             if normalized_result["applied"] != expected_operations:
                 fail("journal.completion_result.applied")
     for field in ("created_at", "updated_at"):
-        if not isinstance(journal[field], str) or RFC3339_UTC.fullmatch(journal[field]) is None:
+        if not rfc3339_utc_valid(journal[field]):
             fail(f"journal.{field}")
 
     return {

@@ -1626,6 +1626,96 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         foreign_replace_root / ".workbench/schema"
     ).read_bytes() == foreign_replace_before
 
+    full_temp_cases = (
+        ("impossible-date", "2026-02-31T00:20:35Z", None),
+        ("invalid-fraction", "2026-07-11T00:20:35.Z", None),
+        (
+            "foreign-created-at",
+            "2026-07-11T00:20:35Z",
+            "2026-07-10T23:59:59Z",
+        ),
+    )
+    for case_name, candidate_time, candidate_created_at in full_temp_cases:
+        case_root = pathlib.Path(temporary) / f"full-temp-{case_name}"
+        case_root.mkdir()
+        case_root = case_root.resolve()
+        case_plan, case_before, _ = fixture_plan(case_root)
+        case_source = canonical_digest(
+            canonical_bytes(case_plan), raw=True
+        )
+        case_journal = build_prepared_journal(
+            case_plan, case_source, CREATED_AT
+        )
+        case_location = resolve_journal_location(
+            case_root,
+            case_plan["plan_digest"],
+            journal_dir=journal_root,
+            environment={},
+        )
+        install_prepared_journal(case_journal, case_location)
+        case_successor = copy.deepcopy(case_journal)
+        case_successor["stage"] = "applying"
+        case_successor["updated_at"] = candidate_time
+        if candidate_created_at is not None:
+            case_successor["created_at"] = candidate_created_at
+        case_payload = canonical_bytes(case_successor)
+        case_location["replace_temp"].write_bytes(case_payload)
+        case_location["replace_temp"].chmod(0o600)
+        rejected(
+            lambda: execute_upgrade(
+                case_plan,
+                case_location,
+                plan_source_digest=case_source,
+                updated_at="2026-07-11T00:20:40Z",
+                validate_after=passed_validation,
+            ),
+            "journal-unsafe",
+        )
+        assert case_location["replace_temp"].read_bytes() == case_payload
+        assert (
+            case_root / ".workbench/schema"
+        ).read_bytes() == case_before
+
+    fractional_root = pathlib.Path(temporary) / "full-temp-fractional"
+    fractional_root.mkdir()
+    fractional_root = fractional_root.resolve()
+    fractional_plan, _, fractional_after = fixture_plan(fractional_root)
+    fractional_source = canonical_digest(
+        canonical_bytes(fractional_plan), raw=True
+    )
+    fractional_journal = build_prepared_journal(
+        fractional_plan, fractional_source, CREATED_AT
+    )
+    fractional_location = resolve_journal_location(
+        fractional_root,
+        fractional_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(fractional_journal, fractional_location)
+    fractional_successor = copy.deepcopy(fractional_journal)
+    fractional_successor["stage"] = "applying"
+    fractional_successor["updated_at"] = "2026-07-11T00:20:35.123Z"
+    fractional_successor = validate_journal(
+        fractional_successor, fractional_plan
+    )
+    fractional_location["replace_temp"].write_bytes(
+        canonical_bytes(fractional_successor)
+    )
+    fractional_location["replace_temp"].chmod(0o600)
+    fractional_result = execute_upgrade(
+        fractional_plan,
+        fractional_location,
+        plan_source_digest=fractional_source,
+        updated_at="2026-07-11T00:20:40Z",
+        validate_after=passed_validation,
+    )
+    assert fractional_result["transaction"]["stage"] == "completed"
+    assert not fractional_location["replace_temp"].exists()
+    assert (
+        fractional_root / ".workbench/schema"
+    ).read_bytes() == fractional_after
+
     exchange_root = pathlib.Path(temporary) / "exchange-crash-workbench"
     exchange_root.mkdir()
     exchange_root = exchange_root.resolve()
