@@ -1,0 +1,58 @@
+---
+name: upgrade-workbench
+description: >-
+  Use when an existing generated, embedded-engine, staged, or current workbench must be diagnosed, upgraded, migrated, or have its embedded engine removed.
+---
+
+# Upgrade Workbench
+
+Run a governed migration with the bundled `workbench-kit` CLI. Keep diagnosis,
+human authorization, apply, and PR merge as separate decisions.
+
+Read [the CLI reference](references/cli.md) when selecting route-specific flags,
+interpreting exit status, or preparing external evidence and journal paths.
+
+## Preconditions
+
+- Work only in a dedicated migration task workspace containing `task/index.md`.
+- Resolve the workspace and every input/output path to absolute paths.
+- Keep plans, approvals, results, and optional journals outside the workspace.
+- Use `workbench-kit` from `PATH`; in Claude Code, fall back to
+  `${CLAUDE_PLUGIN_ROOT}/bin/workbench-kit`.
+- Never create, edit, repair, or infer authority, reviewed-overlay, equivalence,
+  or removal approval receipts. A human or trusted adapter must supply them.
+- Do not install or enable `toolbox`; product adoption is a separate task.
+
+## Procedure
+
+1. **Diagnose with a read-only dry-run.** Create an external `0600` plan file,
+   then run the route-specific dry-run from the CLI reference. If classification is
+   blocked, malformed, unrecognized, or indeterminate, report its exact blocker and
+   stop. Do not repair workspace evidence by hand.
+
+2. **Review before writing.** Summarize `classification_before`, target,
+   `actionable`, blockers, embedded-engine before/after, operations, preserved paths,
+   active v1 tasks, and bound input digests. Show the plan path and ask the human for
+   explicit apply approval. Never rewrite the frozen plan.
+
+3. **Apply only after approval.** Create an external `0600` result file and apply
+   the exact plan with the same route inputs. Reuse an explicit journal directory on
+   retries. Do not add `--remove-embedded-engine` during apply; the plan already binds
+   that request. If bundled equivalence is unavailable, stop on
+   `plugin-equivalence-unavailable`.
+
+4. **Verify and submit.** Require a `completed` transaction, the expected target
+   classification, unchanged preserved paths, and unchanged active v1 task facts.
+   Commit through the workspace task lifecycle, then use `task-submit` to open the
+   migration PR. Retain external inputs, plan, result, and journal until resolution.
+
+5. **Keep merge and cleanup human-owned.** Ask before merge. After the protected
+   default branch is updated, diagnose again. Only valid v2 governance plus doctor
+   readiness is `already-current`; ask again before task cleanup.
+
+## Failure Rules
+
+- A stale plan, source, or input requires a new dry-run and human review.
+- A `rolled-back` result is terminal evidence: report blockers and retain it.
+- Preserve unsafe, corrupt, aliased, or foreign journal/temp state. Never delete or
+  rewrite transaction evidence manually.
