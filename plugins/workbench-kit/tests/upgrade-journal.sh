@@ -446,6 +446,19 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     plan_source_digest = canonical_digest(raw_plan, raw=True)
     first = build_prepared_journal(plan, plan_source_digest, CREATED_AT)
     second = build_prepared_journal(plan, plan_source_digest, CREATED_AT)
+    assert journal_module.MAX_JOURNAL_BYTES == 64 * 1024 * 1024
+    journal_module._require_journal_size(
+        journal_module.MAX_JOURNAL_BYTES - 1, "below-limit"
+    )
+    journal_module._require_journal_size(
+        journal_module.MAX_JOURNAL_BYTES, "at-limit"
+    )
+    rejected(
+        lambda: journal_module._require_journal_size(
+            journal_module.MAX_JOURNAL_BYTES + 1, "above-limit"
+        ),
+        "journal-too-large",
+    )
     assert canonical_bytes(first) == canonical_bytes(second)
     assert validate_journal(first, plan) == first
     assert first["journal_id"] == "upgrade-" + plan["plan_digest"][7:]
@@ -485,6 +498,23 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         / first["workspace_id"]
         / "owner.json"
     )
+    original_journal_limit = journal_module.MAX_JOURNAL_BYTES
+    journal_module.MAX_JOURNAL_BYTES = len(canonical_bytes(first)) - 1
+    try:
+        rejected(
+            lambda: build_prepared_journal(
+                plan, plan_source_digest, CREATED_AT
+            ),
+            "journal-too-large",
+        )
+        rejected(
+            lambda: install_prepared_journal(first, location),
+            "journal-too-large",
+        )
+    finally:
+        journal_module.MAX_JOURNAL_BYTES = original_journal_limit
+    assert not location["owner"].exists()
+    assert not location["journal"].exists()
     installed = install_prepared_journal(first, location)
     assert installed == location["journal"]
     installed_stat = os.lstat(installed)
@@ -571,6 +601,21 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     completed = load_journal(location, plan)
     assert completed["stage"] == "completed"
     assert completed["cursor"] == 1
+    completed_foreign_temp = root / first["effects"][0]["temp_path"]
+    completed_foreign_temp.write_bytes(before)
+    completed_foreign_temp.chmod(0o644)
+    rejected(
+        lambda: execute_upgrade(
+            plan,
+            location,
+            plan_source_digest=plan_source_digest,
+            updated_at="2026-07-11T00:01:30Z",
+            validate_after=passed_validation,
+        ),
+        "transaction-state-mismatch",
+    )
+    assert completed_foreign_temp.read_bytes() == before
+    completed_foreign_temp.unlink()
     replay = execute_upgrade(
         plan,
         location,
@@ -714,6 +759,40 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert (rollback_root / ".workbench/schema").read_bytes() == rollback_before
     terminal_rollback = load_journal(rollback_location, rollback_plan)
     assert terminal_rollback["stage"] == "rolled-back"
+    rollback_foreign_temp = (
+        rollback_root / rollback_journal["effects"][0]["temp_path"]
+    )
+    rollback_after = base64.b64decode(
+        rollback_journal["effects"][0]["after"]["content_base64"],
+        validate=True,
+    )
+    rollback_foreign_temp.write_bytes(rollback_after)
+    rollback_foreign_temp.chmod(0o644)
+    rejected(
+        lambda: execute_upgrade(
+            rollback_plan,
+            rollback_location,
+            plan_source_digest=canonical_digest(
+                canonical_bytes(rollback_plan), raw=True
+            ),
+            updated_at="2026-07-11T00:06:30Z",
+            validate_after=passed_validation,
+        ),
+        "transaction-state-mismatch",
+    )
+    assert rollback_foreign_temp.read_bytes() == rollback_after
+    rollback_foreign_temp.unlink()
+    rollback_replay = execute_upgrade(
+        rollback_plan,
+        rollback_location,
+        plan_source_digest=canonical_digest(
+            canonical_bytes(rollback_plan), raw=True
+        ),
+        updated_at="2026-07-11T00:06:45Z",
+        validate_after=passed_validation,
+    )
+    assert rollback_replay["transaction"]["stage"] == "rolled-back"
+    assert rollback_replay["transaction"]["resumed"] is True
 
     stale_root = pathlib.Path(temporary) / "stale-preserved-workbench"
     stale_root.mkdir()
@@ -1446,6 +1525,63 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert not exchange_location["replace_temp"].exists()
     assert (exchange_root / ".workbench/schema").read_bytes() == exchange_after
 
+    partial_time = "2026-07-11T00:20:55Z"
+    partial_specs = ("empty", "short", "mid-utf8", "last-byte", "full")
+    for partial_spec in partial_specs:
+        partial_root = (
+            pathlib.Path(temporary)
+            / f"replace-partial-{partial_spec}-교체-workbench"
+        )
+        partial_root.mkdir()
+        partial_root = partial_root.resolve()
+        partial_plan, _, partial_after = fixture_plan(partial_root)
+        partial_source = canonical_digest(
+            canonical_bytes(partial_plan), raw=True
+        )
+        partial_journal = build_prepared_journal(
+            partial_plan, partial_source, CREATED_AT
+        )
+        partial_location = resolve_journal_location(
+            partial_root,
+            partial_plan["plan_digest"],
+            journal_dir=journal_root,
+            environment={},
+        )
+        install_prepared_journal(partial_journal, partial_location)
+        partial_successor = copy.deepcopy(partial_journal)
+        partial_successor["stage"] = "applying"
+        partial_successor["updated_at"] = partial_time
+        partial_successor = validate_journal(
+            partial_successor, partial_plan
+        )
+        successor_bytes = canonical_bytes(partial_successor)
+        if partial_spec == "empty":
+            prefix_length = 0
+        elif partial_spec == "short":
+            prefix_length = 31
+        elif partial_spec == "mid-utf8":
+            utf8_start = successor_bytes.index("교체".encode("utf-8"))
+            prefix_length = utf8_start + 1
+        elif partial_spec == "last-byte":
+            prefix_length = len(successor_bytes) - 1
+        else:
+            prefix_length = len(successor_bytes)
+        replace_prefix = successor_bytes[:prefix_length]
+        partial_location["replace_temp"].write_bytes(replace_prefix)
+        partial_location["replace_temp"].chmod(0o600)
+        partial_result = execute_upgrade(
+            partial_plan,
+            partial_location,
+            plan_source_digest=partial_source,
+            updated_at=partial_time,
+            validate_after=passed_validation,
+        )
+        assert partial_result["transaction"]["stage"] == "completed"
+        assert not partial_location["replace_temp"].exists()
+        assert (
+            partial_root / ".workbench/schema"
+        ).read_bytes() == partial_after
+
     umask_root = pathlib.Path(temporary) / "umask-workbench"
     umask_root.mkdir()
     umask_root = umask_root.resolve()
@@ -1539,6 +1675,58 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert (
         umask_crash_root / ".workbench/schema"
     ).read_bytes() == umask_crash_after
+
+    umask_027_root = pathlib.Path(temporary) / "umask-027-crash-workbench"
+    umask_027_root.mkdir()
+    umask_027_root = umask_027_root.resolve()
+    umask_027_plan, umask_027_after = fixture_create_plan(umask_027_root)
+    umask_027_source = canonical_digest(
+        canonical_bytes(umask_027_plan), raw=True
+    )
+    umask_027_journal = build_prepared_journal(
+        umask_027_plan, umask_027_source, CREATED_AT
+    )
+    umask_027_location = resolve_journal_location(
+        umask_027_root,
+        umask_027_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(umask_027_journal, umask_027_location)
+    previous_umask = os.umask(0o027)
+    try:
+        try:
+            execute_upgrade(
+                umask_027_plan,
+                umask_027_location,
+                plan_source_digest=umask_027_source,
+                updated_at="2026-07-11T00:21:45Z",
+                validate_after=passed_validation,
+                fault_hook=crash_after_directory_create,
+            )
+        except Crash:
+            pass
+        else:
+            raise AssertionError("umask 027 crash was not injected")
+    finally:
+        os.umask(previous_umask)
+    assert stat.S_IMODE(
+        os.lstat(umask_027_root / ".workbench").st_mode
+    ) == 0o700
+    umask_027_replay = execute_upgrade(
+        umask_027_plan,
+        umask_027_location,
+        plan_source_digest=umask_027_source,
+        updated_at="2026-07-11T00:22:00Z",
+        validate_after=passed_validation,
+    )
+    assert umask_027_replay["transaction"]["stage"] == "completed"
+    assert stat.S_IMODE(
+        os.lstat(umask_027_root / ".workbench").st_mode
+    ) == 0o755
+    assert (
+        umask_027_root / ".workbench/schema"
+    ).read_bytes() == umask_027_after
 
     noop_root = pathlib.Path(temporary) / "noop-workbench"
     noop_root.mkdir()

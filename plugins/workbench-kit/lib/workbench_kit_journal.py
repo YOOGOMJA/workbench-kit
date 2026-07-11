@@ -37,6 +37,14 @@ class JournalError(RuntimeError):
         self.ref = ref
 
 
+MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+
+
+def _require_journal_size(size: int, ref: str) -> None:
+    if size > MAX_JOURNAL_BYTES:
+        raise JournalError("journal-too-large", ref)
+
+
 def _lstat_directory(path: pathlib.Path, code: str) -> os.stat_result:
     try:
         node = os.lstat(path)
@@ -367,7 +375,9 @@ def resolve_journal_location(
                 "transaction-in-progress", owner["journal_path"]
             )
         owner_location = _location_from_owner(location, owner)
-        owner_journal = load_journal(owner_location)
+        owner_journal = load_journal(
+            owner_location, defer_replace_partial=True
+        )
         _require_owner_journal_binding(owner, owner_journal, owner_location)
         return owner_location
 
@@ -411,6 +421,7 @@ def _install_prepared_journal_unlocked(
     if final.name != expected_name:
         raise JournalError("journal-identity-mismatch", str(final))
     payload = canonical_bytes(normalized)
+    _require_journal_size(len(payload), str(final))
     existing = _existing_file(final)
     temp_existing = _existing_file(temporary)
     if existing is not None and temp_existing is not None:
@@ -496,8 +507,9 @@ def _read_regular_file(
     path: pathlib.Path,
     *,
     allowed_links: tuple[int, ...] = (1,),
-    max_bytes: int = 64 * 1024 * 1024,
+    max_bytes: int | None = None,
 ) -> bytes:
+    limit = MAX_JOURNAL_BYTES if max_bytes is None else max_bytes
     node = _existing_file(path)
     if node is None:
         raise JournalError("journal-missing", str(path))
@@ -519,8 +531,10 @@ def _read_regular_file(
             or opened.st_nlink not in allowed_links
             or (opened.st_dev, opened.st_ino) != (node.st_dev, node.st_ino)
             or opened.st_size != node.st_size
-            or opened.st_size > max_bytes
+            or opened.st_size > limit
         ):
+            if opened.st_size > limit:
+                raise JournalError("journal-too-large", str(path))
             raise JournalError("journal-unsafe", str(path))
         chunks = []
         total = 0
@@ -529,8 +543,8 @@ def _read_regular_file(
             if not chunk:
                 break
             total += len(chunk)
-            if total > max_bytes:
-                raise JournalError("journal-unsafe", str(path))
+            if total > limit:
+                raise JournalError("journal-too-large", str(path))
             chunks.append(chunk)
         verified = os.fstat(descriptor)
         snapshot_fields = (
@@ -816,6 +830,9 @@ def install_prepared_journal(
     journal: dict[str, Any], location: dict[str, pathlib.Path]
 ) -> pathlib.Path:
     normalized = validate_journal(journal)
+    _require_journal_size(
+        len(canonical_bytes(normalized)), "prepared-journal"
+    )
     root = pathlib.Path(normalized["workspace"]["root"]).resolve(strict=True)
     with _workspace_lock(root, location) as root_fd:
         _require_effect_temps_absent(
@@ -946,6 +963,9 @@ def _direct_journal_successor(
 def _reconcile_replace_temp(
     location: dict[str, pathlib.Path],
     plan: dict[str, Any] | None = None,
+    *,
+    expected: dict[str, Any] | None = None,
+    defer_partial: bool = False,
 ) -> None:
     temporary = location["replace_temp"]
     if _existing_file(temporary) is None:
@@ -958,11 +978,27 @@ def _reconcile_replace_temp(
         current = _decode_journal_payload(
             current_raw, location["journal"], plan, code="journal-unsafe"
         )
+    except JournalError as error:
+        raise JournalError("journal-unsafe", str(temporary)) from error
+    try:
         candidate = _decode_journal_payload(
             temporary_raw, temporary, plan, code="journal-unsafe"
         )
     except JournalError as error:
-        raise JournalError("journal-unsafe", str(temporary)) from error
+        if expected is None:
+            if defer_partial:
+                return
+            raise JournalError("journal-unsafe", str(temporary)) from error
+        normalized_expected = validate_journal(expected, plan)
+        expected_payload = canonical_bytes(normalized_expected)
+        if (
+            not _direct_journal_successor(current, normalized_expected)
+            or not expected_payload.startswith(temporary_raw)
+        ):
+            raise JournalError("journal-unsafe", str(temporary)) from error
+        os.unlink(temporary)
+        _fsync_directory(directory)
+        return
     if not (
         _direct_journal_successor(current, candidate)
         or _direct_journal_successor(candidate, current)
@@ -973,9 +1009,18 @@ def _reconcile_replace_temp(
 
 
 def load_journal(
-    location: dict[str, pathlib.Path], plan: dict[str, Any] | None = None
+    location: dict[str, pathlib.Path],
+    plan: dict[str, Any] | None = None,
+    *,
+    expected_replacement: dict[str, Any] | None = None,
+    defer_replace_partial: bool = False,
 ) -> dict[str, Any]:
-    _reconcile_replace_temp(location, plan)
+    _reconcile_replace_temp(
+        location,
+        plan,
+        expected=expected_replacement,
+        defer_partial=defer_replace_partial,
+    )
     raw = _read_regular_file(location["journal"])
     journal = _decode_journal_payload(
         raw, location["journal"], plan, code="journal-corrupt"
@@ -993,7 +1038,11 @@ def _replace_journal(
     plan: dict[str, Any],
 ) -> dict[str, Any]:
     normalized = validate_journal(journal, plan)
-    current = load_journal(location, plan)
+    payload = canonical_bytes(normalized)
+    _require_journal_size(len(payload), str(location["journal"]))
+    current = load_journal(
+        location, plan, expected_replacement=normalized
+    )
     if current["journal_id"] != normalized["journal_id"]:
         raise JournalError("journal-identity-mismatch", current["journal_id"])
     directory = location["directory"]
@@ -1023,7 +1072,6 @@ def _replace_journal(
     except BaseException:
         os.close(directory_fd)
         raise
-    payload = canonical_bytes(normalized)
     try:
         try:
             _write_all(descriptor, payload)
@@ -1610,7 +1658,11 @@ def _transition_effect(
                 )
             return
         if target_image["node_type"] == "directory":
-            os.mkdir(target_name, 0o755, dir_fd=directory_fd)
+            previous_umask = os.umask(0)
+            try:
+                os.mkdir(target_name, 0o700, dir_fd=directory_fd)
+            finally:
+                os.umask(previous_umask)
             fault_hook("after-directory-create", effect, direction)
             _require_workspace_binding(root_fd, root)
             if not _parent_binding_valid(directory_fd, parent_path):
@@ -2161,7 +2213,11 @@ def execute_upgrade(
     root = pathlib.Path(normalized_plan["workspace"]["root"]).resolve(strict=True)
     hook = fault_hook or (lambda _point, _effect, _direction: None)
     with _workspace_lock(root, location) as root_fd:
-        journal = load_journal(location, normalized_plan)
+        journal = load_journal(
+            location,
+            normalized_plan,
+            defer_replace_partial=True,
+        )
         _claim_owner(journal, location)
         if journal["plan_source_digest"] != plan_source_digest:
             raise JournalError("plan-source-stale", "--plan-file")
@@ -2178,6 +2234,14 @@ def execute_upgrade(
                 root,
                 journal["effects"],
                 code="operation-temp-stale",
+            )
+        elif entry_stage in ("completed", "rolled-back"):
+            _reconcile_replace_temp(location, normalized_plan)
+            _require_effect_temps_absent(
+                root_fd,
+                root,
+                journal["effects"],
+                code="transaction-state-mismatch",
             )
         else:
             _reconcile_partial_directory(root_fd, root, journal)
@@ -2597,4 +2661,8 @@ def build_prepared_journal(
         "created_at": created_at,
         "updated_at": created_at,
     }
-    return validate_journal(journal, normalized_plan)
+    normalized_journal = validate_journal(journal, normalized_plan)
+    _require_journal_size(
+        len(canonical_bytes(normalized_journal)), "prepared-journal"
+    )
+    return normalized_journal
