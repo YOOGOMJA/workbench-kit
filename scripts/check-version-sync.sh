@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-version-sync.sh — assert every plugin manifest carries the same version.
-# The version lives in 4 files; this guards against drift (in CI and before a release).
+# The version lives in 6 files; this guards against drift (in CI and before a release).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

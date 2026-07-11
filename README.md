@@ -40,12 +40,14 @@ one more thing on the bench.
 
 ## What you get
 
-workbench-kit is a **marketplace** of two plugins that work together. Install both.
+workbench-kit is a **marketplace** of three plugins. Install the engine and
+bootstrap together; add the product-delivery pack only when you need it.
 
 | Plugin | Role | You use it to… |
 |---|---|---|
 | **`workbench`** | **Engine.** Worktree/task isolation, incremental knowledge harvest, and a skill-driven task lifecycle. | run day-to-day work: start a task, submit it, harvest what's worth keeping. |
 | **`workbench-kit`** | **Bootstrap.** Interviews you for your conventions, then generates a minimal personalized workbench repo. | set up a *new* workbench once, tuned to your taste. |
+| **`toolbox`** *(optional)* | **Product delivery pack.** Durable product/scenario state and governed discovery, design, TDD, release, and portfolio workflows. | let an agent carry a product from intent to one policy-authorized implementation slice at a time. |
 
 It's **tool-neutral**: the same `skills/` source installs on both Claude Code and
 Codex. "Bring your own rules" — the mechanism is fixed, your conventions are not.
@@ -58,6 +60,8 @@ Codex. "Bring your own rules" — the mechanism is fixed, your conventions are n
 /plugin marketplace add YOOGOMJA/workbench-kit
 /plugin install workbench@workbench-kit
 /plugin install workbench-kit@workbench-kit
+# Optional product-delivery workflows:
+/plugin install toolbox@workbench-kit
 ```
 
 **Codex**
@@ -66,6 +70,8 @@ Codex. "Bring your own rules" — the mechanism is fixed, your conventions are n
 codex plugin marketplace add https://github.com/YOOGOMJA/workbench-kit
 codex plugin add workbench
 codex plugin add workbench-kit
+# Optional product-delivery workflows:
+codex plugin add toolbox
 ```
 
 Requirements: Claude Code **or** Codex, `git` (with worktree support), and the
@@ -121,6 +127,25 @@ Other entry points: `/workbench:ticket-incubate` (idea → issue),
 `/workbench:task-status` · `/workbench:task-tickets` (read-only overviews),
 and the `docs-query` · `docs-ingest` · `docs-lint` skills for the knowledge wiki.
 
+**3. Add governed product delivery (optional).** Toolbox keeps living product and
+scenario state in the caller workbench's `products/` directory. Its skills make
+product decisions, then delegate every implementation mutation to the workbench
+engine instead of creating a second task lifecycle:
+
+```
+/toolbox:product-start       # initialize one product mandate
+/toolbox:scenario-refine     # make one scenario implementation-ready
+/toolbox:design-system       # establish or refine the product design contract
+/toolbox:tdd-slice           # deliver one scenario with test evidence
+/toolbox:product-status      # inspect product-wide readiness and blockers
+/toolbox:product-run         # authorize and run exactly one primary scenario
+/toolbox:release-review      # collect release evidence without bypassing gates
+```
+
+Toolbox is never required by a generated workbench. Install or remove it without
+changing the engine/bootstrap contract. In Codex, invoke the corresponding skills
+with `$product-start`, `$product-run`, and the other `$skill-name` forms.
+
 ## How it works
 
 - **Work is disposable, knowledge accumulates.** Everything happens on a task
@@ -128,6 +153,9 @@ and the `docs-query` · `docs-ingest` · `docs-lint` skills for the knowledge wi
   `main` keeps one refined increment. The exploration is swept out.
 - **Two layers.** *Judgment* (what to extract, the prose) is the agent's; *plumbing*
   (git state transitions) is `utils/`'s. The agent's entry point is always a skill.
+- **One lifecycle, optional capability packs.** Toolbox owns product judgment and
+  living state, but the workbench engine remains the sole owner of task branches,
+  policy authorization, codebase effects, harvest, submission, and cleanup.
 - **`AGENTS.core` + `AGENTS.overlay` → `AGENTS.md`.** The framework core is fixed and
   English (upgrades overwrite it). Your persona — language, slug style, issue/PR
   shape, labels, gates — lives in the overlay. The bootstrap composes the two.
@@ -144,9 +172,11 @@ plugins/
   workbench/        engine — skills, utils/, bin/workbench, tests/
   workbench-kit/    bootstrap — interview + generate-workbench skills, and
                     scaffold/ (incl. AGENTS.core.md) it lays into a user repo
+  toolbox/          optional product delivery — product/scenario state, skills,
+                    deterministic CLI, schemas, templates, tests/
 framework-docs/     design decisions, lessons, runbooks, synthesis
 scripts/            release tooling (bump / version-sync / release)
-tests/              frontmatter, install-model, CI checks
+tests/              shared CI/release suite and repository-level contracts
 AGENTS.md           repo/dev guide (for working ON the kit)
 ```
 
@@ -155,7 +185,9 @@ the engine reads it via `${CLAUDE_PLUGIN_ROOT}`.
 
 ## Status & known gaps
 
-- **Early stage**, first release (`0.1.0`) in progress. See [CHANGELOG.md](CHANGELOG.md).
+- **Early stage.** The latest release is `0.1.1`; the governed lifecycle, safe
+  migration, and optional toolbox are being prepared for `0.2.0`. See
+  [CHANGELOG.md](CHANGELOG.md).
 - **Translation in progress.** Framework-facing content (this README, `AGENTS.core`,
   scaffold, bootstrap skills) and all skill *descriptions* are English. The engine
   skill *bodies* and `framework-docs/` are still Korean, being translated incrementally.
@@ -169,8 +201,8 @@ the engine reads it via `${CLAUDE_PLUGIN_ROOT}`.
 ## Contributing
 
 PRs welcome. Every change that affects behavior adds a line under `## [Unreleased]`
-in [CHANGELOG.md](CHANGELOG.md). CI runs frontmatter lint, manifest parse, version
-sync, ShellCheck, and lifecycle/compose smoke tests — see
+in [CHANGELOG.md](CHANGELOG.md). CI runs the shared repository suite used by release
+preparation, plus manifest parsing, ShellCheck, and the compose smoke test — see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## License

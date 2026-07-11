@@ -1,7 +1,7 @@
 # Contributing to workbench-kit
 
-Thanks for helping! This repo is a marketplace of two plugins (`workbench`,
-`workbench-kit`). A few conventions keep it releasable.
+Thanks for helping! This repo is a marketplace of three plugins (`workbench`,
+`workbench-kit`, and the optional `toolbox`). A few conventions keep it releasable.
 
 ## Changelog — every behavior change, at PR time, by semver
 
@@ -17,7 +17,8 @@ its [Semantic Versioning](https://semver.org/) impact:
 | **Fixed** | bug fix, non-breaking | **patch** |
 | **Removed** / any breaking change | incompatible change | **major** |
 
-Note the plugin (`workbench` / `workbench-kit`) when an entry is plugin-specific.
+Note the plugin (`workbench` / `workbench-kit` / `toolbox`) when an entry is
+plugin-specific.
 The next release bump is the **highest** impact among the `[Unreleased]` entries —
 so classifying at PR time means the bump is derivable, not guessed (see
 [RELEASING.md](RELEASING.md)).
@@ -28,22 +29,19 @@ check. If a PR genuinely needs no entry (CI-only, a typo, docs polish), add the
 
 ## Tests & CI
 
-CI (`.github/workflows/ci.yml`) is dependency-light and runs: skill-frontmatter
-lint, JSON manifest parse, plugin version sync, ShellCheck, the engine lifecycle
-and public-contract tests, the governed upgrade suite on Python 3.9 and the latest
-Python (with pinned `uv`), the install-model test, the codebases.yaml parsing test,
-the compose smoke test, and the CHANGELOG-entry check above. Run the shell tests
-locally before pushing:
+CI (`.github/workflows/ci.yml`) is dependency-light. The same deterministic root
+suite used by release preparation covers repository contracts plus every registered
+plugin test, including the v1/v2 engine, optional toolbox, and governed upgrades.
+CI also exercises upgrades on the latest Python and runs the CHANGELOG checks above.
+Run the shared suite locally before pushing:
 
 ```
-bash plugins/workbench/tests/task-lifecycle.sh
-bash plugins/workbench-kit/tests/run.sh
-bash tests/check-codebases-yaml.sh
-bash tests/check-install-model.sh
+bash tests/run.sh
 ```
 
-Authoritative plugin validation (`claude plugin validate`) needs the Claude Code
-CLI, so it stays a local/manual gate.
+Authoritative plugin validation (`claude plugin validate`) and an isolated real
+Codex marketplace add/list need their respective CLIs, so they remain local
+release gates.
 
 ## Releases
 
