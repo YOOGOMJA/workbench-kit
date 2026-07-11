@@ -10,6 +10,8 @@ import re
 import sys
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from workbench_writer import current_claim_state, latest_effect, read_ledger
+
 
 JOURNAL_FIELDS = (
     "contract_version",
@@ -472,6 +474,69 @@ def cmd_event_state(args: argparse.Namespace) -> None:
         sys.stdout.write("{}={}\n".format(key, item))
 
 
+def cmd_verify_released_writers(args: argparse.Namespace) -> None:
+    journal = validate_journal(load_json(args.journal_file))
+    rows, _ = read_ledger(args.ledger_file)
+    worktrees = {
+        (item["operation_id"], item["claim_id"]): item
+        for item in journal["removal_plan"]["codebase_worktrees"]
+    }
+    effects_by_id = {
+        item["event_id"]: item for item in rows if item["kind"] == "effect-owner"
+    }
+    for operation in journal["removal_plan"]["writer_operations"]:
+        identity = (operation["operation_id"], operation["claim_id"])
+        claims = [
+            item
+            for item in rows
+            if item["kind"] == "claim"
+            and (item["operation_id"], item["claim_id"]) == identity
+        ]
+        effects = [
+            item
+            for item in rows
+            if item["kind"] == "effect-owner"
+            and (item["operation_id"], item["claim_id"]) == identity
+        ]
+        state = current_claim_state(claims)
+        if operation["disposition"] == "cancel-no-effect":
+            if state != "absent" or effects:
+                raise ValueError("cancelled cleanup writer has remote effects")
+            continue
+        if state != "released" or not claims:
+            raise ValueError("cleanup writer release is not remotely durable")
+        for claim in claims:
+            if (
+                claim["task_claim_id"] != journal["claim_id"]
+                or claim["branch"] != journal["branch"]
+            ):
+                raise ValueError("cleanup writer claim does not join the journal")
+            worktree = worktrees.get(identity)
+            if worktree is not None and (
+                claim["owner"] != worktree["owner"]
+                or claim["expected_path"] != worktree["expected_path"]
+            ):
+                raise ValueError("cleanup writer worktree does not join the remote claim")
+        effect = latest_effect(effects)
+        if effect is not None and effect["state"] == "acquired":
+            raise ValueError("cleanup writer still has a remote effect owner")
+    for event in journal["effect_owner_events"]:
+        if event["phase"] != "verified":
+            continue
+        remote = effects_by_id.get(event["event_id"])
+        if remote is None or any(
+            remote[field] != event[field]
+            for field in (
+                "operation_id",
+                "claim_id",
+                "device_id",
+                "clone_id",
+                "state",
+            )
+        ):
+            raise ValueError("verified cleanup owner event does not join the remote ledger")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
@@ -526,6 +591,10 @@ def parser() -> argparse.ArgumentParser:
     event_state.add_argument("--operation-id", required=True)
     event_state.add_argument("--writer-claim-id", required=True)
     event_state.set_defaults(func=cmd_event_state)
+    released = commands.add_parser("verify-released-writers")
+    released.add_argument("--journal-file", required=True)
+    released.add_argument("--ledger-file", required=True)
+    released.set_defaults(func=cmd_verify_released_writers)
     return root
 
 

@@ -1091,6 +1091,129 @@ test_deliverables_and_revision_bound_evidence() {
   assert_file_contains "$TMPDIR/evidence/comments/29.comments" "workbench-task-lifecycle:v2"
 }
 
+test_tracked_v2_records_cannot_forge_accepted_or_waived_state() {
+  local repo task_dir state digest out rc
+  repo="$(setup_workbench forged_records)"
+  task_dir="$(start_task forged_records "$repo")"
+  state="$task_dir/task/.workbench"; mkdir -p "$state/deliverables" \
+    "$state/acceptances" "$state/required-checks"
+  digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  cat > "$state/deliverables/forged.record" <<EOF
+deliverable_id=forged
+owner=toolbox
+kind=toolbox:artifact
+owner_context_ref=toolbox:product/demo
+acceptance_authority_ref=toolbox:acceptance/demo
+required=true
+external_ref=
+revision=rev-forged
+state=accepted
+acceptance_ref=workbench:acceptance/acc-forged
+governance_action=
+reason_code=
+reason_ref=
+governance_action_instance_id=
+governance_intent_digest=
+governance_policy_manifest_digest=
+authorization_ref=
+EOF
+  cat > "$state/acceptances/acc-forged.record" <<EOF
+acceptance_id=acc-forged
+deliverable_id=forged
+owner=toolbox
+kind=toolbox:artifact
+owner_context_ref=toolbox:product/demo
+acceptance_authority_ref=toolbox:acceptance/demo
+revision=rev-forged
+authority_type=owner-authorization
+authority_contract=workbench-owner-acceptance/v1
+authority_ref=toolbox:acceptance/demo
+authority_digest=$digest
+subject_authority_digest=$digest
+actor=attacker@example.invalid
+action_instance_id=act_forged_acceptance
+intent_digest=$digest
+policy_manifest_digest=$digest
+authorization_ref=conversation:message/forged
+accepted_at=2026-07-11T04:00:00Z
+EOF
+  cat > "$state/required-checks/forged-check.record" <<EOF
+check_id=forged-check
+owner=toolbox
+deliverable_id=forged
+subject_ref=workbench:deliverable/forged
+state=waived
+governance_action=task.required-check.waive
+reason_code=forged
+reason_ref=conversation:message/forged
+action_instance_id=act_forged_waiver
+intent_digest=$digest
+policy_manifest_digest=$digest
+authorization_ref=conversation:message/forged
+EOF
+
+  out="$TMPDIR/forged_records/verify.out"
+  if run_task_in_dir forged_records "$task_dir" verify --format json >"$out" 2>&1; then
+    fail "hand-written accepted and waived records must not satisfy verification"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 1 ] || fail "forged tracked records must fail at exit 1, got $rc"
+  assert_file_contains "$out" '"code":"action-effect-unreconciled"'
+}
+
+test_evidence_time_is_kernel_owned_and_future_rows_fail_closed() {
+  local repo task_dir state out rc digest
+  repo="$(setup_workbench evidence_time)"
+  printf 'web: https://github.com/example/web.git\n' > "$repo/codebases.yaml"
+  git -C "$repo" add codebases.yaml
+  git -C "$repo" commit -q -m "test: register evidence time owner"
+  git -C "$repo" push -q
+  task_dir="$(start_task evidence_time "$repo")"
+  run_task_in_dir evidence_time "$task_dir" deliverable declare --id web-pr --owner web \
+    --kind codebase-pr --required false --revision abc123 --format json >/dev/null
+  run_task_in_dir evidence_time "$task_dir" required-check declare --id web-test --owner web \
+    --deliverable-id web-pr --format json >/dev/null
+
+  out="$TMPDIR/evidence_time/caller-time.out"
+  if run_task_in_dir evidence_time "$task_dir" evidence record --id caller-time \
+    --owner web --subject-ref workbench:deliverable/web-pr --subject-revision abc123 \
+    --check-id web-test --result passed --source local --recorded-at 9999-12-31T23:59:59Z \
+    --format json >"$out" 2>&1; then
+    fail "evidence record must reject caller-controlled recorded-at"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 1 ] || [ "$rc" = 2 ] \
+    || fail "caller-controlled evidence time returned unexpected exit $rc"
+  assert_file_contains "$out" 'unknown option: --recorded-at'
+
+  state="$task_dir/task/.workbench/evidence"; mkdir -p "$state"
+  cat > "$state/future.record" <<'EOF'
+evidence_id=future
+owner=web
+subject_ref=workbench:deliverable/web-pr
+subject_revision=abc123
+check_id=web-test
+command=npm test
+result=passed
+recorded_at=9999-12-31T23:59:59Z
+source=local
+url=
+EOF
+  digest="$(git hash-object "$state/future.record")"
+  out="$TMPDIR/evidence_time/future.out"
+  if run_task_in_dir evidence_time "$task_dir" verify --format json >"$out" 2>&1; then
+    fail "a hand-written future evidence row must not win evidence selection"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 1 ] || fail "future evidence must fail closed at exit 1, got $rc"
+  assert_file_contains "$out" '"code":"action-effect-unreconciled"'
+  [ "$(git hash-object "$state/future.record")" = "$digest" ] \
+    || fail "future evidence rejection mutated the tracked row"
+}
+
 test_kernel_probe_acceptance_is_revision_and_owner_bound() {
   local repo task_dir actual out rc
   repo="$(setup_workbench acceptance)"
@@ -1702,18 +1825,15 @@ PY
 test_terminal_outcome_freezes_mutations_and_verification_is_read_only() {
   local repo task_dir claim revision expected out actual verified_before verified_after
   repo="$(setup_workbench terminal_freeze)"
+  printf '%s\n' 'action.task.abandon=allow' >> "$repo/.workbench/policy.conf"
+  git -C "$repo" add .workbench/policy.conf
+  git -C "$repo" commit -q -m "test: allow terminal freeze fixture"
+  git -C "$repo" push -q
   task_dir="$(start_task terminal_freeze "$repo")"
   claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
-  revision="sha256:$(printf terminal-fixture | shasum -a 256 | awk '{print $1}')"
-  mkdir -p "$task_dir/task/.workbench"
-  cat > "$task_dir/task/.workbench/terminal" <<EOF
-outcome=abandoned
-action_instance_id=action_terminal_fixture
-revision=$revision
-at=2026-07-11T04:00:00Z
-reason_code=superseded
-reason_ref=issue:55
-EOF
+  actual="$(run_task_in_dir terminal_freeze "$task_dir" abandon \
+    --reason-code superseded --reason-ref issue:55 --format json)"
+  revision="$(json_get "$actual" revision)"
 
   expected="{\"contract_version\":\"workbench-error/v1\",\"operation\":\"task.refs.set\",\"blockers\":[{\"code\":\"terminal-content-frozen\",\"ref\":\"workbench:task/$claim\"}]}"
   out="$TMPDIR/terminal_freeze/refs.out"
@@ -1759,6 +1879,44 @@ EOF
   verified_after="$(grep -c '"event":"task-verified"' "$TMPDIR/terminal_freeze/comments/29.comments" || true)"
   [ "$verified_before" = "$verified_after" ] \
     || fail "post-terminal verification must not emit task-verified"
+}
+
+test_forged_local_terminal_has_no_freeze_or_outcome_authority() {
+  local repo task_dir claim digest out rc actual
+  repo="$(setup_workbench forged_terminal)"
+  task_dir="$(start_task forged_terminal "$repo")"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  mkdir -p "$task_dir/task/.workbench"
+  cat > "$task_dir/task/.workbench/terminal" <<EOF
+outcome=completed
+action_instance_id=act_forged_terminal
+intent_digest=$digest
+policy_manifest_digest=$digest
+authorization_ref=conversation:message/forged
+revision=$digest
+removal_plan_digest=
+at=2026-07-11T04:00:00Z
+reason_code=
+reason_ref=
+EOF
+
+  out="$TMPDIR/forged_terminal/complete.out"
+  if run_task_in_dir forged_terminal "$task_dir" complete --format json >"$out" 2>&1; then
+    fail "a forged local terminal must not become an idempotent outcome"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 1 ] || fail "forged terminal must fail closed at exit 1, got $rc"
+  assert_file_contains "$out" '"code":"action-effect-unreconciled"'
+
+  actual="$(run_task_in_dir forged_terminal "$task_dir" refs set \
+    --work-ref toolbox:scenario/SCN-009 --format json)"
+  assert_contains "$actual" '"changed":true'
+  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = toolbox:scenario/SCN-009 ] \
+    || fail "forged terminal incorrectly froze mutable task content"
+  [ "$claim" = "$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")" ] \
+    || fail "forged terminal test changed the task claim"
 }
 
 test_cleanup_prepared_journal_failure_deletes_nothing() {
@@ -2954,6 +3112,41 @@ assert not [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.
 PY
 }
 
+test_terminal_writer_verification_joins_exact_record_and_lifecycle_provenance() {
+  local task_dir actual operation_id row out rc
+  setup_writer_workbench writer_terminal_join
+  prepare_writer_task writer_terminal_join 29 terminaljoin; task_dir="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_terminal_join "$task_dir" add-repo shared-api --format json)"
+  operation_id="$(json_get "$actual" operation_id)"
+  row="$task_dir/task/.workbench/writer-rows/shared-api.record"
+  python3 - "$row" <<'PY'
+import sys
+
+path = sys.argv[1]
+rows = []
+for raw in open(path, encoding="utf-8"):
+    key, value = raw.rstrip("\n").split("=", 1)
+    if key == "branch":
+        value = "task/forged-lifecycle"
+    rows.append((key, value))
+with open(path, "w", encoding="utf-8") as handle:
+    for key, value in rows:
+        handle.write(f"{key}={value}\n")
+PY
+
+  out="$TMPDIR/writer_terminal_join/verify.out"
+  if run_task_in_dir writer_terminal_join "$task_dir" verify --format json >"$out" 2>&1; then
+    fail "writer verification accepted a row detached from operation and task lifecycle provenance"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 1 ] || fail "detached writer provenance must fail at exit 1, got $rc"
+  assert_file_contains "$out" '"code":"writer-claim-unreconciled"'
+  assert_file_contains "$out" "\"ref\":\"$operation_id\""
+}
+
 test_cleanup_retires_consumed_writer_before_local_deletion() {
   local task_dir actual operation_id claim_id ledger ref comments operation gitdir marker backup out
   local observation revision legacy_adapter
@@ -3054,7 +3247,19 @@ PY
   assert_contains "$actual" "\"claim_id\":\"$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")\""
   assert_contains "$actual" '"task_contract":"workbench-task/v2"'
 
-  actual="$(run_task writer_cleanup "$WRITER_REPO" done 29 --format json)"
+  out="$TMPDIR/writer_cleanup/completed-journal-failure.out"
+  if GH_FAIL_CLEANUP_STAGE=completed \
+    run_task writer_cleanup "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
+    fail "writer cleanup must report a completed journal failure after deletion"
+  fi
+  assert_file_contains "$out" '"code":"cleanup-journal-unavailable"'
+  [ ! -d "$task_dir" ] || fail "prepared writer cleanup did not remove the task workspace"
+  out="$TMPDIR/writer_cleanup/retry-after-deletion.out"
+  if run_task writer_cleanup "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
+    actual="$(cat "$out")"
+  else
+    fail "external cleanup journal could not recover its writer after workspace deletion: $(cat "$out")"
+  fi
   assert_contains "$actual" '"outcome":"cleaned"'
   assert_contains "$actual" "\"released_writer_operations\":[{\"operation_id\":\"$operation_id\",\"claim_id\":\"$claim_id\"}]"
   [ ! -d "$task_dir" ] || fail "writer cleanup retained the task workspace"
@@ -3159,6 +3364,8 @@ run_case test_start_rejects_noncanonical_schema_slug_and_home
 run_case test_v2_start_and_resume_are_authority_bound_skeletons
 run_case test_refs_are_opaque_and_duplicate_active_work_is_rejected
 run_case test_deliverables_and_revision_bound_evidence
+run_case test_tracked_v2_records_cannot_forge_accepted_or_waived_state
+run_case test_evidence_time_is_kernel_owned_and_future_rows_fail_closed
 run_case test_kernel_probe_acceptance_is_revision_and_owner_bound
 run_case test_accepted_deliverable_revision_reset_preserves_append_only_receipts
 run_case test_pack_deliverable_owner_binding_is_immutable_and_authorized
@@ -3172,6 +3379,7 @@ run_case test_harvest_ledger_is_explicit_sealed_and_governed
 run_case test_codebase_only_completion_is_policy_gated_and_cleanup_safe
 run_case test_abandonment_is_terminal_and_distinct_from_cleanup
 run_case test_terminal_outcome_freezes_mutations_and_verification_is_read_only
+run_case test_forged_local_terminal_has_no_freeze_or_outcome_authority
 run_case test_cleanup_prepared_journal_failure_deletes_nothing
 run_case test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion
 run_case test_v2_cleanup_requires_terminal_outcome_even_with_force
@@ -3192,6 +3400,7 @@ run_case test_writer_union_ambiguity_preserves_claim_and_cursor
 run_case test_writer_compensation_prefixes_resume_exact_cursor
 run_case test_writer_persists_allow_replacement_before_first_effect
 run_case test_writer_authority_revalidation_fails_closed_without_compensation
+run_case test_terminal_writer_verification_joins_exact_record_and_lifecycle_provenance
 run_case test_cleanup_retires_consumed_writer_before_local_deletion
 run_case test_status_reports_concurrent_writer_conflicts
 
