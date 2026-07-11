@@ -805,9 +805,6 @@ STATUS_CLAIM_FIELDS = (
 
 
 def operation_claim_binding(operation: Mapping[str, Any]) -> Dict[str, str]:
-    policy_digest = (
-        "null" if operation["policy_manifest"] is None else operation["policy_manifest"]["digest"]
-    )
     return {
         "task_claim_id": operation["task_claim_id"],
         "owner": operation["owner"],
@@ -815,10 +812,6 @@ def operation_claim_binding(operation: Mapping[str, Any]) -> Dict[str, str]:
         "expected_path": operation["expected_path"],
         "codebase_origin_url": operation["codebase_origin_url"],
         "context_policy_set_digest": operation["context_policy_set_digest"],
-        "action_instance_id": operation["action_instance_id"] or "null",
-        "policy_manifest_digest": policy_digest,
-        "intent_digest": operation["intent_digest"] or "null",
-        "authorization_ref": operation["authorization_ref"] or "null",
     }
 
 
@@ -1297,21 +1290,7 @@ def cmd_ledger_state(args: argparse.Namespace) -> None:
             or operation["claim_id"] != args.claim_id
         ):
             raise ValueError("writer operation identity does not match the ledger query")
-        policy_digest = (
-            "null" if operation["policy_manifest"] is None else operation["policy_manifest"]["digest"]
-        )
-        expected = {
-            "task_claim_id": operation["task_claim_id"],
-            "owner": operation["owner"],
-            "branch": operation["branch"],
-            "expected_path": operation["expected_path"],
-            "codebase_origin_url": operation["codebase_origin_url"],
-            "context_policy_set_digest": operation["context_policy_set_digest"],
-            "action_instance_id": operation["action_instance_id"] or "null",
-            "policy_manifest_digest": policy_digest,
-            "intent_digest": operation["intent_digest"] or "null",
-            "authorization_ref": operation["authorization_ref"] or "null",
-        }
+        expected = operation_claim_binding(operation)
         for claim in matching_claims:
             if any(claim[key] != item for key, item in expected.items()):
                 raise ValueError("writer claim does not join the exact local operation")

@@ -1201,6 +1201,13 @@ writer_conflict_final() {
   WRITER_CONFLICT_COUNT="$(printf '%s\n' "$WRITER_CONFLICTS_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
 }
 
+writer_conflict_has_legacy() {
+  printf '%s\n' "${WRITER_CONFLICTS_JSON:-[]}" | python3 -c '
+import json, sys
+raise SystemExit(0 if any(item.get("source") == "legacy-v1" for item in json.load(sys.stdin)) else 1)
+'
+}
+
 writer_publish_ledger() {
   local root="$1" origin="$2" observed="$3" next="$4" commit
   commit="$(writer_create_coordination_commit "$root" "$next" "$observed")" || return 1
@@ -1440,8 +1447,8 @@ write_writer_row_final() {
   } > "$tmp" && mv "$tmp" "$file"
 }
 
-writer_row_matches_final() {
-  local file="$1"
+writer_row_matches_values_final() {
+  local file="$1" action="$2" intent="$3" manifest="$4" authorization="$5"
   [ -f "$file" ] || return 1
   [ "$(record_get "$file" operation_id)" = "$WRITER_OPERATION_ID" ] \
     && [ "$(record_get "$file" claim_id)" = "$WRITER_CLAIM_ID" ] \
@@ -1453,10 +1460,19 @@ writer_row_matches_final() {
     && [ "$(record_get "$file" registry_revision)" = "$WRITER_OPERATION_REGISTRY_REVISION" ] \
     && [ "$(record_get "$file" registry_digest)" = "$WRITER_OPERATION_REGISTRY_DIGEST" ] \
     && [ "$(record_get "$file" context_policy_set_digest)" = "$WRITER_CONTEXT_DIGEST" ] \
-    && [ "$(record_get "$file" action_instance_id)" = "$WRITER_OPERATION_ACTION" ] \
-    && [ "$(record_get "$file" intent_digest)" = "$WRITER_OPERATION_INTENT" ] \
-    && [ "$(record_get "$file" policy_manifest_digest)" = "$WRITER_OPERATION_MANIFEST" ] \
-    && [ "$(record_get "$file" authorization_ref)" = "$WRITER_OPERATION_AUTHORIZATION" ]
+    && [ "$(record_get "$file" action_instance_id)" = "$action" ] \
+    && [ "$(record_get "$file" intent_digest)" = "$intent" ] \
+    && [ "$(record_get "$file" policy_manifest_digest)" = "$manifest" ] \
+    && [ "$(record_get "$file" authorization_ref)" = "$authorization" ]
+}
+
+writer_row_matches_final() {
+  writer_row_matches_values_final "$1" "$WRITER_OPERATION_ACTION" "$WRITER_OPERATION_INTENT" \
+    "$WRITER_OPERATION_MANIFEST" "$WRITER_OPERATION_AUTHORIZATION"
+}
+
+writer_row_matches_pending_final() {
+  writer_row_matches_values_final "$1" "" "" "" ""
 }
 
 writer_consumed_matches_final() {
@@ -1565,6 +1581,7 @@ writer_recover_zero_history() {
 writer_resolve_final() {
   local operation="$1" ledger="$2" instance_id="$3" authorization_file="$4"
   local payload policy_file action_rc
+  local GOVERNED_REQUIRE_EXPLICIT_AUTHORIZATION=0
   writer_conflict_final "$ledger" "$operation" || return 1
   if [ "$WRITER_CONFLICT_COUNT" -eq 0 ]; then
     writer_operation_update "$operation" --clear-action-binding --stage prepared
@@ -1580,6 +1597,7 @@ writer_resolve_final() {
     --field "codebase_origin_url=$WRITER_CODEBASE_ORIGIN" \
     --field "context_policy_set_digest=$WRITER_CONTEXT_DIGEST" \
     --field "conflict_revision=$WRITER_CONFLICT_REVISION" > "$payload" || { rm -f "$payload"; return 1; }
+  writer_conflict_has_legacy && GOVERNED_REQUIRE_EXPLICIT_AUTHORIZATION=1
   resolve_governed_action task.concurrent-write "workbench:codebase/$WRITER_OWNER" \
     "$WRITER_CONFLICT_REVISION" "$instance_id" "$authorization_file" \
     workbench-writer-request/v1 "$payload"
@@ -1596,11 +1614,308 @@ writer_resolve_final() {
   [ "$action_rc" -eq 0 ] || { printf '%s\n' "$GOVERNED_POLICY_OUTPUT"; return "$action_rc"; }
 }
 
+writer_revalidate_final() {
+  local operation="$1" root="$2" origin="$3" instance_id="$4" authorization_file="$5"
+  local ledger payload policy_file state action_rc protected_digest protected_origin
+  local GOVERNED_REQUIRE_EXPLICIT_AUTHORIZATION=0
+  local GOVERNED_ALLOW_ACTION_REPLACEMENT=1
+  writer_load_operation_final "$operation" || return 1
+  protected_registry_entry "$root" "$WRITER_OWNER" \
+    "$(index_get workspace_authority_descriptor_digest)" || return 1
+  protected_digest="$PROTECTED_REGISTRY_DIGEST"; protected_origin="$PROTECTED_REGISTRY_ORIGIN"
+  [ "$protected_digest" = "$WRITER_OPERATION_REGISTRY_DIGEST" ] \
+    && [ "$protected_origin" = "$WRITER_CODEBASE_ORIGIN" ] || return 1
+  [ "$(record_get "$(task_state_dir)/policy-context/state.record" digest)" \
+    = "$WRITER_CONTEXT_DIGEST" ] || return 1
+  ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-revalidate.XXXXXX")"
+  writer_load_remote_ledger "$root" "$origin" "$ledger" || { rm -f "$ledger"; return 1; }
+  state="$(python3 "$(writer_helper)" ledger-state "$ledger" \
+    --operation-id "$WRITER_OPERATION_ID" --claim-id "$WRITER_CLAIM_ID" \
+    --operation-file "$operation" --format shell | sed -n 's/^claim_state=//p')" \
+    || { rm -f "$ledger"; return 1; }
+  [ "$state" = active ] || { rm -f "$ledger"; return 1; }
+  writer_conflict_final "$ledger" "$operation" || { rm -f "$ledger"; return 1; }
+  rm -f "$ledger"
+  if [ "$WRITER_CONFLICT_COUNT" -eq 0 ]; then
+    if [ -n "$WRITER_OPERATION_ACTION" ]; then
+      writer_operation_update "$operation" --clear-action-binding || return 1
+      writer_load_operation_final "$operation" || return 1
+    fi
+    GOVERNED_POLICY_OUTPUT=""; GOVERNED_POLICY_RC=0
+    return 0
+  fi
+  [ -n "$instance_id" ] || instance_id="$WRITER_OPERATION_ACTION"
+  payload="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-intent.XXXXXX")"
+  python3 "$(intent_helper)" build-payload --contract workbench-writer-request/v1 \
+    --field "operation_id=$WRITER_OPERATION_ID" --field "claim_id=$WRITER_CLAIM_ID" \
+    --field "owner=$WRITER_OWNER" --field "branch=$CURRENT_BRANCH" \
+    --field "expected_path=task/codebases/$WRITER_OWNER" \
+    --field "codebase_origin_url=$WRITER_CODEBASE_ORIGIN" \
+    --field "context_policy_set_digest=$WRITER_CONTEXT_DIGEST" \
+    --field "conflict_revision=$WRITER_CONFLICT_REVISION" > "$payload" \
+    || { rm -f "$payload"; return 1; }
+  writer_conflict_has_legacy && GOVERNED_REQUIRE_EXPLICIT_AUTHORIZATION=1
+  resolve_governed_action task.concurrent-write "workbench:codebase/$WRITER_OWNER" \
+    "$WRITER_CONFLICT_REVISION" "$instance_id" "$authorization_file" \
+    workbench-writer-request/v1 "$payload"
+  rm -f "$payload"; action_rc="$GOVERNED_POLICY_RC"
+  case "$action_rc" in 0|3|4) ;; *) return 1 ;; esac
+  policy_file="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-policy.XXXXXX")"
+  printf '%s\n' "$GOVERNED_POLICY_OUTPUT" > "$policy_file"
+  writer_operation_update "$operation" --policy-resolution-file "$policy_file" \
+    || { rm -f "$policy_file"; return 1; }
+  rm -f "$policy_file"
+  writer_load_operation_final "$operation" || return 1
+  return "$action_rc"
+}
+
+writer_compensation_start_step() {
+  if [ "$WRITER_OPERATION_RECORD_OWNERSHIP" != none ]; then printf 'record\n'
+  elif [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" != none ]; then printf 'worktree\n'
+  elif [ "$WRITER_OPERATION_EFFECT_OWNER_STATE" = acquired ]; then printf 'effect-owner\n'
+  elif [ "$1" = released ]; then printf 'claim\n'
+  else printf 'finish\n'
+  fi
+}
+
+writer_reconcile_compensation_effects() {
+  local operation="$1" row_file record_count owner_rows
+  writer_load_operation_final "$operation" || return 1
+  row_file="$(writer_row_dir)/$WRITER_OWNER.record"
+  record_count="$(repos_block | grep -Fxc -- "- $WRITER_OWNER | $WRITER_CODEBASE_BRANCH | work" || true)"
+  owner_rows="$(repos_block | grep -c "^- $WRITER_OWNER |" || true)"
+  if [ "$WRITER_OPERATION_RECORD_OWNERSHIP" = none ]; then
+    if [ -e "$row_file" ]; then
+      writer_row_matches_pending_final "$row_file" || writer_row_matches_final "$row_file" \
+        || return 1
+      [ "$record_count" = 1 ] && [ "$owner_rows" = 1 ] || return 1
+      writer_operation_update "$operation" --repo-record-ownership adopted || return 1
+      writer_load_operation_final "$operation" || return 1
+    else
+      [ "$record_count" = 0 ] && [ "$owner_rows" = 0 ] || return 1
+    fi
+  fi
+  if [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" = none ]; then
+    if [ -e "$WRITER_WORKTREE" ]; then
+      writer_worktree_matches_final || return 1
+      writer_operation_update "$operation" --worktree-ownership adopted || return 1
+      writer_load_operation_final "$operation" || return 1
+    else
+      ! git -C "$WRITER_CLONE" worktree list --porcelain | \
+        grep -Fqx "branch refs/heads/$WRITER_CODEBASE_BRANCH" || return 1
+    fi
+  fi
+}
+
+writer_remove_repo_index_row_idempotent() {
+  local row="- $WRITER_OWNER | $WRITER_CODEBASE_BRANCH | work" file tmp count owner_rows
+  file="$TASK_DIR/task/index.md"; tmp="$file.tmp.$$"
+  count="$(grep -Fxc -- "$row" "$file" || true)"
+  owner_rows="$(repos_block | grep -c "^- $WRITER_OWNER |" || true)"
+  if [ "$count" = 0 ] && [ "$owner_rows" = 0 ]; then return 0; fi
+  [ "$count" = 1 ] && [ "$owner_rows" = 1 ] || return 1
+  awk -v row="$row" '$0 != row { print }' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+writer_print_stored_policy_final() {
+  local operation="$1" decision="$2" action_file
+  writer_load_operation_final "$operation" || return 1
+  [ -n "$WRITER_OPERATION_ACTION" ] || return 1
+  action_file="$(task_state_dir)/actions/$WRITER_OPERATION_ACTION.record"
+  python3 - "$operation" "$action_file" "$decision" <<'PY'
+import json
+import sys
+
+operation = json.load(open(sys.argv[1], encoding="utf-8"))
+record = {}
+for raw in open(sys.argv[2], encoding="utf-8"):
+    key, separator, value = raw.rstrip("\n").partition("=")
+    if not separator or key in record:
+        raise SystemExit(1)
+    record[key] = value
+decision = sys.argv[3]
+expected = {
+    "id": operation["action_instance_id"],
+    "action_id": "task.concurrent-write",
+    "task_claim_id": operation["task_claim_id"],
+    "target_ref": f"workbench:codebase/{operation['owner']}",
+    "intent_digest": operation["intent_digest"],
+    "policy_manifest_digest": operation["policy_manifest"]["digest"],
+}
+if any(record.get(key) != value for key, value in expected.items()):
+    raise SystemExit(1)
+if decision == "deny" and record.get("status") != "denied":
+    raise SystemExit(1)
+value = {
+    "contract_version": "workbench-policy/v1",
+    "action_instance": {
+        "id": record["id"],
+        "action_id": record["action_id"],
+        "task_claim_id": record["task_claim_id"],
+        "target_ref": record["target_ref"],
+        "revision": record["revision"],
+        "intent_digest": record["intent_digest"],
+        "policy_manifest": operation["policy_manifest"],
+        "status": record["status"],
+    },
+    "decision": decision,
+    "authorization_ref": operation["authorization_ref"],
+}
+print(json.dumps(value, separators=(",", ":")))
+PY
+}
+
+writer_compensate_revalidation() {
+  local operation="$1" root="$2" origin="$3" target="$4" reason="$5"
+  local row_file next_step state ledger
+  writer_reconcile_compensation_effects "$operation" || return 1
+  writer_load_operation_final "$operation" || return 1
+  if [ "$WRITER_OPERATION_STAGE" != compensation-pending ] \
+    && [ "$WRITER_OPERATION_STAGE" != release-pending ]; then
+    next_step="$(writer_compensation_start_step "$target")"
+    if [ "$next_step" = claim ]; then
+      writer_operation_update "$operation" --stage release-pending \
+        --compensation-target released --compensation-reason "$reason" \
+        --compensation-next-step claim || return 1
+    else
+      writer_operation_update "$operation" --stage compensation-pending \
+        --compensation-target "$target" --compensation-reason "$reason" \
+        --compensation-next-step "$next_step" || return 1
+    fi
+    writer_load_operation_final "$operation" || return 1
+  fi
+  [ "$(writer_json_query "$(cat "$operation")" compensation_target)" = "$target" ] \
+    && [ "$(writer_json_query "$(cat "$operation")" compensation_reason)" = "$reason" ] || return 1
+
+  next_step="$(writer_json_query "$(cat "$operation")" compensation_next_step)"
+  if [ "$next_step" = record ]; then
+    row_file="$(writer_row_dir)/$WRITER_OWNER.record"
+    [ "$WRITER_OPERATION_RECORD_OWNERSHIP" != none ] || return 1
+    if [ -e "$row_file" ]; then
+      writer_row_matches_pending_final "$row_file" || writer_row_matches_final "$row_file" \
+        || return 1
+      writer_remove_repo_index_row_idempotent || return 1
+      rm -f "$row_file"
+    else
+      writer_remove_repo_index_row_idempotent || return 1
+    fi
+    if writer_test_interrupt compensation-record-removed "$operation"; then return 1; fi
+    writer_operation_update "$operation" --repo-record-ownership none \
+      --compensation-next-step worktree || return 1
+    writer_load_operation_final "$operation" || return 1
+    next_step=worktree
+  fi
+
+  if [ "$next_step" = worktree ]; then
+    [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" != none ] || return 1
+    if [ -e "$WRITER_WORKTREE" ]; then
+      writer_worktree_matches_final \
+        && git -C "$WRITER_CLONE" worktree remove "$WRITER_WORKTREE" >/dev/null 2>&1 \
+        || return 1
+    else
+      ! git -C "$WRITER_CLONE" worktree list --porcelain | \
+        grep -Fqx "branch refs/heads/$WRITER_CODEBASE_BRANCH" || return 1
+    fi
+    if writer_test_interrupt compensation-worktree-removed "$operation"; then return 1; fi
+    writer_operation_update "$operation" --worktree-ownership none \
+      --compensation-next-step effect-owner || return 1
+    writer_load_operation_final "$operation" || return 1
+    next_step=effect-owner
+  fi
+
+  if [ "$next_step" = effect-owner ]; then
+    [ "$WRITER_OPERATION_EFFECT_OWNER_STATE" = acquired ] || return 1
+    writer_effect_owner_cas "$root" "$origin" released "" "$operation" || return 1
+    if writer_test_interrupt compensation-effect-owner-released "$operation"; then return 1; fi
+    if [ "$target" = released ]; then
+      writer_operation_update "$operation" --stage release-pending --effect-owner-state released \
+        --coordination-oid "$WRITER_COORDINATION_REVISION" \
+        --compensation-target released --compensation-reason "$reason" \
+        --compensation-next-step claim || return 1
+      next_step=claim
+    else
+      writer_operation_update "$operation" --effect-owner-state released \
+        --coordination-oid "$WRITER_COORDINATION_REVISION" \
+        --compensation-next-step finish || return 1
+      next_step=finish
+    fi
+    writer_load_operation_final "$operation" || return 1
+  fi
+
+  if [ "$next_step" = claim ]; then
+    [ "$target" = released ] && [ "$WRITER_OPERATION_STAGE" = release-pending ] || return 1
+    writer_append_release_final "$root" "$origin" "$operation" || return 1
+    if writer_test_interrupt compensation-claim-released "$operation"; then return 1; fi
+    ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-compensation.XXXXXX")"
+    writer_load_remote_ledger "$root" "$origin" "$ledger" || { rm -f "$ledger"; return 1; }
+    state="$(python3 "$(writer_helper)" ledger-state "$ledger" \
+      --operation-id "$WRITER_OPERATION_ID" --claim-id "$WRITER_CLAIM_ID" \
+      --operation-file "$operation" --format shell | sed -n 's/^claim_state=//p')" \
+      || { rm -f "$ledger"; return 1; }
+    rm -f "$ledger"; [ "$state" = released ] || return 1
+    writer_operation_update "$operation" --coordination-oid "$WRITER_COORDINATION_REVISION" \
+      --compensation-next-step finish || return 1
+    writer_load_operation_final "$operation" || return 1
+    next_step=finish
+  fi
+
+  [ "$next_step" = finish ] || return 1
+  if [ "$target" = reserved ]; then
+    writer_operation_update "$operation" --stage remote-claimed --clear-compensation || return 1
+  else
+    writer_operation_update "$operation" --stage released --clear-compensation || return 1
+  fi
+  writer_load_operation_final "$operation"
+}
+
+writer_revalidation_gate() {
+  local operation="$1" root="$2" origin="$3" instance_id="$4" authorization_file="$5"
+  local revalidation_rc policy_output
+  if writer_revalidate_final "$operation" "$root" "$origin" "$instance_id" "$authorization_file"; then
+    writer_load_operation_final "$operation"
+    return 0
+  else
+    revalidation_rc=$?
+  fi
+  policy_output="${GOVERNED_POLICY_OUTPUT:-}"
+  case "$revalidation_rc" in
+    3)
+      writer_load_operation_final "$operation" || return 1
+      writer_reconcile_compensation_effects "$operation" || {
+        writer_load_operation_final "$operation" || true
+        print_writer_claim_json_final false writer-recovery-blocked; return 1
+      }
+      if [ "$WRITER_OPERATION_RECORD_OWNERSHIP" != none ] \
+        || [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" != none ] \
+        || [ "$WRITER_OPERATION_EFFECT_OWNER_STATE" = acquired ]; then
+        writer_compensate_revalidation "$operation" "$root" "$origin" reserved ask || {
+          writer_load_operation_final "$operation" || true
+          print_writer_claim_json_final false writer-recovery-blocked; return 1
+        }
+      fi
+      printf '%s\n' "$policy_output"; return 3
+      ;;
+    4)
+      writer_load_operation_final "$operation" || return 1
+      writer_compensate_revalidation "$operation" "$root" "$origin" released deny || {
+        writer_load_operation_final "$operation" || true
+        print_writer_claim_json_final false writer-recovery-blocked; return 1
+      }
+      printf '%s\n' "$policy_output"; return 4
+      ;;
+    *)
+      writer_load_operation_final "$operation" || true
+      print_writer_claim_json_final false writer-recovery-blocked; return 1
+      ;;
+  esac
+}
+
 cmd_add_repo_v2_work_final() {
   local name="$1" ref="$2" instance_id="$3" authorization_file="$4"
-  local root context_state operation_dir operation ledger origin observed existing recovery_rc
+  local root context_state operation_dir operation ledger origin observed existing recovery_rc gate_rc
   local issue parent slug snapshot row_file primary_digest changed=true
   local marker_file recovery_digest record_recovered=false record_count owner_rows
+  local compensation_target compensation_reason
   root="$(wb_root)"; WRITER_OWNER="$name"; WRITER_CLONE="$root/.codebases/$name"
   [ -d "$WRITER_CLONE/.git" ] || die ".codebases/$name 없음 — codebases.yaml에 추가 후 workbench setup 실행"
   current_task_identity; writer_runtime_identity "$root"
@@ -1660,10 +1975,39 @@ cmd_add_repo_v2_work_final() {
   fi
   writer_load_operation_final "$operation" || { rm -f "$ledger"; return 1; }
   WRITER_OPERATION_FILE="$operation"
-  [ "$WRITER_OPERATION_REGISTRY_REVISION" = "$PROTECTED_REGISTRY_REVISION" ] \
-    && [ "$WRITER_OPERATION_REGISTRY_DIGEST" = "$PROTECTED_REGISTRY_DIGEST" ] \
+  [ "$WRITER_OPERATION_REGISTRY_DIGEST" = "$PROTECTED_REGISTRY_DIGEST" ] \
     && [ "$WRITER_CODEBASE_ORIGIN" = "$PROTECTED_REGISTRY_ORIGIN" ] \
     || { rm -f "$ledger"; print_writer_claim_json_final false writer-recovery-blocked; return 1; }
+  case "$WRITER_OPERATION_STAGE" in
+    compensation-pending|release-pending)
+      compensation_target="$(writer_json_query "$(cat "$operation")" compensation_target)"
+      compensation_reason="$(writer_json_query "$(cat "$operation")" compensation_reason)"
+      case "$compensation_target:$compensation_reason" in
+        reserved:ask|released:deny|released:authorization-deny) ;;
+        *) rm -f "$ledger"; print_writer_claim_json_final false writer-recovery-blocked; return 1 ;;
+      esac
+      [ "$WRITER_DEVICE_ID" = "$WRITER_RUNTIME_DEVICE_ID" ] \
+        && [ "$WRITER_CLONE_ID" = "$WRITER_RUNTIME_CLONE_ID" ] \
+        || { rm -f "$ledger"; print_writer_claim_json_final false writer-recovery-blocked; return 1; }
+      rm -f "$ledger"
+      writer_compensate_revalidation "$operation" "$root" "$origin" \
+        "$compensation_target" "$compensation_reason" || {
+        writer_load_operation_final "$operation" || true
+        print_writer_claim_json_final false writer-recovery-blocked; return 1
+      }
+      if [ "$compensation_target" = released ]; then
+        writer_print_stored_policy_final "$operation" deny || {
+          print_writer_claim_json_final false writer-recovery-blocked; return 1
+        }
+        return 4
+      fi
+      ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
+      writer_load_remote_ledger "$root" "$origin" "$ledger" || {
+        rm -f "$ledger"; print_writer_claim_json_final false writer-lock-unavailable; return 1
+      }
+      observed="$WRITER_OBSERVED_OID"
+      ;;
+  esac
   if [ "$WRITER_OPERATION_STAGE" = consumed ]; then
     writer_conflict_final "$ledger" "$operation" || { rm -f "$ledger"; return 1; }
     if ! writer_consumed_matches_final "$ledger" "$operation"; then
@@ -1718,6 +2062,11 @@ cmd_add_repo_v2_work_final() {
     print_writer_claim_json_final false writer-lock-unavailable
     return 1
   fi
+  if writer_revalidation_gate "$operation" "$root" "$origin" "$instance_id" "$authorization_file"; then
+    :
+  else
+    gate_rc=$?; return "$gate_rc"
+  fi
   if writer_effect_owner_cas "$root" "$origin" acquired; then
     :
   else
@@ -1730,6 +2079,11 @@ cmd_add_repo_v2_work_final() {
     writer_load_operation_final "$operation"
   fi
   if writer_test_interrupt effect-owner-acquired "$operation"; then return 1; fi
+  if writer_revalidation_gate "$operation" "$root" "$origin" "$instance_id" "$authorization_file"; then
+    :
+  else
+    gate_rc=$?; return "$gate_rc"
+  fi
 
   if [ -z "$WRITER_OPERATION_WORKTREE_SET_DIGEST" ]; then
     snapshot="$(writer_worktree_snapshot_digest "$WRITER_CLONE" "$WRITER_CODEBASE_ORIGIN" \
@@ -1798,6 +2152,12 @@ cmd_add_repo_v2_work_final() {
     fi
     writer_load_operation_final "$operation"
   fi
+  if writer_test_interrupt worktree-ready "$operation"; then return 1; fi
+  if writer_revalidation_gate "$operation" "$root" "$origin" "$instance_id" "$authorization_file"; then
+    :
+  else
+    gate_rc=$?; return "$gate_rc"
+  fi
   writer_operation_update "$operation" --stage record-create-pending
   writer_load_operation_final "$operation"
   record_count="$(repos_block | grep -Fxc -- "- $name | $WRITER_CODEBASE_BRANCH | work" || true)"
@@ -1812,13 +2172,12 @@ cmd_add_repo_v2_work_final() {
   fi
   row_file="$(writer_row_dir)/$name.record"
   if [ -e "$row_file" ]; then
-    writer_row_matches_final "$row_file" || {
+    writer_row_matches_pending_final "$row_file" || {
       print_writer_claim_json_final false writer-recovery-blocked; return 1
     }
     record_recovered=true
   else
-    write_writer_row_final "$row_file" "$WRITER_OPERATION_ACTION" "$WRITER_OPERATION_INTENT" \
-      "$WRITER_OPERATION_MANIFEST" "$WRITER_OPERATION_AUTHORIZATION"
+    write_writer_row_final "$row_file" "" "" "" ""
     if writer_test_interrupt writer-row-written "$operation"; then return 1; fi
   fi
   if [ "$record_recovered" = true ]; then
@@ -1827,7 +2186,14 @@ cmd_add_repo_v2_work_final() {
     writer_operation_update "$operation" --stage record-ready --repo-record-ownership created
   fi
   writer_load_operation_final "$operation"
+  if writer_revalidation_gate "$operation" "$root" "$origin" "$instance_id" "$authorization_file"; then
+    :
+  else
+    gate_rc=$?; return "$gate_rc"
+  fi
   if [ -n "$WRITER_OPERATION_ACTION" ]; then
+    write_writer_row_final "$row_file" "$WRITER_OPERATION_ACTION" "$WRITER_OPERATION_INTENT" \
+      "$WRITER_OPERATION_MANIFEST" "$WRITER_OPERATION_AUTHORIZATION"
     primary_digest="$(digest_manifest "$row_file")"
     consume_governed_action task.concurrent-write "workbench:codebase/$name" "$WRITER_CONFLICT_REVISION" \
       "$WRITER_OPERATION_ACTION" "$WRITER_OPERATION_INTENT" "$primary_digest" || {
@@ -2017,7 +2383,7 @@ cmd_writer_operation_handoff() {
       --compensation-target reserved --compensation-reason handoff --compensation-next-step record
     writer_load_operation_final "$WRITER_OPERATION_FILE"
   elif [ "$WRITER_OPERATION_STAGE" != compensation-pending ] \
-    || [ "$(json_get "$(cat "$WRITER_OPERATION_FILE")" compensation_reason)" != handoff ]; then
+    || [ "$(writer_json_query "$(cat "$WRITER_OPERATION_FILE")" compensation_reason)" != handoff ]; then
     rm -f "$WRITER_OPERATION_LEDGER"
     writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
   fi
@@ -4721,6 +5087,7 @@ resolve_governed_action() {
   [ -z "$authorization_file" ] || args+=(--authorization-file "$authorization_file")
   if output="$(cd "$TASK_DIR" && \
     WORKBENCH_REQUIRE_EXPLICIT_AUTHORIZATION="${GOVERNED_REQUIRE_EXPLICIT_AUTHORIZATION:-0}" \
+    WORKBENCH_ALLOW_ACTION_REPLACEMENT="${GOVERNED_ALLOW_ACTION_REPLACEMENT:-0}" \
     "$policy_util" "${args[@]}")"; then rc=0; else rc=$?; fi
   rm -f "$request_file"
   GOVERNED_POLICY_OUTPUT="$output"; GOVERNED_POLICY_RC="$rc"

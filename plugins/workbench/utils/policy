@@ -446,7 +446,13 @@ cmd_resolve() {
     [ "$(record_get "$file" action_id)" = "$ACTION_ID" ] || integrity_error "action instance binding mismatch: action_id"
     [ "$(record_get "$file" task_claim_id)" = "$CLAIM_ID" ] || integrity_error "action instance binding mismatch: task_claim_id"
     [ "$(record_get "$file" target_ref)" = "$TARGET_REF" ] || integrity_error "action instance binding mismatch: target_ref"
-    [ "$(record_get "$file" revision)" = "$REVISION" ] || integrity_error "action instance binding mismatch: revision"
+    if [ "$(record_get "$file" revision)" != "$REVISION" ]; then
+      [ "${WORKBENCH_ALLOW_ACTION_REPLACEMENT:-0}" = 1 ] \
+        || integrity_error "action instance binding mismatch: revision"
+      rewrite_action_status "$file" superseded
+      mint_bound_action "$actions_dir" "$requires_auth"
+      file="$CURRENT_ACTION_FILE"
+    else
     stored_manifest="$(record_get "$file" policy_manifest_digest)"
     stored_intent="$(record_get "$file" intent_digest)"
     if [ -n "$INTENT_DIGEST" ]; then
@@ -503,6 +509,7 @@ cmd_resolve() {
       else
         CURRENT_DECISION=allow; rewrite_action_status "$file" authorized
       fi
+    fi
     fi
   fi
 

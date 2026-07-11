@@ -1974,11 +1974,10 @@ import sys
 first = json.load(open(sys.argv[1], encoding="utf-8"))
 second = json.load(open(sys.argv[2], encoding="utf-8"))
 assert first["claim_id"] != second["claim_id"]
-assert sorted((len(first["conflicts"]), len(second["conflicts"]))) == [0, 1]
-assert sorted((first["action_instance_id"] is None, second["action_instance_id"] is None)) == [False, True]
-conflicted = first if first["conflicts"] else second
-winner = second if first["conflicts"] else first
-assert conflicted["conflicts"][0]["claim_id"] == winner["claim_id"]
+conflict_lengths = sorted((len(first["conflicts"]), len(second["conflicts"])))
+assert conflict_lengths in ([0, 1], [1, 1]), conflict_lengths
+for value, peer in ((first, second), (second, first)):
+    assert all(item["claim_id"] == peer["claim_id"] for item in value["conflicts"])
 lines = open(sys.argv[3], encoding="utf-8").read().splitlines()
 assert lines[0] == "workbench-writer-claims/v1"
 rows = [line.split("\t") for line in lines[1:]]
@@ -1987,6 +1986,7 @@ effects = [row for row in rows if row[0] == "effect-owner"]
 assert len(claims) == 2 and len(effects) == 2
 assert all(row[-1] == "active" for row in claims)
 assert all(row[-1] == "acquired" for row in effects)
+assert sorted(row[9] == "null" for row in claims) == [False, True]
 assert {row[2] for row in claims} == {first["claim_id"], second["claim_id"]}
 assert {row[3] for row in effects} == {first["claim_id"], second["claim_id"]}
 assert claims == sorted(claims, key=lambda row: (row[4], row[3], row[1], row[2], 0 if row[-1] == "active" else 1))
@@ -2112,7 +2112,7 @@ PY
 }
 
 test_writer_conflict_uses_complete_legacy_and_v2_union() {
-  local task_dir observation adapter revision actual
+  local task_dir observation adapter revision actual pending out instance target intent manifest auth claim
   setup_writer_workbench writer_legacy_union
   prepare_writer_task writer_legacy_union 29 union; task_dir="$WRITER_TASK_DIR"
   revision="$(git -C "$WRITER_REPO" rev-parse origin/main)"
@@ -2123,10 +2123,31 @@ test_writer_conflict_uses_complete_legacy_and_v2_union() {
   adapter="$TMPDIR/writer_legacy_union/bin/active-legacy-adapter"
   write_fake_legacy_adapter "$adapter" "$observation"
 
+  out="$TMPDIR/writer_legacy_union/pending.out"
+  if WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_legacy_union "$task_dir" add-repo shared-api --format json >"$out"; then
+    fail "legacy writer conflict must require explicit authorization"
+  else
+    [ "$?" = 3 ] || fail "legacy writer conflict must ask at exit 3"
+  fi
+  pending="$(cat "$out")"; assert_contains "$pending" '"decision":"ask"'
+  instance="$(json_get "$pending" action_instance.id)"
+  target="$(json_get "$pending" action_instance.target_ref)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  auth="$TMPDIR/writer_legacy_union/authorization.json"
+  write_authorization "$auth" "$instance" task.concurrent-write "$claim" "$target" \
+    "$revision" "$manifest" allow owner@example.com 2026-07-11T05:30:00Z \
+    conversation:message/writer-legacy-union "$intent"
   actual="$(WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
     WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
     WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
-    run_task_in_dir writer_legacy_union "$task_dir" add-repo shared-api --format json)"
+    run_task_in_dir writer_legacy_union "$task_dir" add-repo shared-api \
+      --action-instance-id "$instance" --authorization-file "$auth" --format json)"
   ACTUAL="$actual" python3 - <<'PY'
 import json
 import os
@@ -2524,6 +2545,7 @@ PY
 
 test_writer_effect_prefix_resumes_bound_conflict_action() {
   local task_dir observation adapter revision out first operation_id action_id actual operation
+  local pending instance target intent manifest auth claim
   setup_writer_workbench writer_prefix_action
   prepare_writer_task writer_prefix_action 29 action; task_dir="$WRITER_TASK_DIR"
   revision="$(git -C "$WRITER_REPO" rev-parse origin/main)"
@@ -2533,12 +2555,32 @@ test_writer_effect_prefix_resumes_bound_conflict_action() {
     "$TMPDIR/writer_prefix_action/shared-api.git"
   adapter="$TMPDIR/writer_prefix_action/bin/active-legacy-adapter"
   write_fake_legacy_adapter "$adapter" "$observation"
+  out="$TMPDIR/writer_prefix_action/pending.out"
+  if WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_prefix_action "$task_dir" add-repo shared-api --format json >"$out"; then
+    fail "legacy prefix action must require explicit authorization"
+  else
+    [ "$?" = 3 ] || fail "legacy prefix action must ask at exit 3"
+  fi
+  pending="$(cat "$out")"; instance="$(json_get "$pending" action_instance.id)"
+  target="$(json_get "$pending" action_instance.target_ref)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  auth="$TMPDIR/writer_prefix_action/authorization.json"
+  write_authorization "$auth" "$instance" task.concurrent-write "$claim" "$target" \
+    "$revision" "$manifest" allow owner@example.com 2026-07-11T05:31:00Z \
+    conversation:message/writer-prefix-action "$intent"
   out="$TMPDIR/writer_prefix_action/interrupted.out"
   if WORKBENCH_TEST_FAIL_WRITER_STAGE=writer-row-written \
     WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
     WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
     WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
-    run_task_in_dir writer_prefix_action "$task_dir" add-repo shared-api --format json >"$out"; then
+    run_task_in_dir writer_prefix_action "$task_dir" add-repo shared-api \
+      --action-instance-id "$instance" --authorization-file "$auth" --format json >"$out"; then
     fail "bound action fixture did not interrupt after its writer row"
   fi
   first="$(cat "$out")"; operation_id="$(json_get "$first" operation_id)"
@@ -2547,7 +2589,8 @@ test_writer_effect_prefix_resumes_bound_conflict_action() {
   if actual="$(WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
     WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
     WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
-    run_task_in_dir writer_prefix_action "$task_dir" add-repo shared-api --format json)"; then
+    run_task_in_dir writer_prefix_action "$task_dir" add-repo shared-api \
+      --action-instance-id "$instance" --authorization-file "$auth" --format json)"; then
     :
   else
     fail "bound writer action did not resume: $actual"
@@ -2561,6 +2604,354 @@ test_writer_effect_prefix_resumes_bound_conflict_action() {
   [ "$(json_get "$(cat "$operation")" action_instance_id)" = "$action_id" ] \
     || fail "consumed operation lost its conflict action binding"
   assert_file_contains "$task_dir/task/.workbench/actions/$action_id.record" 'status=consumed'
+}
+
+test_writer_revalidates_stale_policy_at_effect_boundaries() {
+  local decision case_name task_dir first_task policy out first operation_id claim_id
+  local retry operation ledger ref rc
+  for decision in ask deny; do
+    case_name="writer_revalidate_${decision}"
+    setup_writer_workbench "$case_name"
+    prepare_writer_task "$case_name" 31 first; first_task="$WRITER_TASK_DIR"
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$first_task" add-repo shared-api --format json >/dev/null
+    prepare_writer_task "$case_name" 29 "${decision}gate"; task_dir="$WRITER_TASK_DIR"
+    out="$TMPDIR/$case_name/interrupted.out"
+    if WORKBENCH_TEST_FAIL_WRITER_STAGE=worktree-ready \
+      WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+      WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$task_dir" add-repo shared-api --format json >"$out"; then
+      fail "stale $decision policy fixture did not stop after its owned worktree"
+    fi
+    first="$(cat "$out")"; operation_id="$(json_get "$first" operation_id)"
+    claim_id="$(json_get "$first" claim_id)"
+    policy="$TMPDIR/$case_name/$decision.policy"
+    printf '%s\n' 'schema=workbench-policy/v1' \
+      "action.task.concurrent-write=$decision" > "$policy"
+    retry="$TMPDIR/$case_name/retry.out"
+    if WORKBENCH_PLATFORM_POLICY="$policy" \
+      WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$task_dir" add-repo shared-api --format json >"$retry"; then
+      fail "writer ignored stale allow-to-$decision before its repo record"
+    else
+      rc=$?
+    fi
+    operation="$task_dir/task/.workbench/writer-operations/$operation_id.json"
+    ! grep -q '^- shared-api |' "$task_dir/task/index.md" \
+      || fail "stale $decision policy wrote a repo index row"
+    [ ! -e "$task_dir/task/.workbench/writer-rows/shared-api.record" ] \
+      || fail "stale $decision policy wrote a writer row"
+
+    ref=refs/heads/workbench-coordination/writer-claims
+    ledger="$TMPDIR/$case_name/writer-claims.tsv"
+    git --git-dir="$TMPDIR/$case_name/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+    if [ "$decision" = ask ]; then
+      [ "$rc" = 3 ] || fail "stale ask must exit 3, got $rc"
+      assert_file_contains "$retry" '"decision":"ask"'
+      [ ! -e "$task_dir/task/codebases/shared-api" ] \
+        || fail "ask compensation retained an owned local worktree"
+      [ "$(json_get "$(cat "$operation")" stage)" = remote-claimed ] \
+        || fail "ask compensation did not return to the reservation stage"
+      [ "$(json_get "$(cat "$operation")" compensation_target)" = "" ] \
+        || fail "ask compensation did not clear its completed cursor"
+      python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert [row[-1] for row in claims] == ["active"]
+assert [row[-1] for row in effects] == ["acquired", "released"]
+PY
+    else
+      [ "$rc" = 4 ] || fail "stale deny must exit 4, got $rc"
+      assert_file_contains "$retry" '"decision":"deny"'
+      [ ! -e "$task_dir/task/codebases/shared-api" ] \
+        || fail "deny compensation retained the owned worktree"
+      [ "$(json_get "$(cat "$operation")" stage)" = released ] \
+        || fail "deny compensation did not release the operation"
+      python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert [row[-1] for row in claims] == ["active", "released"]
+assert [row[-1] for row in effects] == ["acquired", "released"]
+PY
+    fi
+  done
+}
+
+test_writer_revalidates_legacy_union_before_first_primary() {
+  local task_dir out first operation_id claim_id observation adapter revision retry operation ledger ref rc
+  setup_writer_workbench writer_revalidate_union
+  prepare_writer_task writer_revalidate_union 29 uniongate; task_dir="$WRITER_TASK_DIR"
+  out="$TMPDIR/writer_revalidate_union/claim.out"
+  if WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM=1 \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_union "$task_dir" add-repo shared-api --format json >"$out"; then
+    fail "legacy union drift fixture did not stop after its claim"
+  fi
+  first="$(cat "$out")"; operation_id="$(json_get "$first" operation_id)"
+  claim_id="$(json_get "$first" claim_id)"
+  revision="$(git -C "$WRITER_REPO" rev-parse origin/main)"
+  observation="$TMPDIR/writer_revalidate_union/active-legacy.json"
+  write_active_legacy_observation "$observation" "$revision" \
+    "$(git -C "$WRITER_REPO" remote get-url origin)" shared-api \
+    "$TMPDIR/writer_revalidate_union/shared-api.git"
+  adapter="$TMPDIR/writer_revalidate_union/bin/active-legacy-adapter"
+  write_fake_legacy_adapter "$adapter" "$observation"
+  retry="$TMPDIR/writer_revalidate_union/retry.out"
+  if WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_union "$task_dir" add-repo shared-api --format json >"$retry"; then
+    fail "writer ignored a changed legacy union before effect ownership"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 3 ] || fail "new legacy conflict must reserve at exit 3, got $rc"
+  assert_file_contains "$retry" '"decision":"ask"'
+  [ ! -e "$task_dir/task/codebases/shared-api" ] \
+    || fail "legacy union drift created a local worktree"
+  operation="$task_dir/task/.workbench/writer-operations/$operation_id.json"
+  [ "$(json_get "$(cat "$operation")" stage)" = remote-claimed ] \
+    || fail "legacy union drift did not retain its reservation"
+  [ -n "$(json_get "$(cat "$operation")" action_instance_id)" ] \
+    || fail "legacy union drift did not persist its replacement action"
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/writer_revalidate_union/writer-claims.tsv"
+  git --git-dir="$TMPDIR/writer_revalidate_union/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+assert [row[-1] for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]] == ["active"]
+assert not [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+PY
+}
+
+test_writer_union_ambiguity_preserves_claim_and_cursor() {
+  local task_dir out first operation_id claim_id operation operation_before
+  local retry ledger ref coordination_before rc
+  setup_writer_workbench writer_revalidate_union_ambiguous
+  prepare_writer_task writer_revalidate_union_ambiguous 29 unionunknown; task_dir="$WRITER_TASK_DIR"
+  out="$TMPDIR/writer_revalidate_union_ambiguous/claim.out"
+  if WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM=1 \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_union_ambiguous "$task_dir" \
+      add-repo shared-api --format json >"$out"; then
+    fail "union ambiguity fixture did not stop after its claim"
+  fi
+  first="$(cat "$out")"; operation_id="$(json_get "$first" operation_id)"
+  claim_id="$(json_get "$first" claim_id)"
+  operation="$task_dir/task/.workbench/writer-operations/$operation_id.json"
+  operation_before="$(git hash-object "$operation")"
+  ref=refs/heads/workbench-coordination/writer-claims
+  coordination_before="$(git --git-dir="$TMPDIR/writer_revalidate_union_ambiguous/origin.git" \
+    rev-parse "$ref")"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 9' \
+    > "$TMPDIR/writer_revalidate_union_ambiguous/bin/legacy-adapter"
+  chmod +x "$TMPDIR/writer_revalidate_union_ambiguous/bin/legacy-adapter"
+
+  retry="$TMPDIR/writer_revalidate_union_ambiguous/retry.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_union_ambiguous "$task_dir" \
+      add-repo shared-api --format json >"$retry"; then
+    fail "writer proceeded with an incomplete legacy union"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 1 ] || fail "union ambiguity must exit 1, got $rc"
+  assert_file_contains "$retry" '"code":"writer-recovery-blocked"'
+  [ "$(git hash-object "$operation")" = "$operation_before" ] \
+    || fail "union ambiguity mutated the operation cursor"
+  [ "$(git --git-dir="$TMPDIR/writer_revalidate_union_ambiguous/origin.git" \
+    rev-parse "$ref")" = "$coordination_before" ] \
+    || fail "union ambiguity mutated the coordination ledger"
+  [ ! -e "$task_dir/task/codebases/shared-api" ] \
+    || fail "union ambiguity created a local worktree"
+  ledger="$TMPDIR/writer_revalidate_union_ambiguous/writer-claims.tsv"
+  git --git-dir="$TMPDIR/writer_revalidate_union_ambiguous/origin.git" \
+    show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+assert [row[-1] for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]] == ["active"]
+assert not [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+PY
+}
+
+test_writer_compensation_prefixes_resume_exact_cursor() {
+  local decision case_name first_task task_dir policy out first operation_id claim_id
+  local interrupted resumed operation ledger ref rc expected_stage expected_cursor
+  local prefix_stage compensation_stage
+  for decision in ask deny; do
+    case_name="writer_compensation_resume_$decision"
+    setup_writer_workbench "$case_name"
+    prepare_writer_task "$case_name" 31 first; first_task="$WRITER_TASK_DIR"
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$first_task" add-repo shared-api --format json >/dev/null
+    prepare_writer_task "$case_name" 29 "${decision}resume"; task_dir="$WRITER_TASK_DIR"
+    if [ "$decision" = ask ]; then
+      prefix_stage=writer-row-written; compensation_stage=record-removed
+    else
+      prefix_stage=worktree-ready; compensation_stage=claim-released
+    fi
+    out="$TMPDIR/$case_name/prefix.out"
+    if WORKBENCH_TEST_FAIL_WRITER_STAGE="$prefix_stage" \
+      WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+      WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$task_dir" add-repo shared-api --format json >"$out"; then
+      fail "compensation $decision fixture did not stop at $prefix_stage"
+    fi
+    first="$(cat "$out")"; operation_id="$(json_get "$first" operation_id)"
+    claim_id="$(json_get "$first" claim_id)"
+    operation="$task_dir/task/.workbench/writer-operations/$operation_id.json"
+    policy="$TMPDIR/$case_name/$decision.policy"
+    printf '%s\n' 'schema=workbench-policy/v1' \
+      "action.task.concurrent-write=$decision" > "$policy"
+    interrupted="$TMPDIR/$case_name/compensation-interrupted.out"
+    if WORKBENCH_TEST_FAIL_WRITER_STAGE="compensation-$compensation_stage" \
+      WORKBENCH_PLATFORM_POLICY="$policy" \
+      WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$task_dir" add-repo shared-api --format json \
+        >"$interrupted"; then
+      fail "compensation $decision interruption unexpectedly succeeded"
+    else
+      rc=$?
+    fi
+    [ "$rc" = 1 ] || fail "compensation $decision interruption must exit 1, got $rc"
+    assert_file_contains "$interrupted" '"code":"writer-recovery-blocked"'
+    if [ "$decision" = ask ]; then
+      expected_stage=compensation-pending; expected_cursor=record
+    else
+      expected_stage=release-pending; expected_cursor=claim
+    fi
+    [ "$(json_get "$(cat "$operation")" stage)" = "$expected_stage" ] \
+      || fail "compensation $decision lost its durable stage"
+    [ "$(json_get "$(cat "$operation")" compensation_next_step)" = "$expected_cursor" ] \
+      || fail "compensation $decision advanced past its interrupted cursor"
+
+    resumed="$TMPDIR/$case_name/resumed.out"
+    if WORKBENCH_PLATFORM_POLICY="$policy" \
+      WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$task_dir" add-repo shared-api --format json >"$resumed"; then
+      fail "compensation $decision retry unexpectedly returned success"
+    else
+      rc=$?
+    fi
+    [ "$rc" = "$([ "$decision" = ask ] && printf 3 || printf 4)" ] \
+      || fail "compensation $decision retry returned $rc"
+    [ ! -e "$task_dir/task/codebases/shared-api" ] \
+      || fail "compensation $decision retry retained its worktree"
+    ref=refs/heads/workbench-coordination/writer-claims
+    ledger="$TMPDIR/$case_name/writer-claims.tsv"
+    git --git-dir="$TMPDIR/$case_name/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+    python3 - "$ledger" "$operation_id" "$claim_id" "$decision" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row[-1] for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row[-1] for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert claims == (["active"] if sys.argv[4] == "ask" else ["active", "released"])
+assert effects == ["acquired", "released"]
+PY
+    [ "$(json_get "$(cat "$operation")" stage)" \
+      = "$([ "$decision" = ask ] && printf remote-claimed || printf released)" ] \
+      || fail "compensation $decision retry did not finish its exact target"
+  done
+}
+
+test_writer_persists_allow_replacement_before_first_effect() {
+  local task_dir competing out first operation_id claim_id actual operation ledger ref
+  setup_writer_workbench writer_revalidate_allow
+  prepare_writer_task writer_revalidate_allow 29 allowgate; task_dir="$WRITER_TASK_DIR"
+  out="$TMPDIR/writer_revalidate_allow/claim.out"
+  if WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM=1 \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_allow "$task_dir" add-repo shared-api --format json >"$out"; then
+    fail "allow replacement fixture did not stop after its claim"
+  fi
+  first="$(cat "$out")"; operation_id="$(json_get "$first" operation_id)"
+  claim_id="$(json_get "$first" claim_id)"
+  [ "$(json_get "$first" action_instance_id)" = "" ] \
+    || fail "allow replacement fixture unexpectedly started with a conflict action"
+
+  prepare_writer_task writer_revalidate_allow 31 competitor; competing="$WRITER_TASK_DIR"
+  WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+  WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_allow "$competing" add-repo shared-api --format json >/dev/null
+
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_allow "$task_dir" add-repo shared-api --format json)"
+  assert_contains "$actual" '"operation_stage":"consumed"'
+  [ "$(json_get "$actual" operation_id)" = "$operation_id" ] \
+    || fail "allow replacement changed the stable operation"
+  [ -n "$(json_get "$actual" action_instance_id)" ] \
+    || fail "allow replacement did not persist its new action binding"
+  operation="$task_dir/task/.workbench/writer-operations/$operation_id.json"
+  [ -n "$(json_get "$(cat "$operation")" action_instance_id)" ] \
+    || fail "allow replacement operation retained the claim-time null binding"
+
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/writer_revalidate_allow/writer-claims.tsv"
+  git --git-dir="$TMPDIR/writer_revalidate_allow/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claim = next(row for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4])
+assert claim[9:13] == ["null", "null", "null", "null"]
+assert [row[-1] for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]] == ["acquired"]
+PY
+}
+
+test_writer_authority_revalidation_fails_closed_without_compensation() {
+  local task_dir out first operation_id claim_id retry ledger ref
+  setup_writer_workbench writer_revalidate_authority
+  prepare_writer_task writer_revalidate_authority 29 authgate; task_dir="$WRITER_TASK_DIR"
+  out="$TMPDIR/writer_revalidate_authority/claim.out"
+  if WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM=1 \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_authority "$task_dir" add-repo shared-api --format json >"$out"; then
+    fail "authority drift fixture did not stop after its claim"
+  fi
+  first="$(cat "$out")"; operation_id="$(json_get "$first" operation_id)"
+  claim_id="$(json_get "$first" claim_id)"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 9' \
+    > "$TMPDIR/writer_revalidate_authority/bin/hosting-authority"
+  chmod +x "$TMPDIR/writer_revalidate_authority/bin/hosting-authority"
+  retry="$TMPDIR/writer_revalidate_authority/retry.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_revalidate_authority "$task_dir" add-repo shared-api --format json \
+      >"$retry" 2>&1; then
+    fail "writer proceeded after authority revalidation failed"
+  fi
+  assert_file_contains "$retry" 'policy-authority-unavailable'
+  [ ! -e "$task_dir/task/codebases/shared-api" ] \
+    || fail "authority failure created a local worktree"
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/writer_revalidate_authority/writer-claims.tsv"
+  git --git-dir="$TMPDIR/writer_revalidate_authority/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+assert [row[-1] for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]] == ["active"]
+assert not [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+PY
 }
 
 test_cleanup_retires_consumed_writer_before_local_deletion() {
@@ -2795,6 +3186,12 @@ run_case test_writer_operation_handoff_transfers_to_explicit_clone
 run_case test_writer_effect_prefix_crashes_resume_once_only
 run_case test_writer_effect_prefix_mismatch_preserves_external_effects
 run_case test_writer_effect_prefix_resumes_bound_conflict_action
+run_case test_writer_revalidates_stale_policy_at_effect_boundaries
+run_case test_writer_revalidates_legacy_union_before_first_primary
+run_case test_writer_union_ambiguity_preserves_claim_and_cursor
+run_case test_writer_compensation_prefixes_resume_exact_cursor
+run_case test_writer_persists_allow_replacement_before_first_effect
+run_case test_writer_authority_revalidation_fails_closed_without_compensation
 run_case test_cleanup_retires_consumed_writer_before_local_deletion
 run_case test_status_reports_concurrent_writer_conflicts
 
