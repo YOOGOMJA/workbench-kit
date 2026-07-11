@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/toolbox/product-v1",
+  "title": "Toolbox product state v1",
+  "x-workbench": {
+    "capability_pack_contract": "workbench-capability-pack/v1",
+    "workspace_schemas": ["workbench/v2"],
+    "capabilities": ["workspace.schema/v1", "profile.language/v1"]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "name",
+    "language",
+    "status",
+    "objective",
+    "repositories"
+  ],
+  "properties": {
+    "schema": { "const": "toolbox-product/v1" },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+      "maxLength": 64
+    },
+    "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "language": {
+      "type": "string",
+      "pattern": "^(?:[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*|[Ii]-[A-Za-z0-9]{1,8}|[Xx](?:-[A-Za-z0-9]{1,8})+)$"
+    },
+    "status": {
+      "enum": ["draft", "active", "paused", "completed", "archived"]
+    },
+    "objective": { "type": "string" },
+    "repositories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "path", "role"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          },
+          "path": { "type": "string", "minLength": 1 },
+          "role": { "enum": ["owner", "work", "reference"] }
+        }
+      }
+    }
+  }
+}

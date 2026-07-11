@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/toolbox/autonomy-v1",
+  "title": "Toolbox autonomy policy v1",
+  "x-workbench": {
+    "capability_pack_contract": "workbench-capability-pack/v1",
+    "workspace_schemas": ["workbench/v2"],
+    "capabilities": ["workspace.schema/v1", "profile.language/v1"]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "default", "actions"],
+  "properties": {
+    "schema": { "const": "toolbox-autonomy/v1" },
+    "default": { "enum": ["allow", "ask", "deny"] },
+    "actions": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+      },
+      "additionalProperties": { "enum": ["allow", "ask", "deny"] }
+    }
+  }
+}

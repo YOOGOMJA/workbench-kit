@@ -1,0 +1,19 @@
+{
+  "name": "toolbox",
+  "version": "0.1.1",
+  "description": "Optional product delivery capability pack for workbench: versioned product state, deterministic portfolio plumbing, and agent-led workflows.",
+  "author": { "name": "YOOGOMJA" },
+  "homepage": "https://github.com/YOOGOMJA/workbench-kit",
+  "repository": "https://github.com/YOOGOMJA/workbench-kit",
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Toolbox",
+    "shortDescription": "Governed product state and delivery workflows",
+    "longDescription": "Optional workbench capability pack for product, scenario, and portfolio workflows.",
+    "developerName": "YOOGOMJA",
+    "category": "Developer Tools",
+    "capabilities": ["Product state", "Portfolio inspection", "Workflow skills"],
+    "defaultPrompt": "Use $product-start to initialize governed product state in this workbench."
+  }
+}

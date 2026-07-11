@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/toolbox/scenario-v1",
+  "title": "Toolbox scenario state v1",
+  "x-workbench": {
+    "capability_pack_contract": "workbench-capability-pack/v1",
+    "workspace_schemas": ["workbench/v2"],
+    "capabilities": ["workspace.schema/v1", "profile.language/v1"]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "productId",
+    "title",
+    "status",
+    "priority",
+    "dependsOn",
+    "acceptanceCriteria",
+    "designRefs",
+    "verificationRefs"
+  ],
+  "properties": {
+    "schema": { "const": "toolbox-scenario/v1" },
+    "id": {
+      "type": "string",
+      "pattern": "^SCN-[A-Z0-9][A-Z0-9-]*$",
+      "maxLength": 64
+    },
+    "productId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+    },
+    "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "status": {
+      "enum": ["draft", "ready", "active", "blocked", "completed", "abandoned"]
+    },
+    "priority": { "type": "integer", "minimum": 0 },
+    "dependsOn": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^SCN-[A-Z0-9][A-Z0-9-]*$"
+      },
+      "uniqueItems": true
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "designRefs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "verificationRefs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    }
+  }
+}

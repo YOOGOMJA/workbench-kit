@@ -1,0 +1,12 @@
+{
+  "schema": "toolbox-scenario/v1",
+  "id": "SCN-001",
+  "productId": "example-product",
+  "title": "Describe a user outcome",
+  "status": "draft",
+  "priority": 100,
+  "dependsOn": [],
+  "acceptanceCriteria": [],
+  "designRefs": [],
+  "verificationRefs": []
+}

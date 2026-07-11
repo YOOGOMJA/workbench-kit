@@ -1,0 +1,9 @@
+{
+  "schema": "toolbox-product/v1",
+  "id": "example-product",
+  "name": "Example Product",
+  "language": "en",
+  "status": "draft",
+  "objective": "Describe the current product objective.",
+  "repositories": []
+}
