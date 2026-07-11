@@ -11,8 +11,10 @@
   legacy-aware CAS writer claims with crash-safe operation journals, protected-default
   authority descriptors and closed legacy-home inventories, per-effect post-CAS revalidation,
   terminal writer reconciliation, declaration-bound pack ownership, per-participant sealed
-  policy authority, and capability discovery kernel contracts. Keep product semantics in an
-  optional pack.
+  policy authority, effect-owner CAS and explicit cross-device handoff, no-effect
+  cancellation plus cursor-based compensation, requested-effect intent digests, a dedicated
+  abandonment revision, submitted-v1 PR ancestry projection, exact cleanup removal plans,
+  and capability discovery kernel contracts. Keep product semantics in an optional pack.
 - **Context:** V1 isolates task work and accumulates knowledge, but it treats a workbench
   increment pull request as the normal delivery path and describes human gates only in
   prose. It has no durable category for current intent and no supported way for an optional
@@ -29,8 +31,10 @@
   Mermaid diagrams. Missing known rules default to `ask`, unknown action IDs are
   non-executable, unsupported capabilities block mutation, authorization is bound to
   action/task/target/revision/full authority manifest, legacy writers cannot be silently
-  omitted, remote claims are cross-device recoverable, and verification is tied to exact
-  evidence subjects and immutable revisions.
+  omitted, every approval also binds its exact transition/reason/assertion/plan payload,
+  remote effects have one device/clone owner and explicit handoff, abandonment never pretends
+  to have a completion revision, submitted legacy work survives branch deletion through its
+  PR ancestry, and verification is tied to exact evidence subjects and immutable revisions.
 - **Rejected alternatives:**
   1. Put product, portfolio, scenario, design, and TDD semantics in the kernel. This would
      burden every non-product workbench and collapse the generic engine/domain boundary.
@@ -129,13 +133,34 @@
       `resume ID [--parent N]`, preserving the existing slug fallback.
   35. Leave digest booleans as semantic placeholders. Implementations could hash `True`, `1`,
       or JSON text differently; every manifest now uses exact lowercase `true|false` tokens.
+  36. Bind authorization only to target and subject revision. Two different requested effects
+      could share the same pre-state; every action now hashes a frozen per-action payload into
+      `workbench-action-intent/v1`, and every authorization and post-effect record repeats it.
+  37. Treat a process lock or local journal as cross-device effect ownership, or allow forced
+      takeover after a timeout. Another device could remove live effects it cannot observe;
+      append-only remote effect-owner CAS and source-led handoff are required instead.
+  38. Use one generic rollback stage after partial writer effects. A crash could repeat or skip
+      a deletion; compensation now records target, reason, and the exact reverse cursor before
+      each step, while pre-publication ask/deny remains provably effect-free.
+  39. Bind abandonment to the completion revision. That revision is intentionally null when
+      writers are incomplete and omits the requested reason/cleanup plan; abandonment has its
+      own content, writer, deliverable, reason, and removal-plan revision.
+  40. Project submitted v1 writers only from a task branch. Branch deletion would hide a live
+      non-cleaned writer; submitted projection now binds trusted PR head plus the newest
+      canonical first-parent index snapshot, while missing/ambiguous ancestry fails closed.
+  41. Treat a changed registry origin as an in-place edit. That could abandon live v1 history
+      at the old origin; it is removal plus addition and requires zero non-cleaned old claims.
+  42. Put timestamped GitHub probe observations directly in retryable action intent. Each
+      re-probe would supersede authorization forever; kernel acceptance uses a stable
+      timestamp-free PR subject digest and keeps the full observation only in its receipt.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing
   task contract is always v1, so active tasks can finish without forced conversion.
-  Workspace, task, lifecycle, profile, policy, authority descriptor, coordination operation,
-  evidence, pack, and domain schemas are versioned separately from plugin SemVer. Migration
-  is a governed task and pull request, not an install-time rewrite.
+  Workspace, task, lifecycle, profile, policy, action intent, authority descriptor,
+  coordination/effect-owner operation, completion/abandonment revision, evidence, cleanup
+  plan, pack, and domain schemas are versioned separately from plugin SemVer. Migration is a
+  governed task and pull request, not an install-time rewrite.
 - **Source:** workbench-kit#25 / 2026-07-11
 - **Relations:**
   - extends [[0015-task-lifecycle-events]]

@@ -74,12 +74,13 @@ The exact `workbench-contract/v1` shape is defined in
 ```
 
 Capabilities add `task.contract/v2`, `profile.language/v1`, `task.acceptance/v1`,
-`task.required-checks/v1`, `task.harvest/v1`, `task.cleanup/v1`,
+`task.abandonment/v1`, `task.required-checks/v1`, `task.harvest/v1`, `task.cleanup/v1`,
 `task.writer-conflicts/v1`, `task.writer-claims/v1`, `policy.authorization/v1`,
-`policy.authority/v1`, `policy.context-set/v1`, `workspace.authority/v1`,
+`task.writer-handoff/v1`, `policy.authority/v1`, `policy.context-set/v1`, `policy.intent/v1`, `workspace.authority/v1`,
 `workspace.doctor/v1`, and `knowledge.applicability/v1`. Supported records add the workspace
-and policy-authority, authorization, acceptance, external-probe, writer-ledger/claim,
-doctor, cleanup-journal, and frozen action-ID contracts defined below.
+and policy-authority, authorization/action-intent, completion/abandonment revision, acceptance,
+stable and timestamped external-probe, writer-ledger/claim/effect-owner, doctor,
+cleanup-plan/journal, and frozen action-ID contracts defined below.
 
 ### Profile language
 
@@ -237,6 +238,7 @@ The v2 machine form contains at least these exact fields:
           "branch": "task/41-a",
           "context_policy_set_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
           "source_revision": null,
+          "pr_head_revision": null,
           "lifecycle_digest": null
         },
         {
@@ -248,6 +250,7 @@ The v2 machine form contains at least these exact fields:
           "branch": "task/40-legacy",
           "context_policy_set_digest": null,
           "source_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pr_head_revision": "cccccccccccccccccccccccccccccccccccccccc",
           "lifecycle_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
         }
       ]
@@ -291,19 +294,42 @@ home is exhaustively queried. A home with a non-cleaned v1 claim returns
 `legacy-home-in-use` until restored or cleaned; only a provably fully cleaned home may remain
 absent. Inability to read history/snapshot or exhaust a removed home returns
 `legacy-writer-source-unavailable`. The same comparison runs before accepting a registry
-removal.
+removal. Changing the canonical origin for an existing `HOME` is exactly removal of the old
+`(HOME, origin)` pair plus addition of the new pair. The adapter must exhaust the old origin
+and prove zero non-cleaned v1 claims; querying only the replacement origin cannot authorize
+the change.
 
-A v1 claim is potentially active
-from its first claim fact until an authoritative `task-cleaned` fact for the same claim; a
-completed, abandoned, or submitted but non-cleaned task remains potentially active. For each
-such claim the kernel fetches its recorded task branch from the canonical workspace origin,
-pins the advertised OID, reads `<OID>:task/index.md`, and projects every canonical
-`role: work` repo entry. Local worktrees and cached status are not source facts.
+A v1 claim is potentially active from its first claim fact until an authoritative
+`task-cleaned` fact for the same claim; a completed, abandoned, or submitted but non-cleaned
+task remains potentially active. Reducing its authoritative history, `task-submitted` selects
+that PR until a later `task-active` invalidates the submission; later verified, completed, or
+abandoned facts retain the current submission source until cleanup. The reduced source chooses
+one procedure:
+
+1. With no current submission, the kernel fetches the recorded task branch from the
+   canonical workspace origin, pins its advertised OID, and reads
+   `<OID>:task/index.md`. That branch tip is `source_revision` and `pr_head_revision` is null.
+2. With one current submitted PR number, the trusted hosting adapter validates that PR
+   against home, branch, issue, and claim, obtains its exact current immutable head OID, and
+   traverses the fetched head's first-parent chain newest to oldest. The first tree containing
+   one canonical `task/index.md` whose claim, issue, home, parent, and branch equal lifecycle
+   identity and whose repo entries parse canonically is the index snapshot. Its commit OID is
+   `source_revision`; the PR head OID is `pr_head_revision`. Role rows are projected from that
+   snapshot, not from the PR head tree. First-parent order is total, so the first match is the
+   newest unique snapshot.
+
+The adapter must prove a complete, unique lifecycle-to-PR mapping and the entire traversed
+first-parent ancestry. No matching snapshot, multiple eligible PRs or identities, missing
+ancestry objects, a noncanonical index, or a PR/head mismatch is
+`legacy-writer-source-unavailable`. Branch deletion after submission does not hide the claim:
+the PR head and reachable index snapshot remain authoritative. Local worktrees and cached
+status are never source facts.
 
 Each entry produces this exact pseudo-claim field set: `source: "legacy-v1"`, `claim_id`,
 `operation_id: null`, `task_claim_id`, `owner`, `branch`,
-`context_policy_set_digest: null`, `source_revision` (the task-branch OID), and
-`lifecycle_digest`. Each authoritative marker first hashes its complete exact comment bytes as
+`context_policy_set_digest: null`, `source_revision` (branch tip or index-snapshot OID),
+`pr_head_revision` (submitted PR head or null), and `lifecycle_digest`. Each authoritative
+marker first hashes its complete exact comment bytes as
 `sha256:<64-lowercase-hex>`; those digests are sorted lexicographically and serialized as:
 
 ```text
@@ -321,12 +347,13 @@ owner<TAB>OWNER
 branch<TAB>BRANCH
 ```
 
-An adapter must prove a complete lifecycle inventory, branch identity, task metadata parse,
-and role inventory. Missing, unreadable, ambiguous, or corrupt input returns
+An adapter must prove a complete lifecycle inventory, branch/PR identity, task metadata parse,
+ancestry, and role inventory. Missing, unreadable, ambiguous, or corrupt input returns
 `legacy-writer-source-unavailable` at exit `1`; the kernel must not assume an empty legacy
-set. A task branch deleted before its authoritative `task-cleaned` fact is unavailable and
-fail-closed, not an absent writer. A later authoritative v1 `task-cleaned` fact removes the
-pseudo-claim dynamically. V1
+set. A pre-submission task branch deleted before its authoritative `task-cleaned` fact is
+unavailable and fail-closed, not an absent writer; a submitted task continues through its PR
+source procedure. A later authoritative v1 `task-cleaned` fact removes the pseudo-claim
+dynamically. V1
 engines never need to write a v2 ledger row. Bootstrap/migration may seed or cache projections
 for performance, but every v2 decision always joins and revalidates the authoritative sources.
 
@@ -348,21 +375,34 @@ LF-terminated schema:
 
 ```text
 workbench-writer-claims/v1
-claim<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>TASK_CLAIM_ID<TAB>OWNER<TAB>BRANCH<TAB>EXPECTED_PATH<TAB>CODEBASE_ORIGIN_URL<TAB>CONTEXT_POLICY_SET_DIGEST<TAB>ACTION_INSTANCE_ID_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>active|released
+claim<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>TASK_CLAIM_ID<TAB>OWNER<TAB>BRANCH<TAB>EXPECTED_PATH<TAB>CODEBASE_ORIGIN_URL<TAB>CONTEXT_POLICY_SET_DIGEST<TAB>ACTION_INSTANCE_ID_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>active|released
+effect-owner<TAB>EVENT_ID<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>DEVICE_ID<TAB>CLONE_ID<TAB>acquired|released
 ```
 
-Rows form an append-only set and are sorted by owner, task claim, operation ID, claim ID, then
-state (`active` before `released`). An operation/claim pair has exactly one active row and at
-most one later released row; release repeats every other field. `EXPECTED_PATH` is the
+Rows form one append-only set. Canonical serialization groups every `claim` row first, sorted
+by owner, task claim, operation ID, claim ID, then state (`active` before `released`), followed
+by every `effect-owner` row sorted by operation ID, claim ID, then event ID. An operation/claim
+pair has exactly one active claim row and at most one later released row; release repeats every
+other field. `EXPECTED_PATH` is the
 normalized workspace-relative `task/codebases/<NAME>` path, and `CODEBASE_ORIGIN_URL` is the
-canonical repository origin. Action and manifest fields are null only when the joined writer
-set had no conflict at publication. They preserve the claim-time binding; later re-resolution
-may replace the final task-local consumption binding without rewriting this append-only row.
+canonical repository origin. Action, manifest, and intent fields are null only when the joined
+writer set had no conflict at publication. They preserve the claim-time binding; later
+re-resolution may replace the final task-local consumption binding without rewriting this
+append-only row.
 A claim is current only when its active row has no release. Rows are never removed or
 rewritten. The canonical file is reserialized from the union after each append. The row
 carries enough task, path, branch, origin, context, and claim-time authorization identity to
 reconstruct lost local bookkeeping and re-resolve current policy. A malformed file or
 non-fast-forward history outside this protocol is `writer-lock-unavailable`.
+
+Effect-owner event IDs are nonempty printable ASCII, unique within an operation/claim, and
+lexicographically monotonic in that sequence's creation order; a retry reuses its prepared ID.
+Reducing each operation/claim sequence in event-ID order starts with no owner: `acquired`
+is valid only while its claim is active and no owner exists; `released` must name the exact
+current device/clone and clears it. A claim `released` row is valid only after current effect
+owner is null, and no later acquisition is valid. Any other sequence is malformed. `device_id` is a stable trusted-platform device
+identifier; `clone_id` is a UUID stored in the workspace common Git directory outside every
+task branch. Acquisition and release use the same parent-OID CAS loop as claims.
 
 The fixed ref is infrastructure, never a task branch; task branch discovery and cleanup must
 exclude it by exact ref name.
@@ -381,7 +421,10 @@ disposable bookkeeping:
   "expected_path": "task/codebases/shared-api",
   "codebase_origin_url": "https://github.com/example/shared-api.git",
   "context_policy_set_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+  "device_id": "device:trusted-platform/macbook-01",
+  "clone_id": "123e4567-e89b-12d3-a456-426614174000",
   "action_instance_id": "act_01J00000000000000000000000",
+  "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
   "policy_manifest": {
     "contract_version": "workbench-policy-manifest/v1",
     "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
@@ -399,26 +442,38 @@ disposable bookkeeping:
       }
     ]
   },
+  "effect_owner_state": "none",
   "worktree_ownership": "none",
   "repo_record_ownership": "none",
+  "worktree_set_digest": null,
+  "compensation_target": null,
+  "compensation_reason": null,
+  "compensation_next_step": null,
   "coordination_ref": "refs/heads/workbench-coordination/writer-claims",
   "coordination_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "stage": "prepared"
 }
 ```
 
-Those fields and order are exact. `coordination_oid`, `action_instance_id`, and
-`policy_manifest` may be null; the latter two are both null or both non-null. The manifest is
-the exact `workbench-policy-manifest/v1` object bound to the action. Ownership is exactly
+Those fields and order are exact. `coordination_oid`, `action_instance_id`, `intent_digest`,
+and `policy_manifest` may be null; the latter three are all null or all non-null. The manifest
+and intent are the exact `workbench-policy-manifest/v1` object and
+`workbench-action-intent/v1` digest bound to the action. Effect-owner state is
+`none`, `acquired`, or `released`. Ownership is exactly
 `none`, `created`, or `adopted`; `created`/`adopted` is valid only with the matching proof
-below. Stable
-operation and claim IDs are reused by every retry. Stage is exactly `prepared`,
-`remote-claimed`, `worktree-ready`, `record-ready`, `consumed`, `release-pending`, or
-`released`. The object is excluded from task-content and outcome digests. Each stage is
-written by atomic replace before the next CAS or local effect: `prepared` before remote claim,
-`remote-claimed` before worktree creation/adoption, `worktree-ready` before repo-record write,
-`record-ready` before action consumption, and `release-pending` before exact partial cleanup
-or remote release.
+below. `worktree_set_digest` is null until create intent. Compensation target is null,
+`reserved`, or `released`; reason is null, `ask`, `deny`, `authorization-deny`, `handoff`,
+`creation-failure`, or `cleanup`; next step is null, `record`, `worktree`, `effect-owner`,
+`claim`, or `finish`. Stable operation and claim IDs are reused by every retry.
+`device_id` and `clone_id` identify the clone that wrote this operation copy; they may change
+only when an explicit handoff receiver reconstructs it, and `effect_owner_state: "acquired"`
+must match that exact remote owner.
+
+Stage is exactly `prepared`, `authorization-pending`, `cancelled`, `remote-claimed`,
+`effect-owner-acquired`, `worktree-create-pending`, `worktree-ready`,
+`record-create-pending`, `record-ready`, `compensation-pending`, `handoff-ready`, `consumed`,
+`release-pending`, or `released`. The object is excluded from task-content and outcome digests.
+Every stage/compensation cursor is written by atomic replace before its CAS or local effect.
 
 Every kernel-created worktree writes an untracked per-worktree Git-dir ownership marker with
 exact fields `contract_version: "workbench-writer-worktree-owner/v1"`, `operation_id`,
@@ -428,6 +483,33 @@ path, branch, common Git directory, and origin all match. An exact matching mark
 prior attempt is `adopted`; absence/mismatch is external or ambiguous and is never removed.
 A repo record is operation-owned only when its content writer row carries the same operation,
 claim, task, owner, branch, path, and origin; an exact prior row may be adopted.
+
+Before `git worktree add`, the current effect owner serializes the complete porcelain-observed
+worktree set as sorted LF rows and stores its digest with `worktree-create-pending`:
+
+```text
+workbench-worktree-set/v1
+worktree<TAB>ABSOLUTE_PATH<TAB>BRANCH_OR_null<TAB>COMMON_GIT_DIR<TAB>CANONICAL_ORIGIN_URL
+```
+
+The snapshot must prove expected path and branch absent. After a crash between add and marker,
+only that same current device/clone may adopt one exact path/branch/common-dir/origin created
+from the absent snapshot and write the marker. A different effect owner never assumes the
+snapshot still proves absence and never adopts or removes that worktree.
+
+Public operation inspection and no-effect cancellation are:
+
+```text
+workbench task writer-operation show --id ID --format json
+workbench task writer-operation cancel --id ID --format json
+workbench task writer-operation handoff --id ID --format json
+```
+
+`show` returns the strict operation with `changed: false`. `cancel` is valid only for
+`prepared` or `authorization-pending` with no remote claim, effect owner, worktree, repo row,
+or content writer row; it atomically writes terminal `cancelled`. Abandon cleanup performs the
+same no-effect cancellation without requiring a remote row. Other cancellation attempts are
+`writer-recovery-blocked`.
 
 The claim algorithm is exact:
 
@@ -440,81 +522,101 @@ The claim algorithm is exact:
    `task.concurrent-write` over all available sealed v2 context sets. A conflict containing
    `legacy-v1` always requires an explicit matching action-instance authorization even when
    every present policy says `allow`, because v1 supplies no sealed owner policy. With no
-   conflict, action and manifest fields are null.
-3. Persist `prepared`. Immediately before remote mutation, refetch both the ledger and legacy
-   projection, recompute conflicts/policy, and atomically replace prepared bindings if the old
-   action is superseded. Create a commit whose sole parent is the observed ledger OID (or no
-   parent for initial creation) and whose tree adds the exact active row.
-4. Push normally as a fast-forward or with exact
+   conflict, action, manifest, and intent fields are null.
+3. Persist `prepared`. Revalidate the exact action binding before remote mutation. Unresolved
+   `ask` persists `authorization-pending`, returns exit `3`, and creates no remote/local/content
+   effect; retry with the exact authorization revalidates and may continue. Policy or explicit
+   authorization deny persists terminal `cancelled`, returns exit `4`, and likewise creates no
+   effect. A no-conflict or authorized allow continues.
+4. Refetch both ledger and legacy projection, recompute binding, and persist any replacement
+   before creating a commit whose sole parent is the observed ledger OID (or no parent for
+   initial creation) and whose tree adds the exact active claim row. Push normally or with exact
    `--force-with-lease=<ref>:<observed-oid>` compare-and-swap. Initial creation compares
    against an absent ref. CAS failure refetches and restarts from step 1; changed conflict or
    policy binding supersedes the old action and authorization before retry.
 5. After push success, refetch the remote ref and verify the exact claim, persist
    `remote-claimed`, then immediately re-fetch the closed home set, joined writers, all policy
-   sources, and authority. Persist any replacement action/manifest before continuing.
-6. Immediately before each worktree create **or** adopt attempt, repeat that full revalidation
-   and persist any replacement binding first. Inspect `git worktree list --porcelain`, expected
-   path, branch, common Git directory, origin, and ownership marker. Adopt one exact generated
-   worktree without creating another; create one only when no worktree, repo record,
-   expected-path partial, or branch checkout exists. Verify it, record `created` or `adopted`,
-   and persist `worktree-ready`.
-7. Immediately before each repo-record create **or** adopt attempt, repeat full revalidation
-   and persist any replacement binding first. Create/adopt only the exact operation-owned
-   `role: work` row, verify remote claim/worktree/record, record ownership, and persist
-   `record-ready`.
-8. After the record exists and immediately before consumption, repeat full revalidation once
-   more. Persist any replacement action/manifest before obtaining newly required
+   sources, authority, and exact writer-request intent. Persist any replacement
+   action/manifest/intent before continuing.
+6. Before any worktree or record effect, CAS-acquire the effect owner for this operation/claim
+   and persist `effect-owner-acquired`. A current different device/clone blocks. Cross-device
+   automatic reconstruction is permitted only when no effect-owner event has ever existed;
+   after acquisition, another clone needs explicit source-side handoff.
+7. Immediately before each worktree create/adopt, repeat full revalidation and persist any
+   replacement binding. Capture the absent worktree-set digest, persist
+   `worktree-create-pending`, then create or marker-proven adopt. Verify and persist
+   `worktree-ready` plus ownership.
+8. Immediately before each repo-record create/adopt, repeat full revalidation and persist any
+   replacement binding. Persist `record-create-pending`, create/adopt only the exact
+   operation-owned `role: work` row, verify remote claim/worktree/record, then persist
+   `record-ready` plus ownership.
+9. After the record exists and immediately before consumption, repeat full revalidation once
+   more. Persist any replacement action/manifest/intent before obtaining newly required
    authorization. Consume the final action idempotently when one exists, persist its binding
-   in the task-content writer row, and then persist `consumed`. No-conflict operations skip
-   action consumption but still reach `consumed`.
+   and intent in the task-content writer row, and then persist `consumed`. No-conflict
+   operations skip action consumption but still reach `consumed`.
 
 The remote commit OID is the serialization token. It is not a local-write fencing token, and
 no expiry or process-local lease grants authority. Before an active row is published, policy
 `ask` or `deny` publishes no claim. A changed legacy projection or ledger row supersedes the
 binding just like changed policy.
 
-At each post-publication revalidation gate, standing `allow` may continue only for the exact
-current binding. An unresolved policy `ask` compensates local effects in strict reverse order:
-atomically remove only the exact operation-owned repo record, then remove/prune only the exact
-marker-proven generated worktree, and verify both absent. It then clears both ownership fields,
-persists the replacement pending action/manifest and `remote-claimed`, keeps the active remote
-claim as a reservation, returns exit `3`, and waits for the exact authorization. If no local
-effect exists, ask simply remains `remote-claimed`.
+At each post-publication gate, unresolved `ask` chooses compensation target `reserved`; policy
+or authorization deny chooses target `released`. Before deleting anything the current effect
+owner persists `compensation-pending` with exact reason and next step. Reverse steps are
+`record -> worktree -> effect-owner -> claim -> finish`. Each step is idempotent: verify the
+current cursor, remove/release only the exact owned effect, verify the result, then atomically
+advance `compensation_next_step`. A crash resumes that exact prefix instead of being treated as
+a generic mismatch.
 
-A policy `deny` or explicit authorization with `decision: "deny"` performs the same exact
-compensation, persists `release-pending`, CAS-appends and refetch-verifies `released`, persists
-`released`, and exits `4`; with no local effects it releases directly. A deny never leaves the
-claim reserved for a later authorization.
+For target `reserved`, `claim` is skipped and `finish` clears compensation fields and returns
+to `remote-claimed` with the active claim as reservation, exit `3`. For target `released`,
+`claim` CAS-appends/refetch-verifies release, then `finish` persists `released`, exit `4`.
+When no effect owner or local effect exists, ask remains `remote-claimed`; deny may enter
+`release-pending` and release the claim directly. Terminal `cancelled` is used only before
+remote publication.
 
 | Revalidation result | Exact local transition | Remote claim | Exit |
 |---|---|---|---|
 | `allow`, same binding | Continue next effect | active | `0` after consume |
 | `ask`, no local effect | stay `remote-claimed` | active reservation | `3` |
-| `ask`, owned local effects | record remove -> worktree remove -> verify -> `remote-claimed` | active reservation | `3` |
-| policy or authorization `deny` | exact compensation -> `release-pending` -> verified `released` | released | `4` |
-| compensation/ownership ambiguity | keep current stage and emit `writer-recovery-blocked` | active | `1` |
+| `ask`, owned local effects | `compensation-pending(reserved)` prefix -> `remote-claimed` | active reservation | `3` |
+| policy or authorization `deny` | `compensation-pending(released)` -> `release-pending` -> verified `released` | released | `4` |
+| compensation/ownership ambiguity | keep exact compensation cursor and emit `writer-recovery-blocked` | active | `1` |
 
 Authority, integrity, ownership, or ambiguity failure during revalidation or compensation
-keeps the active remote claim, returns `writer-recovery-blocked`, and never releases around a
-possible orphan. An external or unmarked worktree is never operation-owned and never removed.
+keeps the active remote claim and exact cursor, returns `writer-recovery-blocked`, and never
+releases around a possible orphan. An external or unmarked worktree is never operation-owned
+and never removed.
 
 Retry and cross-device adoption are fail-closed. If the local journal is missing but exactly
-one active remote row matches current task claim, owner, and branch, the kernel reconstructs
+one active remote row matches current task claim, owner, and branch and no effect-owner event
+has ever existed, the kernel reconstructs
 the strict operation from that row, re-resolves current authority/policy, and continues; it
 does not abandon or release the row merely because bookkeeping was not pushed. Multiple
 matches are `writer-recovery-ambiguous`. An exact generated worktree or exact repo record is
-adopted and the next stage recorded. A wrong path/branch/origin, ambiguous checkout, external
-worktree, mismatched record, or possible orphan returns `writer-recovery-blocked` and leaves
-the remote claim active.
+adopted only by its current effect owner. A current owner on another device/clone, wrong
+path/branch/origin, ambiguous checkout, external worktree, mismatched record, or possible orphan
+returns `writer-recovery-blocked` and leaves the remote claim active.
 
-A recoverable failed local creation first persists `release-pending`. The kernel may
-remove/prune only a partial it can prove was generated by this exact operation; it then
-re-runs porcelain/path/branch/origin and record checks. Only after no exact or possible orphan
-worktree and no live repo record remain may it append the matching released row by CAS,
-refetch, verify, and persist `released`. It never releases around an ambiguous or external
-partial. A crash after repo record but before consumption instead verifies remote, worktree,
-and record and consumes idempotently; it does not release. Remote failure leaves the active
-row visible and returns `writer-lock-unavailable`.
+A recoverable creation failure uses `compensation-pending` target `released`; it never jumps
+directly to claim release. A crash after repo record but before consumption resumes from the
+record cursor, revalidates, and either consumes or compensates. Remote failure leaves the
+active row/cursor visible and returns `writer-lock-unavailable`.
+
+`handoff` is source-led and valid only for a reconciled `consumed` operation whose executing
+clone is current effect owner. It persists `compensation_target: "reserved"`, reason
+`handoff`, and cursor `worktree`; leaves the exact content repo row; removes and verifies the
+owned local worktree; advances to `effect-owner`; CAS-releases it; then persists
+`handoff-ready` with cursor `finish` and claim active. Another device may explicitly acquire
+effect owner and rematerialize the worktree, clear handoff fields, and return to `consumed`;
+v1 has no forced takeover. If the source owner is unavailable, the claim stays active and
+recovery blocks.
+
+Cleanup may release a claim only when its executing clone is current effect owner and removes
+then releases those effects, or when the ledger proves effect owner already released and the
+operation is `handoff-ready`. Device B cannot release while device A is current. The external
+cleanup journal records every effect-owner acquisition/release event used during cleanup.
 
 The action target is `workbench:codebase/<owner>`. Its revision is the canonical
 `workbench-writer-conflict/v1` digest below, computed from joined current rows plus the
@@ -547,6 +649,7 @@ Success returns:
   "coordination_ref": "refs/heads/workbench-coordination/writer-claims",
   "coordination_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "action_instance_id": "act_01J00000000000000000000000",
+  "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
   "worktree_ownership": "created",
   "repo_record_ownership": "created",
   "operation_stage": "consumed",
@@ -676,7 +779,8 @@ most one. A governed call contains only its one effect plus required `--reason-c
 `--reason-ref`, and action/authorization flags; combining it with another required/state,
 revision, or external-ref mutation is invalid at exit `2`. This preserves one action and one
 authorization binding. The updated record stores action ID, reason, consumed action instance,
-and authorization ref. Repeating the exact resulting governed record is idempotent.
+intent digest, and authorization ref. Repeating the exact resulting governed record is
+idempotent.
 
 Changing a revision makes prior evidence stale. From `accepted`, `waived`, or `rejected`, a
 revision change must explicitly select `declared` or `submitted` in the same non-governed
@@ -721,9 +825,28 @@ The strict probe object is:
 }
 ```
 
-`authority_digest` is SHA-256 over the exact minified, key-ordered JSON plus LF. The probe
-receipt is valid only while repository, PR number, external ref, merged state, and head
-revision all match the deliverable.
+`authority_digest` in the acceptance receipt is SHA-256 over that exact minified, key-ordered
+observation JSON plus LF. The time-independent accept-intent subject is a second strict object:
+
+```json
+{
+  "contract_version": "workbench-probe/github-pr-subject/v1",
+  "repository": "example/web-app",
+  "pull_request": 12,
+  "external_ref": "https://github.com/example/web-app/pull/12",
+  "state": "merged",
+  "head_revision": "0123456789abcdef",
+  "merge_revision": "fedcba9876543210"
+}
+```
+
+Its listed-order minified JSON plus LF yields the stable `subject_authority_digest` used by
+`workbench-deliverable-accept-intent/v1`; `observed_at` never enters that intent. The kernel
+mints `acceptance_id` once before its first probe and persists it in the private acceptance
+attempt record; every retry reuses that ID. A changed immutable subject supersedes the attempt,
+while a fresh observation of the same subject does not. The receipt remains valid only while
+repository, PR number, external ref, merged state, head revision, and merge revision match the
+deliverable and stored intent.
 
 A namespaced pack-owned kind rejects kernel probing and requires
 `--owner-acceptance-file`. That strict `workbench-owner-acceptance/v1` input repeats
@@ -788,6 +911,7 @@ A mutation returns:
     "reason_code": null,
     "reason_ref": null,
     "governance_action_instance_id": null,
+    "governance_intent_digest": null,
     "authorization_ref": null
   }
 }
@@ -815,6 +939,7 @@ A governed waiver uses the same envelope and persists the exact reason and bindi
     "reason_code": "owner-deferred",
     "reason_ref": "conversation:message/msg-456",
     "governance_action_instance_id": "act_01J00000000000000000000001",
+    "governance_intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
     "authorization_ref": "conversation:message/msg-456"
   }
 }
@@ -830,8 +955,12 @@ A governed waiver uses the same envelope and persists the exact reason and bindi
 }
 ```
 
-The record fields and state meanings are normative. Repeating `declare` with an identical
-record is idempotent and reports `changed: false`; the same ID with different data fails.
+The exact deliverable field order is `deliverable_id`, `owner`, `kind`, `owner_context_ref`,
+`acceptance_authority_ref`, `required`, `external_ref`, `revision`, `state`, `acceptance_ref`,
+`governance_action`, `reason_code`, `reason_ref`, `governance_action_instance_id`,
+`governance_intent_digest`, and `authorization_ref`. The state meanings are normative.
+Repeating `declare` with an identical record is idempotent and reports `changed: false`; the
+same ID with different data fails.
 
 Successful acceptance returns the updated deliverable plus this append-only receipt:
 
@@ -855,6 +984,7 @@ Successful acceptance returns the updated deliverable plus this append-only rece
     "reason_code": null,
     "reason_ref": null,
     "governance_action_instance_id": null,
+    "governance_intent_digest": null,
     "authorization_ref": null
   },
   "acceptance": {
@@ -872,6 +1002,7 @@ Successful acceptance returns the updated deliverable plus this append-only rece
     "authority_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
     "actor": null,
     "action_instance_id": null,
+    "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
     "accepted_at": "2026-07-11T03:20:00Z"
   }
 }
@@ -889,7 +1020,7 @@ choice. `actor` is the authorization actor and `accepted_at` is the authorizatio
 The exact `workbench-acceptance/v1` fields are `contract_version`, `acceptance_id`,
 `deliverable_id`, `owner`, `kind`, `owner_context_ref`, `acceptance_authority_ref`, `revision`,
 `authority_type`, `authority_contract`, `authority_ref`, `authority_digest`, `actor`,
-`action_instance_id`, and `accepted_at`; kernel probes use null owner bindings and
+`action_instance_id`, `intent_digest`, and `accepted_at`; kernel probes use null owner bindings and
 `actor: null`.
 `acceptance list` returns a `workbench-acceptances/v1` object with exact fields
 `contract_version` and `acceptances`; the latter is the receipt array and is empty when no
@@ -910,7 +1041,8 @@ workbench task required-check declare \
 
 ```text
 workbench task required-check waive \
-  --id ID [--action-instance-id ID] [--authorization-file FILE] --format json
+  --id ID --reason-code CODE [--reason-ref REF] \
+  [--action-instance-id ID] [--authorization-file FILE] --format json
 ```
 
 Waiving a required check is a governed action. It preserves the record for audit instead of
@@ -935,15 +1067,22 @@ Mutation output is:
     "deliverable_id": "web-pr",
     "subject_ref": "workbench:deliverable/web-pr",
     "state": "required",
+    "reason_code": null,
+    "reason_ref": null,
     "action_instance_id": null,
+    "intent_digest": null,
     "authorization_ref": null
   }
 }
 ```
 
 List output replaces `changed` and `required_check` with `required_checks: []`. A waived
-record has `state: "waived"`, the consumed action instance ID, and the authorization source
-reference that permitted it.
+record has `state: "waived"`, the exact reason code/reference, consumed action instance ID,
+intent digest, and authorization source reference that permitted it. The reason code is a
+required stable machine identifier; `reason_ref` is optional prose provenance.
+The exact required-check field order is `check_id`, `owner`, `deliverable_id`, `subject_ref`,
+`state`, `reason_code`, `reason_ref`, `action_instance_id`, `intent_digest`, and
+`authorization_ref`.
 When `--deliverable-id` is present, `subject_ref` is
 `workbench:deliverable/<deliverable_id>` and owner must equal the deliverable owner. Without
 it, `deliverable_id` is null and subject is `workbench:task/<claim_id>`.
@@ -1170,7 +1309,12 @@ All three commands return:
   "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
   "registration_ref": "workbench:context-registration/ctxreg-1",
   "registration_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
-  "action_instance_id": "act_01J00000000000000000000000",
+  "registration_action_instance_id": "act_01J00000000000000000000000",
+  "registration_intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "registration_authorization_ref": "conversation:message/msg-register",
+  "seal_action_instance_id": "act_01J00000000000000000000001",
+  "seal_intent_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+  "seal_authorization_ref": "conversation:message/msg-seal",
   "participants": [
     {
       "context_ref": "toolbox:product/acme-api",
@@ -1219,10 +1363,11 @@ fields):
 Participants are sorted by context ref and stored in task content. `registration_ref` is
 `workbench:context-registration/<registration_id>` for an owner registration.
 `registration_digest` is SHA-256 over its canonical registration JSON. `show` reports
-`changed: false`; before registration/lazy seal its digest, registration refs, and action ID
-are null with empty participants and null task policy. Register returns `sealed: false` and
-its consumed action ID; seal returns `sealed: true` and its consumed action ID. Lazy
-null-context seal returns `sealed: true` with a null action ID. Every governed mutation
+`changed: false`; before registration/lazy seal its digest, registration refs, action IDs,
+intent digests, and authorization refs are null with empty participants and null task policy.
+Register returns `sealed: false` and persists its consumed action, intent, and authorization;
+seal returns `sealed: true` and adds the corresponding seal triple. Lazy null-context seal
+returns `sealed: true` with both triples null. Every governed mutation
 derives all context and task sources from the complete sealed set; caller
 flags cannot subtract or replace them. `task.concurrent-write` uses the union of sealed sets
 from the prospective task and every active v2 writer; legacy-v1 pseudo-claims contribute no
@@ -1323,22 +1468,119 @@ otherwise the command returns `ask` at exit `3` until the exact authenticated au
 is supplied, even when every policy source says `allow`. This requirement is kernel-derived
 from action/bound owner/conflict facts and cannot be relaxed by caller input.
 
-### Canonical per-action binding
+### Canonical action intent and per-action binding
 
-| Action | `target_ref` | `revision` binding | Required context policy set |
-|---|---|---|---|
-| `task.complete` | `work_ref`, else `workbench:task/<claim_id>` | current `workbench-task-revision/v1` digest | complete sealed task context-policy set |
-| `task.abandon` | `work_ref`, else `workbench:task/<claim_id>` | current `workbench-task-revision/v1` digest, with pending/null facts encoded | complete sealed task context-policy set |
-| `task.deliverable.accept` | `workbench:deliverable/<deliverable_id>` | deliverable-record digest with non-null revision and immutable owner bindings | complete sealed task set; pack acceptance uses the one participant bound at declaration |
-| `task.deliverable.waive` | `workbench:deliverable/<deliverable_id>` | deliverable-record digest | complete sealed task context-policy set |
-| `task.deliverable.reject` | `workbench:deliverable/<deliverable_id>` | deliverable-record digest | complete sealed task context-policy set |
-| `task.deliverable.weaken` | `workbench:deliverable/<deliverable_id>` | deliverable-record digest | complete sealed task context-policy set |
-| `task.required-check.waive` | `workbench:required-check/<check_id>` | required-check-record digest | complete sealed task context-policy set |
-| `task.harvest.dispose` | `workbench:harvest/<candidate_id>` | harvest-candidate-record digest before disposition | complete sealed task context-policy set |
-| `task.policy-context.register` | `workbench:task/<claim_id>` | strict registration-input digest | required workspace plus optional trusted platform; no proposed context/task source |
-| `task.policy-context.seal` | `workbench:task/<claim_id>` | registered-set digest | required workspace, optional platform, every proposed participant, and optional proposed task policy |
-| `task.concurrent-write` | `workbench:codebase/<owner>` | writer-conflict-set digest including authoritative legacy projections | union of available sealed v2 sets; any legacy-v1 row additionally forces explicit authorization |
-| `task.cleanup` | `workbench:task/<claim_id>` | immutable terminal outcome revision | frozen sealed set recorded by terminal action |
+Authorization binds both the observed subject and the exact requested effect. Every governed
+action derives this LF-terminated manifest and stores its SHA-256 as `intent_digest`:
+
+```text
+workbench-action-intent/v1
+action_id<TAB>ACTION_ID
+task_claim_id<TAB>TASK_CLAIM_ID
+target_ref<TAB>TARGET_REF
+subject_revision<TAB>REVISION
+payload_contract<TAB>PAYLOAD_CONTRACT
+payload_digest<TAB>PAYLOAD_DIGEST
+```
+
+`revision` in action and authorization objects is the same `subject_revision`; it continues
+to identify the exact pre-effect subject. `payload_digest` is SHA-256 over the exact canonical
+payload named by `payload_contract`. Consequently the same target and revision cannot reuse an
+approval for a different transition, reason, disposition, assertion, writer request, or
+cleanup plan.
+
+| Action | `target_ref` | `revision` subject binding | Exact payload | Required context policy set |
+|---|---|---|---|---|
+| `task.complete` | `work_ref`, else `workbench:task/<claim_id>` | current `workbench-task-revision/v1` digest | `workbench-task-complete-intent/v1` | complete sealed task context-policy set |
+| `task.abandon` | `work_ref`, else `workbench:task/<claim_id>` | current `workbench-task-abandonment-revision/v1` digest | `workbench-task-abandon-intent/v1` including exact reason | complete sealed task context-policy set |
+| `task.deliverable.accept` | `workbench:deliverable/<deliverable_id>` | deliverable-record digest with non-null revision and immutable owner bindings | `workbench-deliverable-accept-intent/v1` | complete sealed task set; pack acceptance uses the one participant bound at declaration |
+| `task.deliverable.waive` | `workbench:deliverable/<deliverable_id>` | current deliverable-record digest | `workbench-deliverable-transition-intent/v1`, transition `waive` | complete sealed task context-policy set |
+| `task.deliverable.reject` | `workbench:deliverable/<deliverable_id>` | current deliverable-record digest | `workbench-deliverable-transition-intent/v1`, transition `reject` | complete sealed task context-policy set |
+| `task.deliverable.weaken` | `workbench:deliverable/<deliverable_id>` | current deliverable-record digest | `workbench-deliverable-transition-intent/v1`, transition `weaken` | complete sealed task context-policy set |
+| `task.required-check.waive` | `workbench:required-check/<check_id>` | current required-check-record digest | `workbench-required-check-waive-intent/v1` | complete sealed task context-policy set |
+| `task.harvest.dispose` | `workbench:harvest/<candidate_id>` | current pending harvest-candidate-record digest | `workbench-harvest-disposition-intent/v1` | complete sealed task context-policy set |
+| `task.policy-context.register` | `workbench:task/<claim_id>` | strict registration-input digest | exact `workbench-context-policy-registration/v1` canonical JSON | required workspace plus optional trusted platform; no proposed context/task source |
+| `task.policy-context.seal` | `workbench:task/<claim_id>` | registered-set digest | exact `workbench-context-policy-set/v1` canonical manifest | required workspace, optional platform, every proposed participant, and optional proposed task policy |
+| `task.concurrent-write` | `workbench:codebase/<owner>` | writer-conflict-set digest including authoritative legacy projections | `workbench-writer-request/v1` | union of available sealed v2 sets; any legacy-v1 row additionally forces explicit authorization |
+| `task.cleanup` | `workbench:task/<claim_id>` | immutable terminal outcome revision | `workbench-task-cleanup-intent/v1` including exact removal-plan digest | frozen sealed set recorded by terminal action |
+
+The exact action-specific LF payloads are:
+
+```text
+workbench-task-complete-intent/v1
+outcome<TAB>completed
+completion_snapshot<TAB>TASK_REVISION
+
+workbench-task-abandon-intent/v1
+outcome<TAB>abandoned
+abandonment_revision<TAB>ABANDONMENT_REVISION
+reason_code<TAB>REASON_CODE
+reason_ref<TAB>REASON_REF_OR_null
+
+workbench-deliverable-transition-intent/v1
+deliverable_id<TAB>DELIVERABLE_ID
+record_revision<TAB>DELIVERABLE_RECORD_REVISION
+transition<TAB>waive|reject|weaken
+from_required<TAB>BOOLEAN
+to_required<TAB>BOOLEAN
+from_state<TAB>STATE
+to_state<TAB>STATE
+reason_code<TAB>REASON_CODE
+reason_ref<TAB>REASON_REF_OR_null
+
+workbench-deliverable-accept-intent/v1
+deliverable_id<TAB>DELIVERABLE_ID
+record_revision<TAB>DELIVERABLE_RECORD_REVISION
+mode<TAB>kernel-probe|owner-assertion
+acceptance_id<TAB>ACCEPTANCE_ID
+deliverable_revision<TAB>DELIVERABLE_REVISION
+owner_context_ref<TAB>OWNER_CONTEXT_REF_OR_null
+acceptance_authority_ref<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null
+authority_contract<TAB>AUTHORITY_CONTRACT
+subject_authority_digest<TAB>SUBJECT_AUTHORITY_DIGEST
+actor<TAB>ACTOR_OR_null
+accepted_at<TAB>RFC3339_UTC_OR_null
+
+workbench-required-check-waive-intent/v1
+check_id<TAB>CHECK_ID
+record_revision<TAB>REQUIRED_CHECK_RECORD_REVISION
+transition<TAB>required-to-waived
+reason_code<TAB>REASON_CODE
+reason_ref<TAB>REASON_REF_OR_null
+
+workbench-harvest-disposition-intent/v1
+candidate_id<TAB>CANDIDATE_ID
+record_revision<TAB>PENDING_CANDIDATE_RECORD_REVISION
+decision<TAB>absorb|codebase|follow-up|discard
+target_ref<TAB>TARGET_REF_OR_null
+reason_code<TAB>REASON_CODE
+reason_ref<TAB>REASON_REF_OR_null
+
+workbench-writer-request/v1
+operation_id<TAB>OPERATION_ID
+claim_id<TAB>CLAIM_ID
+owner<TAB>OWNER
+branch<TAB>BRANCH
+expected_path<TAB>EXPECTED_PATH
+codebase_origin_url<TAB>CANONICAL_ORIGIN_URL
+context_policy_set_digest<TAB>CONTEXT_POLICY_SET_DIGEST
+conflict_revision<TAB>WRITER_CONFLICT_REVISION
+
+workbench-task-cleanup-intent/v1
+terminal_revision<TAB>TERMINAL_REVISION
+removal_plan_digest<TAB>REMOVAL_PLAN_DIGEST
+```
+
+For completion, the task revision is the deterministic content-plus-selected-evidence
+snapshot already defined by `workbench-task-revision/v1`. For pack acceptance,
+`subject_authority_digest` is the strict owner-assertion digest, which binds acceptance ID, immutable
+owner bindings, deliverable revision, actor, and timestamp. Kernel PR acceptance instead uses
+the stable `workbench-probe/github-pr-subject/v1` digest and null actor/timestamp values;
+its payload `authority_contract` is that subject contract, while the receipt separately uses
+timestamped `workbench-probe/github-pr/v1`. Register and seal use their
+already-defined strict canonical inputs directly as payloads; concurrent write binds both the
+complete conflict pre-state and the exact prospective writer row. Cleanup's removal-plan
+manifest is defined under governed cleanup.
 
 A record digest is SHA-256 over a contract line, its exact current row from the task-content
 manifest, and final LF. The contract lines are `workbench-deliverable-record/v1`,
@@ -1355,13 +1597,14 @@ source, claim ID, then branch:
 workbench-writer-conflict/v1
 owner<TAB>OWNER
 legacy_home_set<TAB>HOME_SET_DIGEST
-writer<TAB>SOURCE<TAB>CLAIM_ID<TAB>OPERATION_ID_OR_null<TAB>TASK_CLAIM_ID<TAB>BRANCH<TAB>CONTEXT_POLICY_SET_DIGEST_OR_null<TAB>SOURCE_REVISION_OR_null<TAB>LIFECYCLE_DIGEST_OR_null
+writer<TAB>SOURCE<TAB>CLAIM_ID<TAB>OPERATION_ID_OR_null<TAB>TASK_CLAIM_ID<TAB>BRANCH<TAB>CONTEXT_POLICY_SET_DIGEST_OR_null<TAB>SOURCE_REVISION_OR_null<TAB>PR_HEAD_REVISION_OR_null<TAB>LIFECYCLE_DIGEST_OR_null
 ```
 
 `SOURCE` is `ledger-v2` or `legacy-v1`; the prospective row uses `ledger-v2` so publishing
-it does not change its own digest. V2 source/lifecycle revisions are null. Legacy rows have
-null operation/context digest, the canonical task-branch OID as source revision, and the
-authoritative lifecycle digest. The closed home-set digest is always present, even with no
+it does not change its own digest. V2 source/PR-head/lifecycle revisions are null. Legacy rows
+have null operation/context digest, the canonical branch-tip or index-snapshot OID as source
+revision, the submitted PR head when applicable, and the authoritative lifecycle digest. The
+closed home-set digest is always present, even with no
 legacy claim. Thus a home registry, v1 branch, or cleanup fact change supersedes a pending
 authorization without creating an action/coordination-OID hash cycle.
 
@@ -1373,17 +1616,39 @@ and abandonment.
 
 ### Resolve
 
+Direct resolution uses one strict request file so requested-effect fields are not inferred
+from an opaque digest:
+
+```json
+{
+  "contract_version": "workbench-action-request/v1",
+  "action_id": "task.complete",
+  "task_claim_id": "task__example__42-20260711T030000Z-1234",
+  "target_ref": "toolbox:scenario/SCN-001",
+  "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "payload_contract": "workbench-task-complete-intent/v1",
+  "payload": "workbench-task-complete-intent/v1\noutcome\tcompleted\ncompletion_snapshot\tsha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+}
+```
+
+Those seven fields and order are exact. `payload` is a JSON string containing the exact
+canonical payload bytes, including its final LF; registration JSON is likewise carried as its
+canonical minified JSON plus LF. The kernel parses the named payload grammar, recomputes its
+digest and generic intent, and independently re-derives every state-backed field. A caller
+cannot authorize an arbitrary digest or omit a transition/reason field.
+
 ```text
 workbench policy resolve \
-  --action-id ID --task-claim-id ID --target-ref REF --revision REV \
+  --request-file FILE --intent-digest DIGEST \
   [--action-instance-id ID] [--authorization-file FILE] \
   --format json|decision
 ```
 
 Without `--action-instance-id`, the kernel mints and persists a unique action instance.
-With an instance ID, all binding arguments are recomputed and must match the stored
-instance exactly. For a kernel action, even the first call derives `target_ref`, `revision`,
-and context set from the action table; caller values are assertions and a mismatch fails.
+With an instance ID, the request and all binding arguments are recomputed and must match the
+stored instance exactly. For a kernel action, even the first call derives `target_ref`,
+`revision`, intent payload, intent digest, and context set from current state; request values
+and `--intent-digest` are assertions and a mismatch fails.
 Only the frozen kernel registry above is executable. A governed mutation invokes derivation
 internally, so calling `policy resolve` cannot substitute a weaker binding.
 
@@ -1398,6 +1663,7 @@ JSON output is:
     "task_claim_id": "task__example__42-20260711T030000Z-1234",
     "target_ref": "toolbox:scenario/SCN-001",
     "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
     "policy_manifest": {
       "contract_version": "workbench-policy-manifest/v1",
       "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
@@ -1444,7 +1710,9 @@ JSON output is:
 }
 ```
 
-`status` is `pending`, `authorized`, `consumed`, `denied`, or `superseded`.
+The exact action-instance field order is `id`, `action_id`, `task_claim_id`, `target_ref`,
+`revision`, `intent_digest`, `policy_manifest`, and `status`. `status` is `pending`,
+`authorized`, `consumed`, `denied`, or `superseded`.
 `--format decision` prints only `allow`, `ask`, or `deny` plus LF and uses the same exit
 status.
 
@@ -1468,6 +1736,7 @@ after sealing the kernel makes per-call omission impossible.
   "task_claim_id": "task__example__42-20260711T030000Z-1234",
   "target_ref": "toolbox:scenario/SCN-001",
   "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
   "policy_manifest_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
   "decision": "allow",
   "actor": "human@example.com",
@@ -1476,16 +1745,21 @@ after sealing the kernel makes per-call omission impossible.
 }
 ```
 
-The decision is `allow` or `deny`; `ask` is not an authorization. Every binding field must
-match the stored action instance, including `policy_manifest_digest`.
+The exact authorization field order is `contract_version`, `authorization_id`,
+`action_instance_id`, `action_id`, `task_claim_id`, `target_ref`, `revision`, `intent_digest`,
+`policy_manifest_digest`, `decision`, `actor`, `authorized_at`, and `source_ref`. The decision
+is `allow` or `deny`; `ask` is not an authorization. Every binding field must
+match the stored action instance, including `intent_digest` and `policy_manifest_digest`.
 `authorization_id` is unique within the task and may be attached to only one instance. A
-used authorization or an instance with a different action, task claim, target, revision, or
-policy manifest is rejected at exit `1`.
+used authorization or an instance with a different action, task claim, target, revision,
+intent, or policy manifest is rejected at exit `1`.
 
 Immediately before consuming any governed action, the command re-derives its required
 context set, revalidates its authority receipts, re-observes the descriptor-pinned workspace
 default ref/OID, reopens the descriptor and every present source, and recomputes every digest
-and decision. It never
+and decision. It also re-derives the exact action payload and intent digest. A payload change
+supersedes the old instance and rejects its authorization even when target and subject
+revision are unchanged. It never
 trusts a cached decision or a task-branch workspace policy copy. A changed protected
 workspace revision or trusted platform receipt supersedes the old instance and
 authorization, then resolves a replacement against the new full manifest. New `deny`
@@ -1496,8 +1770,8 @@ A sealed context or task-policy byte/receipt mismatch instead returns
 restrictive workspace source nor a caller-edited sealed source can be bypassed between
 approval and consumption.
 
-The kernel persists action status in tracked, disposable task state. The storage path is
-private, but the record survives session handoff when the task state is committed. A
+The kernel persists the exact strict action request plus action status in tracked, disposable
+task state. The storage path is private, but the record survives session handoff when the task state is committed. A
 governed mutation marks an authorized instance `consumed` only after the mutation and its
 required lifecycle observation, if any, succeed. Cleanup is the documented exception: its
 externally durable `prepared` journal is the committed mutation and consumption point because
@@ -1527,15 +1801,15 @@ task_contract<TAB>workbench-task/v2
 workspace_authority_descriptor<TAB>DESCRIPTOR_DIGEST
 context_ref<TAB>REF_OR_null
 work_ref<TAB>REF_OR_null
-policy_context_set<TAB>BOOLEAN<TAB>SET_DIGEST_OR_null<TAB>REGISTRATION_REF_OR_null<TAB>REGISTRATION_DIGEST_OR_null
+policy_context_set<TAB>BOOLEAN<TAB>SET_DIGEST_OR_null<TAB>REGISTRATION_REF_OR_null<TAB>REGISTRATION_DIGEST_OR_null<TAB>REGISTRATION_ACTION_INSTANCE_OR_null<TAB>REGISTRATION_INTENT_DIGEST_OR_null<TAB>REGISTRATION_AUTHORIZATION_REF_OR_null<TAB>SEAL_ACTION_INSTANCE_OR_null<TAB>SEAL_INTENT_DIGEST_OR_null<TAB>SEAL_AUTHORIZATION_REF_OR_null
 policy_context<TAB>CONTEXT_REF<TAB>POLICY_REF<TAB>POLICY_DIGEST<TAB>AUTHORITY_IDENTITY<TAB>AUTHORITY_REF<TAB>AUTHORITY_REVISION<TAB>AUTHORITY_RECEIPT_DIGEST
 task_policy<TAB>POLICY_REF<TAB>POLICY_DIGEST<TAB>AUTHORITY_IDENTITY<TAB>AUTHORITY_REF<TAB>AUTHORITY_REVISION<TAB>AUTHORITY_RECEIPT_DIGEST
-writer_claim<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>OWNER<TAB>TASK_CLAIM_ID<TAB>BRANCH<TAB>EXPECTED_PATH<TAB>CODEBASE_ORIGIN_URL<TAB>CONTEXT_POLICY_SET_DIGEST<TAB>ACTION_INSTANCE_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null
-deliverable<TAB>ID<TAB>OWNER<TAB>KIND<TAB>OWNER_CONTEXT_REF_OR_null<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null<TAB>BOOLEAN<TAB>EXTERNAL_REF_OR_null<TAB>REVISION_OR_null<TAB>STATE<TAB>ACCEPTANCE_REF_OR_null<TAB>GOVERNANCE_ACTION_OR_null<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>GOVERNANCE_ACTION_INSTANCE_OR_null<TAB>AUTHORIZATION_REF_OR_null
-acceptance<TAB>ID<TAB>DELIVERABLE_ID<TAB>OWNER<TAB>KIND<TAB>OWNER_CONTEXT_REF_OR_null<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null<TAB>REVISION<TAB>AUTHORITY_TYPE<TAB>AUTHORITY_CONTRACT<TAB>AUTHORITY_REF<TAB>AUTHORITY_DIGEST<TAB>ACTOR_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>ACCEPTED_AT
-required_check<TAB>ID<TAB>OWNER<TAB>SUBJECT_REF<TAB>STATE<TAB>ACTION_INSTANCE_OR_null<TAB>AUTHORIZATION_REF_OR_null
+writer_claim<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>OWNER<TAB>TASK_CLAIM_ID<TAB>BRANCH<TAB>EXPECTED_PATH<TAB>CODEBASE_ORIGIN_URL<TAB>CONTEXT_POLICY_SET_DIGEST<TAB>ACTION_INSTANCE_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null
+deliverable<TAB>ID<TAB>OWNER<TAB>KIND<TAB>OWNER_CONTEXT_REF_OR_null<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null<TAB>BOOLEAN<TAB>EXTERNAL_REF_OR_null<TAB>REVISION_OR_null<TAB>STATE<TAB>ACCEPTANCE_REF_OR_null<TAB>GOVERNANCE_ACTION_OR_null<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>GOVERNANCE_ACTION_INSTANCE_OR_null<TAB>GOVERNANCE_INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
+acceptance<TAB>ID<TAB>DELIVERABLE_ID<TAB>OWNER<TAB>KIND<TAB>OWNER_CONTEXT_REF_OR_null<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null<TAB>REVISION<TAB>AUTHORITY_TYPE<TAB>AUTHORITY_CONTRACT<TAB>AUTHORITY_REF<TAB>AUTHORITY_DIGEST<TAB>ACTOR_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST<TAB>ACCEPTED_AT
+required_check<TAB>ID<TAB>OWNER<TAB>SUBJECT_REF<TAB>STATE<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
 harvest<TAB>BOOLEAN
-harvest_candidate<TAB>ID<TAB>KIND<TAB>SOURCE_REF<TAB>STATE<TAB>DECISION_OR_null<TAB>TARGET_REF_OR_null<TAB>REASON_CODE_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>AUTHORIZATION_REF_OR_null
+harvest_candidate<TAB>ID<TAB>KIND<TAB>SOURCE_REF<TAB>STATE<TAB>DECISION_OR_null<TAB>TARGET_REF_OR_null<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
 ```
 
 SHA-256 over those bytes is the `workbench-task-content/v1` revision. The outcome manifest
@@ -1546,6 +1820,45 @@ workbench-task-revision/v1
 content_revision<TAB>SHA256_CONTENT_REVISION
 evidence<TAB>CHECK_ID<TAB>SUBJECT_REF<TAB>SUBJECT_REVISION<TAB>EVIDENCE_ID_OR_null<TAB>RESULT_OR_null<TAB>BOOLEAN
 ```
+
+Abandonment does not reuse a possibly nonexistent completion revision. It derives the current
+writer snapshot first:
+
+```text
+workbench-writer-abandonment-snapshot/v1
+operation<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>STAGE<TAB>ACTION_INSTANCE_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>REMOTE_CLAIM_STATE<TAB>REMOTE_CLAIM_DIGEST_OR_null<TAB>EFFECT_OWNER_EVENT_ID_OR_null<TAB>EFFECT_OWNER_HISTORY_DIGEST_OR_null<TAB>EFFECT_OWNER_DEVICE_OR_null<TAB>EFFECT_OWNER_CLONE_OR_null<TAB>WORKTREE_OWNERSHIP<TAB>REPO_RECORD_OWNERSHIP<TAB>WORKTREE_SET_DIGEST_OR_null<TAB>COMPENSATION_TARGET_OR_null<TAB>COMPENSATION_REASON_OR_null<TAB>COMPENSATION_NEXT_STEP_OR_null
+```
+
+There is one row for every current non-cancelled operation, sorted by operation and claim ID.
+`REMOTE_CLAIM_STATE` is `absent`, `active`, or `released`; current effect owner is reduced from
+the remote event ledger. `REMOTE_CLAIM_DIGEST` is SHA-256 over the contract line
+`workbench-writer-claim-snapshot/v1`, then every exact matching canonical claim row in state
+order, each LF-terminated; it is null only for `absent`. `EFFECT_OWNER_EVENT_ID` is the latest
+reduced event or null when none has ever existed. `EFFECT_OWNER_HISTORY_DIGEST` is SHA-256 over
+`workbench-effect-owner-snapshot/v1` plus every exact matching event row in event-ID order,
+each LF-terminated; it is null only when the event ID is null. The snapshot includes no private path, but
+its authorization, ownership, and cursor facts must equal the strict local operation and
+remote ledger. Any malformed, ambiguous, or
+unjoinable fact is `writer-claim-unreconciled`, and abandonment cannot mint an action.
+
+The abandonment action revision is SHA-256 over:
+
+```text
+workbench-task-abandonment-revision/v1
+content_revision<TAB>SHA256_CONTENT_REVISION
+writer_snapshot<TAB>SHA256_WRITER_ABANDONMENT_SNAPSHOT
+removal_plan<TAB>SHA256_REMOVAL_PLAN
+reason_code<TAB>REASON_CODE
+reason_ref<TAB>REASON_REF_OR_null
+deliverable<TAB>ID<TAB>BOOLEAN<TAB>STATE<TAB>REVISION_OR_null
+```
+
+Deliverable rows are sorted by ID and repeat `required`, state, and nullable revision, so
+pending and null outcomes are explicit rather than being mistaken for completion. The cleanup
+plan is the exact canonical plan defined under governed cleanup. A reason, writer event,
+operation cursor, deliverable fact, or removal-plan change supersedes the pending abandonment
+instance and its authorization. This revision is the terminal revision recorded for an
+abandoned task; `workbench-task-revision/v1` remains the completion-only revision.
 
 For every canonical TAB-separated manifest in this contract, `<TAB>` is one byte `0x09`,
 each row ends in one LF byte `0x0a`, and no value contains TAB or LF. `BOOLEAN` serializes
@@ -1586,7 +1899,7 @@ workbench task harvest candidate declare \
 ```text
 workbench task harvest dispose \
   --id ID --decision absorb|codebase|follow-up|discard \
-  --reason-code CODE [--target-ref REF] \
+  --reason-code CODE [--reason-ref REF] [--target-ref REF] \
   [--action-instance-id ID] [--authorization-file FILE] --format json
 ```
 
@@ -1624,7 +1937,9 @@ All four commands return the complete ledger:
         "decision": "absorb",
         "target_ref": "workbench:docs/auth-testing",
         "reason_code": "cross-project-reuse",
+        "reason_ref": "conversation:message/msg-123",
         "action_instance_id": "act_01J00000000000000000000000",
+        "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
         "authorization_ref": "conversation:message/msg-123"
       }
     }
@@ -1634,7 +1949,9 @@ All four commands return the complete ledger:
 
 `show` always reports `changed: false`; mutations report whether the ledger changed.
 Candidates are sorted by ID. A pending candidate has `state: "pending"` and
-`disposition: null`. Repeating an identical declaration or disposition is idempotent;
+`disposition: null`. A disposition stores the exact optional reason reference and consumed
+intent digest. Its exact field order is `decision`, `target_ref`, `reason_code`, `reason_ref`,
+`action_instance_id`, `intent_digest`, and `authorization_ref`. Repeating an identical declaration or disposition is idempotent;
 conflicting data fails. Completion emits `harvest-unsealed` when the inventory is open and
 `harvest-undisposed` for each pending candidate.
 
@@ -1688,10 +2005,13 @@ content row, and worktree is satisfied. One exact `released` operation with a ve
 remote row, no live worktree, and no content writer row is satisfied. Rows are matched by
 operation/claim/task/owner/branch/path/origin.
 
-Any `prepared`, `remote-claimed`, `worktree-ready`, `record-ready`, or `release-pending`
-operation produces `writer-operation-incomplete`. An unmatched or duplicate active remote
-row, local/remote identity mismatch, consumed operation without matching record/worktree, or
-recovery blocker produces `writer-claim-unreconciled`. In either case `revision` is null,
+One exact `cancelled` operation with no remote claim, effect-owner event, worktree, repo row,
+or content writer row is also satisfied. Any `prepared`, `authorization-pending`,
+`remote-claimed`, `effect-owner-acquired`, `worktree-create-pending`, `worktree-ready`,
+`record-create-pending`, `record-ready`, `compensation-pending`, `handoff-ready`, or
+`release-pending` operation produces `writer-operation-incomplete`. An unmatched or duplicate
+active remote row, local/remote identity mismatch, consumed operation without matching
+record/worktree, or recovery blocker produces `writer-claim-unreconciled`. In either case `revision` is null,
 `verified` is false, and task revision hashing does not begin. Missing or
 failed current evidence, a required non-waived deliverable that is not accepted at a
 non-null revision, and unresolved required records produce `verified: false`, JSON stdout,
@@ -1738,18 +2058,21 @@ workbench task abandon \
   [--action-instance-id ID] [--authorization-file FILE] --format json
 ```
 
-The action ID is `task.abandon`; target and revision follow completion. `reason-code` is a
-stable machine identifier supplied by the judgment layer. `reason-ref` may point to the
-human explanation without requiring shell plumbing to write it.
+The action ID is `task.abandon`; target follows completion, but revision is the independently
+computed `workbench-task-abandonment-revision/v1` digest. `reason-code` is a stable machine
+identifier supplied by the judgment layer. `reason-ref` may point to the human explanation
+without requiring shell plumbing to write it. Both reason values are inside the abandonment
+revision and its action intent.
 
 Abandonment does **not** require accepted deliverables, passing evidence, a sealed harvest
 ledger, or a workbench increment. It requires a non-terminal v2 task, a parseable current
-content/revision snapshot, a sealed context-policy set, a reason code, and successful policy
-resolution. Pending and null deliverable facts are encoded in its revision binding. Dirty or
-unpushed work may still block later cleanup, but it is not misrepresented as a completion
-predicate. `writer-operation-incomplete` and `writer-claim-unreconciled` do not block an
-authorized abandonment; abandonment freezes new writer effects, and governed cleanup must
-compensate/release every existing operation before deletion.
+content and writer-abandonment snapshot, an exact cleanup plan, a sealed context-policy set,
+a reason code, and successful policy resolution. Pending and null deliverable facts are
+encoded in its dedicated revision binding. Dirty or unpushed work may still block later
+cleanup, but it is not misrepresented as a completion
+predicate. A valid incomplete writer operation does not block authorized abandonment;
+malformed, ambiguous, or unjoinable writer facts do. Abandonment freezes new writer effects,
+and governed cleanup must compensate/release every existing operation before deletion.
 
 Successful outcome output is:
 
@@ -1760,14 +2083,22 @@ Successful outcome output is:
   "outcome": "completed",
   "changed": true,
   "action_instance_id": "act_01J00000000000000000000000",
+  "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
   "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "removal_plan_digest": null,
   "reason_code": null,
   "reason_ref": null,
   "blockers": []
 }
 ```
 
-Abandonment changes `outcome` to `abandoned` and sets the reason fields. A computed
+The exact outcome field order is `contract_version`, `task_contract`, `outcome`, `changed`,
+`action_instance_id`, `intent_digest`, `revision`, `removal_plan_digest`, `reason_code`,
+`reason_ref`, and `blockers`.
+
+Abandonment changes `outcome` to `abandoned`, sets the reason fields, and stores the exact
+non-null cleanup-plan digest already bound by its revision; completion leaves that field null
+and cleanup derives its later plan before authorization. A computed
 precondition failure returns the same shape with `outcome: null`, `changed: false`, and
 blocker objects at exit `1`; it does not consume the instance. Repeating an already-recorded
 terminal outcome is idempotent with `changed: false`. A conflicting terminal outcome fails.
@@ -1791,22 +2122,69 @@ For `workbench-task/v2`, `--force` is invalid at exit `2`. The selected task mus
 `task-completed` or `task-abandoned` outcome, clean task and nested codebase worktrees, and a
 pushed task branch. Preflight blockers are `missing-terminal-outcome`,
 `dirty-task-worktree`, `dirty-codebase-worktree`, `unpushed-task-branch`,
-`ambiguous-task-selection`, and `action-binding-stale`.
+`ambiguous-task-selection`, `cleanup-plan-mismatch`, `writer-recovery-blocked`, and
+`action-binding-stale`. A current effect owner on another device/clone is
+`writer-recovery-blocked`; cleanup never converts elapsed time or source unavailability into
+forced takeover.
 
 Cleanup uses action `task.cleanup`, target `workbench:task/<claim_id>`, and the terminal
-outcome revision. Its first-call, `ask`, `deny`, retry, and authorization behavior is the
-same as completion. Preflight blockers are computed before minting. An authorized cleanup
+outcome revision. Its intent additionally binds the canonical removal-plan digest. For an
+abandoned task that digest must equal the one frozen in its abandonment revision. Its
+first-call, `ask`, `deny`, retry, and authorization behavior is the same as completion.
+Preflight blockers are computed before minting. An authorized cleanup
 revalidates the frozen participant/task bindings, re-observes current workspace and trusted
 platform authority, and resolves the resulting manifest immediately before consumption.
+
+The removal plan is SHA-256 over these exact LF-terminated rows:
+
+```text
+workbench-task-removal-plan/v1
+task_id<TAB>TASK_ID
+claim_id<TAB>TASK_CLAIM_ID
+task_branch<TAB>BRANCH
+writer_operation<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>cancel-no-effect|compensate-release|retire-consumed|release-handoff
+codebase_worktree<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>OWNER<TAB>EXPECTED_PATH
+task_workspace<TAB>WORKSPACE_RELATIVE_PATH
+local_branch<TAB>BRANCH
+```
+
+Writer-operation rows are sorted by operation and claim ID. Worktree rows are sorted by
+owner, operation, and claim ID and occur only where the exact operation owns or must retire a
+planned worktree. There is exactly one task-workspace and one local-branch row. Paths are
+normalized relative to the common workbench root and contain no `..`, TAB, or LF. The plan is
+deliberately terminal-revision-free so abandonment may include its digest without a hash cycle;
+the cleanup action-intent envelope binds both values. The plan is derived before authorization
+from the terminal writer snapshot plus current exact owned effects; a different stage prefix
+may remove an already completed step but never alter the
+frozen operation identity or desired final absence. A changed operation set, identity, path,
+branch, or disposition changes the digest and supersedes a pending cleanup authorization.
 
 The durable recovery journal is stored in the task home's GitHub issue comments, outside the
 local task workspace, using this marker before any deletion:
 
 ```html
 <!-- workbench-task-cleanup:v1
-{"contract_version":"workbench-task-cleanup-journal/v1","journal_id":"cleanup-task__workbench-kit__25","stage":"prepared","task_id":"workbench-kit#25","claim_id":"task__workbench-kit__25-20260711T030000Z-1234","branch":"task/25-example","revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","policy_manifest":{"contract_version":"workbench-policy-manifest/v1","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","sources":[{"layer":"workspace","context_ref":null,"policy_ref":".workbench/policy.conf","policy_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","authority_identity":"github:example/workbench","authority_ref":"refs/heads/main","authority_revision":"1111111111111111111111111111111111111111","authority_receipt_digest":"sha256:abababababababababababababababababababababababababababababababab","decision":"allow"}]},"authorization_ref":"conversation:message/msg-123","removal_plan":{"writer_operations":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000"}],"codebase_worktrees":["web-app"],"task_workspace":true,"local_branch":true},"at":"2026-07-11T03:30:00Z"}
+{"contract_version":"workbench-task-cleanup-journal/v1","journal_id":"cleanup-task__workbench-kit__25","stage":"prepared","task_id":"workbench-kit#25","claim_id":"task__workbench-kit__25-20260711T030000Z-1234","branch":"task/25-example","revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","intent_digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777","policy_manifest":{"contract_version":"workbench-policy-manifest/v1","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","sources":[{"layer":"workspace","context_ref":null,"policy_ref":".workbench/policy.conf","policy_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","authority_identity":"github:example/workbench","authority_ref":"refs/heads/main","authority_revision":"1111111111111111111111111111111111111111","authority_receipt_digest":"sha256:abababababababababababababababababababababababababababababababab","decision":"allow"}]},"authorization_ref":"conversation:message/msg-123","removal_plan_digest":"sha256:9999999999999999999999999999999999999999999999999999999999999999","removal_plan":{"writer_operations":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","disposition":"retire-consumed"}],"codebase_worktrees":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","owner":"web-app","expected_path":"task/codebases/web-app"}],"task_workspace":".worktrees/task__workbench-kit__25","local_branch":"task/25-example"},"effect_owner_events":[],"at":"2026-07-11T03:30:00Z"}
 -->
 ```
+
+The exact top-level key order is shown. `removal_plan` has exact keys
+`writer_operations`, `codebase_worktrees`, `task_workspace`, and `local_branch`; operation
+objects have `operation_id`, `claim_id`, `disposition`, and worktree objects have
+`operation_id`, `claim_id`, `owner`, `expected_path`, in those orders. Arrays use the same
+canonical sorting as the manifest. `stage` is `prepared`, `effect-owner-acquired`,
+`effect-owner-released`, or `completed`. `effect_owner_events` is a prefix-ordered array of
+strict objects with exact fields `event_id`, `operation_id`, `claim_id`, `device_id`,
+`clone_id`, `state`, `phase`, and `at`; `state` is `acquired` or `released` and `phase` is
+`intended` or `verified`. Before every effect-owner CAS used by cleanup, the kernel appends an
+`intended` prefix, then appends the matching `verified` prefix after the ledger event is
+observed. Recovery requires every verified prefix to agree exactly with the remote ledger and
+never infers an owner transition from missing local state.
+
+Comments with one `journal_id` form an append-only prefix chain: immutable top-level bindings
+and removal plan are byte-equal, every later event array strictly extends the prior array, and
+timestamps are nondecreasing. The unique longest valid prefix is current. A fork, rewrite,
+duplicate non-idempotent prefix, or remote disagreement is `cleanup-reconciliation-failed`.
 
 The kernel writes `stage: "prepared"` only after final policy resolution; that durable
 receipt consumes the action instance. If the comment cannot be written, it returns
@@ -1814,9 +2192,10 @@ receipt consumes the action instance. If the comment cannot be written, it retur
 claim ID. For each pair, cleanup uses the remote row to recover expected path/branch/origin,
 removes only the exact planned nested worktree, prunes it, and verifies that no exact or
 possible orphan remains. The prepared journal then acts as the external retirement record for
-the otherwise frozen task-content repo row; cleanup appends the matching remote `released`
-row through CAS and refetches it. All operation releases must be verified before the task
-workspace or local task branch is deleted.
+the otherwise frozen task-content repo row; a consumed operation therefore begins cleanup at
+the `worktree` cursor and never edits that frozen row. Cleanup appends the matching remote
+`released` row through CAS and refetches it. All operation releases must be verified before
+the task workspace or local task branch is deleted.
 
 Release changes coordination state, not frozen task content. Ambiguous/external worktrees or
 CAS failure keep the task workspace and remote claim active and return
@@ -1839,7 +2218,9 @@ Success or a computed blocker returns:
   "outcome": "cleaned",
   "changed": true,
   "action_instance_id": "act_01J00000000000000000000000",
+  "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
   "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "removal_plan_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
   "released_writer_operations": [
     {
       "operation_id": "wop_01J00000000000000000000000",
@@ -1855,16 +2236,19 @@ Success or a computed blocker returns:
 }
 ```
 
+The exact cleanup field order is `contract_version`, `task_contract`, `task_id`, `claim_id`,
+`branch`, `outcome`, `changed`, `action_instance_id`, `intent_digest`, `revision`,
+`removal_plan_digest`, `released_writer_operations`, `removed`, and `blockers`.
 Blocked preflight sets `outcome: null`, `changed: false`, `action_instance_id: null`, and
 lists blockers at exit `1`. Policy `ask` and `deny` return the policy object at exit `3` and
 `4`. Retry first reads the issue journal: `prepared` resumes only exact worktree retirement,
 writer-operation release, verification, and removal steps and does not reauthorize the
 already consumed action; `completed` reconciles a missing `task-cleaned` lifecycle marker; a
 prior lifecycle marker is idempotent with `changed: false`. Failures use
-`cleanup-journal-unavailable`, `cleanup-reconciliation-failed`, `writer-recovery-blocked`,
-`writer-lock-unavailable`, or `lifecycle-write-failed`. The external prepared receipt and
-remote operation row are the recovery and consumption sources after task-local state
-disappears.
+`cleanup-plan-mismatch`, `cleanup-journal-unavailable`, `cleanup-reconciliation-failed`,
+`writer-recovery-blocked`, `writer-lock-unavailable`, or `lifecycle-write-failed`. The external
+prepared receipt and remote operation row are the recovery and consumption sources after
+task-local state disappears.
 
 Legacy `workbench-task/v1` tasks retain the existing `done ID [--parent N] [--force]`
 behavior and do not accept the v2 JSON contract by implication.

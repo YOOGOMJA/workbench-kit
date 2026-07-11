@@ -145,23 +145,31 @@ flowchart TD
 The kernel reports simultaneous `role: work` writers as `writer_conflicts`. Current writers
 are always the union of active v2 rows on fixed canonical-origin ref
 `refs/heads/workbench-coordination/writer-claims` and deterministic pseudo-claims derived from
-authoritative non-cleaned v1 lifecycle facts plus canonical task-branch `task/index.md` role
-entries. The closed home inventory comes from descriptor `workspace_home` plus same-OID
+authoritative non-cleaned v1 lifecycle facts plus canonical `task/index.md` role entries.
+Active v1 tasks use the pinned branch tip; submitted tasks survive branch deletion by binding
+the trusted PR head and the newest matching canonical index snapshot on its first-parent chain.
+The closed home inventory comes from descriptor `workspace_home` plus same-OID
 `codebases.yaml`; adapters exhaust every home's pagination, and an in-use legacy home cannot
-be removed. Missing registry, pagination, branch, or legacy input fails closed. A legacy
+be removed. Replacing a home's origin is removal of the old pair and requires proof that the
+old origin has no non-cleaned v1 claim. Missing registry, pagination, branch/PR ancestry, or
+legacy input fails closed. A legacy
 conflict always requires explicit
 `task.concurrent-write` authorization because v1 has no sealed context policy; a later v1
 `task-cleaned` fact dynamically retires its pseudo-claim.
 
-Each explicit v2 add-repo persists a strict `workbench-writer-operation/v1` journal and an
-expanded remote row before creating a worktree. Parent-OID fast-forward/CAS commits serialize
-claims. The full joined set and policy are revalidated after publication, before every local
-worktree/record create or adopt, and after the record before consume. Ask compensates exact
-operation-owned effects and keeps the claim reserved; policy or authorization deny compensates
-then verifies release. External or ambiguous effects are never removed. Recovery reconstructs
-a missing local journal from the remote row and never releases while a possible orphan or live
-record remains. Cleanup carries operation/claim IDs in its external journal and verifies releases
-before deleting the task workspace without changing frozen task content. `workbench doctor`
+Each explicit v2 add-repo first persists a strict `workbench-writer-operation/v1` journal.
+Unresolved pre-publication ask has `authorization-pending` and no effects; deny/cancel becomes
+terminal `cancelled`. Parent-OID CAS commits then serialize remote claims and append-only
+effect-owner events. Only the current trusted device/clone owner may create, adopt, compensate,
+or remove local effects. Every stage and compensation cursor is durable before its effect.
+The full joined set, policy, and exact writer intent are revalidated after publication, before
+every local worktree/record create or adopt, and after the record before consume. Ask performs
+cursor-based reverse compensation and keeps the claim reserved; policy or authorization deny
+compensates then verifies release. External or ambiguous effects are never removed. Recovery
+is automatic across devices only before any effect-owner event; later movement requires an
+explicit source-led handoff that releases ownership without releasing the claim. Cleanup carries
+operation/claim IDs and every effect-owner transition in its external journal and verifies
+releases before deleting the task workspace without changing frozen task content. `workbench doctor`
 checks descriptor, legacy inventory, ledger, and hosting-adapter ref permissions read-only;
 unknown permission is not ready, and actual CAS remains final proof.
 
@@ -205,6 +213,7 @@ A task declares zero or more deliverables. Each deliverable has, at minimum:
 | `governance_action` | Waive, reject, or weaken action ID; otherwise null |
 | `reason_code`, `reason_ref` | Required stable reason and optional prose reference for a governed change |
 | `governance_action_instance_id` | Consumed action for waiver, rejection, or weakening; otherwise null |
+| `governance_intent_digest` | Exact authorized transition/reason digest; otherwise null |
 | `authorization_ref` | Matching authorization provenance, or null for standing allow |
 
 The kernel understands the mechanics of its own kinds, such as a codebase pull request or
@@ -215,7 +224,7 @@ must not create an empty workbench pull request merely to reach completion.
 
 `submitted` and `accepted` require a non-null revision; `declared`, `waived`, and `rejected`
 may remain null. One update can weaken, waive, or reject, never combine those governed
-effects, and must persist its reason and one action/authorization binding. A later explicit
+effects, and must persist its reason and one action/intent/authorization binding. A later explicit
 reset to `declared`/`submitted` clears current governance/acceptance fields but retains
 append-only receipts; a changed revision makes prior evidence stale. Owner context and
 acceptance authority never change on reset or revision update; a different owner binding uses
@@ -225,12 +234,16 @@ from "required evidence is missing". Exact commands and reset rules are in
 [[workbench-v2-cli-contract]].
 
 No caller can set `accepted` directly. Kernel-owned pull-request kinds require a deterministic
-merged-PR probe whose repository and head revision match. Pack-owned kinds require a strict
+merged-PR probe whose repository and head revision match; accept intent uses a timestamp-free
+probe-subject digest and one persisted acceptance ID, while the receipt retains the timestamped
+observation. Pack-owned kinds require a strict
 owner assertion plus explicit `task.deliverable.accept` authorization. Declaration first
 binds an exact owner context and acceptance authority that resolve one sealed participant;
 the assertion repeats those stored values and cannot select another authority. Its independent
 receipt authenticates the actor. Standing `allow` alone is insufficient.
-Both paths create `workbench-acceptance/v1` receipts included in the task content revision.
+Both paths create `workbench-acceptance/v1` receipts with `intent_digest`, included in the task
+content revision. Required-check waiver likewise requires a reason code, optional reason ref,
+and persisted intent digest.
 
 ### Verification evidence
 
@@ -289,27 +302,28 @@ The canonical v2 marker is UTF-8 JSON inside a versioned HTML comment:
 
 ```html
 <!-- workbench-task-lifecycle:v2
-{"task_contract":"workbench-task/v2","event":"task-completed","claim_id":"task__example__42-20260711T030000Z-1234","issue":42,"home":null,"branch":"task/42-example","workspace_authority_descriptor_digest":"sha256:abababababababababababababababababababababababababababababababab","pr":null,"revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","actor":"human@example.com","tool":"workbench","at":"2026-07-11T03:02:00Z"}
+{"task_contract":"workbench-task/v2","event":"task-completed","claim_id":"task__example__42-20260711T030000Z-1234","issue":42,"home":null,"branch":"task/42-example","workspace_authority_descriptor_digest":"sha256:abababababababababababababababababababababababababababababababab","pr":null,"revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","intent_digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777","actor":"human@example.com","tool":"workbench","at":"2026-07-11T03:02:00Z"}
 -->
 ```
 
 The opening line, one minified JSON line, and closing line are exact. Keys are serialized in
 the shown order. Strings use RFC 8259 escaping. The descriptor digest is required and equals
 the digest stored by `task-claimed`; every later event repeats it. Missing `home`, `pr`,
-`revision`, and `action_instance_id` values are JSON `null`, never `-`, an empty string, or an
-omitted key.
+`revision`, `action_instance_id`, and `intent_digest` values are JSON `null`, never `-`, an
+empty string, or an omitted key.
 `issue` and `pr` are JSON integers when present; `at` is RFC 3339 UTC. `task-verified`
-requires the verified `workbench-task-revision/v1` digest. Completion and abandonment
-require both revision and action instance. A human-readable comment line may follow the
+requires the verified `workbench-task-revision/v1` digest. Completion uses that completion
+revision; abandonment uses `workbench-task-abandonment-revision/v1`. Both terminal outcomes
+require revision, action instance, and matching intent digest. A human-readable comment line may follow the
 marker but is not part of the contract.
 
-| Event | `pr` | `revision` | `action_instance_id` |
-|---|---|---|---|
-| `task-claimed`, `task-claim-conflict`, `task-active` | null | null | null |
-| `task-verified` | null | required | null |
-| `task-submitted` | required | required | null |
-| `task-completed`, `task-abandoned` | null or related workbench PR | required | required |
-| `task-cleaned` | null | terminal revision | cleanup action instance |
+| Event | `pr` | `revision` | `action_instance_id` | `intent_digest` |
+|---|---|---|---|---|
+| `task-claimed`, `task-claim-conflict`, `task-active` | null | null | null | null |
+| `task-verified` | null | required | null | null |
+| `task-submitted` | required | required | null | null |
+| `task-completed`, `task-abandoned` | null or related workbench PR | required | required | required |
+| `task-cleaned` | null | terminal revision | cleanup action instance | cleanup intent |
 
 V1 key/value markers remain readable and are never rewritten. Detailed deliverable,
 evidence, and policy facts remain available through public CLI records instead of being
@@ -349,21 +363,26 @@ A v2 task is complete only when all applicable conditions hold:
    have exact active claim/content-row/worktree matches, and released operations have no live
    writer effect. Pending, duplicate, unmatched, or blocked writer state prevents completion.
 
-Abandonment is a different terminal predicate. It requires a non-terminal task, a parseable
-current revision snapshot, sealed context policy, a reason code, and authorized
-`task.abandon`. It deliberately does not require accepted deliverables, passing evidence,
-harvest disposition, or reconciled writer operations; claiming those would misstate
-non-adoption as completion. It freezes new writer effects and delegates exact compensation
-and release of existing operations to cleanup.
+Abandonment is a different terminal predicate. It derives
+`workbench-task-abandonment-revision/v1` from content, explicit nullable/pending deliverable
+facts, the joined writer/effect-owner/cursor snapshot, exact reason, and canonical cleanup-plan
+digest. It does not borrow the completion revision, which may be null while writers are
+incomplete. It requires a non-terminal task, parseable and unambiguous inputs, sealed context
+policy, a reason code, and authorized `task.abandon`. It deliberately does not require
+accepted deliverables, passing evidence, harvest disposition, or completed writer operations;
+claiming those would misstate non-adoption as completion. It freezes new writer effects and
+delegates exact compensation and release of existing operations to cleanup.
 
 Cleanup is never a completion predicate. Destructive cleanup before completion or
 abandonment is invalid for v2 tasks. Existing v1 force-cleanup behavior remains a legacy
 compatibility path until migration policy removes it in a future major contract. V2 cleanup
-is the governed `task.cleanup` action and has its own revision-bound receipt, blockers, and
+is the governed `task.cleanup` action and has its own terminal-revision plus exact
+`workbench-task-removal-plan/v1` intent binding, blockers, and
 retry semantics in [[workbench-v2-cli-contract]]. Before deleting task-local recovery state,
 it persists a `prepared` cleanup journal in the task home's issue comments; retries reconcile
-that external receipt's writer operation/claim pairs through exact worktree retirement,
-verified CAS release, `completed`, and `task-cleaned`. All releases finish before task
+that external receipt's writer operation/claim pairs and every intended/verified effect-owner
+event through exact worktree retirement, verified CAS release, `completed`, and
+`task-cleaned`. All releases finish before task
 workspace deletion; a post-delete retry uses the external journal and remote ledger. Release
 does not mutate frozen task content.
 
@@ -434,19 +453,23 @@ Remote/descriptor unavailability is `policy-authority-unavailable`; a changed de
 identity, or ref is `policy-authority-mismatch`; a valid current authority revision missing
 required workspace policy is `policy-source-missing`.
 
-The kernel mints a unique action instance bound to `action_id`, `task_claim_id`,
-`target_ref`, revision digest, and the full canonical policy-source manifest. An
-authorization repeats the manifest digest with every other binding field. The sealed task
+The kernel derives `workbench-action-intent/v1` from `action_id`, `task_claim_id`, target,
+pre-effect subject revision, payload contract, and exact payload digest. It then mints a unique
+action instance bound to that intent digest and the full canonical policy-source manifest. An
+authorization repeats both intent and manifest digests with every other binding field. Every
+kernel action has one frozen payload schema covering its exact transition, reason, disposition,
+owner assertion or stable PR subject, context input/set, writer request, or cleanup plan. The sealed task
 context-policy set makes participant omission impossible for a direct caller. Immediately
 before consumption, the kernel re-observes the descriptor origin/default ref with
 `ls-remote --symref`, fetches its current OID, reads `.workbench/authority.json` and
 `.workbench/policy.conf` plus `codebases.yaml` from that same immutable object, validates the
 task claim's descriptor digest, closed legacy home set, every sealed participant/task receipt
-and digest, and re-resolves strictest policy. The task-branch workspace copy is ignored. A
+and digest, re-derives the exact action payload, and re-resolves strictest policy. The
+task-branch workspace copy is ignored. A
 changed protected
 workspace revision supersedes old authorization; changed sealed context/task bytes fail as
 `policy-source-tampered` without a replacement. These rules prevent approval for one task,
-target, revision, policy set, or authority revision from authorizing another. The trusted
+target, revision, requested effect, policy set, or authority revision from authorizing another. The trusted
 platform remains responsible for authenticating approving actors and authority receipts.
 
 The public `workbench-policy/v1` resolution object is:
@@ -460,6 +483,7 @@ The public `workbench-policy/v1` resolution object is:
     "task_claim_id": "task__example__42-20260711T030000Z-1234",
     "target_ref": "toolbox:scenario/SCN-001",
     "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
     "policy_manifest": {
       "contract_version": "workbench-policy-manifest/v1",
       "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
@@ -545,23 +569,48 @@ The canonical v1 shape is:
     "policy_authority_receipt_contracts": ["workbench-policy-authority-receipt/v1"],
     "context_policy_contracts": ["workbench-context-policy-registration/v1", "workbench-context-policy-set/v1"],
     "authorization_contracts": ["workbench-authorization/v1"],
+    "action_intent_contracts": [
+      "workbench-action-request/v1",
+      "workbench-action-intent/v1",
+      "workbench-task-complete-intent/v1",
+      "workbench-task-abandon-intent/v1",
+      "workbench-deliverable-transition-intent/v1",
+      "workbench-deliverable-accept-intent/v1",
+      "workbench-required-check-waive-intent/v1",
+      "workbench-harvest-disposition-intent/v1",
+      "workbench-context-policy-registration/v1",
+      "workbench-context-policy-set/v1",
+      "workbench-writer-request/v1",
+      "workbench-task-cleanup-intent/v1"
+    ],
+    "task_revision_contracts": [
+      "workbench-task-content/v1",
+      "workbench-task-revision/v1",
+      "workbench-task-abandonment-revision/v1"
+    ],
     "acceptance_contracts": [
       "workbench-acceptance/v1",
       "workbench-acceptances/v1",
       "workbench-deliverable-acceptance/v1",
       "workbench-owner-acceptance/v1"
     ],
-    "external_probe_contracts": ["workbench-probe/github-pr/v1"],
-    "cleanup_journal_contracts": ["workbench-task-cleanup-journal/v1"],
+    "external_probe_contracts": ["workbench-probe/github-pr-subject/v1", "workbench-probe/github-pr/v1"],
+    "cleanup_journal_contracts": ["workbench-task-removal-plan/v1", "workbench-task-cleanup-journal/v1"],
     "doctor_contracts": ["workbench-doctor/v1"],
     "evidence_contracts": ["workbench-evidence/v1"],
     "writer_claim_contracts": [
       "workbench-legacy-home-set/v1",
+      "workbench-legacy-lifecycle-set/v1",
       "workbench-legacy-writer-identity/v1",
+      "workbench-effect-owner-snapshot/v1",
+      "workbench-writer-conflict/v1",
       "workbench-writer-claim/v1",
+      "workbench-writer-claim-snapshot/v1",
       "workbench-writer-claims/v1",
       "workbench-writer-operation/v1",
-      "workbench-writer-worktree-owner/v1"
+      "workbench-writer-worktree-owner/v1",
+      "workbench-worktree-set/v1",
+      "workbench-writer-abandonment-snapshot/v1"
     ],
     "capability_pack_contracts": ["workbench-capability-pack/v1"],
     "action_ids": [
@@ -584,9 +633,11 @@ The canonical v1 shape is:
     "policy.authority/v1",
     "policy.authorization/v1",
     "policy.context-set/v1",
+    "policy.intent/v1",
     "policy.resolve/v1",
     "profile.language/v1",
     "task.acceptance/v1",
+    "task.abandonment/v1",
     "task.cleanup/v1",
     "task.completion/v1",
     "task.contract/v2",
@@ -600,6 +651,7 @@ The canonical v1 shape is:
     "task.start/v2",
     "task.writer-claims/v1",
     "task.writer-conflicts/v1",
+    "task.writer-handoff/v1",
     "task.writer-recovery/v1",
     "task.writer-reconciliation/v1",
     "workspace.authority/v1",
