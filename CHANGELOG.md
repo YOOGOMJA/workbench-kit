@@ -18,6 +18,13 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   can't pollute a published version's notes. `RELEASING.md` documents the hazard; covered
   by `tests/check-changelog-section-guard.sh` (#21).
 
+### Fixed
+
+- **Task commit subject policy enforcement** — the `workbench` plugin now rejects
+  invalid `workbench task commit` subjects and audits raw/bypassed task commits in
+  `workbench task check`, restoring current workbench Conventional Commits behavior while
+  keeping the policy logic in one extension point (#22).
+
 ## [0.1.1] - 2026-06-17
 
 ### Fixed
