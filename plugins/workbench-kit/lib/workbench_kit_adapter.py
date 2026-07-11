@@ -91,6 +91,23 @@ class AdapterError(Exception):
         self.ref = ref
 
 
+def canonical_digest(value: Any) -> str:
+    raw = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def source_digest(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def require_object(value: Any, ref: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AdapterError("public-contract-invalid", ref)
@@ -182,7 +199,7 @@ def run_public_json(
     argv: Sequence[str],
     workspace: pathlib.Path,
     allowed_exits: set[int],
-) -> tuple[dict[str, Any], int]:
+) -> tuple[dict[str, Any], int, str]:
     ref = "workbench " + " ".join(argv)
     try:
         completed = subprocess.run(
@@ -211,7 +228,11 @@ def run_public_json(
         json.JSONDecodeError,
     ) as error:
         raise AdapterError("public-json-invalid", ref) from error
-    return require_object(value, ref), completed.returncode
+    return (
+        require_object(value, ref),
+        completed.returncode,
+        source_digest(completed.stdout),
+    )
 
 
 def validate_contract(
@@ -697,7 +718,7 @@ def inspect_public_kernel(
     if inventory_mode not in (None, "show", "bootstrap-show"):
         raise AdapterError("public-inventory-mode-invalid", str(inventory_mode))
     binary = resolve_workbench_binary()
-    contract, _ = run_public_json(
+    contract, _, _ = run_public_json(
         binary, ("contract", "show", "--format", "json"), workspace, {0}
     )
     schema = validate_contract(
@@ -706,7 +727,7 @@ def inspect_public_kernel(
         require_bootstrap=inventory_mode == "bootstrap-show",
         require_engine_manifest=include_engine_manifest,
     )
-    doctor, doctor_status = run_public_json(
+    doctor, doctor_status, doctor_source_digest = run_public_json(
         binary, ("doctor", "--format", "json"), workspace, {0, 1}
     )
     validate_doctor(doctor, doctor_status)
@@ -732,19 +753,37 @@ def inspect_public_kernel(
     else:
         inventory_argv = ("legacy-inventory", "show", "--format", "json")
         inventory_command = "show"
-    inventory, inventory_status = run_public_json(
+    inventory, inventory_status, inventory_source_digest = run_public_json(
         binary, inventory_argv, workspace, {0, 1}
     )
     active = validate_inventory(inventory, inventory_status, inventory_command)
     snapshot = {
         "contract": contract,
         "doctor": doctor,
+        "doctor_projection": {
+            "contract_version": doctor["contract_version"],
+            "ready": doctor["ready"],
+            "object_digest": canonical_digest(doctor),
+            "source_digest": doctor_source_digest,
+            "writer_coordination_digest": canonical_digest(
+                doctor["writer_coordination"]
+            ),
+        },
         "legacy_inventory": inventory,
+        "legacy_inventory_projection": {
+            "contract_version": inventory["contract_version"],
+            "command": inventory_command,
+            "object_digest": canonical_digest(inventory),
+            "source_digest": inventory_source_digest,
+            "authority_revision": inventory["authority"]["default_revision"],
+            "home_set_digest": inventory["home_set"]["digest"],
+            "complete": inventory["complete"],
+        },
         "legacy_inventory_command": inventory_command,
         "active_v1_tasks": active,
     }
     if include_engine_manifest:
-        manifest, _ = run_public_json(
+        manifest, _, manifest_source_digest = run_public_json(
             binary,
             ("engine-manifest", "show", "--format", "json"),
             workspace,
@@ -752,4 +791,12 @@ def inspect_public_kernel(
         )
         validate_engine_manifest(manifest, contract["engine"]["version"])
         snapshot["engine_manifest"] = manifest
+        snapshot["engine_manifest_projection"] = {
+            "contract_version": manifest["contract_version"],
+            "command": "engine-manifest show",
+            "object_digest": canonical_digest(manifest),
+            "source_digest": manifest_source_digest,
+            "content_revision": manifest["source"]["revision"],
+            "manifest_digest": manifest["digest"],
+        }
     return snapshot

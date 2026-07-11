@@ -85,7 +85,7 @@ try:
 except AdapterError as error:
     print(json.dumps({"code": error.code, "ref": error.ref}, sort_keys=True))
     raise SystemExit(1)
-print(json.dumps(snapshot, sort_keys=True, separators=(",", ":")))
+print(json.dumps(snapshot, separators=(",", ":")))
 PY
 }
 
@@ -98,12 +98,40 @@ set -e
 [ "$legacy_git_before" = "$(git_state_digest "$legacy_workspace")" ] \
   || { echo "legacy public calls mutated caller Git state" >&2; exit 1; }
 python3 - "$ok" <<'PY'
+import hashlib
 import json
 import sys
 snapshot = json.loads(sys.argv[1])
+
+def digest(value):
+    raw = (json.dumps(value, separators=(",", ":")) + "\n").encode()
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
 assert snapshot["contract"]["workspace"]["schema"] == "workbench/v1"
 assert snapshot["doctor"]["ready"] is False
 assert snapshot["legacy_inventory"]["complete"] is True
+expected_doctor_projection = {
+    "contract_version": "workbench-doctor/v1",
+    "ready": False,
+    "object_digest": digest(snapshot["doctor"]),
+    "source_digest": digest(snapshot["doctor"]),
+    "writer_coordination_digest": digest(snapshot["doctor"]["writer_coordination"]),
+}
+assert snapshot["doctor_projection"] == expected_doctor_projection, (
+    snapshot["doctor_projection"], expected_doctor_projection
+)
+expected_inventory_projection = {
+    "contract_version": "workbench-legacy-inventory/v1",
+    "command": "bootstrap-show",
+    "object_digest": digest(snapshot["legacy_inventory"]),
+    "source_digest": digest(snapshot["legacy_inventory"]),
+    "authority_revision": "1" * 40,
+    "home_set_digest": "sha256:" + "b" * 64,
+    "complete": True,
+}
+assert snapshot["legacy_inventory_projection"] == expected_inventory_projection, (
+    snapshot["legacy_inventory_projection"], expected_inventory_projection
+)
 assert snapshot["active_v1_tasks"] == [{
     "source": "legacy-inventory:homes[].claims",
     "home": "workbench",
@@ -176,6 +204,13 @@ snapshot = json.loads(sys.argv[1])
 assert snapshot["engine_manifest"]["plugin"] == {
     "name": "workbench", "version": "0.2.0"
 }
+projection = snapshot["engine_manifest_projection"]
+assert projection["contract_version"] == "workbench-plugin-manifest/v1"
+assert projection["command"] == "engine-manifest show"
+assert projection["content_revision"] == snapshot["engine_manifest"]["source"]["revision"]
+assert projection["manifest_digest"] == snapshot["engine_manifest"]["digest"]
+assert projection["object_digest"].startswith("sha256:")
+assert projection["source_digest"].startswith("sha256:")
 PY
 expected_removal="$current_workspace"$'\t'"contract show --format json"$'\n'
 expected_removal+="$current_workspace"$'\t'"doctor --format json"$'\n'
