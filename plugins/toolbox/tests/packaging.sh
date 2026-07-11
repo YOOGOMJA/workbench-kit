@@ -18,6 +18,7 @@ python3 - "$ROOT" <<'PY'
 import ast
 import json
 import pathlib
+import re
 import sys
 
 root = pathlib.Path(sys.argv[1])
@@ -41,6 +42,22 @@ assert codex["interface"] == {
 
 for path in sorted((root / "lib").glob("*.py")):
     ast.parse(path.read_text(), filename=str(path), feature_version=(3, 9))
+
+for skill in sorted((root / "skills").iterdir()):
+    if not skill.is_dir():
+        continue
+    metadata_path = skill / "agents" / "openai.yaml"
+    assert metadata_path.is_file(), f"missing Codex metadata for {skill.name}"
+    metadata = metadata_path.read_text()
+    match = re.search(
+        r'^\s*default_prompt:\s*"([^"]*)"\s*$', metadata, re.MULTILINE
+    )
+    assert match, f"missing default_prompt for {skill.name}"
+    tokens = re.findall(r"\$[a-z0-9-]+", match.group(1))
+    expected = f"${skill.name}"
+    assert expected in tokens, (
+        f"default_prompt for {skill.name} must contain exact token {expected}"
+    )
 PY
 
 [ -x "$ROOT/bin/toolbox" ] || fail "bin/toolbox is missing or not executable"

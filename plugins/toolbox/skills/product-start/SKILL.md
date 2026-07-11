@@ -48,7 +48,10 @@ operational language.
 
 5. Run `toolbox product check <id>`, then read the normalized result with
    `toolbox product inspect <id>`.
-6. Record the created `toolbox:product/<id>` reference in the task's product-facing
+6. Run `toolbox product policy sync <id>` to materialize the complete canonical
+   context policy. Owner-authenticated context registration belongs to `product-run`;
+   product start does not create or bind a task.
+7. Record the created `toolbox:product/<id>` reference in the task's product-facing
    deliverable or follow-up plan when the public workbench task contract supports
    that operation.
 

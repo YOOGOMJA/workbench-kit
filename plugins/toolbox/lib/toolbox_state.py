@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -16,6 +18,38 @@ from toolbox_language import is_language_tag
 
 
 PRODUCT_ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+RFC3339_UTC = re.compile(
+    r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+    r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+)
+KERNEL_ACTION_IDS = (
+    "task.abandon",
+    "task.cleanup",
+    "task.complete",
+    "task.concurrent-write",
+    "task.deliverable.accept",
+    "task.deliverable.reject",
+    "task.deliverable.waive",
+    "task.deliverable.weaken",
+    "task.harvest.dispose",
+    "task.policy-context.register",
+    "task.policy-context.seal",
+    "task.required-check.waive",
+)
+AUTHORITY_RECEIPT_CONTRACT = "workbench-policy-authority-receipt/v1"
+AUTHORITY_RECEIPT_FIELDS = (
+    "contract_version",
+    "authority_identity",
+    "authority_ref",
+    "authority_revision",
+    "policy_ref",
+    "policy_digest",
+    "actor",
+    "issued_at",
+    "source_ref",
+)
+SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+AUTHORITY_REVISION = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64}|sha256:[0-9a-f]{64})$")
 
 
 class StateError(Exception):
@@ -161,6 +195,59 @@ def write_json(path: pathlib.Path, document: dict[str, Any]) -> None:
     except OSError as error:
         diagnostic = error.strerror or type(error).__name__
         raise StateError(f"unable to write state document {path}: {diagnostic}") from error
+
+
+def atomic_replace_text(
+    workspace: pathlib.Path, path: pathlib.Path, content: str
+) -> None:
+    """Replace one caller-owned text document without exposing a partial write."""
+    target = safe_state_path(workspace, path, "state document")
+    parent = safe_state_path(workspace, target.parent, "state document directory")
+    if not parent.is_dir():
+        raise StateError(f"state document directory does not exist: {parent}")
+
+    descriptor = -1
+    temporary: pathlib.Path | None = None
+    try:
+        descriptor, raw_temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=parent
+        )
+        temporary = pathlib.Path(raw_temporary)
+        safe_state_path(workspace, temporary, "temporary state document")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        if hasattr(os, "O_DIRECTORY"):
+            directory_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(f"unable to replace state document {target}: {diagnostic}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def atomic_replace_json(
+    workspace: pathlib.Path, path: pathlib.Path, document: dict[str, Any]
+) -> None:
+    atomic_replace_text(
+        workspace, path, json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    )
 
 
 def product_root(workspace: pathlib.Path, product_id: str) -> pathlib.Path:
@@ -348,19 +435,24 @@ def load_product(workspace: pathlib.Path, product_id: str) -> dict[str, Any]:
 
 def check_product(workspace: pathlib.Path, product_id: str) -> None:
     bundle = load_product(workspace, product_id)
-    product = bundle["product"]
-    validate_document("product", product)
-    validate_language(product["language"])
-    validate_document("autonomy", bundle["autonomy"])
-    validate_document("quality", bundle["quality"])
+    validate_product_bundle(product_id, bundle)
     paths = scenario_paths(workspace, product_id)
     for path, scenario in zip(paths, bundle["scenarios"]):
-        validate_document("scenario", scenario)
         expected_name = f"{scenario['id']}.json"
         if path.name != expected_name:
             raise StateError(
                 f"scenario file '{path.name}' must be named '{expected_name}'"
             )
+
+
+def validate_product_bundle(product_id: str, bundle: dict[str, Any]) -> None:
+    product = bundle["product"]
+    validate_document("product", product)
+    validate_language(product["language"])
+    validate_document("autonomy", bundle["autonomy"])
+    validate_document("quality", bundle["quality"])
+    for scenario in bundle["scenarios"]:
+        validate_document("scenario", scenario)
 
     if product.get("id") != product_id:
         raise StateError(
@@ -374,6 +466,17 @@ def check_product(workspace: pathlib.Path, product_id: str) -> None:
     check_ids = [item["id"] for item in bundle["quality"]["checks"]]
     if len(check_ids) != len(set(check_ids)):
         raise StateError(f"product '{product_id}' contains duplicate quality check IDs")
+    repositories = {item["id"]: item for item in product["repositories"]}
+    for quality_check in bundle["quality"]["checks"]:
+        owner = quality_check["owner"]
+        if owner not in repositories:
+            raise StateError(
+                f"quality check '{quality_check['id']}' references unknown repository owner '{owner}'"
+            )
+        if repositories[owner]["role"] == "reference":
+            raise StateError(
+                f"quality check '{quality_check['id']}' references non-writable repository owner '{owner}'"
+            )
 
     local_scenario_ids: set[str] = set()
     for scenario in bundle["scenarios"]:
@@ -384,6 +487,304 @@ def check_product(workspace: pathlib.Path, product_id: str) -> None:
         if scenario["id"] in local_scenario_ids:
             raise StateError(f"duplicate scenario ID '{scenario['id']}'")
         local_scenario_ids.add(scenario["id"])
+
+
+def validate_repository_path(path: str) -> None:
+    candidate = pathlib.PurePosixPath(path)
+    if (
+        not path
+        or candidate.is_absolute()
+        or ".." in candidate.parts
+        or "." in candidate.parts
+        or str(candidate) != path
+    ):
+        raise StateError("repository path must be workspace-relative and normalized")
+
+
+def set_repository(
+    workspace: pathlib.Path,
+    product_id: str,
+    repository_id: str,
+    path: str,
+    role: str,
+) -> tuple[bool, dict[str, Any]]:
+    validate_product_id(repository_id)
+    validate_repository_path(path)
+    safe_state_path(workspace, workspace / path, "repository path")
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    repository = {"id": repository_id, "path": path, "role": role}
+    repositories = bundle["product"]["repositories"]
+    for existing in repositories:
+        if existing["path"] == path and existing["id"] != repository_id:
+            raise StateError(
+                f"repository path '{path}' already belongs to repository '{existing['id']}'"
+            )
+    existing = next(
+        (item for item in repositories if item["id"] == repository_id), None
+    )
+    if existing == repository:
+        return False, repository
+    proposed = dict(bundle["product"])
+    proposed["repositories"] = sorted(
+        [item for item in repositories if item["id"] != repository_id] + [repository],
+        key=lambda item: item["id"],
+    )
+    proposed_bundle = dict(bundle)
+    proposed_bundle["product"] = proposed
+    validate_product_bundle(product_id, proposed_bundle)
+    atomic_replace_json(
+        workspace, product_root(workspace, product_id) / "product.json", proposed
+    )
+    return True, repository
+
+
+def set_autonomy(
+    workspace: pathlib.Path, product_id: str, action_id: str, decision: str
+) -> bool:
+    if action_id not in KERNEL_ACTION_IDS:
+        raise StateError(f"unsupported workbench action '{action_id}'")
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    proposed = dict(bundle["autonomy"])
+    proposed["actions"] = dict(proposed["actions"])
+    if proposed["actions"].get(action_id) == decision:
+        return False
+    proposed["actions"][action_id] = decision
+    proposed["actions"] = dict(sorted(proposed["actions"].items()))
+    proposed_bundle = dict(bundle)
+    proposed_bundle["autonomy"] = proposed
+    validate_product_bundle(product_id, proposed_bundle)
+    atomic_replace_json(
+        workspace, product_root(workspace, product_id) / "autonomy.json", proposed
+    )
+    return True
+
+
+def render_policy(bundle: dict[str, Any]) -> str:
+    autonomy = bundle["autonomy"]
+    unknown = sorted(set(autonomy["actions"]) - set(KERNEL_ACTION_IDS))
+    if unknown:
+        raise StateError(f"unsupported workbench action '{unknown[0]}'")
+    lines = ["schema=workbench-policy/v1"]
+    for action_id in KERNEL_ACTION_IDS:
+        decision = autonomy["actions"].get(action_id, autonomy["default"])
+        lines.append(f"action.{action_id}={decision}")
+    return "\n".join(lines) + "\n"
+
+
+def sync_policy(workspace: pathlib.Path, product_id: str) -> tuple[bool, str]:
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    content = render_policy(bundle)
+    policy_ref = f"products/{product_id}/policy.conf"
+    path = safe_state_path(workspace, workspace / policy_ref, "product policy")
+    try:
+        current = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        current = None
+    except UnicodeDecodeError as error:
+        raise StateError(f"product policy is not valid UTF-8: {path}") from error
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(f"unable to read product policy {path}: {diagnostic}") from error
+    if current == content:
+        return False, policy_ref
+    atomic_replace_text(workspace, path, content)
+    return True, policy_ref
+
+
+def validate_utc_timestamp(value: str, field: str) -> None:
+    if RFC3339_UTC.fullmatch(value) is None:
+        raise StateError(f"{field} must be an RFC 3339 UTC timestamp")
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise StateError(f"{field} must be an RFC 3339 UTC timestamp") from error
+
+
+def read_authority_receipt(path: pathlib.Path) -> dict[str, str]:
+    try:
+        payload = path.read_bytes().decode("utf-8")
+    except FileNotFoundError as error:
+        raise StateError(f"missing authority receipt: {path}") from error
+    except UnicodeDecodeError as error:
+        raise StateError(f"authority receipt is not valid UTF-8: {path}") from error
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(f"unable to read authority receipt {path}: {diagnostic}") from error
+    try:
+        value = strict_json_loads(payload)
+    except DuplicateJsonMember as error:
+        raise StateError(
+            f"duplicate JSON member '{error.member}' in authority receipt"
+        ) from error
+    except InvalidJsonConstant as error:
+        raise StateError(
+            f"invalid JSON constant '{error.constant}' in authority receipt"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise StateError(f"malformed authority receipt JSON: {error.msg}") from error
+    if not isinstance(value, dict):
+        raise StateError("authority receipt must contain an object")
+
+    missing = [field for field in AUTHORITY_RECEIPT_FIELDS if field not in value]
+    if missing:
+        raise StateError(f"authority receipt is missing required field '{missing[0]}'")
+    unknown = [field for field in value if field not in AUTHORITY_RECEIPT_FIELDS]
+    if unknown:
+        raise StateError(f"authority receipt contains unknown field '{unknown[0]}'")
+    for field in AUTHORITY_RECEIPT_FIELDS:
+        if not isinstance(value[field], str):
+            raise StateError(f"authority receipt field '{field}' must be a string")
+    if value["contract_version"] != AUTHORITY_RECEIPT_CONTRACT:
+        raise StateError(
+            f"unsupported authority receipt contract '{value['contract_version']}'"
+        )
+    for field in ("authority_identity", "authority_ref", "actor", "source_ref"):
+        item = value[field]
+        if not item or any(ord(character) < 0x20 or ord(character) > 0x7E for character in item):
+            raise StateError(
+                f"authority receipt field '{field}' must be nonempty printable ASCII"
+            )
+    if AUTHORITY_REVISION.fullmatch(value["authority_revision"]) is None:
+        raise StateError("authority receipt authority_revision is invalid")
+    if SHA256_DIGEST.fullmatch(value["policy_digest"]) is None:
+        raise StateError("authority receipt policy_digest is invalid")
+    validate_utc_timestamp(value["issued_at"], "authority receipt issued_at")
+    return {field: value[field] for field in AUTHORITY_RECEIPT_FIELDS}
+
+
+def context_registration(
+    workspace: pathlib.Path,
+    product_id: str,
+    task_claim_id: str,
+    actor: str,
+    authority_receipt_file: pathlib.Path,
+    registered_at: str,
+) -> dict[str, Any]:
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    if not task_claim_id:
+        raise StateError("task-claim-id must not be empty")
+    if not actor:
+        raise StateError("actor must not be empty")
+    validate_utc_timestamp(registered_at, "registered-at")
+
+    policy_ref = f"products/{product_id}/policy.conf"
+    policy_path = safe_state_path(workspace, workspace / policy_ref, "product policy")
+    try:
+        policy_bytes = policy_path.read_bytes()
+        policy = policy_bytes.decode("utf-8")
+    except FileNotFoundError as error:
+        raise StateError("product policy must be synchronized before registration") from error
+    except (OSError, UnicodeError) as error:
+        raise StateError("product policy must be readable before registration") from error
+    if policy != render_policy(bundle):
+        raise StateError("product policy must be synchronized before registration")
+    policy_digest = "sha256:" + hashlib.sha256(policy_bytes).hexdigest()
+
+    authority_receipt = read_authority_receipt(authority_receipt_file)
+    if authority_receipt["policy_ref"] != policy_ref:
+        raise StateError("authority receipt policy_ref does not match the product policy")
+    if authority_receipt["policy_digest"] != policy_digest:
+        raise StateError("authority receipt policy_digest does not match the product policy")
+
+    product_ref = f"toolbox:product/{product_id}"
+    return {
+        "contract_version": "workbench-context-policy-registration/v1",
+        "registration_id": f"ctxreg-toolbox-{product_id}",
+        "task_claim_id": task_claim_id,
+        "task_context_ref": product_ref,
+        "participants": [
+            {
+                "context_ref": product_ref,
+                "policy_ref": policy_ref,
+                "policy_digest": policy_digest,
+                "authority_ref": authority_receipt["authority_ref"],
+                "authority_receipt": authority_receipt,
+            }
+        ],
+        "task_policy": None,
+        "actor": actor,
+        "registered_at": registered_at,
+    }
+
+
+def set_quality_check(
+    workspace: pathlib.Path,
+    product_id: str,
+    check_id: str,
+    owner: str,
+    kind: str,
+    required: bool,
+    command: list[str],
+) -> tuple[bool, dict[str, Any]]:
+    validate_product_id(check_id)
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    quality_check = {
+        "id": check_id,
+        "owner": owner,
+        "kind": kind,
+        "command": command,
+        "required": required,
+    }
+    checks = bundle["quality"]["checks"]
+    existing = next((item for item in checks if item["id"] == check_id), None)
+    if existing == quality_check:
+        return False, quality_check
+    proposed = dict(bundle["quality"])
+    proposed["checks"] = sorted(
+        [item for item in checks if item["id"] != check_id] + [quality_check],
+        key=lambda item: item["id"],
+    )
+    proposed_bundle = dict(bundle)
+    proposed_bundle["quality"] = proposed
+    validate_product_bundle(product_id, proposed_bundle)
+    atomic_replace_json(
+        workspace, product_root(workspace, product_id) / "quality.json", proposed
+    )
+    return True, quality_check
+
+
+def apply_scenario(
+    workspace: pathlib.Path, product_id: str, source: pathlib.Path
+) -> tuple[bool, dict[str, Any]]:
+    scenario = read_json(source)
+    validate_document("scenario", scenario)
+    if scenario["productId"] != product_id:
+        raise StateError(
+            f"scenario '{scenario['id']}' belongs to product '{scenario['productId']}', not '{product_id}'"
+        )
+
+    bundle = load_product(workspace, product_id)
+    validate_product_bundle(product_id, bundle)
+    existing = next(
+        (item for item in bundle["scenarios"] if item["id"] == scenario["id"]), None
+    )
+    if existing == scenario:
+        return False, scenario
+
+    proposed_bundle = dict(bundle)
+    proposed_bundle["scenarios"] = sorted(
+        [item for item in bundle["scenarios"] if item["id"] != scenario["id"]]
+        + [scenario],
+        key=lambda item: item["id"],
+    )
+    validate_product_bundle(product_id, proposed_bundle)
+
+    portfolio = load_portfolio(workspace)
+    portfolio["products"] = [
+        proposed_bundle if item["product"]["id"] == product_id else item
+        for item in portfolio["products"]
+    ]
+    index = scenario_index(portfolio)
+    check_dependency_graph(index)
+
+    target = product_root(workspace, product_id) / "scenarios" / f"{scenario['id']}.json"
+    atomic_replace_json(workspace, target, scenario)
+    return True, scenario
 
 
 def load_portfolio(workspace: pathlib.Path) -> dict[str, Any]:
@@ -513,3 +914,259 @@ def candidate_scenarios(
         candidates,
         key=lambda item: (item["priority"], item["product_id"], item["scenario_id"]),
     )
+
+
+def get_product_bundle(portfolio: dict[str, Any], product_id: str) -> dict[str, Any]:
+    validate_product_id(product_id)
+    for bundle in portfolio["products"]:
+        if bundle["product"]["id"] == product_id:
+            return bundle
+    raise StateError(f"product '{product_id}' does not exist")
+
+
+def product_blockers(bundle: dict[str, Any]) -> list[dict[str, str]]:
+    product = bundle["product"]
+    product_ref = f"toolbox:product/{product['id']}"
+    if product["status"] == "paused":
+        return [{"code": "product-paused", "ref": product_ref}]
+    if product["status"] in ("completed", "archived"):
+        return [{"code": "product-terminal", "ref": product_ref}]
+
+    active = sorted(
+        (item for item in bundle["scenarios"] if item["status"] == "active"),
+        key=lambda item: item["id"],
+    )
+    if len(active) > 1:
+        return [{"code": "multiple-active-scenarios", "ref": product_ref}]
+    return []
+
+
+def local_scenario_blockers(
+    bundle: dict[str, Any], index: dict[str, tuple[str, dict[str, Any]]]
+) -> list[dict[str, str]]:
+    blockers: list[dict[str, str]] = []
+    for scenario in sorted(bundle["scenarios"], key=lambda item: item["id"]):
+        scenario_ref = f"toolbox:scenario/{scenario['id']}"
+        if scenario["status"] == "blocked":
+            blockers.append({"code": "scenario-blocked", "ref": scenario_ref})
+        elif scenario["status"] == "ready" and not all(
+            index[dependency][1]["status"] == "completed"
+            for dependency in scenario["dependsOn"]
+        ):
+            blockers.append(
+                {"code": "scenario-dependency-incomplete", "ref": scenario_ref}
+            )
+    return blockers
+
+
+def product_status(workspace: pathlib.Path, product_id: str) -> dict[str, Any]:
+    portfolio, index = check_portfolio(workspace)
+    bundle = get_product_bundle(portfolio, product_id)
+    scenarios = bundle["scenarios"]
+    counts = {
+        status: sum(1 for scenario in scenarios if scenario["status"] == status)
+        for status in ("abandoned", "active", "blocked", "completed", "draft", "ready")
+    }
+    active = sorted(
+        (item for item in scenarios if item["status"] == "active"),
+        key=lambda item: item["id"],
+    )
+    candidates = [
+        {
+            "priority": item["priority"],
+            "scenario_ref": item["scenario_ref"],
+            "title": item["title"],
+        }
+        for item in candidate_scenarios(workspace, product_id)
+    ]
+    wide_blockers = product_blockers(bundle)
+    blockers = wide_blockers or local_scenario_blockers(bundle, index)
+    if bundle["product"]["status"] in ("completed", "archived"):
+        next_action = "none"
+    elif wide_blockers:
+        next_action = "resolve-blocker"
+    elif len(active) == 1:
+        next_action = "continue-active-scenario"
+    elif candidates:
+        next_action = "start-ready-scenario"
+    elif blockers:
+        next_action = "resolve-blocker"
+    else:
+        next_action = "none"
+    return {
+        "contract_version": "toolbox-product-status/v1",
+        "product_id": product_id,
+        "product_ref": f"toolbox:product/{product_id}",
+        "product_status": bundle["product"]["status"],
+        "scenario_counts": counts,
+        "active_scenario_ref": (
+            f"toolbox:scenario/{active[0]['id']}" if len(active) == 1 else None
+        ),
+        "ready_candidates": candidates,
+        "blockers": blockers,
+        "next_action": next_action,
+    }
+
+
+def build_run_plan(
+    bundle: dict[str, Any],
+    scenario: dict[str, Any],
+    selection_scope: str,
+    skipped_products: list[dict[str, Any]],
+    remaining_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    repositories = sorted(
+        item["id"]
+        for item in bundle["product"]["repositories"]
+        if item["role"] in ("owner", "work")
+    )
+    checks = sorted(
+        (
+            {
+                "id": item["id"],
+                "owner": item["owner"],
+                "kind": item["kind"],
+                "command": item["command"],
+            }
+            for item in bundle["quality"]["checks"]
+            if item["required"]
+        ),
+        key=lambda item: item["id"],
+    )
+    return {
+        "contract_version": "toolbox-run-plan/v1",
+        "selection_scope": selection_scope,
+        "product_ref": f"toolbox:product/{bundle['product']['id']}",
+        "scenario_ref": f"toolbox:scenario/{scenario['id']}",
+        "repository_owners": repositories,
+        "required_quality_checks": checks,
+        "remaining_candidates": remaining_candidates,
+        "skipped_products": skipped_products,
+    }
+
+
+def product_run_plan(
+    workspace: pathlib.Path, product_id: str, scenario_id: str | None = None
+) -> dict[str, Any]:
+    portfolio, index = check_portfolio(workspace)
+    bundle = get_product_bundle(portfolio, product_id)
+    product_ref = f"toolbox:product/{product_id}"
+    wide_blockers = product_blockers(bundle)
+    if wide_blockers:
+        blocker = wide_blockers[0]
+        raise StateError(f"{blocker['code']}: {blocker['ref']}")
+    active = sorted(
+        (item for item in bundle["scenarios"] if item["status"] == "active"),
+        key=lambda item: item["id"],
+    )
+    if active:
+        raise StateError(
+            f"active-scenario-exists: toolbox:scenario/{active[0]['id']}"
+        )
+    if bundle["product"]["status"] == "paused":
+        raise StateError(f"product-paused: {product_ref}")
+    if bundle["product"]["status"] in ("completed", "archived"):
+        raise StateError(f"product-terminal: {product_ref}")
+
+    if scenario_id is not None:
+        candidate = next(
+            (item for item in bundle["scenarios"] if item["id"] == scenario_id), None
+        )
+        if candidate is None:
+            raise StateError(f"scenario '{scenario_id}' does not exist in product '{product_id}'")
+        if candidate["status"] != "ready":
+            raise StateError(
+                f"scenario-not-ready: toolbox:scenario/{candidate['id']}"
+            )
+        if not all(
+            index[dependency][1]["status"] == "completed"
+            for dependency in candidate["dependsOn"]
+        ):
+            raise StateError(
+                f"scenario-dependency-incomplete: toolbox:scenario/{candidate['id']}"
+            )
+    else:
+        candidates = candidate_scenarios(workspace, product_id)
+        if not candidates:
+            blockers = local_scenario_blockers(bundle, index)
+            if blockers:
+                blocker = blockers[0]
+                raise StateError(f"{blocker['code']}: {blocker['ref']}")
+            raise StateError(f"no-ready-scenario: {product_ref}")
+        candidate = index[candidates[0]["scenario_id"]][1]
+    return build_run_plan(bundle, candidate, "product", [], [])
+
+
+def portfolio_run_plan(workspace: pathlib.Path) -> dict[str, Any]:
+    portfolio, index = check_portfolio(workspace)
+    candidates = candidate_scenarios(workspace)
+    candidates_by_product: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        candidates_by_product.setdefault(candidate["product_id"], []).append(candidate)
+
+    eligible: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for bundle in portfolio["products"]:
+        product_id = bundle["product"]["id"]
+        product_ref = f"toolbox:product/{product_id}"
+        wide_blockers = product_blockers(bundle)
+        local_blockers = local_scenario_blockers(bundle, index)
+        active = sorted(
+            (item for item in bundle["scenarios"] if item["status"] == "active"),
+            key=lambda item: item["id"],
+        )
+        if wide_blockers:
+            reasons = wide_blockers
+        elif active:
+            reasons = [{
+                "code": "active-scenario-exists",
+                "ref": f"toolbox:scenario/{active[0]['id']}",
+            }]
+        elif candidates_by_product.get(product_id):
+            eligible.extend(candidates_by_product[product_id])
+            continue
+        elif local_blockers:
+            reasons = local_blockers
+        else:
+            reasons = [{"code": "no-ready-scenario", "ref": product_ref}]
+        skipped.append({"product_ref": product_ref, "reasons": reasons[:1]})
+
+    if not eligible:
+        raise StateError("no-ready-scenario: toolbox:portfolio")
+    selected = sorted(
+        eligible,
+        key=lambda item: (item["priority"], item["product_id"], item["scenario_id"]),
+    )[0]
+    for candidate in eligible:
+        if candidate["product_id"] != selected["product_id"]:
+            if not any(
+                item["product_ref"] == candidate["product_ref"] for item in skipped
+            ):
+                skipped.append(
+                    {
+                        "product_ref": candidate["product_ref"],
+                        "reasons": [{
+                            "code": "lower-priority-candidate",
+                            "ref": candidate["scenario_ref"],
+                        }],
+                    }
+                )
+    skipped = sorted(
+        {item["product_ref"]: item for item in skipped}.values(),
+        key=lambda item: item["product_ref"],
+    )
+    bundle = get_product_bundle(portfolio, selected["product_id"])
+    scenario = index[selected["scenario_id"]][1]
+    remaining = [
+        {
+            "priority": candidate["priority"],
+            "product_ref": candidate["product_ref"],
+            "scenario_ref": candidate["scenario_ref"],
+        }
+        for candidate in sorted(
+            eligible,
+            key=lambda item: (item["priority"], item["product_id"], item["scenario_id"]),
+        )
+        if candidate["scenario_ref"] != selected["scenario_ref"]
+    ]
+    return build_run_plan(bundle, scenario, "portfolio", skipped, remaining)

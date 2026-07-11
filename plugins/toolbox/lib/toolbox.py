@@ -17,13 +17,22 @@ from toolbox_json import DuplicateJsonMember, InvalidJsonConstant, strict_json_l
 from toolbox_language import is_language_tag
 from toolbox_state import (
     StateError,
+    apply_scenario,
     candidate_scenarios,
     check_portfolio,
     check_product,
+    context_registration,
     find_scenario,
     initialize_product,
     load_portfolio,
     load_product,
+    portfolio_run_plan,
+    product_run_plan,
+    product_status,
+    set_autonomy,
+    set_quality_check,
+    set_repository,
+    sync_policy,
 )
 
 
@@ -108,7 +117,11 @@ def require_string_list(value: Any, field: str) -> list[str]:
     return value
 
 
-def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
+def inspect_workbench_contract(
+    workspace: pathlib.Path,
+    required_capabilities: Sequence[str] = (),
+    required_supported: dict[str, str] | None = None,
+) -> dict[str, Any]:
     binary = resolve_workbench_binary()
     result = run_text_probe(
         [binary, "contract", "show", "--format", "json"],
@@ -178,6 +191,14 @@ def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
     for capability in REQUIRED_CAPABILITIES:
         if capability not in available_capabilities:
             raise ToolboxError(f"workbench is missing required capability '{capability}'")
+    for capability in required_capabilities:
+        if capability not in available_capabilities:
+            raise ToolboxError(f"workbench is missing required capability '{capability}'")
+
+    for field, contract in (required_supported or {}).items():
+        contracts = require_string_list(supported.get(field), f"supported.{field}")
+        if contract not in contracts:
+            raise ToolboxError(f"workbench does not support '{contract}'")
 
     profile_contracts = require_string_list(
         supported.get("profile_contracts"), "supported.profile_contracts"
@@ -211,9 +232,23 @@ def inspect_workbench_contract(workspace: pathlib.Path) -> dict[str, Any]:
     }
 
 
-def write_json(document: Any) -> None:
-    json.dump(document, sys.stdout, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def write_json(document: Any, *, sort_keys: bool = True) -> None:
+    json.dump(
+        document,
+        sys.stdout,
+        ensure_ascii=False,
+        sort_keys=sort_keys,
+        separators=(",", ":"),
+    )
     sys.stdout.write("\n")
+
+
+def parse_boolean(value: str) -> bool:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -242,6 +277,76 @@ def build_parser() -> argparse.ArgumentParser:
     product_inspect.add_argument("product_id")
     product_check = product_commands.add_parser("check", help="Validate one product bundle")
     product_check.add_argument("product_id")
+    product_repository = product_commands.add_parser(
+        "repository", help="Mutate a product repository record"
+    )
+    repository_commands = product_repository.add_subparsers(
+        dest="repository_command", required=True
+    )
+    repository_set = repository_commands.add_parser("set", help="Set a repository record")
+    repository_set.add_argument("product_id")
+    repository_set.add_argument("--id", required=True, dest="repository_id")
+    repository_set.add_argument("--path", required=True)
+    repository_set.add_argument("--role", choices=("owner", "work", "reference"), required=True)
+    product_autonomy = product_commands.add_parser(
+        "autonomy", help="Mutate a product autonomy policy"
+    )
+    autonomy_commands = product_autonomy.add_subparsers(
+        dest="autonomy_command", required=True
+    )
+    autonomy_set = autonomy_commands.add_parser("set", help="Set an action decision")
+    autonomy_set.add_argument("product_id")
+    autonomy_set.add_argument("--action", required=True, dest="action_id")
+    autonomy_set.add_argument("--decision", choices=("allow", "ask", "deny"), required=True)
+    product_quality = product_commands.add_parser(
+        "quality", help="Mutate product quality policy"
+    )
+    quality_commands = product_quality.add_subparsers(dest="quality_command", required=True)
+    quality_check = quality_commands.add_parser("check", help="Mutate a quality check")
+    quality_check_commands = quality_check.add_subparsers(
+        dest="quality_check_command", required=True
+    )
+    quality_check_set = quality_check_commands.add_parser("set", help="Set a quality check")
+    quality_check_set.add_argument("product_id")
+    quality_check_set.add_argument("--id", required=True, dest="check_id")
+    quality_check_set.add_argument("--owner", required=True)
+    quality_check_set.add_argument(
+        "--kind",
+        choices=(
+            "test", "lint", "typecheck", "build", "integration", "e2e",
+            "accessibility", "visual", "performance", "security",
+        ),
+        required=True,
+    )
+    quality_check_set.add_argument("--required", required=True, type=parse_boolean)
+    quality_check_set.add_argument(
+        "--command-part", required=True, action="append", dest="command_parts"
+    )
+    product_policy = product_commands.add_parser(
+        "policy", help="Materialize a canonical product policy source"
+    )
+    policy_commands = product_policy.add_subparsers(dest="policy_command", required=True)
+    policy_sync = policy_commands.add_parser("sync", help="Synchronize product policy")
+    policy_sync.add_argument("product_id")
+    product_registration = product_commands.add_parser(
+        "context-registration", help="Emit a strict workbench context registration"
+    )
+    product_registration.add_argument("product_id")
+    product_registration.add_argument("--task-claim-id", required=True)
+    product_registration.add_argument("--actor", required=True)
+    product_registration.add_argument(
+        "--authority-receipt-file", required=True, type=pathlib.Path
+    )
+    product_registration.add_argument("--registered-at", required=True)
+    product_status_parser = product_commands.add_parser(
+        "status", help="Derive product workflow status"
+    )
+    product_status_parser.add_argument("product_id")
+    product_run_plan_parser = product_commands.add_parser(
+        "run-plan", help="Derive one primary scenario run plan"
+    )
+    product_run_plan_parser.add_argument("product_id")
+    product_run_plan_parser.add_argument("--scenario", dest="scenario_id")
     scenario = commands.add_parser(
         "scenario", help="Inspect, validate, or list scenario candidates"
     )
@@ -254,6 +359,9 @@ def build_parser() -> argparse.ArgumentParser:
         "candidates", help="List dependency-ready scenarios"
     )
     scenario_candidates.add_argument("--product", dest="product_filter")
+    scenario_apply = scenario_commands.add_parser("apply", help="Atomically apply a scenario")
+    scenario_apply.add_argument("--product", required=True, dest="product_id")
+    scenario_apply.add_argument("--file", required=True, type=pathlib.Path)
 
     portfolio = commands.add_parser(
         "portfolio", help="Inspect or validate the joined portfolio"
@@ -262,6 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_commands.add_parser("inspect", help="Read the joined portfolio")
     portfolio_commands.add_parser("check", help="Validate the joined portfolio")
     portfolio_commands.add_parser("candidates", help="List portfolio-wide candidates")
+    portfolio_commands.add_parser("run-plan", help="Select one portfolio run plan")
     workbench = commands.add_parser(
         "workbench", help="Check the public workbench compatibility contract"
     )
@@ -283,7 +392,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_json(inspect_workbench_contract(workspace))
             return 0
         if parsed.command == "product":
-            workbench_contract = inspect_workbench_contract(workspace)
+            required_capabilities: tuple[str, ...] = ()
+            required_supported: dict[str, str] = {}
+            if parsed.product_command == "policy":
+                required_supported["policy_contracts"] = "workbench-policy/v1"
+            if parsed.product_command == "context-registration":
+                required_capabilities = ("policy.context-set/v1",)
+                required_supported[
+                    "context_policy_contracts"
+                ] = "workbench-context-policy-registration/v1"
+            workbench_contract = inspect_workbench_contract(
+                workspace, required_capabilities, required_supported
+            )
             if parsed.product_command == "init":
                 profile_language = workbench_contract["profile"]["language"]
                 if parsed.language != profile_language:
@@ -307,12 +427,90 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                 )
                 return 0
+            if parsed.product_command == "status":
+                write_json(product_status(workspace, parsed.product_id))
+                return 0
+            if parsed.product_command == "run-plan":
+                write_json(
+                    product_run_plan(workspace, parsed.product_id, parsed.scenario_id)
+                )
+                return 0
             if parsed.product_command == "inspect":
                 write_json(load_product(workspace, parsed.product_id))
                 return 0
             if parsed.product_command == "check":
                 check_product(workspace, parsed.product_id)
                 write_json({"product_id": parsed.product_id, "valid": True})
+                return 0
+            if parsed.product_command == "repository":
+                changed, repository = set_repository(
+                    workspace,
+                    parsed.product_id,
+                    parsed.repository_id,
+                    parsed.path,
+                    parsed.role,
+                )
+                write_json(
+                    {
+                        "changed": changed,
+                        "product_id": parsed.product_id,
+                        "repository": repository,
+                    }
+                )
+                return 0
+            if parsed.product_command == "autonomy":
+                changed = set_autonomy(
+                    workspace, parsed.product_id, parsed.action_id, parsed.decision
+                )
+                write_json(
+                    {
+                        "action_id": parsed.action_id,
+                        "changed": changed,
+                        "decision": parsed.decision,
+                        "product_id": parsed.product_id,
+                    }
+                )
+                return 0
+            if parsed.product_command == "quality":
+                changed, quality_check = set_quality_check(
+                    workspace,
+                    parsed.product_id,
+                    parsed.check_id,
+                    parsed.owner,
+                    parsed.kind,
+                    parsed.required,
+                    parsed.command_parts,
+                )
+                write_json(
+                    {
+                        "changed": changed,
+                        "product_id": parsed.product_id,
+                        "quality_check": quality_check,
+                    }
+                )
+                return 0
+            if parsed.product_command == "policy":
+                changed, policy_ref = sync_policy(workspace, parsed.product_id)
+                write_json(
+                    {
+                        "changed": changed,
+                        "policy_ref": policy_ref,
+                        "product_id": parsed.product_id,
+                    }
+                )
+                return 0
+            if parsed.product_command == "context-registration":
+                write_json(
+                    context_registration(
+                        workspace,
+                        parsed.product_id,
+                        parsed.task_claim_id,
+                        parsed.actor,
+                        parsed.authority_receipt_file,
+                        parsed.registered_at,
+                    ),
+                    sort_keys=False,
+                )
                 return 0
         if parsed.command == "scenario":
             inspect_workbench_contract(workspace)
@@ -335,6 +533,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {"candidates": candidate_scenarios(workspace, parsed.product_filter)}
                 )
                 return 0
+            if parsed.scenario_command == "apply":
+                changed, scenario_document = apply_scenario(
+                    workspace, parsed.product_id, parsed.file
+                )
+                write_json(
+                    {
+                        "changed": changed,
+                        "product_id": parsed.product_id,
+                        "scenario": scenario_document,
+                        "scenario_ref": f"toolbox:scenario/{scenario_document['id']}",
+                    }
+                )
+                return 0
         if parsed.command == "portfolio":
             inspect_workbench_contract(workspace)
             if parsed.portfolio_command == "inspect":
@@ -352,6 +563,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             if parsed.portfolio_command == "candidates":
                 write_json({"candidates": candidate_scenarios(workspace)})
+                return 0
+            if parsed.portfolio_command == "run-plan":
+                write_json(portfolio_run_plan(workspace))
                 return 0
         parser.error("a command action is required")
     except (StateError, ToolboxError) as error:

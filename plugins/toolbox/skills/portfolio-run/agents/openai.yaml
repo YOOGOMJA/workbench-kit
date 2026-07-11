@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run the Portfolio"
+  short_description: "Select the next ready portfolio scenario"
+  default_prompt: "Use $portfolio-run to continue the next governed scenario across toolbox products."
