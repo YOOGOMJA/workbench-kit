@@ -4,10 +4,24 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" <<'PY'
 import sys
+import base64
+import os
+import pathlib
+import subprocess
+import tempfile
 
 sys.path.insert(0, sys.argv[1])
 
+import workbench_kit_upgrade as upgrade_module
 from workbench_kit_cli import CliError, parse_request, validate_route_flags
+from workbench_kit_contracts import canonical_bytes, canonical_digest, strict_load
+from workbench_kit_upgrade import (
+    language_decision,
+    load_receipt_projection,
+    load_runtime_bundle,
+    read_migration_task,
+    route_for_diagnosis,
+)
 
 
 WORKSPACE = "/tmp/workbench-kit-cli-workspace"
@@ -178,4 +192,294 @@ rejected(
 )
 
 print("PASS: closed upgrade CLI flag matrix")
+
+
+with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
+    base = pathlib.Path(temporary).resolve()
+    workspace = base / "workspace"
+    (workspace / "task").mkdir(parents=True)
+    index = (
+        "---\n"
+        "id: workbench#27\n"
+        "issue: 27\n"
+        "home: \n"
+        "parent: \n"
+        "slug: migrate-workbench\n"
+        "branch: task/27-upgrade\n"
+        "claim_id: claim-27\n"
+        "---\n\n# Task\n"
+    ).encode()
+    (workspace / "task/index.md").write_bytes(index)
+    task = read_migration_task(workspace, "implicit-v1")
+    assert task == {
+        "task_id": "workbench#27",
+        "claim_id": "claim-27",
+        "task_contract": "workbench-task/v1",
+        "branch": "task/27-upgrade",
+        "index_digest": canonical_digest(index, raw=True),
+    }
+    rejected_task = False
+    try:
+        read_migration_task(workspace, "current-v2")
+    except CliError as error:
+        rejected_task = error.code == "migration-task-contract-invalid"
+    assert rejected_task
+
+    v2_index = index.replace(
+        b"claim_id: claim-27\n",
+        b"claim_id: claim-27\ntask_contract: workbench-task/v2\n",
+    )
+    (workspace / "task/index.md").write_bytes(v2_index)
+    assert read_migration_task(workspace, "current-v2")["task_contract"] == (
+        "workbench-task/v2"
+    )
+
+    authority = {
+        "contract_version": "workbench-bootstrap-authority-approval/v1",
+        "approval_id": "approval-27",
+        "proposed_descriptor": {
+            "contract_version": "workbench-workspace-authority/v1",
+            "authority_identity": "github:example/workbench",
+            "origin_url": "https://github.com/example/workbench.git",
+            "default_ref": "refs/heads/main",
+            "workspace_home": "workbench",
+            "hosting_adapter": "github",
+            "hosting_ref": "github:repository/example/workbench",
+        },
+        "default_revision": "1" * 40,
+        "protection": {
+            "ref": "refs/heads/main",
+            "revision": "1" * 40,
+            "direct_task_actor_writes": "blocked",
+            "verified_at": "2026-07-11T00:00:00Z",
+            "evidence_ref": "github:ruleset/example",
+        },
+        "actor": "github:user/example",
+        "approved_at": "2026-07-11T00:00:00Z",
+        "source_ref": "github:repository/example/workbench",
+    }
+    external = base / "authority.json"
+    external.write_bytes(canonical_bytes(authority))
+    external.chmod(0o600)
+    projection = load_receipt_projection(
+        external, workspace, "bootstrap-authority"
+    )
+    assert projection["receipt"] == authority
+    assert projection["source_digest"] == canonical_digest(
+        canonical_bytes(authority), raw=True
+    )
+    inside = workspace / "authority.json"
+    inside.write_bytes(canonical_bytes(authority))
+    inside.chmod(0o600)
+    for unsafe_path in (inside, base / "authority-link.json"):
+        if unsafe_path.name.endswith("link.json"):
+            unsafe_path.symlink_to(external)
+        try:
+            load_receipt_projection(
+                unsafe_path, workspace, "bootstrap-authority"
+            )
+        except CliError as error:
+            assert error.code == "input-file-unsafe"
+        else:
+            raise AssertionError("unsafe receipt input was accepted")
+    hardlink = base / "authority-hardlink.json"
+    os.link(external, hardlink)
+    try:
+        load_receipt_projection(
+            hardlink, workspace, "bootstrap-authority"
+        )
+    except CliError as error:
+        assert error.code == "input-file-unsafe"
+    else:
+        raise AssertionError("hardlinked receipt input was accepted")
+
+    raced = base / "authority-raced.json"
+    raced.write_bytes(canonical_bytes(authority))
+    raced.chmod(0o600)
+    race_alias = base / "authority-raced-alias.json"
+    original_read = upgrade_module.os.read
+    raced_after_read = False
+
+    def mutate_input_after_read(descriptor, count):
+        global raced_after_read
+        chunk = original_read(descriptor, count)
+        if chunk and not raced_after_read:
+            raced_after_read = True
+            os.link(raced, race_alias)
+            raced.chmod(0o644)
+        return chunk
+
+    upgrade_module.os.read = mutate_input_after_read
+    try:
+        try:
+            load_receipt_projection(
+                raced, workspace, "bootstrap-authority"
+            )
+        except CliError as error:
+            assert error.code == "input-file-unsafe"
+        else:
+            raise AssertionError("post-read input mutation was accepted")
+    finally:
+        upgrade_module.os.read = original_read
+        raced.chmod(0o600)
+        race_alias.unlink()
+    assert raced_after_read is True
+
+assert route_for_diagnosis(
+    {"classification": "generated-minimal", "blockers": []}, "workbench/v1"
+) == "implicit-v1"
+assert route_for_diagnosis(
+    {"classification": "migration-staged", "blockers": []}, "workbench/v2"
+) == "staged-v2"
+assert route_for_diagnosis(
+    {"classification": "already-current", "blockers": []}, "workbench/v2"
+) == "current-v2"
+try:
+    route_for_diagnosis(
+        {"classification": "unrecognized", "blockers": []}, "workbench/v1"
+    )
+except CliError as error:
+    assert error.code == "classification-not-actionable"
+else:
+    raise AssertionError("unrecognized workspace received a route")
+
+explicit = language_decision("en-US", "implicit-v1")
+assert explicit["source"] == "explicit-cli"
+profile = language_decision("ko", "staged-v2")
+assert profile["source"] == "workspace-profile"
+
+runtime_bundle = load_runtime_bundle(pathlib.Path(sys.argv[1]).parent)
+assert runtime_bundle["planner"]["contract_version"] == (
+    "workbench-kit-planner/v1"
+)
+assert runtime_bundle["planner"]["plugin_version"] == "0.1.1"
+assert len(runtime_bundle["planner"]["planner_revision"]) == 40
+assert runtime_bundle["target_generator_receipt"]["generator_version"] == "0.1.1"
+assert runtime_bundle["generator_receipts"] == [
+    runtime_bundle["target_generator_receipt"]
+]
+assert runtime_bundle["plugin_equivalence_input"] is None
+assert runtime_bundle["legacy_engine_markers"] == [
+    "skills/task-done/SKILL.md",
+    "skills/task-start/SKILL.md",
+    "skills/task-submit/SKILL.md",
+    "utils/docs",
+    "utils/task",
+    "utils/workbench",
+]
+
+try:
+    load_runtime_bundle(pathlib.Path("/workbench-kit/missing-plugin-root"))
+except CliError as error:
+    assert error.code == "runtime-bundle-invalid"
+else:
+    raise AssertionError("missing runtime bundle root was accepted")
+
+with tempfile.TemporaryDirectory(prefix="workbench-runtime-invalid-") as temporary:
+    invalid_root = pathlib.Path(temporary)
+    source_root = pathlib.Path(sys.argv[1]).parent
+    (invalid_root / ".claude-plugin").mkdir()
+    (invalid_root / "receipts").mkdir()
+    (invalid_root / "scaffold").mkdir()
+    (invalid_root / ".claude-plugin/plugin.json").write_bytes(
+        (source_root / ".claude-plugin/plugin.json").read_bytes()
+    )
+    (invalid_root / "scaffold/AGENTS.core.md").write_bytes(
+        (source_root / "scaffold/AGENTS.core.md").read_bytes()
+    )
+    runtime_path = source_root / "receipts/upgrade-runtime.json"
+    invalid_runtime = strict_load(runtime_path.read_bytes(), str(runtime_path))
+    invalid_runtime["planner_revision"] = "not-an-object-id"
+    (invalid_root / "receipts/upgrade-runtime.json").write_bytes(
+        canonical_bytes(invalid_runtime)
+    )
+    try:
+        load_runtime_bundle(invalid_root)
+    except CliError as error:
+        assert error.code == "runtime-bundle-invalid"
+    else:
+        raise AssertionError("invalid planner revision was accepted")
+
+with tempfile.TemporaryDirectory(prefix="workbench-runtime-compose-") as temporary:
+    temporary_root = pathlib.Path(temporary)
+    persona = temporary_root / "persona"
+    output = temporary_root / "output"
+    persona.mkdir()
+    overlay_bytes = b"# Language\n\nEnglish.\n"
+    (persona / "overlay.md").write_bytes(overlay_bytes)
+    plugin_root = pathlib.Path(sys.argv[1]).parent
+    subprocess.run(
+        [
+            "bash",
+            str(plugin_root / "skills/generate-workbench/scripts/compose.sh"),
+            "--persona",
+            str(persona),
+            "--core",
+            str(plugin_root / "scaffold/AGENTS.core.md"),
+            "--scaffold",
+            str(plugin_root / "scaffold"),
+            "--out",
+            str(output),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    receipt = runtime_bundle["target_generator_receipt"]
+    expected_agents = (
+        base64.b64decode(receipt["header_base64"], validate=True)
+        + base64.b64decode(receipt["core_base64"], validate=True)
+        + base64.b64decode(receipt["separator_base64"], validate=True)
+        + overlay_bytes
+    )
+    assert (output / "AGENTS.md").read_bytes() == expected_agents
+    assert (output / "CLAUDE.md").read_bytes() == expected_agents
+
+print("PASS: safe task, receipt, route, and language orchestration inputs")
 PY
+
+BIN="$ROOT/bin/workbench-kit"
+[ -x "$BIN" ] || { echo "FAIL: workbench-kit entrypoint missing" >&2; exit 1; }
+"$BIN" --help > /dev/null
+set +e
+"$BIN" --workspace /tmp/workbench upgrade-workbench --format json \
+  > /tmp/workbench-kit-cli.stdout 2> /tmp/workbench-kit-cli.stderr
+status=$?
+set -e
+[ "$status" -eq 2 ] || { echo "FAIL: invalid CLI status $status" >&2; exit 1; }
+[ ! -s /tmp/workbench-kit-cli.stdout ] \
+  || { echo "FAIL: invalid CLI wrote stdout" >&2; exit 1; }
+grep -q 'mode-required: --dry-run/--apply' /tmp/workbench-kit-cli.stderr \
+  || { echo "FAIL: invalid CLI diagnostic mismatch" >&2; exit 1; }
+rm -f /tmp/workbench-kit-cli.stdout /tmp/workbench-kit-cli.stderr
+
+runtime_tmp="$(cd /tmp && pwd -P)"
+missing_plan="$runtime_tmp/workbench-kit-missing-plan-$$.json"
+set +e
+"$BIN" --workspace "$runtime_tmp" upgrade-workbench --apply \
+  --plan-file "$missing_plan" --format json \
+  > /tmp/workbench-kit-cli.stdout 2> /tmp/workbench-kit-cli.stderr
+status=$?
+set -e
+[ "$status" -eq 1 ] || { echo "FAIL: runtime CLI status $status" >&2; exit 1; }
+[ ! -s /tmp/workbench-kit-cli.stdout ] \
+  || { echo "FAIL: runtime CLI wrote stdout" >&2; exit 1; }
+grep -q 'input-file-invalid:' /tmp/workbench-kit-cli.stderr \
+  || { echo "FAIL: runtime CLI diagnostic mismatch" >&2; exit 1; }
+! grep -q 'Traceback' /tmp/workbench-kit-cli.stderr \
+  || { echo "FAIL: runtime CLI leaked traceback" >&2; exit 1; }
+rm -f /tmp/workbench-kit-cli.stdout /tmp/workbench-kit-cli.stderr
+
+set +e
+"$BIN" --workspace "$runtime_tmp/workbench-kit-missing-workspace-$$" \
+  upgrade-workbench --dry-run --format json \
+  > /tmp/workbench-kit-cli.stdout 2> /tmp/workbench-kit-cli.stderr
+status=$?
+set -e
+[ "$status" -eq 2 ] || { echo "FAIL: missing workspace status $status" >&2; exit 1; }
+grep -q 'workspace-invalid:' /tmp/workbench-kit-cli.stderr \
+  || { echo "FAIL: missing workspace diagnostic mismatch" >&2; exit 1; }
+! grep -q 'Traceback' /tmp/workbench-kit-cli.stderr \
+  || { echo "FAIL: missing workspace leaked traceback" >&2; exit 1; }
+rm -f /tmp/workbench-kit-cli.stdout /tmp/workbench-kit-cli.stderr
+
+echo "PASS: packaged workbench-kit CLI entrypoint"

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
+import sys
 from collections.abc import Sequence
 from typing import Any
 
@@ -117,3 +119,58 @@ def validate_route_flags(
                 "reviewed-overlay-not-allowed", "--reviewed-overlay-file"
             )
     return request
+
+
+USAGE_ERROR_CODES = {
+    "apply-flag-conflict",
+    "argument-invalid",
+    "authority-approval-not-allowed",
+    "authority-approval-required",
+    "command-required",
+    "dry-run-flag-conflict",
+    "format-invalid",
+    "format-required",
+    "language-not-allowed",
+    "language-required",
+    "mode-conflict",
+    "mode-required",
+    "plan-file-required",
+    "removal-request-required",
+    "reviewed-overlay-not-allowed",
+    "route-invalid",
+    "workspace-not-absolute",
+    "workspace-invalid",
+    "workspace-required",
+}
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    from workbench_kit_contracts import canonical_bytes
+    from workbench_kit_upgrade import (
+        apply_upgrade,
+        dry_run_upgrade,
+        load_runtime_bundle,
+    )
+
+    try:
+        request = parse_request(sys.argv[1:] if argv is None else argv)
+        plugin_root = pathlib.Path(
+            os.environ.get(
+                "WORKBENCH_KIT_PLUGIN_ROOT",
+                str(pathlib.Path(__file__).resolve().parent.parent),
+            )
+        ).resolve(strict=True)
+        bundle = load_runtime_bundle(plugin_root)
+        if request["mode"] == "dry-run":
+            result = dry_run_upgrade(request, bundle)
+        else:
+            result = apply_upgrade(request, bundle)
+        sys.stdout.buffer.write(canonical_bytes(result))
+        return 0 if not result["blockers"] else 1
+    except CliError as error:
+        print(f"workbench-kit: {error.code}: {error.ref}", file=sys.stderr)
+        return 2 if error.code in USAGE_ERROR_CODES else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

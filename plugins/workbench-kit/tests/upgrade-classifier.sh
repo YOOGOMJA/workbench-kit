@@ -262,6 +262,26 @@ with tempfile.TemporaryDirectory(prefix="workbench-classifier-") as temporary:
     assert result["classification"] == "generated-minimal", result
     assert result["embedded_engine"]["state"] == "absent"
 
+    root = base / "embedded-without-receipt"
+    generated_root(root)
+    write(root, "utils/task", b"#!/bin/sh\nexit 0\n", 0o755)
+    result = diagnose_workspace(
+        root,
+        kernel("workbench/v1", False),
+        generator_receipts=[generator],
+        equivalence_receipt=None,
+        legacy_engine_markers=["utils/task"],
+    )
+    assert result["classification"] == "malformed", result
+    assert result["embedded_engine"] == {
+        "state": "present-unverified",
+        "equivalence_receipt_digest": None,
+    }
+    assert result["blockers"] == [{
+        "code": "embedded-engine-unverified",
+        "ref": "embedded-engine",
+    }]
+
     root = base / "embedded"
     generated_root(root)
     write(root, engine_node["path"], engine_bytes, 0o755)

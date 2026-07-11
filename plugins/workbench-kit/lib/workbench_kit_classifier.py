@@ -22,6 +22,7 @@ from workbench_kit_contracts import (
     validate_generator_receipt,
     validate_link_target,
     validate_migration_receipt,
+    validate_relative_path,
 )
 
 
@@ -262,9 +263,18 @@ def _enumerate_owned_root(root: pathlib.Path, relative: str) -> tuple[bool, set[
 
 
 def _embedded_fingerprint(
-    root: pathlib.Path, raw_receipt: dict[str, Any] | None
+    root: pathlib.Path,
+    raw_receipt: dict[str, Any] | None,
+    legacy_engine_markers: Iterable[str] = (),
 ) -> dict[str, Any]:
     if raw_receipt is None:
+        for raw_marker in legacy_engine_markers:
+            marker = validate_relative_path(raw_marker)
+            if _inspect_node(root, marker)["node_type"] != "absent":
+                return {
+                    "state": "present-unverified",
+                    "equivalence_receipt_digest": None,
+                }
         return {"state": "absent", "equivalence_receipt_digest": None}
     receipt = validate_equivalence_receipt(raw_receipt)
     receipt_digest = canonical_digest(receipt)
@@ -443,6 +453,7 @@ def diagnose_workspace(
     *,
     generator_receipts: Iterable[dict[str, Any]] = (),
     equivalence_receipt: dict[str, Any] | None = None,
+    legacy_engine_markers: Iterable[str] = (),
 ) -> dict[str, Any]:
     root = workspace.resolve(strict=True)
     try:
@@ -452,7 +463,9 @@ def diagnose_workspace(
             doctor_ready, bool
         ):
             raise InspectionError("public-snapshot-invalid", "contract/doctor")
-        embedded = _embedded_fingerprint(root, equivalence_receipt)
+        embedded = _embedded_fingerprint(
+            root, equivalence_receipt, legacy_engine_markers
+        )
         generator_receipts = tuple(generator_receipts)
         provenance = _receipt_provenance(root, embedded, generator_receipts)
         normative_nodes = [_inspect_node(root, path) for path in NORMATIVE_PATHS]

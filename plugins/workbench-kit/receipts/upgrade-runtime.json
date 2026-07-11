@@ -1,0 +1,14 @@
+{
+  "contract_version": "workbench-kit-upgrade-runtime/v1",
+  "planner_revision": "85072db5ebc17248d625adde3df44e6f7354676b",
+  "generator_source_revision": "498555ec6886620209b5a790bb3716849d741ccd",
+  "legacy_engine_markers": [
+    "skills/task-done/SKILL.md",
+    "skills/task-start/SKILL.md",
+    "skills/task-submit/SKILL.md",
+    "utils/docs",
+    "utils/task",
+    "utils/workbench"
+  ],
+  "plugin_equivalence_file": null
+}

@@ -21,12 +21,15 @@ from workbench_kit_contracts import (
     strict_load,
     validate_migration_receipt,
     validate_plan,
+    validate_result,
 )
 from workbench_kit_planner import (
     PlanningError,
     build_current_plan,
     build_migration_plan,
 )
+from workbench_kit_cli import CliError, parse_request
+from workbench_kit_upgrade import apply_upgrade, dry_run_upgrade, plan_from_snapshot
 
 OID = "1" * 40
 SHA = "sha256:" + "a" * 64
@@ -519,6 +522,29 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
     assert current_noop["inputs"]["bootstrap_authority_approval"] is None
     assert current_noop["inputs"]["reviewed_overlay"] is None
     assert validate_plan(current_noop) == current_noop
+    current_noop_path = pathlib.Path(temporary).resolve() / "current-noop-plan.json"
+    current_noop_path.write_bytes(canonical_bytes(current_noop))
+    current_noop_path.chmod(0o600)
+    current_noop_journals = pathlib.Path(temporary).resolve() / "current-noop-journals"
+    current_noop_journals.mkdir(mode=0o700)
+    current_noop_request = parse_request([
+        "--workspace", str(root),
+        "upgrade-workbench", "--apply",
+        "--plan-file", str(current_noop_path),
+        "--journal-dir", str(current_noop_journals),
+        "--format", "json",
+    ])
+    try:
+        apply_upgrade(current_noop_request, {
+            "planner": planner_v2,
+            "generator_receipts": [generator],
+            "target_generator_receipt": generator,
+            "plugin_equivalence_input": equivalence_input,
+        })
+    except CliError as error:
+        assert error.code == "plan-not-actionable", error.code
+    else:
+        raise AssertionError("fresh no-op plan was applied")
 
     current_candidate = build_current_plan(
         root,
@@ -568,6 +594,192 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
         for path in (operation["path"] for operation in current_removal["operations"])
     )
     assert validate_plan(current_removal) == current_removal
+
+    task_index = (
+        b"---\n"
+        b"id: workbench#27\n"
+        b"issue: 27\n"
+        b"home: \n"
+        b"parent: \n"
+        b"slug: upgrade\n"
+        b"branch: task/27-upgrade\n"
+        b"claim_id: claim-27\n"
+        b"---\n"
+    )
+    write(root, "task/index.md", task_index)
+    subprocess.run(["git", "-C", str(root), "add", "task/index.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "-qm", "fixture: task metadata"],
+        check=True,
+    )
+    external_root = pathlib.Path(temporary).resolve()
+    authority_path = external_root / "authority.json"
+    authority_path.write_bytes(canonical_bytes(authority))
+    authority_path.chmod(0o600)
+    reviewed_path = external_root / "reviewed.json"
+    reviewed_path.write_bytes(canonical_bytes(reviewed_receipt))
+    reviewed_path.chmod(0o600)
+    orchestration_public = {
+        **public,
+        "contract": {"workspace": {"schema": "workbench/v1"}},
+        "doctor": {"ready": False},
+        "engine_manifest_projection": manifest_projection,
+    }
+    request = parse_request([
+        "--workspace", str(root),
+        "upgrade-workbench", "--dry-run",
+        "--language", "en",
+        "--authority-approval-file", str(authority_path),
+        "--reviewed-overlay-file", str(reviewed_path),
+        "--format", "json",
+    ])
+    bundle = {
+        "planner": planner_v2,
+        "generator_receipts": [generator],
+        "target_generator_receipt": generator,
+        "plugin_equivalence_input": equivalence_input,
+    }
+    orchestrated = plan_from_snapshot(
+        root,
+        request=request,
+        bundle=bundle,
+        public_snapshot=orchestration_public,
+    )
+    assert orchestrated["classification_before"] == "malformed"
+    assert orchestrated["embedded_engine"]["after"] == "present-verified"
+    assert orchestrated["actionable"] is True
+    assert not any(
+        operation["op"] == "remove"
+        for operation in orchestrated["operations"]
+    )
+    assert validate_plan(orchestrated) == orchestrated
+    try:
+        plan_from_snapshot(
+            root,
+            request=request,
+            bundle={
+                **bundle,
+                "plugin_equivalence_input": None,
+                "legacy_engine_markers": ["legacy-engine/task"],
+            },
+            public_snapshot=orchestration_public,
+        )
+    except CliError as error:
+        assert error.code == "classification-not-actionable", error.code
+    else:
+        raise AssertionError("unverified embedded engine was planned")
+
+    cli_root = pathlib.Path(temporary).resolve() / "cli-workbench"
+    cli_agents = header + core + separator + overlay
+    write(cli_root, "AGENTS.overlay.md", overlay)
+    write(cli_root, "AGENTS.md", cli_agents)
+    write(cli_root, "CLAUDE.md", cli_agents)
+    write(cli_root, ".claude/settings.json", canonical_bytes(settings))
+    write(cli_root, "task/index.md", task_index)
+    subprocess.run(["git", "-C", str(cli_root), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(cli_root), "config", "user.name", "Fixture"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(cli_root), "config", "user.email", "fixture@example.invalid"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(cli_root), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(cli_root), "commit", "-qm", "fixture: cli v1"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(cli_root), "switch", "-qc", "task/27-upgrade"],
+        check=True,
+    )
+    cli_request = parse_request([
+        "--workspace", str(cli_root),
+        "upgrade-workbench", "--dry-run",
+        "--language", "en",
+        "--authority-approval-file", str(authority_path),
+        "--format", "json",
+    ])
+    cli_bundle = {**bundle, "plugin_equivalence_input": None}
+    stub = pathlib.Path(sys.argv[1]).parent / "tests/upgrade-public-stub.sh"
+    old_binary = os.environ.get("WORKBENCH_KIT_WORKBENCH_BIN")
+    old_approval = os.environ.get("UPGRADE_STUB_APPROVAL_FILE")
+    old_descriptor = os.environ.get("UPGRADE_STUB_DESCRIPTOR_DIGEST")
+    os.environ["WORKBENCH_KIT_WORKBENCH_BIN"] = str(stub)
+    os.environ["UPGRADE_STUB_APPROVAL_FILE"] = str(authority_path)
+    os.environ["UPGRADE_STUB_DESCRIPTOR_DIGEST"] = canonical_digest(
+        authority["proposed_descriptor"]
+    )
+    cli_before = workspace_digest(cli_root)
+    try:
+        cli_first = dry_run_upgrade(cli_request, cli_bundle)
+        cli_second = dry_run_upgrade(cli_request, cli_bundle)
+    finally:
+        for name, value in (
+            ("WORKBENCH_KIT_WORKBENCH_BIN", old_binary),
+            ("UPGRADE_STUB_APPROVAL_FILE", old_approval),
+            ("UPGRADE_STUB_DESCRIPTOR_DIGEST", old_descriptor),
+        ):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    assert canonical_bytes(cli_first) == canonical_bytes(cli_second)
+    assert cli_first["classification_before"] == "generated-minimal"
+    assert cli_first["actionable"] is True
+    assert workspace_digest(cli_root) == cli_before
+
+    plan_path = external_root / "upgrade-plan.json"
+    plan_path.write_bytes(canonical_bytes(cli_first))
+    plan_path.chmod(0o600)
+    journal_dir = external_root / "upgrade-journals"
+    journal_dir.mkdir(mode=0o700)
+    xdg_state = external_root / "xdg-state"
+    xdg_state.mkdir(mode=0o700)
+    apply_request = parse_request([
+        "--workspace", str(cli_root),
+        "upgrade-workbench", "--apply",
+        "--plan-file", str(plan_path),
+        "--language", "en",
+        "--authority-approval-file", str(authority_path),
+        "--journal-dir", str(journal_dir),
+        "--format", "json",
+    ])
+    previous_environment = {
+        name: os.environ.get(name)
+        for name in (
+            "WORKBENCH_KIT_WORKBENCH_BIN",
+            "UPGRADE_STUB_APPROVAL_FILE",
+            "UPGRADE_STUB_DESCRIPTOR_DIGEST",
+            "UPGRADE_STUB_MODE",
+            "XDG_STATE_HOME",
+        )
+    }
+    os.environ["WORKBENCH_KIT_WORKBENCH_BIN"] = str(stub)
+    os.environ["UPGRADE_STUB_APPROVAL_FILE"] = str(authority_path)
+    os.environ["UPGRADE_STUB_DESCRIPTOR_DIGEST"] = canonical_digest(
+        authority["proposed_descriptor"]
+    )
+    os.environ["UPGRADE_STUB_MODE"] = "staged-v2"
+    os.environ["XDG_STATE_HOME"] = str(xdg_state)
+    try:
+        applied = apply_upgrade(apply_request, cli_bundle)
+        replayed = apply_upgrade(apply_request, cli_bundle)
+    finally:
+        for name, value in previous_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    assert validate_result(applied) == applied
+    assert applied["transaction"]["stage"] == "completed"
+    assert applied["changed"] is True
+    assert (cli_root / ".workbench/schema").read_bytes() == b"workbench/v2\n"
+    assert validate_result(replayed) == replayed
+    assert replayed["changed"] is False
+    assert replayed["applied"] == []
+    assert replayed["transaction"]["resumed"] is True
 
 print("PASS: deterministic migration planner and preservation manifest")
 PY
