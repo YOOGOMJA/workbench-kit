@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-reviewed-overlay-v1",
+  "title": "Workbench kit reviewed overlay v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "review_id",
+    "content_base64",
+    "content_digest",
+    "actor",
+    "reviewed_at",
+    "source_ref"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-reviewed-overlay/v1" },
+    "review_id": { "type": "string", "minLength": 1 },
+    "content_base64": { "type": "string", "contentEncoding": "base64" },
+    "content_digest": { "$ref": "#/$defs/digest" },
+    "actor": { "type": "string", "minLength": 1 },
+    "reviewed_at": { "$ref": "#/$defs/timestamp" },
+    "source_ref": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+    }
+  }
+}

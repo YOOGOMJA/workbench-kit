@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-removal-approval-v1",
+  "title": "Workbench kit removal approval v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "approval_id",
+    "equivalence_receipt_id",
+    "equivalence_receipt_digest",
+    "approved_plan_basis_digest",
+    "actor",
+    "approved_at",
+    "source_ref"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-removal-approval/v1" },
+    "approval_id": { "type": "string", "minLength": 1 },
+    "equivalence_receipt_id": { "type": "string", "minLength": 1 },
+    "equivalence_receipt_digest": { "$ref": "#/$defs/digest" },
+    "approved_plan_basis_digest": { "$ref": "#/$defs/digest" },
+    "actor": { "type": "string", "minLength": 1 },
+    "approved_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+    },
+    "source_ref": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

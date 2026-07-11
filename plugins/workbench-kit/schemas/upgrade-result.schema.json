@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-result-v1",
+  "title": "Workbench kit upgrade result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "result_digest",
+    "plan_digest",
+    "classification_before",
+    "target_classification",
+    "embedded_engine",
+    "provenance_final",
+    "workspace",
+    "transaction",
+    "changed",
+    "applied",
+    "preserved",
+    "active_v1_tasks",
+    "validation",
+    "blockers"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-upgrade-result/v1" },
+    "result_digest": { "$ref": "#/$defs/digest" },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "classification_before": { "$ref": "upgrade-plan.schema.json#/$defs/classification" },
+    "target_classification": { "$ref": "upgrade-plan.schema.json#/$defs/classification" },
+    "embedded_engine": { "$ref": "upgrade-plan.schema.json#/$defs/embedded" },
+    "provenance_final": { "$ref": "upgrade-plan.schema.json#/$defs/provenance" },
+    "workspace": { "$ref": "upgrade-plan.schema.json#/$defs/workspace" },
+    "transaction": { "$ref": "#/$defs/transaction" },
+    "changed": { "type": "boolean" },
+    "applied": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/appliedOperation" }
+    },
+    "preserved": {
+      "type": "array",
+      "items": { "$ref": "upgrade-plan.schema.json#/$defs/preservedNode" }
+    },
+    "active_v1_tasks": { "$ref": "upgrade-plan.schema.json#/$defs/activeTasks" },
+    "validation": { "$ref": "#/$defs/validation" },
+    "blockers": {
+      "type": "array",
+      "items": { "$ref": "upgrade-plan.schema.json#/$defs/blocker" }
+    }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nullableDigest": {
+      "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+    },
+    "transaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["journal_id", "workspace_id", "stage", "direction", "cursor", "resumed"],
+      "properties": {
+        "journal_id": { "type": "string", "pattern": "^upgrade-[0-9a-f]{64}$" },
+        "workspace_id": { "type": "string", "pattern": "^ws-[0-9a-f]{64}$" },
+        "stage": { "enum": ["completed", "rolled-back"] },
+        "direction": { "const": "none" },
+        "cursor": { "type": "integer", "minimum": 0 },
+        "resumed": { "type": "boolean" }
+      }
+    },
+    "appliedOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "path", "before_digest", "after_digest"],
+      "properties": {
+        "op": { "enum": ["create", "update", "remove"] },
+        "path": { "$ref": "upgrade-plan.schema.json#/$defs/path" },
+        "before_digest": { "$ref": "#/$defs/nullableDigest" },
+        "after_digest": { "$ref": "#/$defs/nullableDigest" }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "classification_after",
+        "basis_kind",
+        "basis_digest",
+        "blockers",
+        "digest"
+      ],
+      "properties": {
+        "status": { "enum": ["pending", "passed", "failed"] },
+        "classification_after": {
+          "oneOf": [
+            { "$ref": "upgrade-plan.schema.json#/$defs/classification" },
+            { "type": "null" }
+          ]
+        },
+        "basis_kind": { "enum": ["migration-candidate", "removal-plan", null] },
+        "basis_digest": { "$ref": "#/$defs/nullableDigest" },
+        "blockers": {
+          "type": "array",
+          "items": { "$ref": "upgrade-plan.schema.json#/$defs/blocker" }
+        },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

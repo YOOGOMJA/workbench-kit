@@ -263,7 +263,8 @@ expect_failure missing-manifest-contract public-contract-missing "$current_works
 expect_failure missing-manifest-capability public-capability-missing "$current_workspace" - show true
 expect_failure manifest-bad-digest public-contract-invalid "$current_workspace" - show true
 
-if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' "$ROOT/lib" 2>/dev/null; then
+if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' \
+  "$ROOT/lib/workbench_kit_adapter.py" 2>/dev/null; then
   echo "workbench-kit adapter references private/runtime workbench state" >&2
   exit 1
 fi

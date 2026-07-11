@@ -1,0 +1,431 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1",
+  "title": "Workbench kit upgrade plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "plan_digest",
+    "classification_before",
+    "target_classification",
+    "embedded_engine",
+    "provenance_before",
+    "provenance_after",
+    "workspace",
+    "planner",
+    "doctor",
+    "legacy_inventory",
+    "inputs",
+    "engine_manifest",
+    "plugin_equivalence",
+    "removal_plan_basis_digest",
+    "removal_approval",
+    "active_v1_tasks",
+    "preserved",
+    "parent_directories",
+    "artifacts",
+    "operations",
+    "blockers",
+    "changed",
+    "actionable"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-upgrade-plan/v1" },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "classification_before": { "$ref": "#/$defs/classification" },
+    "target_classification": { "$ref": "#/$defs/classification" },
+    "embedded_engine": { "$ref": "#/$defs/embedded" },
+    "provenance_before": { "$ref": "#/$defs/provenance" },
+    "provenance_after": { "$ref": "#/$defs/provenance" },
+    "workspace": { "$ref": "#/$defs/workspace" },
+    "planner": { "$ref": "#/$defs/planner" },
+    "doctor": { "$ref": "#/$defs/doctor" },
+    "legacy_inventory": { "$ref": "#/$defs/legacyInventory" },
+    "inputs": { "$ref": "#/$defs/inputs" },
+    "engine_manifest": {
+      "oneOf": [{ "$ref": "#/$defs/engineManifest" }, { "type": "null" }]
+    },
+    "plugin_equivalence": {
+      "oneOf": [{ "$ref": "#/$defs/equivalenceInput" }, { "type": "null" }]
+    },
+    "removal_plan_basis_digest": {
+      "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+    },
+    "removal_approval": {
+      "oneOf": [{ "$ref": "#/$defs/removalInput" }, { "type": "null" }]
+    },
+    "active_v1_tasks": { "$ref": "#/$defs/activeTasks" },
+    "preserved": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/preservedNode" }
+    },
+    "parent_directories": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/parentDirectory" }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "operations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operation" }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/blocker" }
+    },
+    "changed": { "type": "boolean" },
+    "actionable": { "type": "boolean" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nullableDigest": {
+      "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+    },
+    "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "nullableOid": {
+      "oneOf": [{ "$ref": "#/$defs/oid" }, { "type": "null" }]
+    },
+    "path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+    },
+    "classification": {
+      "enum": [
+        "generated-minimal",
+        "embedded-legacy",
+        "migration-staged",
+        "already-current",
+        "malformed",
+        "unrecognized",
+        "indeterminate"
+      ]
+    },
+    "embeddedState": {
+      "enum": ["absent", "present-verified", "present-unverified", "indeterminate"]
+    },
+    "embedded": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before", "after", "equivalence_receipt_digest"],
+      "properties": {
+        "before": { "$ref": "#/$defs/embeddedState" },
+        "after": { "$ref": "#/$defs/embeddedState" },
+        "equivalence_receipt_digest": { "$ref": "#/$defs/nullableDigest" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "state", "receipt_digest", "ref"],
+      "properties": {
+        "kind": { "enum": ["generation", "migration", null] },
+        "state": { "enum": ["absent", "valid", "stale", "invalid"] },
+        "receipt_digest": { "$ref": "#/$defs/nullableDigest" },
+        "ref": { "type": ["string", "null"] }
+      }
+    },
+    "migrationTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_id", "claim_id", "task_contract", "branch", "index_digest"],
+      "properties": {
+        "task_id": { "type": "string", "minLength": 1 },
+        "claim_id": { "type": "string", "minLength": 1 },
+        "task_contract": { "enum": ["workbench-task/v1", "workbench-task/v2"] },
+        "branch": { "type": "string", "minLength": 1 },
+        "index_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root",
+        "source_revision",
+        "default_revision",
+        "source_tree_digest",
+        "migration_task"
+      ],
+      "properties": {
+        "root": { "type": "string", "pattern": "^/" },
+        "source_revision": { "$ref": "#/$defs/oid" },
+        "default_revision": { "$ref": "#/$defs/oid" },
+        "source_tree_digest": {
+          "type": "string",
+          "pattern": "^git-tree:(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "migration_task": { "$ref": "#/$defs/migrationTask" }
+      }
+    },
+    "planner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "plugin_version", "planner_revision"],
+      "properties": {
+        "contract_version": { "const": "workbench-kit-planner/v1" },
+        "plugin_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+        },
+        "planner_revision": { "$ref": "#/$defs/oid" }
+      }
+    },
+    "doctor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "ready",
+        "object_digest",
+        "source_digest",
+        "writer_coordination_digest"
+      ],
+      "properties": {
+        "contract_version": { "const": "workbench-doctor/v1" },
+        "ready": { "type": "boolean" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "writer_coordination_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "legacyInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "command",
+        "object_digest",
+        "source_digest",
+        "authority_revision",
+        "home_set_digest",
+        "complete"
+      ],
+      "properties": {
+        "contract_version": { "const": "workbench-legacy-inventory/v1" },
+        "command": { "enum": ["show", "bootstrap-show"] },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "authority_revision": { "$ref": "#/$defs/oid" },
+        "home_set_digest": { "$ref": "#/$defs/digest" },
+        "complete": { "const": true }
+      }
+    },
+    "language": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "tag", "source", "source_ref", "digest"],
+      "properties": {
+        "contract_version": { "const": "workbench-kit-language-decision/v1" },
+        "tag": { "type": "string", "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$" },
+        "source": { "enum": ["explicit-cli", "workspace-profile", "generation-input"] },
+        "source_ref": { "type": "string", "minLength": 1 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "authorityInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt", "object_digest", "source_digest"],
+      "properties": {
+        "receipt": { "$ref": "bootstrap-authority-approval.schema.json" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "reviewedInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt", "object_digest", "source_digest"],
+      "properties": {
+        "receipt": { "$ref": "reviewed-overlay.schema.json" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "equivalenceInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt", "object_digest", "source_digest"],
+      "properties": {
+        "receipt": { "$ref": "plugin-equivalence.schema.json" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "removalInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt", "object_digest", "source_digest"],
+      "properties": {
+        "receipt": { "$ref": "removal-approval.schema.json" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "bootstrap_authority_approval", "reviewed_overlay"],
+      "properties": {
+        "language": { "$ref": "#/$defs/language" },
+        "bootstrap_authority_approval": {
+          "oneOf": [{ "$ref": "#/$defs/authorityInput" }, { "type": "null" }]
+        },
+        "reviewed_overlay": {
+          "oneOf": [{ "$ref": "#/$defs/reviewedInput" }, { "type": "null" }]
+        }
+      }
+    },
+    "engineManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "command",
+        "object_digest",
+        "source_digest",
+        "content_revision",
+        "manifest_digest"
+      ],
+      "properties": {
+        "contract_version": { "const": "workbench-plugin-manifest/v1" },
+        "command": { "const": "engine-manifest show" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "content_revision": { "$ref": "#/$defs/digest" },
+        "manifest_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "activeTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "home",
+        "claim_id",
+        "task_claim_id",
+        "task_contract",
+        "issue",
+        "parent",
+        "branch",
+        "lifecycle_state",
+        "lifecycle_digest",
+        "source_revision",
+        "pr_head_revision",
+        "ancestry_complete"
+      ],
+      "properties": {
+        "source": { "const": "legacy-inventory:homes[].claims" },
+        "home": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "claim_id": { "type": "string", "minLength": 1 },
+        "task_claim_id": { "type": "string", "minLength": 1 },
+        "task_contract": { "const": "workbench-task/v1" },
+        "issue": { "type": "integer", "minimum": 1 },
+        "parent": { "type": ["integer", "null"], "minimum": 1 },
+        "branch": { "type": "string", "minLength": 1 },
+        "lifecycle_state": { "type": "string", "minLength": 1 },
+        "lifecycle_digest": { "$ref": "#/$defs/digest" },
+        "source_revision": { "$ref": "#/$defs/oid" },
+        "pr_head_revision": { "$ref": "#/$defs/nullableOid" },
+        "ancestry_complete": { "const": true }
+      }
+    },
+    "activeTasks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "source_inventory_object_digest", "tasks", "digest"],
+      "properties": {
+        "contract_version": { "const": "workbench-kit-active-v1-tasks/v1" },
+        "source_inventory_object_digest": { "$ref": "#/$defs/digest" },
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/activeTask" } },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "preservedNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "node_type", "mode", "digest", "link_target"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "node_type": { "enum": ["file", "symlink"] },
+        "mode": { "enum": ["100644", "100755", "120000"] },
+        "digest": { "$ref": "#/$defs/digest" },
+        "link_target": { "type": ["string", "null"] }
+      }
+    },
+    "parentDirectory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "before_type", "before_mode", "after_type", "after_mode"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "before_type": { "enum": ["directory", null] },
+        "before_mode": { "type": ["string", "null"], "pattern": "^04[0-7]{4}$" },
+        "after_type": { "const": "directory" },
+        "after_mode": { "type": "string", "pattern": "^04[0-7]{4}$" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "node_type",
+        "mode",
+        "content_base64",
+        "link_target",
+        "source_ref",
+        "source_digest"
+      ],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "node_type": { "enum": ["file", "symlink"] },
+        "mode": { "enum": ["100644", "100755", "120000"] },
+        "content_base64": { "type": ["string", "null"], "contentEncoding": "base64" },
+        "link_target": { "type": ["string", "null"] },
+        "source_ref": { "type": "string", "minLength": 1 },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "path",
+        "before_type",
+        "before_mode",
+        "before_digest",
+        "after_type",
+        "after_mode",
+        "after_digest",
+        "artifact_source_digest",
+        "equivalence_receipt_ref"
+      ],
+      "properties": {
+        "op": { "enum": ["create", "update", "remove"] },
+        "path": { "$ref": "#/$defs/path" },
+        "before_type": { "enum": ["file", "symlink", null] },
+        "before_mode": { "enum": ["100644", "100755", "120000", null] },
+        "before_digest": { "$ref": "#/$defs/nullableDigest" },
+        "after_type": { "enum": ["file", "symlink", null] },
+        "after_mode": { "enum": ["100644", "100755", "120000", null] },
+        "after_digest": { "$ref": "#/$defs/nullableDigest" },
+        "artifact_source_digest": { "$ref": "#/$defs/nullableDigest" },
+        "equivalence_receipt_ref": { "type": ["string", "null"] }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "ref"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "ref": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

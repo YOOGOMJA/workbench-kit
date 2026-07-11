@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-journal-v1",
+  "title": "Workbench kit upgrade journal v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "journal_id",
+    "workspace_id",
+    "plan_digest",
+    "plan_source_digest",
+    "workspace",
+    "stage",
+    "direction",
+    "cursor",
+    "effects",
+    "applied",
+    "validation",
+    "completion_result",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-upgrade-journal/v1" },
+    "journal_id": { "type": "string", "pattern": "^upgrade-[0-9a-f]{64}$" },
+    "workspace_id": { "type": "string", "pattern": "^ws-[0-9a-f]{64}$" },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "plan_source_digest": { "$ref": "#/$defs/digest" },
+    "workspace": { "$ref": "upgrade-plan.schema.json#/$defs/workspace" },
+    "stage": {
+      "enum": [
+        "prepared",
+        "applying",
+        "validating",
+        "rolling-back",
+        "rolled-back",
+        "completed"
+      ]
+    },
+    "direction": { "enum": ["forward", "reverse", "none"] },
+    "cursor": { "type": "integer", "minimum": 0 },
+    "effects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/effect" }
+    },
+    "applied": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^effect-[0-9]{4}$" }
+    },
+    "validation": { "$ref": "upgrade-result.schema.json#/$defs/validation" },
+    "completion_result": {
+      "oneOf": [{ "$ref": "upgrade-result.schema.json" }, { "type": "null" }]
+    },
+    "created_at": { "$ref": "#/$defs/timestamp" },
+    "updated_at": { "$ref": "#/$defs/timestamp" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nullableDigest": {
+      "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+    },
+    "nodeImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_type", "mode", "content_base64", "link_target", "digest"],
+      "properties": {
+        "node_type": { "enum": ["absent", "directory", "file", "symlink"] },
+        "mode": { "type": ["string", "null"] },
+        "content_base64": { "type": ["string", "null"], "contentEncoding": "base64" },
+        "link_target": { "type": ["string", "null"] },
+        "digest": { "$ref": "#/$defs/nullableDigest" }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "kind",
+        "path",
+        "temp_path",
+        "before",
+        "after",
+        "artifact_source_digest",
+        "equivalence_receipt_ref"
+      ],
+      "properties": {
+        "effect_id": { "type": "string", "pattern": "^effect-[0-9]{4}$" },
+        "kind": { "enum": ["ensure-directory", "create", "update", "remove"] },
+        "path": { "$ref": "upgrade-plan.schema.json#/$defs/path" },
+        "temp_path": {
+          "oneOf": [
+            { "$ref": "upgrade-plan.schema.json#/$defs/path" },
+            { "type": "null" }
+          ]
+        },
+        "before": { "$ref": "#/$defs/nodeImage" },
+        "after": { "$ref": "#/$defs/nodeImage" },
+        "artifact_source_digest": { "$ref": "#/$defs/nullableDigest" },
+        "equivalence_receipt_ref": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

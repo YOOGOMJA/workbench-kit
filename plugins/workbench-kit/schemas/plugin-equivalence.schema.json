@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-plugin-equivalence-v1",
+  "title": "Workbench plugin equivalence receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "receipt_id",
+    "replacement_plugin",
+    "public_contract",
+    "required_capabilities",
+    "legacy_source",
+    "legacy_manifest_digest",
+    "allowed_roots",
+    "removable_nodes",
+    "discovery_links",
+    "verification_evidence"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-plugin-equivalence/v1" },
+    "receipt_id": { "type": "string", "minLength": 1 },
+    "replacement_plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plugin_name",
+        "plugin_version",
+        "source_revision",
+        "plugin_manifest_digest",
+        "source_ref"
+      ],
+      "properties": {
+        "plugin_name": { "const": "workbench" },
+        "plugin_version": { "$ref": "#/$defs/semver" },
+        "source_revision": { "$ref": "#/$defs/oid" },
+        "plugin_manifest_digest": { "$ref": "#/$defs/digest" },
+        "source_ref": { "type": "string", "minLength": 1 }
+      }
+    },
+    "public_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "engine_name",
+        "engine_version",
+        "supported_object_digest",
+        "capabilities"
+      ],
+      "properties": {
+        "contract_version": { "const": "workbench-contract/v1" },
+        "engine_name": { "const": "workbench" },
+        "engine_version": { "$ref": "#/$defs/semver" },
+        "supported_object_digest": { "$ref": "#/$defs/digest" },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "required_capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "legacy_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_ref", "source_revision"],
+      "properties": {
+        "source_ref": { "type": "string", "minLength": 1 },
+        "source_revision": { "$ref": "#/$defs/oid" }
+      }
+    },
+    "legacy_manifest_digest": { "$ref": "#/$defs/digest" },
+    "allowed_roots": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/path" }
+    },
+    "removable_nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "discovery_links": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "verification_evidence": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidence_id", "kind", "source_ref", "source_revision", "digest"],
+        "properties": {
+          "evidence_id": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["manifest-audit", "contract-test", "integration-test"] },
+          "source_ref": { "type": "string", "minLength": 1 },
+          "source_revision": { "$ref": "#/$defs/oid" },
+          "digest": { "$ref": "#/$defs/digest" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "node_type", "mode", "digest", "link_target"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "node_type": { "enum": ["file", "symlink"] },
+        "mode": { "enum": ["100644", "100755", "120000"] },
+        "digest": { "$ref": "#/$defs/digest" },
+        "link_target": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-generator-receipt-v1",
+  "title": "Workbench kit generator receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "receipt_id",
+    "generator_id",
+    "generator_version",
+    "source_revision",
+    "compose_contract",
+    "header_base64",
+    "core_base64",
+    "core_digest",
+    "separator_base64",
+    "settings_owned",
+    "generated_nodes",
+    "receipt_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-generator-receipt/v1" },
+    "receipt_id": { "type": "string", "minLength": 1 },
+    "generator_id": { "const": "workbench-kit:generate-workbench" },
+    "generator_version": { "$ref": "#/$defs/semver" },
+    "source_revision": { "$ref": "#/$defs/oid" },
+    "compose_contract": { "const": "workbench-kit-compose/v1" },
+    "header_base64": { "type": "string", "contentEncoding": "base64", "minLength": 1 },
+    "core_base64": { "type": "string", "contentEncoding": "base64", "minLength": 1 },
+    "core_digest": { "$ref": "#/$defs/digest" },
+    "separator_base64": { "type": "string", "contentEncoding": "base64", "minLength": 1 },
+    "settings_owned": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["marketplace", "plugin_enabled"],
+      "properties": {
+        "marketplace": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source"],
+          "properties": {
+            "source": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source", "repo"],
+              "properties": {
+                "source": { "const": "github" },
+                "repo": { "const": "YOOGOMJA/workbench-kit" }
+              }
+            }
+          }
+        },
+        "plugin_enabled": { "const": true }
+      }
+    },
+    "generated_nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "node_type", "mode"],
+        "properties": {
+          "path": { "$ref": "#/$defs/path" },
+          "node_type": { "enum": ["file", "symlink"] },
+          "mode": { "enum": ["100644", "120000"] }
+        }
+      }
+    },
+    "receipt_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+    }
+  }
+}
