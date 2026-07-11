@@ -146,15 +146,21 @@ The kernel reports simultaneous `role: work` writers as `writer_conflicts`. Curr
 are always the union of active v2 rows on fixed canonical-origin ref
 `refs/heads/workbench-coordination/writer-claims` and deterministic pseudo-claims derived from
 authoritative non-cleaned v1 lifecycle facts plus canonical task-branch `task/index.md` role
-entries. Missing legacy input fails closed. A legacy conflict always requires explicit
+entries. The closed home inventory comes from descriptor `workspace_home` plus same-OID
+`codebases.yaml`; adapters exhaust every home's pagination, and an in-use legacy home cannot
+be removed. Missing registry, pagination, branch, or legacy input fails closed. A legacy
+conflict always requires explicit
 `task.concurrent-write` authorization because v1 has no sealed context policy; a later v1
 `task-cleaned` fact dynamically retires its pseudo-claim.
 
 Each explicit v2 add-repo persists a strict `workbench-writer-operation/v1` journal and an
 expanded remote row before creating a worktree. Parent-OID fast-forward/CAS commits serialize
-claims. Recovery adopts only one exact path/branch/origin worktree, reconstructs a missing
-local journal from the remote row, and never releases while a possible orphan or live record
-remains. Cleanup carries operation/claim IDs in its external journal and verifies releases
+claims. The full joined set and policy are revalidated after publication, before every local
+worktree/record create or adopt, and after the record before consume. Ask compensates exact
+operation-owned effects and keeps the claim reserved; policy or authorization deny compensates
+then verifies release. External or ambiguous effects are never removed. Recovery reconstructs
+a missing local journal from the remote row and never releases while a possible orphan or live
+record remains. Cleanup carries operation/claim IDs in its external journal and verifies releases
 before deleting the task workspace without changing frozen task content. `workbench doctor`
 checks descriptor, legacy inventory, ledger, and hosting-adapter ref permissions read-only;
 unknown permission is not ready, and actual CAS remains final proof.
@@ -339,11 +345,16 @@ A v2 task is complete only when all applicable conditions hold:
    current state is not mislabeled as workbench knowledge to satisfy this condition.
 6. No applicable policy resolves to `deny`, and no required action remains unresolved at
    `ask`.
+7. Every task-local writer operation and remote task claim is reconciled: consumed operations
+   have exact active claim/content-row/worktree matches, and released operations have no live
+   writer effect. Pending, duplicate, unmatched, or blocked writer state prevents completion.
 
 Abandonment is a different terminal predicate. It requires a non-terminal task, a parseable
 current revision snapshot, sealed context policy, a reason code, and authorized
 `task.abandon`. It deliberately does not require accepted deliverables, passing evidence,
-or harvest disposition; claiming those would misstate non-adoption as completion.
+harvest disposition, or reconciled writer operations; claiming those would misstate
+non-adoption as completion. It freezes new writer effects and delegates exact compensation
+and release of existing operations to cleanup.
 
 Cleanup is never a completion predicate. Destructive cleanup before completion or
 abandonment is invalid for v2 tasks. Existing v1 force-cleanup behavior remains a legacy
@@ -359,9 +370,12 @@ does not mutate frozen task content.
 Completion and abandonment both freeze every revision-affecting fact. Refs, context set,
 deliverables and acceptance, required checks, evidence, harvest, and writer claims reject
 mutation with `terminal-content-frozen`. Only read-only queries, same-outcome reconciliation,
-durable cleanup-journal reconciliation, and bookkeeping excluded from the content revision
-remain available. Coordination-ledger release is cleanup bookkeeping, not a task-content
-change. Result changes require a new task.
+existing writer-operation/cleanup reconciliation, durable cleanup-journal reconciliation, and
+bookkeeping excluded from the content revision remain available. Completion cannot freeze
+until writers are reconciled. Abandonment may freeze unresolved existing operations, but only
+cleanup may compensate/release them; it permits no new claim or local writer effect.
+Coordination-ledger release is cleanup bookkeeping, not a task-content change. Result changes
+require a new task.
 
 ## Policy contract
 
@@ -411,7 +425,9 @@ authorization reference without asking shell plumbing to invent explanatory pros
 
 V2 bootstrap/migration writes the fixed protected-default `.workbench/authority.json`
 descriptor (`workbench-workspace-authority/v1`) beside profile, schema marker, and required
-policy in one accepted commit. The one-time trust root is an explicitly approved canonical
+policy in one accepted commit. The descriptor supplies canonical `workspace_home`; the same
+OID's `codebases.yaml` supplies every exact codebase home. The one-time trust root is an
+explicitly approved canonical
 origin/default ref or authenticated hosting-repository selection; issue comments and task
 branches are non-authoritative. Each task claim records the descriptor digest for audit.
 Remote/descriptor unavailability is `policy-authority-unavailable`; a changed descriptor,
@@ -424,9 +440,10 @@ authorization repeats the manifest digest with every other binding field. The se
 context-policy set makes participant omission impossible for a direct caller. Immediately
 before consumption, the kernel re-observes the descriptor origin/default ref with
 `ls-remote --symref`, fetches its current OID, reads `.workbench/authority.json` and
-`.workbench/policy.conf` from that same immutable object, validates the task claim's descriptor
-digest plus every sealed participant/task receipt and digest, and re-resolves strictest
-policy. The task-branch workspace copy is ignored. A changed protected
+`.workbench/policy.conf` plus `codebases.yaml` from that same immutable object, validates the
+task claim's descriptor digest, closed legacy home set, every sealed participant/task receipt
+and digest, and re-resolves strictest policy. The task-branch workspace copy is ignored. A
+changed protected
 workspace revision supersedes old authorization; changed sealed context/task bytes fail as
 `policy-source-tampered` without a replacement. These rules prevent approval for one task,
 target, revision, policy set, or authority revision from authorizing another. The trusted
@@ -539,10 +556,12 @@ The canonical v1 shape is:
     "doctor_contracts": ["workbench-doctor/v1"],
     "evidence_contracts": ["workbench-evidence/v1"],
     "writer_claim_contracts": [
+      "workbench-legacy-home-set/v1",
       "workbench-legacy-writer-identity/v1",
       "workbench-writer-claim/v1",
       "workbench-writer-claims/v1",
-      "workbench-writer-operation/v1"
+      "workbench-writer-operation/v1",
+      "workbench-writer-worktree-owner/v1"
     ],
     "capability_pack_contracts": ["workbench-capability-pack/v1"],
     "action_ids": [
@@ -582,6 +601,7 @@ The canonical v1 shape is:
     "task.writer-claims/v1",
     "task.writer-conflicts/v1",
     "task.writer-recovery/v1",
+    "task.writer-reconciliation/v1",
     "workspace.authority/v1",
     "workspace.doctor/v1",
     "workspace.schema/v1"
@@ -610,8 +630,8 @@ turn an unreadable or unwritable coordination ref into authority.
 
 `workspace_authority_contracts` identifies the protected-default descriptor contract, not an
 issue marker. `task.start/v2` means skeleton-only start/resume. Writer-claim support is
-complete only when legacy projection and writer recovery capabilities are also advertised;
-the ledger contract alone is insufficient.
+complete only when legacy projection, writer recovery, and terminal reconciliation
+capabilities are also advertised; the ledger contract alone is insufficient.
 
 Only workspace schemas listed under `supported.workspace_schemas.write` may receive v2
 mutations without migration. A v2 engine can read an implicit v1 workspace and run legacy
@@ -764,7 +784,9 @@ flowchart TD
   the protected default branch. Doctor must prove descriptor/legacy readability and
   hosting-adapter coordination-ref permission; unsupported permission inspection is not
   ready. Migration does not add `task_contract` to active legacy tasks; only newly created v2
-  tasks receive it.
+  tasks receive it. Migration preserves every registered home with a non-cleaned v1 claim;
+  removal returns `legacy-home-in-use`. G2 may seed only a disposable projection cache, never
+  a correctness source.
 - A **capability pack** adopts or migrates only its own domain state after the generic
   workbench contract is compatible. Installing a pack never implies adoption.
 - The **user or resolved policy** controls merge, destructive cleanup, production effects,

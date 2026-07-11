@@ -9,9 +9,10 @@
   public CLI/JSON records, authority-backed acceptance, terminal content freeze, a sealed
   harvest ledger, externally journaled cleanup, skeleton-only v2 start/resume,
   legacy-aware CAS writer claims with crash-safe operation journals, protected-default
-  authority descriptors, declaration-bound pack ownership, per-participant sealed policy
-  authority, and capability discovery kernel contracts. Keep product semantics in an optional
-  pack.
+  authority descriptors and closed legacy-home inventories, per-effect post-CAS revalidation,
+  terminal writer reconciliation, declaration-bound pack ownership, per-participant sealed
+  policy authority, and capability discovery kernel contracts. Keep product semantics in an
+  optional pack.
 - **Context:** V1 isolates task work and accumulates knowledge, but it treats a workbench
   increment pull request as the normal delivery path and describes human gates only in
   prose. It has no durable category for current intent and no supported way for an optional
@@ -113,6 +114,21 @@
   30. Treat a no-op dry-run push as proof of writer-ref readiness. It may not prove permission
       or rules; doctor now requires read-only hosting-adapter inspection, reports unsupported
       inspection as unknown/not-ready, and leaves actual CAS as final proof.
+  31. Revalidate policy only once after remote claim. Writer and authority state can change
+      before each local effect; every create/adopt and final consume now has its own full gate,
+      with exact reverse compensation and no removal of external effects.
+  32. Let verification/completion hash task content without joining writer operations and
+      remote claims. A pending or orphan writer could be terminal-frozen; completion now
+      requires exact consumed/released reconciliation while abandonment delegates release to
+      cleanup.
+  33. Discover legacy homes opportunistically from observed lifecycle comments. Omitted homes
+      would look empty; the descriptor workspace home plus same-OID canonical codebase
+      registry is the closed paginated inventory, and active legacy homes cannot be removed.
+  34. Leave start/resume positional syntax implicit. Agents could disagree about slug or task
+      selection; the public forms now specify `start ID [slug] [--parent N]` and
+      `resume ID [--parent N]`, preserving the existing slug fallback.
+  35. Leave digest booleans as semantic placeholders. Implementations could hash `True`, `1`,
+      or JSON text differently; every manifest now uses exact lowercase `true|false` tokens.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing
