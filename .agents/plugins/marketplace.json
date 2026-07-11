@@ -14,6 +14,13 @@
       "policy": { "installation": "AVAILABLE" },
       "category": "Development",
       "description": "Bootstrap — interview for persona, then generate a minimal personalized workbench (@workbench-kit:generate-workbench)."
+    },
+    {
+      "name": "toolbox",
+      "source": { "source": "local", "path": "./plugins/toolbox" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Development",
+      "description": "Optional product delivery capability pack — governed product state, scenarios, portfolios, and agent-led workflows (@toolbox:product-start …)."
     }
   ]
 }
