@@ -10,11 +10,13 @@ PYTHONDONTWRITEBYTECODE=1 uv run --quiet \
   --with-requirements "$ROOT/tests/requirements-schema.txt" \
   python3 - "$ROOT/lib" "$ROOT/schemas" <<'PY'
 import base64
+import binascii
 import copy
 import hashlib
 import json
 import pathlib
 import sys
+import unicodedata
 
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
@@ -24,6 +26,7 @@ from workbench_kit_contracts import (
     ContractError,
     canonical_bytes,
     canonical_digest,
+    decode_artifact,
     node_digest,
     parse_authority_approval,
     parse_reviewed_overlay,
@@ -51,13 +54,29 @@ schema_registry = Registry().with_resources(
     (document["$id"], Resource.from_contents(document))
     for document in schema_documents.values()
 )
+schema_format_checker = FormatChecker()
+
+
+@schema_format_checker.checks(
+    "canonical-base64", raises=(ValueError, binascii.Error)
+)
+def canonical_base64(value):
+    if not isinstance(value, str):
+        return True
+    decoded = base64.b64decode(value, validate=True)
+    return base64.b64encode(decoded).decode("ascii") == value
+
+
+@schema_format_checker.checks("nfc")
+def normalized_nfc(value):
+    return not isinstance(value, str) or unicodedata.normalize("NFC", value) == value
 
 
 def schema_accepts(filename, value):
     validator = Draft202012Validator(
         schema_documents[filename],
         registry=schema_registry,
-        format_checker=FormatChecker(),
+        format_checker=schema_format_checker,
     )
     errors = list(validator.iter_errors(value))
     assert not errors, (filename, errors[0].json_path, errors[0].message)
@@ -67,7 +86,7 @@ def schema_rejects(filename, value):
     validator = Draft202012Validator(
         schema_documents[filename],
         registry=schema_registry,
-        format_checker=FormatChecker(),
+        format_checker=schema_format_checker,
     )
     assert list(validator.iter_errors(value)), filename
 
@@ -188,6 +207,23 @@ language = {
     "digest": None,
 }
 language["digest"] = canonical_digest(language, null_field="digest")
+unicode_artifact = {
+    "path": "example.txt",
+    "node_type": "file",
+    "mode": "100644",
+    "content_base64": base64.b64encode(b"x").decode("ascii"),
+    "link_target": None,
+    "source_ref": "artifact:\uc124\uacc4",
+    "source_digest": canonical_digest(b"x", raw=True),
+}
+rejected(lambda: decode_artifact(unicode_artifact))
+noncanonical_artifact = {
+    **unicode_artifact,
+    "content_base64": "AB==",
+    "source_ref": "artifact:test",
+    "source_digest": canonical_digest(b"\x00", raw=True),
+}
+rejected(lambda: decode_artifact(noncanonical_artifact))
 active = {
     "contract_version": "workbench-kit-active-v1-tasks/v1",
     "source_inventory_object_digest": SHA,

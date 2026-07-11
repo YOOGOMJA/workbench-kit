@@ -63,6 +63,29 @@ def workspace_digest(root):
     return hashlib.sha256(canonical_bytes(rows)).hexdigest()
 
 
+def git_observable_state(root):
+    environment = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    git_dir = pathlib.Path(subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "--absolute-git-dir"],
+        env=environment,
+    ).decode().strip())
+    rows = []
+    for name in ("HEAD", "index", "FETCH_HEAD", "packed-refs"):
+        path = git_dir / name
+        rows.append((name, path.read_bytes() if path.exists() else None))
+    refs = git_dir / "refs"
+    for path in sorted(item for item in refs.rglob("*") if item.is_file()):
+        rows.append((path.relative_to(git_dir).as_posix(), path.read_bytes()))
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain=v2", "--untracked-files=all"],
+        capture_output=True,
+        check=True,
+        env=environment,
+    )
+    rows.append(("status", status.stdout))
+    return tuple(rows)
+
+
 def hold_workspace_lock(path, ready, release):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -781,6 +804,15 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
     os.environ["UPGRADE_STUB_DESCRIPTOR_DIGEST"] = canonical_digest(
         authority["proposed_descriptor"]
     )
+    git_dir = pathlib.Path(git(cli_root, "rev-parse", "--absolute-git-dir"))
+    (git_dir / "FETCH_HEAD").write_bytes(b"fixture fetch state\n")
+    stale_node = cli_root / "AGENTS.md"
+    stale_stat = stale_node.stat()
+    os.utime(
+        stale_node,
+        ns=(stale_stat.st_atime_ns, stale_stat.st_mtime_ns + 2_000_000_000),
+    )
+    git_state_before = git_observable_state(cli_root)
     cli_before = workspace_digest(cli_root)
     try:
         cli_first = dry_run_upgrade(cli_request, cli_bundle)
@@ -799,6 +831,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
     assert cli_first["classification_before"] == "generated-minimal"
     assert cli_first["actionable"] is True
     assert workspace_digest(cli_root) == cli_before
+    assert git_observable_state(cli_root) == git_state_before
 
     plan_path = external_root / "upgrade-plan.json"
     plan_path.write_bytes(canonical_bytes(cli_first))
@@ -968,6 +1001,74 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
     assert staged_noop["artifacts"] == []
     assert (cli_root / ".workbench/migration.json").read_bytes() == staged_receipt_before
     assert workspace_digest(cli_root) == staged_before
+
+    current_descriptor = canonical_digest(authority["proposed_descriptor"])
+    current_index = task_index.replace(
+        b"id: workbench#27\n", b"id: 27\n"
+    ).replace(
+        b"claim_id: claim-27\n",
+        (
+            b"claim_id: claim-27\n"
+            b"task_contract: workbench-task/v2\n"
+            b"workspace_authority_descriptor_digest: "
+            + current_descriptor.encode("ascii")
+            + b"\n"
+        ),
+    )
+    write(cli_root, "task/index.md", current_index)
+    subprocess.run(["git", "-C", str(cli_root), "add", "task/index.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(cli_root), "commit", "-qm", "fixture: native v2 task"],
+        check=True,
+    )
+    current_log = external_root / "historical-current.log"
+    current_environment = {
+        **os.environ,
+        "WORKBENCH_KIT_WORKBENCH_BIN": str(stub),
+        "UPGRADE_STUB_APPROVAL_FILE": str(authority_path),
+        "UPGRADE_STUB_DESCRIPTOR_DIGEST": current_descriptor,
+        "UPGRADE_STUB_MODE": "v2-ok",
+        "UPGRADE_STUB_LOG": str(current_log),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    cli = pathlib.Path(sys.argv[1]).parent / "bin/workbench-kit"
+    command = [
+        str(cli), "--workspace", str(cli_root),
+        "upgrade-workbench", "--dry-run", "--format", "json",
+    ]
+    historical = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        env=current_environment,
+    )
+    assert historical.returncode == 0, historical.stderr.decode()
+    assert historical.stderr == b""
+    historical_plan = strict_load(historical.stdout, "historical-current")
+    assert historical_plan["classification_before"] == "already-current"
+    assert historical_plan["changed"] is False
+    assert current_log.read_text().splitlines() == [
+        f"{cli_root}\tcontract show --format json",
+        f"{cli_root}\tdoctor --format json",
+        f"{cli_root}\tlegacy-inventory show --format json",
+        f"{cli_root}\ttask status --format json",
+    ]
+
+    hardlink = cli_root / ".workbench/migration-hardlink.json"
+    os.link(cli_root / ".workbench/migration.json", hardlink)
+    unsafe_historical = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        env=current_environment,
+    )
+    assert unsafe_historical.returncode == 1
+    assert unsafe_historical.stdout == b""
+    assert b"workbench-kit: node-hardlink: .workbench/migration.json" in (
+        unsafe_historical.stderr
+    )
+    assert b"Traceback" not in unsafe_historical.stderr
+    hardlink.unlink()
 
 print("PASS: deterministic migration planner and preservation manifest")
 PY

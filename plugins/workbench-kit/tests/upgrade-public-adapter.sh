@@ -504,6 +504,189 @@ finally:
 assert (common / "config").read_bytes() == third_party
 PY
 
+UPGRADE_STUB_MODE=mutate-state \
+UPGRADE_STUB_APPROVAL_FILE="$approval" \
+WORKBENCH_KIT_WORKBENCH_BIN="$ROOT/tests/upgrade-public-stub.sh" \
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" "$tmp" "$approval" <<'PY'
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, sys.argv[1])
+import workbench_kit_adapter as adapter
+
+base = pathlib.Path(sys.argv[2])
+approval = pathlib.Path(sys.argv[3])
+
+
+def repository(name):
+    root = pathlib.Path(tempfile.mkdtemp(prefix=name + "-", dir=base))
+    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.name", "Fixture"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.email", "fixture@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--allow-empty", "-qm", "fixture"],
+        check=True,
+    )
+    return root
+
+
+def expect_restore_failure(root, inject):
+    original = adapter._restore_worktree
+
+    def raced(workspace, state, *remaining):
+        inject(workspace)
+        return original(workspace, state, *remaining)
+
+    adapter._restore_worktree = raced
+    try:
+        try:
+            adapter.inspect_public_kernel(root, approval)
+        except adapter.AdapterError as error:
+            assert error.code == "public-adapter-restore-failed", error.code
+        else:
+            raise AssertionError("raced worktree restore was accepted")
+    finally:
+        adapter._restore_worktree = original
+
+
+worktree_root = repository("worktree-race")
+
+
+def concurrent_nodes(root):
+    (root / "concurrent-file").write_bytes(b"preserve concurrent file\n")
+    (root / "concurrent-directory").mkdir()
+    (root / "concurrent-directory/owned").write_bytes(b"preserve directory\n")
+    (root / "concurrent-link").symlink_to("concurrent-file")
+
+
+expect_restore_failure(worktree_root, concurrent_nodes)
+assert (worktree_root / "concurrent-file").read_bytes() == b"preserve concurrent file\n"
+assert (worktree_root / "concurrent-directory/owned").read_bytes() == b"preserve directory\n"
+assert os.readlink(worktree_root / "concurrent-link") == "concurrent-file"
+
+replacement_root = repository("root-replacement")
+moved_root = replacement_root.with_name(replacement_root.name + "-original")
+
+
+def replace_root(root):
+    os.rename(root, moved_root)
+    root.mkdir()
+    (root / "replacement-file").write_bytes(b"do not touch replacement\n")
+    (root / "replacement-directory").mkdir()
+    (root / "replacement-directory/owned").write_bytes(b"replacement directory\n")
+    (root / "replacement-link").symlink_to("replacement-file")
+
+
+expect_restore_failure(replacement_root, replace_root)
+assert (replacement_root / "replacement-file").read_bytes() == b"do not touch replacement\n"
+assert (replacement_root / "replacement-directory/owned").read_bytes() == b"replacement directory\n"
+assert os.readlink(replacement_root / "replacement-link") == "replacement-file"
+
+
+def removal_race(kind):
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"remove-{kind}-", dir=base))
+    target = root / "owned"
+    replacement = root / "replacement"
+    if kind == "file":
+        target.write_bytes(b"adapter mutation\n")
+        replacement.write_bytes(b"concurrent file\n")
+    elif kind == "directory":
+        target.mkdir()
+        replacement.mkdir()
+        (replacement / "child").write_bytes(b"concurrent directory\n")
+    else:
+        target.symlink_to("adapter-target")
+        replacement.symlink_to("concurrent-target")
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    expected = adapter._state_node_at(descriptor, "owned", "owned")
+    original = adapter._rename_noreplace
+    injected = False
+
+    def raced(parent_fd, source, destination, ref):
+        nonlocal injected
+        if source == "owned" and not injected:
+            injected = True
+            os.rename(
+                "owned", "adapter-before-race",
+                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+            )
+            os.rename(
+                "replacement", "owned",
+                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+            )
+        return original(parent_fd, source, destination, ref)
+
+    adapter._rename_noreplace = raced
+    try:
+        try:
+            adapter._remove_state_node_at(
+                descriptor, "owned", expected, "owned"
+            )
+        except adapter.AdapterError as error:
+            assert error.code == "public-adapter-restore-failed", error.code
+        else:
+            raise AssertionError("replacement node was removed")
+    finally:
+        adapter._rename_noreplace = original
+        os.close(descriptor)
+    if kind == "file":
+        assert target.read_bytes() == b"concurrent file\n"
+    elif kind == "directory":
+        assert (target / "child").read_bytes() == b"concurrent directory\n"
+    else:
+        assert os.readlink(target) == "concurrent-target"
+
+
+for node_kind in ("file", "directory", "symlink"):
+    removal_race(node_kind)
+
+chmod_root = pathlib.Path(tempfile.mkdtemp(prefix="chmod-race-", dir=base))
+(chmod_root / "owned").mkdir(mode=0o755)
+(chmod_root / "replacement").mkdir(mode=0o711)
+chmod_fd = os.open(chmod_root, os.O_RDONLY | os.O_DIRECTORY)
+original_open = adapter.os.open
+injected_chmod = False
+
+
+def raced_open(path, flags, *args, dir_fd=None, **kwargs):
+    global injected_chmod
+    if path == "owned" and dir_fd == chmod_fd and not injected_chmod:
+        injected_chmod = True
+        os.rename(
+            "owned", "adapter-before-chmod",
+            src_dir_fd=chmod_fd, dst_dir_fd=chmod_fd,
+        )
+        os.rename(
+            "replacement", "owned",
+            src_dir_fd=chmod_fd, dst_dir_fd=chmod_fd,
+        )
+    return original_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+
+adapter.os.open = raced_open
+try:
+    try:
+        adapter._chmod_directory_at(
+            chmod_fd, "owned", ("directory", 0o755, None), 0o700, "owned"
+        )
+    except adapter.AdapterError as error:
+        assert error.code == "public-adapter-restore-failed", error.code
+    else:
+        raise AssertionError("replacement directory was chmodded")
+finally:
+    adapter.os.open = original_open
+    os.close(chmod_fd)
+assert os.stat(chmod_root / "owned").st_mode & 0o777 == 0o711
+PY
+
 if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' \
   "$ROOT/lib/workbench_kit_adapter.py" 2>/dev/null; then
   echo "workbench-kit adapter references private/runtime workbench state" >&2

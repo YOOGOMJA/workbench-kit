@@ -11,7 +11,11 @@ import subprocess
 from typing import Any
 
 from workbench_kit_adapter import AdapterError, inspect_public_kernel
-from workbench_kit_classifier import _inspect_node, diagnose_workspace
+from workbench_kit_classifier import (
+    StaticInspectionError,
+    _inspect_node,
+    diagnose_workspace,
+)
 from workbench_kit_cli import CliError, validate_route_flags
 from workbench_kit_contracts import (
     ContractError,
@@ -517,7 +521,9 @@ def _staged_inventory_mode(root: pathlib.Path) -> str | None:
         )
         if node["content"] != canonical_bytes(receipt):
             return None
-        return "bootstrap-show"
+        return "bootstrap-if-not-ready"
+    except StaticInspectionError as error:
+        raise CliError(error.code, error.ref) from error
     except (ContractError, OSError):
         return None
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import json
 from typing import Any
 
 from workbench_kit_contracts import (
@@ -59,7 +60,16 @@ def merge_settings(raw: bytes | None) -> bytes:
         plugins["workbench@workbench-kit"] = True
     elif plugins["workbench@workbench-kit"] is not True:
         fail("enabledPlugins.workbench@workbench-kit", "structured-merge-conflict")
-    return canonical_bytes(settings)
+    return (
+        json.dumps(
+            settings,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=False,
+        )
+        + "\n"
+    ).encode("utf-8")
 
 
 def _text_lines(raw: bytes | None, ref: str) -> tuple[list[str], str]:

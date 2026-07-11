@@ -53,6 +53,7 @@ def _git(root: pathlib.Path, *argv: str, check: bool = True) -> str:
         ["git", "-C", str(root), *argv],
         capture_output=True,
         check=False,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
     )
     if check and (completed.returncode != 0 or completed.stderr):
         raise PlanningError("workspace-git-invalid", "git " + " ".join(argv))
@@ -75,7 +76,26 @@ def _source_identity(
         raise PlanningError("workspace-dirty", "rebase-in-progress")
     source_revision = _git(root, "rev-parse", "HEAD")
     source_tree = _git(root, "rev-parse", "HEAD^{tree}")
-    if _git(root, "write-tree") != source_tree:
+    index_diff = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff-index",
+            "--cached",
+            "--quiet",
+            "HEAD",
+            "--",
+        ],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+    )
+    if index_diff.stderr or index_diff.returncode not in (0, 1):
+        raise PlanningError(
+            "workspace-git-invalid", "git diff-index --cached --quiet HEAD --"
+        )
+    if index_diff.returncode == 1:
         raise PlanningError("workspace-dirty", "git-index")
     branch = _git(root, "symbolic-ref", "--short", "HEAD")
     if branch != migration_task["branch"]:

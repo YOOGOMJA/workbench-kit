@@ -47,8 +47,25 @@ expected_settings = {
     },
 }
 merged_settings = merge_settings(settings)
-assert merged_settings == canonical_bytes(expected_settings)
+assert merged_settings == (
+    b'{"user":{"x":1},"enabledPlugins":{"other":true,'
+    b'"workbench@workbench-kit":true},"extraKnownMarketplaces":{'
+    b'"workbench-kit":{"source":{"source":"github",'
+    b'"repo":"YOOGOMJA/workbench-kit"}}}}\n'
+)
+assert json.loads(merged_settings) == expected_settings
 assert merge_settings(merged_settings) == merged_settings
+reverse_order = (
+    b'{"tail":{"second":2,"first":1},"extraKnownMarketplaces":{'
+    b'"z":{"preserved":true}},"enabledPlugins":{"z":false},"head":0}\n'
+)
+assert merge_settings(reverse_order) == (
+    b'{"tail":{"second":2,"first":1},"extraKnownMarketplaces":{'
+    b'"z":{"preserved":true},"workbench-kit":{"source":{'
+    b'"source":"github","repo":"YOOGOMJA/workbench-kit"}}},'
+    b'"enabledPlugins":{"z":false,"workbench@workbench-kit":true},'
+    b'"head":0}\n'
+)
 rejected(lambda: merge_settings(
     b'{"enabledPlugins":{"workbench@workbench-kit":false}}\n'
 ))

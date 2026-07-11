@@ -10,10 +10,13 @@ PYTHONDONTWRITEBYTECODE=1 uv run --quiet \
   --with-requirements "$ROOT/tests/requirements-schema.txt" \
   python3 - "$ROOT/schemas" <<'PY'
 import copy
+import base64
+import binascii
 import json
 import pathlib
 import re
 import sys
+import unicodedata
 
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
@@ -67,6 +70,19 @@ registry = Registry().with_resources(
     for document in documents.values()
 )
 format_checker = FormatChecker()
+
+
+@format_checker.checks("canonical-base64", raises=(ValueError, binascii.Error))
+def canonical_base64(value):
+    if not isinstance(value, str):
+        return True
+    decoded = base64.b64decode(value, validate=True)
+    return base64.b64encode(decoded).decode("ascii") == value
+
+
+@format_checker.checks("nfc")
+def normalized_nfc(value):
+    return not isinstance(value, str) or unicodedata.normalize("NFC", value) == value
 
 
 def validator_for(filename):
@@ -255,6 +271,30 @@ for invalid in (
     assert not definition_accepts(
         "upgrade-plan.schema.json", "operation", invalid
     ), invalid
+assert not definition_accepts(
+    "upgrade-plan.schema.json",
+    "operation",
+    {**create_operation, "path": "Cafe\u0301"},
+)
+
+artifact = {
+    "path": "AGENTS.md", "node_type": "file", "mode": "100644",
+    "content_base64": "eA==", "link_target": None,
+    "source_ref": "constant:agents", "source_digest": SHA,
+}
+assert definition_accepts("upgrade-plan.schema.json", "artifact", artifact)
+assert not definition_accepts(
+    "upgrade-plan.schema.json", "artifact", {**artifact, "content_base64": "eA"}
+)
+assert not definition_accepts(
+    "upgrade-plan.schema.json", "artifact", {**artifact, "content_base64": "AB=="}
+)
+assert not definition_accepts(
+    "upgrade-plan.schema.json", "artifact", {**artifact, "source_ref": "bad\nref"}
+)
+assert not definition_accepts(
+    "upgrade-plan.schema.json", "artifact", {**artifact, "source_ref": "artifact:\uc124\uacc4"}
+)
 
 absent_image = {
     "node_type": "absent", "mode": None, "content_base64": None,
