@@ -227,6 +227,28 @@ EOF
 DEFAULT_HOSTING_ADAPTER="$TMPDIR/default-hosting-adapter"
 write_test_hosting_adapter "$DEFAULT_HOSTING_ADAPTER"
 
+write_test_legacy_adapter() {
+  local file="$1" observation="$2"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    printf 'observation=%q\n' "$observation"
+    cat <<'EOF'
+[ "${1:-}" = collect ] || exit 2
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --authority-file|--registry-file|--workspace-origin|--default-ref|--default-revision|--bootstrap-revision)
+      [ -n "${2:-}" ]; shift 2 ;;
+    --format) [ "${2:-}" = json ]; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+cat "$observation"
+EOF
+  } > "$file"
+  chmod +x "$file"
+}
+
 readonly_git_snapshot() {
   local repo="$1" common fetch index
   common="$(git -C "$repo" rev-parse --git-common-dir)"
@@ -773,6 +795,8 @@ value = {
     "branch": "task/42-policy",
     "expected_path": "task/codebases/shared-api",
     "codebase_origin_url": "https://github.com/example/shared-api.git",
+    "registry_revision": "1" * 40,
+    "registry_digest": "sha256:" + "2" * 64,
     "context_policy_set_digest": "sha256:" + "3" * 64,
     "device_id": "device:trusted/mac-1",
     "clone_id": "123e4567-e89b-12d3-a456-426614174000",
@@ -938,7 +962,7 @@ PY
 }
 
 test_public_legacy_inventory_is_exhaustive_and_repo_independent() {
-  local repo revision observation incomplete actual out err rc before after
+  local repo revision observation incomplete actual out err rc before after adapter incomplete_adapter bad_hosting
   repo="$(make_policy_task legacy_inventory)"
   printf '%s\n' 'shared-api: https://github.com/example/shared-api.git' > "$repo/codebases.yaml"
   git -C "$repo" add codebases.yaml
@@ -1003,8 +1027,13 @@ broken["blockers"] = [{"code": "legacy-writer-source-unavailable", "ref": "share
 with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(broken, handle, separators=(",", ":")); handle.write("\n")
 PY
+  adapter="$TMPDIR/legacy-observation-adapter"
+  incomplete_adapter="$TMPDIR/legacy-incomplete-adapter"
+  write_test_legacy_adapter "$adapter" "$observation"
+  write_test_legacy_adapter "$incomplete_adapter" "$incomplete"
   before="$(readonly_git_snapshot "$repo")"
-  actual="$(WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+  actual="$(WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
+    WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$incomplete" \
     run_workbench "$repo" legacy-inventory show --format json)"
   after="$(readonly_git_snapshot "$repo")"
   assert_eq "$before" "$after" "descriptor-backed inventory must not mutate caller Git state"
@@ -1026,13 +1055,30 @@ assert value["active_claims"] == []
 ' || fail "public legacy inventory must retain repo-less active v1 tasks"
 
   out="$TMPDIR/legacy-inventory-incomplete.out"; err="$TMPDIR/legacy-inventory-incomplete.err"
-  if WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$incomplete" \
+  if WORKBENCH_TRUSTED_LEGACY_ADAPTER="$incomplete_adapter" \
     run_workbench "$repo" legacy-inventory show --format json >"$out" 2>"$err"; then
     fail "partial legacy pagination must fail closed"
   else rc=$?; fi
   assert_eq 1 "$rc" "incomplete legacy inventory uses state-failure exit"
   assert_file_contains "$out" '"complete":false'
   assert_file_contains "$out" '"code":"legacy-writer-source-unavailable"'
+
+  bad_hosting="$TMPDIR/legacy-unprotected-hosting-adapter"
+  write_test_hosting_adapter "$bad_hosting" false blocked
+  if WORKBENCH_TRUSTED_HOSTING_ADAPTER="$bad_hosting" \
+    WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
+    run_workbench "$repo" legacy-inventory show --format json >"$out" 2>"$err"; then
+    fail "legacy inventory must authenticate protected registry authority"
+  else rc=$?; fi
+  assert_eq 1 "$rc" "unprotected legacy inventory authority is a state failure"
+  assert_file_contains "$err" "protected default authority proof is invalid"
+
+  if WORKBENCH_TRUSTED_LEGACY_ADAPTER="$TMPDIR/missing-legacy-adapter" \
+    run_workbench "$repo" legacy-inventory show --format json >"$out" 2>"$err"; then
+    fail "legacy inventory without a trusted executable adapter must fail"
+  else rc=$?; fi
+  assert_eq 1 "$rc" "missing legacy adapter is a state failure"
+  assert_file_contains "$err" "trusted legacy adapter is unavailable"
 }
 
 write_bootstrap_approval() {
@@ -1129,7 +1175,7 @@ PY
 }
 
 test_bootstrap_legacy_inventory_uses_only_authenticated_approval() {
-  local layout repo approved hostile revision approval adapter observation actual
+  local layout repo approved hostile revision approval adapter legacy_adapter observation actual
   local out err rc before after
   adapter="$TMPDIR/bootstrap-authority-adapter"
   write_bootstrap_adapter "$adapter"
@@ -1157,6 +1203,8 @@ test_bootstrap_legacy_inventory_uses_only_authenticated_approval() {
     observation="$TMPDIR/bootstrap-$layout-observation.json"
     write_bootstrap_approval "$approval" "$approved" "$revision"
     write_complete_bootstrap_observation "$observation" "$revision" "$approved"
+    legacy_adapter="$TMPDIR/bootstrap-$layout-legacy-adapter"
+    write_test_legacy_adapter "$legacy_adapter" "$observation"
 
     mkdir -p "$repo/.workbench"
     if [ "$layout" = embedded-legacy ]; then
@@ -1165,7 +1213,7 @@ test_bootstrap_legacy_inventory_uses_only_authenticated_approval() {
     printf '%s\n' '{"caller":"authored-and-untrusted"}' > "$repo/.workbench/authority.json"
     before="$(readonly_git_snapshot "$repo")"
     actual="$(WORKBENCH_TRUSTED_BOOTSTRAP_AUTHORITY_ADAPTER="$adapter" \
-      WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+      WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
       run_workbench "$repo" legacy-inventory bootstrap-show \
         --authority-approval-file "$approval" --format json)"
     after="$(readonly_git_snapshot "$repo")"
@@ -1199,7 +1247,7 @@ PY
   git -C "$repo" push -q "$approved" main
   out="$TMPDIR/bootstrap-stale-approval.out"; err="$TMPDIR/bootstrap-stale-approval.err"
   if WORKBENCH_TRUSTED_BOOTSTRAP_AUTHORITY_ADAPTER="$adapter" \
-    WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+    WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_workbench "$repo" legacy-inventory bootstrap-show \
       --authority-approval-file "$approval" --format json >"$out" 2>"$err"; then
     fail "bootstrap inventory must reject an approval for a stale default OID"
@@ -1211,7 +1259,7 @@ PY
   write_bootstrap_approval "$approval" "$approved" "$revision"
   write_complete_bootstrap_observation "$observation" "$revision" "$approved"
   if WORKBENCH_TRUSTED_BOOTSTRAP_AUTHORITY_ADAPTER="$adapter" \
-    WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+    WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_workbench "$repo" legacy-inventory bootstrap-show \
       --authority-approval-file "$approval" --format json >"$out" 2>"$err"; then
     fail "bootstrap inventory must close once the approved default contains a v2 marker"
@@ -1262,7 +1310,7 @@ EOF
 }
 
 test_doctor_is_read_only_and_reports_exact_readiness() {
-  local v1 repo revision observation adapter actual before after out err rc origin
+  local v1 repo revision observation adapter legacy_adapter actual before after out err rc origin
   v1="$(make_workspace doctor-v1)"
   out="$TMPDIR/doctor-v1.out"; err="$TMPDIR/doctor-v1.err"
   if run_workbench "$v1" doctor --format json >"$out" 2>"$err"; then
@@ -1311,10 +1359,12 @@ PY
   observation="$TMPDIR/doctor-observation.json"
   write_complete_bootstrap_observation "$observation" "$revision" "$origin"
   adapter="$TMPDIR/doctor-hosting-adapter"
-  write_doctor_hosting_adapter "$adapter"
+  legacy_adapter="$TMPDIR/doctor-legacy-adapter"
+  write_test_hosting_adapter "$adapter"
+  write_test_legacy_adapter "$legacy_adapter" "$observation"
   before="$(readonly_git_snapshot "$repo")"
   actual="$(WORKBENCH_TRUSTED_HOSTING_ADAPTER="$adapter" \
-    WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+    WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_workbench "$repo" doctor --format json)"
   after="$(readonly_git_snapshot "$repo")"
   assert_eq "$before" "$after" "doctor must not mutate caller Git state"
@@ -1340,7 +1390,7 @@ assert coordination["push_ready"] is True and coordination["blocker"] is None
 PY
 
   if WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/missing-doctor-hosting-adapter" \
-    WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+    WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_workbench "$repo" doctor --format json >"$out" 2>"$err"; then
     fail "doctor without trusted ref-permission proof must not be ready"
   else rc=$?; fi

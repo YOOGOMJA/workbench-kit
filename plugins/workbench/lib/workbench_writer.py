@@ -58,6 +58,8 @@ OPERATION_FIELDS = (
     "branch",
     "expected_path",
     "codebase_origin_url",
+    "registry_revision",
+    "registry_digest",
     "context_policy_set_digest",
     "device_id",
     "clone_id",
@@ -316,6 +318,13 @@ def load_operation(file: str) -> Dict[str, Any]:
     if UUID.fullmatch(value["clone_id"] if isinstance(value["clone_id"], str) else "") is None:
         raise ValueError("clone_id must be a lowercase UUID")
     require_digest(value["context_policy_set_digest"], "context_policy_set_digest")
+    if not isinstance(value["registry_revision"], str) or re.fullmatch(
+        r"[0-9a-f]{40}([0-9a-f]{24})?", value["registry_revision"]
+    ) is None:
+        raise ValueError("registry_revision must be a Git object ID")
+    if not isinstance(value["registry_digest"], str):
+        raise ValueError("registry_digest must be a string")
+    require_digest(value["registry_digest"], "registry_digest")
 
     action_binding = (
         value["action_instance_id"],
@@ -459,6 +468,8 @@ def operation_value(args: argparse.Namespace) -> Dict[str, Any]:
         "branch": args.branch,
         "expected_path": args.expected_path,
         "codebase_origin_url": args.codebase_origin_url,
+        "registry_revision": args.registry_revision,
+        "registry_digest": args.registry_digest,
         "context_policy_set_digest": args.context_policy_set_digest,
         "device_id": args.device_id,
         "clone_id": args.clone_id,
@@ -610,32 +621,72 @@ def writer_conflict(
     legacy_home_set_digest: str,
     prospective: Mapping[str, str],
     rows: Sequence[Mapping[str, str]],
-) -> Tuple[str, List[Mapping[str, str]]]:
+    legacy_claims: Sequence[Mapping[str, Any]],
+) -> Tuple[str, List[Mapping[str, Any]]]:
     require_digest(legacy_home_set_digest, "legacy_home_set_digest")
-    writers: List[Tuple[str, ...]] = []
-    union = current_active_claims(rows)
+    union: List[Mapping[str, Any]] = []
+    for row in current_active_claims(rows):
+        union.append(
+            {
+                "source": "ledger-v2",
+                "claim_id": row["claim_id"],
+                "operation_id": row["operation_id"],
+                "task_claim_id": row["task_claim_id"],
+                "owner": row["owner"],
+                "branch": row["branch"],
+                "context_policy_set_digest": row["context_policy_set_digest"],
+                "source_revision": None,
+                "pr_head_revision": None,
+                "lifecycle_digest": None,
+            }
+        )
+    union.extend(legacy_claims)
     if not any(
-        row["operation_id"] == prospective["operation_id"]
+        row["source"] == "ledger-v2"
+        and row["operation_id"] == prospective["operation_id"]
         and row["claim_id"] == prospective["claim_id"]
         for row in union
     ):
-        union.append(prospective)
-    for row in union:
-        if row["owner"] != owner:
-            continue
-        writers.append(
-            (
-                "ledger-v2",
-                row["claim_id"],
-                row["operation_id"],
-                row["task_claim_id"],
-                row["branch"],
-                row["context_policy_set_digest"],
-                "null",
-                "null",
-                "null",
-            )
+        union.append(
+            {
+                "source": "ledger-v2",
+                "claim_id": prospective["claim_id"],
+                "operation_id": prospective["operation_id"],
+                "task_claim_id": prospective["task_claim_id"],
+                "owner": prospective["owner"],
+                "branch": prospective["branch"],
+                "context_policy_set_digest": prospective["context_policy_set_digest"],
+                "source_revision": None,
+                "pr_head_revision": None,
+                "lifecycle_digest": None,
+            }
         )
+    conflicts = [
+        row
+        for row in union
+        if row["owner"] == owner
+        and not (
+            row["source"] == "ledger-v2"
+            and row["operation_id"] == prospective["operation_id"]
+            and row["claim_id"] == prospective["claim_id"]
+        )
+    ]
+    manifest_rows = [row for row in union if row["owner"] == owner]
+    manifest_rows.sort(key=lambda item: (item["source"], item["claim_id"], item["branch"]))
+    writers = [
+        (
+            str(row["source"]),
+            str(row["claim_id"]),
+            "null" if row["operation_id"] is None else str(row["operation_id"]),
+            str(row["task_claim_id"]),
+            str(row["branch"]),
+            "null" if row["context_policy_set_digest"] is None else str(row["context_policy_set_digest"]),
+            "null" if row["source_revision"] is None else str(row["source_revision"]),
+            "null" if row["pr_head_revision"] is None else str(row["pr_head_revision"]),
+            "null" if row["lifecycle_digest"] is None else str(row["lifecycle_digest"]),
+        )
+        for row in manifest_rows
+    ]
     writers.sort(key=lambda item: (item[0], item[1], item[4]))
     lines = [
         "workbench-writer-conflict/v1",
@@ -644,20 +695,36 @@ def writer_conflict(
     ]
     lines.extend("writer\t" + "\t".join(row) for row in writers)
     digest = sha256(("\n".join(lines) + "\n").encode("utf-8"))
-    conflicts = [
-        row
-        for row in current_active_claims(rows)
-        if row["owner"] == owner
-        and not (
-            row["operation_id"] == prospective["operation_id"]
-            and row["claim_id"] == prospective["claim_id"]
-        )
-    ]
     return digest, conflicts
 
 
 def cmd_conflict(args: argparse.Namespace) -> None:
     rows, _ = read_ledger(args.ledger_file)
+    legacy = load_json(args.legacy_inventory_file)
+    expected_top = (
+        "contract_version", "source_revision", "authority", "home_set", "homes",
+        "active_claims", "origin_replacements", "complete", "blockers",
+    )
+    if not isinstance(legacy, dict) or tuple(legacy) != expected_top:
+        raise ValueError("legacy inventory fields or order do not match the public contract")
+    if (
+        legacy["contract_version"] != "workbench-legacy-inventory/v1"
+        or legacy["complete"] is not True
+        or legacy["blockers"] != []
+    ):
+        raise ValueError("legacy inventory is not complete")
+    home_set = legacy["home_set"]
+    if not isinstance(home_set, dict) or tuple(home_set) != (
+        "contract_version", "digest", "source_revision"
+    ):
+        raise ValueError("legacy home set fields or order do not match the contract")
+    if (
+        home_set["contract_version"] != "workbench-legacy-home-set/v1"
+        or home_set["source_revision"] != legacy["source_revision"]
+    ):
+        raise ValueError("legacy home set does not bind the inventory revision")
+    require_digest(home_set["digest"], "legacy_home_set.digest")
+    legacy_claims = [validate_status_claim(item) for item in legacy["active_claims"]]
     prospective_operation = load_operation(args.operation_file)
     prospective = {
         "kind": "claim",
@@ -669,24 +736,13 @@ def cmd_conflict(args: argparse.Namespace) -> None:
         "context_policy_set_digest": prospective_operation["context_policy_set_digest"],
     }
     digest, conflicts = writer_conflict(
-        prospective_operation["owner"], args.legacy_home_set_digest, prospective, rows
+        prospective_operation["owner"], home_set["digest"], prospective, rows, legacy_claims
     )
     value = {
         "contract_version": "workbench-writer-conflict/v1",
         "owner": prospective_operation["owner"],
         "revision": digest,
-        "conflicts": [
-            {
-                "source": "ledger-v2",
-                "claim_id": row["claim_id"],
-                "operation_id": row["operation_id"],
-                "task_claim_id": row["task_claim_id"],
-                "owner": row["owner"],
-                "branch": row["branch"],
-                "context_policy_set_digest": row["context_policy_set_digest"],
-            }
-            for row in conflicts
-        ],
+        "conflicts": conflicts,
     }
     write_json(value)
 
@@ -873,6 +929,8 @@ def local_writer_effects_match(operation_path: str, operation: Mapping[str, Any]
         "branch",
         "expected_path",
         "codebase_origin_url",
+        "registry_revision",
+        "registry_digest",
         "context_policy_set_digest",
         "action_instance_id",
         "intent_digest",
@@ -892,6 +950,8 @@ def local_writer_effects_match(operation_path: str, operation: Mapping[str, Any]
         "branch": codebase_branch,
         "expected_path": operation["expected_path"],
         "codebase_origin_url": operation["codebase_origin_url"],
+        "registry_revision": operation["registry_revision"],
+        "registry_digest": operation["registry_digest"],
         "context_policy_set_digest": operation["context_policy_set_digest"],
         "action_instance_id": operation["action_instance_id"] or "",
         "intent_digest": operation["intent_digest"] or "",
@@ -1225,6 +1285,8 @@ def parser() -> argparse.ArgumentParser:
         "branch",
         "expected_path",
         "codebase_origin_url",
+        "registry_revision",
+        "registry_digest",
         "context_policy_set_digest",
         "device_id",
         "clone_id",
@@ -1281,7 +1343,7 @@ def parser() -> argparse.ArgumentParser:
     conflict = commands.add_parser("conflict")
     conflict.add_argument("--ledger-file", required=True)
     conflict.add_argument("--operation-file", required=True)
-    conflict.add_argument("--legacy-home-set-digest", required=True)
+    conflict.add_argument("--legacy-inventory-file", required=True)
     conflict.set_defaults(func=cmd_conflict)
 
     matching = commands.add_parser("matching-active")

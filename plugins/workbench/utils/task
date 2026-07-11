@@ -131,7 +131,7 @@ legacy_helper() {
 
 observe_workspace_authority() {
   local root="$1" expected_digest="${2:-}" bootstrap_origin remote_lines head_ref head_oid
-  local descriptor policy parsed line key value descriptor_file policy_file
+  local descriptor policy parsed line key value descriptor_file policy_file verification_file adapter
   bootstrap_origin="$(git -C "$root" remote get-url origin 2>/dev/null)" \
     || die "policy-authority-unavailable"
   remote_lines="$(git -C "$root" ls-remote --symref "$bootstrap_origin" HEAD 2>/dev/null)" \
@@ -142,18 +142,20 @@ observe_workspace_authority() {
     || die "policy-authority-unavailable"
   printf '%s' "$head_oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
     || die "policy-authority-unavailable"
-  git -C "$root" fetch --quiet --no-tags "$bootstrap_origin" "$head_oid" >/dev/null 2>&1 \
+  git -C "$root" fetch --quiet --no-tags --no-write-fetch-head \
+    "$bootstrap_origin" "$head_oid" >/dev/null 2>&1 \
     || die "policy-authority-unavailable"
   descriptor_file="$(mktemp "${TMPDIR:-/tmp}/workbench-authority.XXXXXX")"
   policy_file="$(mktemp "${TMPDIR:-/tmp}/workbench-policy.XXXXXX")"
+  verification_file="$(mktemp "${TMPDIR:-/tmp}/workbench-hosting-authority.XXXXXX")"
   if ! git -C "$root" show "$head_oid:.workbench/authority.json" > "$descriptor_file" 2>/dev/null; then
-    rm -f "$descriptor_file" "$policy_file"; die "policy-authority-unavailable"
+    rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-unavailable"
   fi
   if ! git -C "$root" show "$head_oid:.workbench/policy.conf" > "$policy_file" 2>/dev/null; then
-    rm -f "$descriptor_file" "$policy_file"; die "policy-source-missing"
+    rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-source-missing"
   fi
   parsed="$(python3 "$(contract_helper)" authority-descriptor "$descriptor_file" 2>/dev/null)" \
-    || { rm -f "$descriptor_file" "$policy_file"; die "policy-authority-unavailable"; }
+    || { rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-unavailable"; }
   AUTHORITY_DESCRIPTOR_DIGEST=""; AUTHORITY_IDENTITY=""; AUTHORITY_ORIGIN_URL=""
   AUTHORITY_DEFAULT_REF=""; AUTHORITY_HOSTING_ADAPTER=""; AUTHORITY_HOSTING_REF=""
   while IFS= read -r line; do
@@ -168,14 +170,55 @@ observe_workspace_authority() {
     esac
   done <<< "$parsed"
   descriptor="${AUTHORITY_DESCRIPTOR_DIGEST:-}"; policy="${AUTHORITY_ORIGIN_URL:-}"
-  rm -f "$descriptor_file" "$policy_file"
   [ -n "$descriptor" ] && [ -n "$policy" ] \
-    || die "policy-authority-unavailable"
+    || { rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-unavailable"; }
   [ "$AUTHORITY_ORIGIN_URL" = "$bootstrap_origin" ] && [ "$AUTHORITY_DEFAULT_REF" = "$head_ref" ] \
-    || die "policy-authority-mismatch"
+    || { rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-mismatch"; }
   [ -z "$expected_digest" ] || [ "$descriptor" = "$expected_digest" ] \
-    || die "policy-authority-mismatch"
+    || { rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-mismatch"; }
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] \
+    || { rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-unavailable"; }
+  "$adapter" authority --authority-file "$descriptor_file" --default-revision "$head_oid" \
+    --format json > "$verification_file" 2>/dev/null \
+    || { rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-unavailable"; }
+  python3 "$(contract_helper)" hosting-authority --authority-file "$descriptor_file" \
+    --verification-file "$verification_file" --default-revision "$head_oid" >/dev/null 2>&1 \
+    || { rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-mismatch"; }
+  rm -f "$descriptor_file" "$policy_file" "$verification_file"
   AUTHORITY_REVISION="$head_oid"
+}
+
+protected_registry_entry() {
+  local root="$1" owner="$2" expected_digest="${3:-}" tmpdir authority registry parsed line key value
+  observe_workspace_authority "$root" "$expected_digest"
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/workbench-protected-registry.XXXXXX")"
+  authority="$tmpdir/authority.json"; registry="$tmpdir/codebases.yaml"
+  git -C "$root" show "$AUTHORITY_REVISION:.workbench/authority.json" > "$authority" 2>/dev/null \
+    && git -C "$root" show "$AUTHORITY_REVISION:codebases.yaml" > "$registry" 2>/dev/null \
+    || { rm -rf "$tmpdir"; return 1; }
+  parsed="$(python3 "$(legacy_helper)" registry-snapshot --authority-file "$authority" \
+    --registry-file "$registry" --source-revision "$AUTHORITY_REVISION" \
+    --owner "$owner" --format shell 2>/dev/null)" \
+    || { rm -rf "$tmpdir"; return 1; }
+  PROTECTED_REGISTRY_REVISION=""; PROTECTED_REGISTRY_DESCRIPTOR_DIGEST=""
+  PROTECTED_REGISTRY_DIGEST=""; PROTECTED_REGISTRY_OWNER=""; PROTECTED_REGISTRY_ORIGIN=""
+  while IFS= read -r line; do
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      source_revision) PROTECTED_REGISTRY_REVISION="$value" ;;
+      descriptor_digest) PROTECTED_REGISTRY_DESCRIPTOR_DIGEST="$value" ;;
+      registry_digest) PROTECTED_REGISTRY_DIGEST="$value" ;;
+      owner) PROTECTED_REGISTRY_OWNER="$value" ;;
+      origin_url) PROTECTED_REGISTRY_ORIGIN="$value" ;;
+    esac
+  done <<< "$parsed"
+  rm -rf "$tmpdir"
+  [ "$PROTECTED_REGISTRY_REVISION" = "$AUTHORITY_REVISION" ] \
+    && [ "$PROTECTED_REGISTRY_DESCRIPTOR_DIGEST" = "$AUTHORITY_DESCRIPTOR_DIGEST" ] \
+    && [ "$PROTECTED_REGISTRY_OWNER" = "$owner" ] \
+    && [ -n "$PROTECTED_REGISTRY_ORIGIN" ] \
+    && printf '%s' "$PROTECTED_REGISTRY_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
 }
 
 require_v2_task() {
@@ -720,6 +763,7 @@ cmd_add_repo_v1() {
   fi
 
   issue="$(index_get issue)"; parent="$(index_get parent)"; slug="$(index_get slug)"
+  validate_slug "$slug" || die "invalid task slug: $slug"
   local cb_branch="task/${parent:+$parent/}${issue}-${slug}"
   local wt="$TASK_DIR/task/codebases/$name"
   [ -n "$ref" ] || ref="$(git -C "$clone" symbolic-ref --short HEAD)"
@@ -1085,6 +1129,7 @@ writer_load_operation_final() {
   WRITER_OPERATION_ACTION=""; WRITER_OPERATION_INTENT=""; WRITER_OPERATION_MANIFEST=""
   WRITER_OPERATION_AUTHORIZATION=""; WRITER_OPERATION_COORDINATION_OID=""
   WRITER_OPERATION_WORKTREE_OWNERSHIP=""; WRITER_OPERATION_RECORD_OWNERSHIP=""
+  WRITER_OPERATION_REGISTRY_REVISION=""; WRITER_OPERATION_REGISTRY_DIGEST=""
   WRITER_OWNER=""; WRITER_CODEBASE_BRANCH=""; WRITER_CODEBASE_ORIGIN=""
   WRITER_CONTEXT_DIGEST=""; WRITER_DEVICE_ID=""; WRITER_CLONE_ID=""
   while IFS= read -r line; do
@@ -1093,6 +1138,8 @@ writer_load_operation_final() {
       operation_id) WRITER_OPERATION_ID="$value" ;; claim_id) WRITER_CLAIM_ID="$value" ;;
       owner) WRITER_OWNER="$value" ;; branch) WRITER_CODEBASE_BRANCH="$value" ;;
       codebase_origin_url) WRITER_CODEBASE_ORIGIN="$value" ;;
+      registry_revision) WRITER_OPERATION_REGISTRY_REVISION="$value" ;;
+      registry_digest) WRITER_OPERATION_REGISTRY_DIGEST="$value" ;;
       context_policy_set_digest) WRITER_CONTEXT_DIGEST="$value" ;;
       device_id) WRITER_DEVICE_ID="$value" ;; clone_id) WRITER_CLONE_ID="$value" ;;
       stage) WRITER_OPERATION_STAGE="$value" ;; action_instance_id) WRITER_OPERATION_ACTION="$value" ;;
@@ -1124,19 +1171,17 @@ writer_find_operation_for_owner() {
   [ -z "$found" ] || printf '%s\n' "$found"
 }
 
-writer_legacy_home_digest() {
-  local authority="$TASK_DIR/.workbench/authority.json" registry="$TASK_DIR/codebases.yaml" output
-  [ -f "$authority" ] && [ -f "$registry" ] || return 1
-  output="$(python3 "$(legacy_helper)" home-set --authority-file "$authority" \
-    --registry-file "$registry" --format shell)" || return 1
-  printf '%s\n' "$output" | sed -n 's/^digest=//p'
-}
-
 writer_conflict_final() {
-  local ledger="$1" operation="$2" legacy_digest output
-  legacy_digest="$(writer_legacy_home_digest)" || return 1
+  local ledger="$1" operation="$2" inventory output legacy_util root
+  inventory="$(mktemp "${TMPDIR:-/tmp}/workbench-legacy-inventory.XXXXXX")"
+  legacy_util="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/legacy-inventory"
+  root="$(wb_root)"
+  (cd "$root" && "$legacy_util" show --format json) > "$inventory" 2>/dev/null \
+    || { rm -f "$inventory"; return 1; }
   output="$(python3 "$(writer_helper)" conflict --ledger-file "$ledger" \
-    --operation-file "$operation" --legacy-home-set-digest "$legacy_digest")" || return 1
+    --operation-file "$operation" --legacy-inventory-file "$inventory")" \
+    || { rm -f "$inventory"; return 1; }
+  rm -f "$inventory"
   WRITER_CONFLICT_REVISION="$(writer_json_query "$output" revision)"
   WRITER_CONFLICTS_JSON="$(writer_json_query "$output" conflicts)"
   WRITER_CONFLICT_COUNT="$(printf '%s\n' "$WRITER_CONFLICTS_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
@@ -1315,6 +1360,8 @@ write_writer_row_final() {
     printf 'owner=%s\n' "$WRITER_OWNER"; printf 'task_claim_id=%s\n' "$CURRENT_CLAIM_ID"
     printf 'branch=%s\n' "$WRITER_CODEBASE_BRANCH"; printf 'expected_path=task/codebases/%s\n' "$WRITER_OWNER"
     printf 'codebase_origin_url=%s\n' "$WRITER_CODEBASE_ORIGIN"
+    printf 'registry_revision=%s\n' "$PROTECTED_REGISTRY_REVISION"
+    printf 'registry_digest=%s\n' "$PROTECTED_REGISTRY_DIGEST"
     printf 'context_policy_set_digest=%s\n' "$WRITER_CONTEXT_DIGEST"
     printf 'action_instance_id=%s\n' "$action"; printf 'intent_digest=%s\n' "$intent"
     printf 'policy_manifest_digest=%s\n' "$manifest"; printf 'authorization_ref=%s\n' "$authorization"
@@ -1331,6 +1378,8 @@ writer_row_matches_final() {
     && [ "$(record_get "$file" branch)" = "$WRITER_CODEBASE_BRANCH" ] \
     && [ "$(record_get "$file" expected_path)" = "task/codebases/$WRITER_OWNER" ] \
     && [ "$(record_get "$file" codebase_origin_url)" = "$WRITER_CODEBASE_ORIGIN" ] \
+    && [ "$(record_get "$file" registry_revision)" = "$WRITER_OPERATION_REGISTRY_REVISION" ] \
+    && [ "$(record_get "$file" registry_digest)" = "$WRITER_OPERATION_REGISTRY_DIGEST" ] \
     && [ "$(record_get "$file" context_policy_set_digest)" = "$WRITER_CONTEXT_DIGEST" ] \
     && [ "$(record_get "$file" action_instance_id)" = "$WRITER_OPERATION_ACTION" ] \
     && [ "$(record_get "$file" intent_digest)" = "$WRITER_OPERATION_INTENT" ] \
@@ -1412,6 +1461,7 @@ writer_recover_zero_history() {
   python3 "$(writer_helper)" operation-create --operation-id "$operation_id" --claim-id "$claim_id" \
     --task-claim-id "$CURRENT_CLAIM_ID" --owner "$WRITER_OWNER" --branch "$CURRENT_BRANCH" \
     --expected-path "task/codebases/$WRITER_OWNER" --codebase-origin-url "$WRITER_CODEBASE_ORIGIN" \
+    --registry-revision "$PROTECTED_REGISTRY_REVISION" --registry-digest "$PROTECTED_REGISTRY_DIGEST" \
     --context-policy-set-digest "$WRITER_CONTEXT_DIGEST" --device-id "$WRITER_DEVICE_ID" \
     --clone-id "$WRITER_CLONE_ID" --coordination-oid "$WRITER_OBSERVED_OID" \
     --stage remote-claimed --output "$operation" || return 12
@@ -1459,6 +1509,11 @@ cmd_add_repo_v2_work_final() {
   root="$(wb_root)"; WRITER_OWNER="$name"; WRITER_CLONE="$root/.codebases/$name"
   [ -d "$WRITER_CLONE/.git" ] || die ".codebases/$name 없음 — codebases.yaml에 추가 후 workbench setup 실행"
   current_task_identity; writer_runtime_identity "$root"
+  protected_registry_entry "$root" "$name" "$(index_get workspace_authority_descriptor_digest)" \
+    || die "protected-codebase-registry-unavailable: $name"
+  WRITER_CODEBASE_ORIGIN="$PROTECTED_REGISTRY_ORIGIN"
+  [ "$(git -C "$WRITER_CLONE" remote get-url origin 2>/dev/null || true)" = "$WRITER_CODEBASE_ORIGIN" ] \
+    || die "codebase-origin-mismatch: $name"
   context_state="$(task_state_dir)/policy-context/state.record"
   if [ ! -f "$context_state" ]; then
     [ -z "$(index_get context_ref)" ] || { WRITER_CLAIM_ID=""; WRITER_OPERATION_ID=""; WRITER_CONFLICTS_JSON='[]'; print_writer_claim_json_final false policy-context-unsealed; return 1; }
@@ -1467,10 +1522,10 @@ cmd_add_repo_v2_work_final() {
   [ "$(record_get "$context_state" sealed)" = true ] || { WRITER_CLAIM_ID=""; WRITER_OPERATION_ID=""; WRITER_CONFLICTS_JSON='[]'; print_writer_claim_json_final false policy-context-unsealed; return 1; }
   WRITER_CONTEXT_DIGEST="$(record_get "$context_state" digest)"
   issue="$(index_get issue)"; parent="$(index_get parent)"; slug="$(index_get slug)"
+  validate_slug "$slug" || die "invalid task slug: $slug"
   WRITER_CODEBASE_BRANCH="task/${parent:+$parent/}${issue}-${slug}"
   WRITER_WORKTREE="$TASK_DIR/task/codebases/$name"
   [ -n "$ref" ] || ref="$(git -C "$WRITER_CLONE" symbolic-ref --short HEAD)"
-  WRITER_CODEBASE_ORIGIN="$(git -C "$WRITER_CLONE" remote get-url origin)" || return 1
   origin="$(canonical_workspace_origin_url "$root")" || return 1
   operation_dir="$(writer_operation_dir)"; mkdir -p "$operation_dir" "$(writer_row_dir)"
   if existing="$(writer_find_operation_for_owner "$name")"; then operation="$existing"
@@ -1496,7 +1551,9 @@ cmd_add_repo_v2_work_final() {
           python3 "$(writer_helper)" operation-create --operation-id "$WRITER_OPERATION_ID" \
             --claim-id "$WRITER_CLAIM_ID" --task-claim-id "$CURRENT_CLAIM_ID" --owner "$name" \
             --branch "$CURRENT_BRANCH" --expected-path "task/codebases/$name" \
-            --codebase-origin-url "$WRITER_CODEBASE_ORIGIN" --context-policy-set-digest "$WRITER_CONTEXT_DIGEST" \
+            --codebase-origin-url "$WRITER_CODEBASE_ORIGIN" \
+            --registry-revision "$PROTECTED_REGISTRY_REVISION" --registry-digest "$PROTECTED_REGISTRY_DIGEST" \
+            --context-policy-set-digest "$WRITER_CONTEXT_DIGEST" \
             --device-id "$WRITER_DEVICE_ID" --clone-id "$WRITER_CLONE_ID" \
             ${observed:+--coordination-oid "$observed"} --stage prepared --output "$operation" || { rm -f "$ledger"; return 1; }
           ;;
@@ -1506,6 +1563,10 @@ cmd_add_repo_v2_work_final() {
     fi
   fi
   writer_load_operation_final "$operation" || { rm -f "$ledger"; return 1; }
+  [ "$WRITER_OPERATION_REGISTRY_REVISION" = "$PROTECTED_REGISTRY_REVISION" ] \
+    && [ "$WRITER_OPERATION_REGISTRY_DIGEST" = "$PROTECTED_REGISTRY_DIGEST" ] \
+    && [ "$WRITER_CODEBASE_ORIGIN" = "$PROTECTED_REGISTRY_ORIGIN" ] \
+    || { rm -f "$ledger"; print_writer_claim_json_final false writer-recovery-blocked; return 1; }
   if [ "$WRITER_OPERATION_STAGE" = consumed ]; then
     writer_conflict_final "$ledger" "$operation" || { rm -f "$ledger"; return 1; }
     if ! writer_consumed_matches_final "$ledger" "$operation"; then
@@ -1604,6 +1665,7 @@ cmd_add_repo() {
     esac
   done
   [ -n "$name" ] || die "usage: workbench task add-repo <name> [--ref <base>] [--role work|reference]"
+  validate_home_name "$name" || die "invalid codebase home: $name"
   require_task_worktree; [ -f "$TASK_DIR/task/index.md" ] || die "task/index.md 없음"
   task_contract="$(index_get task_contract)"; [ -n "$task_contract" ] || task_contract=workbench-task/v1
   if [ "$task_contract" = workbench-task/v1 ]; then
@@ -1616,6 +1678,10 @@ cmd_add_repo() {
   if [ "$role" = work ]; then
     cmd_add_repo_v2_work_final "$name" "$ref" "$instance_id" "$authorization_file"
   else
+    protected_registry_entry "$(wb_root)" "$name" "$(index_get workspace_authority_descriptor_digest)" \
+      || die "protected-codebase-registry-unavailable: $name"
+    [ "$(git -C "$(wb_root)/.codebases/$name" remote get-url origin 2>/dev/null || true)" \
+      = "$PROTECTED_REGISTRY_ORIGIN" ] || die "codebase-origin-mismatch: $name"
     cmd_add_repo_v1 "$name" ${ref:+--ref "$ref"} --role reference
     WRITER_OWNER="$name"; WRITER_CLAIM_ID=""; WRITER_TASK_CLAIM_ID="$(index_get claim_id)"; WRITER_ROLE=reference
     WRITER_CONFLICT_COUNT=0; print_writer_claim_json true "" ""
@@ -2189,16 +2255,10 @@ github_repository_from_url() {
 }
 
 registered_github_repository() {
-  local owner="$1" url="" remote_name
-  if [ -f "$TASK_DIR/codebases.yaml" ]; then
-    url="$(sed -n "s/^$owner: *//p" "$TASK_DIR/codebases.yaml" | head -1)"
-  fi
-  if [ -z "$url" ]; then
-    url="$(git -C "$TASK_DIR" remote get-url origin 2>/dev/null || true)"
-    remote_name="$(basename "$url" .git)"
-    [ "$remote_name" = "$owner" ] || return 1
-  fi
-  github_repository_from_url "$url"
+  local owner="$1"
+  protected_registry_entry "$(wb_root)" "$owner" \
+    "$(index_get workspace_authority_descriptor_digest)" || return 1
+  github_repository_from_url "$PROTECTED_REGISTRY_ORIGIN"
 }
 
 probe_kernel_deliverable() {
@@ -2539,6 +2599,9 @@ cmd_deliverable() {
         codebase-pr|workbench-increment)
           [ -z "$owner_context_ref$acceptance_authority_ref" ] \
             || die "kernel-owned deliverable rejects owner bindings"
+          protected_registry_entry "$(wb_root)" "$owner" \
+            "$(index_get workspace_authority_descriptor_digest)" \
+            || die "protected-codebase-registry-unavailable: $owner"
           ;;
         *:*)
           [ -n "$owner_context_ref" ] && [ -n "$acceptance_authority_ref" ] \

@@ -316,6 +316,33 @@ def home_set(authority_file: str, registry_file: str) -> Dict[str, Any]:
     }
 
 
+def registry_snapshot(
+    authority_file: str, registry_file: str, source_revision: str
+) -> Dict[str, Any]:
+    authority = load_authority(authority_file)
+    require_oid(source_revision, "source_revision")
+    with open(authority_file, "rb") as handle:
+        descriptor_digest = "sha256:" + hashlib.sha256(handle.read()).hexdigest()
+    with open(registry_file, "rb") as handle:
+        registry_raw = handle.read()
+    codebases = [
+        {"home": home, "origin_url": origin}
+        for home, origin in sorted(parse_registry(registry_file), key=lambda item: item[0])
+    ]
+    return {
+        "contract_version": "workbench-codebase-registry-snapshot/v1",
+        "source_revision": source_revision,
+        "authority_identity": authority["authority_identity"],
+        "descriptor_digest": descriptor_digest,
+        "registry_digest": "sha256:" + hashlib.sha256(registry_raw).hexdigest(),
+        "workspace": {
+            "home": authority["workspace_home"],
+            "origin_url": authority["origin_url"],
+        },
+        "codebases": codebases,
+    }
+
+
 def pseudo_claim_id(task_claim_id: str, owner: str, branch: str) -> str:
     manifest = (
         "workbench-legacy-writer-identity/v1\n"
@@ -596,6 +623,29 @@ def cmd_home_set(args: argparse.Namespace) -> None:
             sys.stdout.write("home={}\t{}\n".format(item["home"], item["origin_url"]))
 
 
+def cmd_registry_snapshot(args: argparse.Namespace) -> None:
+    value = registry_snapshot(args.authority_file, args.registry_file, args.source_revision)
+    entries = [value["workspace"]] + value["codebases"]
+    if args.owner is not None:
+        matches = [item for item in entries if item["home"] == args.owner]
+        if len(matches) != 1:
+            raise ValueError("owner is not present in the protected codebase registry")
+        entry = matches[0]
+        if args.format == "shell":
+            sys.stdout.write("source_revision={}\n".format(value["source_revision"]))
+            sys.stdout.write("descriptor_digest={}\n".format(value["descriptor_digest"]))
+            sys.stdout.write("registry_digest={}\n".format(value["registry_digest"]))
+            sys.stdout.write("owner={}\n".format(entry["home"]))
+            sys.stdout.write("origin_url={}\n".format(entry["origin_url"]))
+            return
+        value = dict(value)
+        value["entry"] = entry
+    if args.format != "json":
+        raise ValueError("shell registry snapshot requires --owner")
+    json.dump(value, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
 def cmd_bootstrap_approval(args: argparse.Namespace) -> None:
     approval, raw = load_bootstrap_approval(args.approval_file)
     validate_bootstrap_verification(approval, raw, args.verification_file)
@@ -681,6 +731,13 @@ def parser() -> argparse.ArgumentParser:
     home.add_argument("--registry-file", required=True)
     home.add_argument("--format", choices=("json", "shell"), required=True)
     home.set_defaults(func=cmd_home_set)
+    registry = commands.add_parser("registry-snapshot")
+    registry.add_argument("--authority-file", required=True)
+    registry.add_argument("--registry-file", required=True)
+    registry.add_argument("--source-revision", required=True)
+    registry.add_argument("--owner")
+    registry.add_argument("--format", choices=("json", "shell"), required=True)
+    registry.set_defaults(func=cmd_registry_snapshot)
     approval = commands.add_parser("bootstrap-approval")
     approval.add_argument("--approval-file", required=True)
     approval.add_argument("--verification-file", required=True)

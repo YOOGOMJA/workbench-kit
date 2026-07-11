@@ -190,6 +190,82 @@ EOF
   chmod +x "$file"
 }
 
+write_fake_legacy_adapter() {
+  local file="$1" observation="$2"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    printf 'observation=%q\n' "$observation"
+    cat <<'EOF'
+[ "${1:-}" = collect ] || exit 2
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --authority-file|--registry-file|--workspace-origin|--default-ref|--default-revision|--bootstrap-revision)
+      [ -n "${2:-}" ]; shift 2 ;;
+    --format) [ "${2:-}" = json ]; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+cat "$observation"
+EOF
+  } > "$file"
+  chmod +x "$file"
+}
+
+write_fake_empty_legacy_adapter() {
+  local file="$1"
+  cat > "$file" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = collect ] || exit 2
+shift
+authority="" registry="" revision=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --authority-file) authority="$2"; shift 2 ;;
+    --registry-file) registry="$2"; shift 2 ;;
+    --default-revision) revision="$2"; shift 2 ;;
+    --workspace-origin|--default-ref|--bootstrap-revision) shift 2 ;;
+    --format) [ "${2:-}" = json ]; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+python3 - "$authority" "$registry" "$revision" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    authority = json.load(handle)
+rows = [(authority["workspace_home"], authority["origin_url"])]
+for raw in open(sys.argv[2], encoding="utf-8"):
+    line = raw.rstrip("\n")
+    if not line or line.startswith("#"):
+        continue
+    home, origin = line.split(": ", 1)
+    rows.append((home, origin))
+pagination = {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None}
+value = {
+    "contract_version": "workbench-legacy-observation/v1",
+    "source_revision": sys.argv[3],
+    "homes": [
+        {
+            "home": home,
+            "origin_url": origin,
+            "membership": "current",
+            "pagination": pagination,
+            "claims": [],
+        }
+        for home, origin in sorted(rows)
+    ],
+    "origin_replacements": [],
+    "blockers": [],
+}
+print(json.dumps(value, separators=(",", ":")))
+PY
+EOF
+  chmod +x "$file"
+}
+
 setup_workbench() {
   local name="$1" schema="${2-workbench/v2}"
   local repo="$TMPDIR/$name/repo" origin="$TMPDIR/$name/origin.git"
@@ -236,6 +312,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(value, handle, separators=(",", ":"))
     handle.write("\n")
 PY
+    printf '%s\n' '# no registered codebases' > "$repo/codebases.yaml"
   fi
   git -C "$repo" config user.name "Test User"
   git -C "$repo" config user.email "test@example.invalid"
@@ -247,6 +324,7 @@ PY
   : > "$TMPDIR/$name/gh.log"
   write_fake_gh "$fake_bin"
   write_fake_hosting_authority "$fake_bin/hosting-authority"
+  write_fake_empty_legacy_adapter "$fake_bin/legacy-adapter"
   printf '%s\n' "$repo"
 }
 
@@ -259,6 +337,7 @@ run_task_in_dir() {
   WORKBENCH_PLATFORM_POLICY="${WORKBENCH_PLATFORM_POLICY:-}" \
   WORKBENCH_PLATFORM_POLICY_REF="${WORKBENCH_PLATFORM_POLICY_REF:-}" \
     WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/$case_name/bin/hosting-authority" \
+    WORKBENCH_TRUSTED_LEGACY_ADAPTER="${WORKBENCH_TRUSTED_LEGACY_ADAPTER:-$TMPDIR/$case_name/bin/legacy-adapter}" \
     WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY:-0}" \
     WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY:-}" \
     WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM="${WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM:-0}" \
@@ -276,6 +355,7 @@ run_policy_in_dir() {
   WORKBENCH_PLATFORM_POLICY="${WORKBENCH_PLATFORM_POLICY:-}" \
   WORKBENCH_PLATFORM_POLICY_REF="${WORKBENCH_PLATFORM_POLICY_REF:-}" \
     WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/$case_name/bin/hosting-authority" \
+    WORKBENCH_TRUSTED_LEGACY_ADAPTER="${WORKBENCH_TRUSTED_LEGACY_ADAPTER:-$TMPDIR/$case_name/bin/legacy-adapter}" \
     bash -c 'dir="$1"; shift; cd "$dir"; "$dir/utils/policy" "$@"' bash "$dir" "$@"
 }
 
@@ -363,7 +443,8 @@ prepare_governed_fixture() {
     printf '%s\n' 'action.task.deliverable.reject=ask'
     printf '%s\n' 'action.task.required-check.waive=ask'
   } > "$GOVERNED_REPO/.workbench/policy.conf"
-  git -C "$GOVERNED_REPO" add .workbench/policy.conf
+  printf '%s\n' 'reporting: https://github.com/example/reporting.git' > "$GOVERNED_REPO/codebases.yaml"
+  git -C "$GOVERNED_REPO" add .workbench/policy.conf codebases.yaml
   git -C "$GOVERNED_REPO" commit -q -m "test: require governed authorization"
   git -C "$GOVERNED_REPO" push -q
   GOVERNED_TASK_DIR="$(start_task "$case_name" "$GOVERNED_REPO")"
@@ -529,6 +610,53 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
 PY
 }
 
+write_active_legacy_observation() {
+  local output="$1" revision="$2" workspace_origin="$3" home="$4" home_origin="$5"
+  python3 - "$output" "$revision" "$workspace_origin" "$home" "$home_origin" <<'PY'
+import json
+import sys
+
+pagination = {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None}
+claim = {
+    "claim_id": "legacy-task-17",
+    "task_claim_id": "legacy-task-17",
+    "task_contract": "workbench-task/v1",
+    "issue": 17,
+    "home": "workbench",
+    "parent": None,
+    "branch": "task/17-legacy-writer",
+    "lifecycle_digest": "sha256:" + "6" * 64,
+    "lifecycle_state": "task-active",
+    "classification": "active-v1",
+    "submission": None,
+    "source_revision": sys.argv[2],
+    "pr_head_revision": None,
+    "ancestry_complete": True,
+    "repos": [{"owner": sys.argv[4], "branch": "task/17-legacy-writer", "role": "work"}],
+}
+homes = [
+    {
+        "home": sys.argv[4], "origin_url": sys.argv[5], "membership": "current",
+        "pagination": pagination, "claims": [],
+    },
+    {
+        "home": "workbench", "origin_url": sys.argv[3], "membership": "current",
+        "pagination": pagination, "claims": [claim],
+    },
+]
+value = {
+    "contract_version": "workbench-legacy-observation/v1",
+    "source_revision": sys.argv[2],
+    "homes": sorted(homes, key=lambda item: item["home"]),
+    "origin_replacements": [],
+    "blockers": [],
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+}
+
 install_writer_git_barrier() {
   local case_name="$1" real_git barrier log
   real_git="$(command -v git)"; barrier="$TMPDIR/$case_name/writer-barrier"; log="$TMPDIR/$case_name/writer-order.log"
@@ -600,7 +728,7 @@ test_start_rejects_noncanonical_schema_slug_and_home() {
 }
 
 test_v2_start_and_resume_are_authority_bound_skeletons() {
-  local repo task_dir started resumed status digest lifecycle observation revision origin
+  local repo task_dir started resumed status digest lifecycle observation revision origin legacy_adapter
   setup_writer_workbench start_skeleton shared-api
   repo="$WRITER_REPO"
 
@@ -643,7 +771,9 @@ PY
   origin="$(git -C "$repo" remote get-url origin)"
   write_empty_legacy_observation "$observation" "$revision" "$origin" shared-api \
     "$TMPDIR/start_skeleton/shared-api.git"
-  status="$(WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+  legacy_adapter="$TMPDIR/start_skeleton/bin/legacy-adapter"
+  write_fake_legacy_adapter "$legacy_adapter" "$observation"
+  status="$(WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_task start_skeleton "$repo" status --format json)"
   [ "$(json_get "$status" tasks.0.workspace_authority_descriptor_digest)" = "$digest" ] \
     || fail "status lost the task authority descriptor binding"
@@ -905,6 +1035,10 @@ PY
 test_deliverables_and_revision_bound_evidence() {
   local repo task_dir actual out
   repo="$(setup_workbench evidence)"
+  printf 'web: https://github.com/example/web.git\n' > "$repo/codebases.yaml"
+  git -C "$repo" add codebases.yaml
+  git -C "$repo" commit -q -m "test: register evidence owner"
+  git -C "$repo" push -q
   task_dir="$(start_task evidence "$repo")"
 
   actual="$(run_task_in_dir evidence "$task_dir" deliverable declare --id web-pr --owner web \
@@ -959,8 +1093,12 @@ test_deliverables_and_revision_bound_evidence() {
 test_kernel_probe_acceptance_is_revision_and_owner_bound() {
   local repo task_dir actual out rc
   repo="$(setup_workbench acceptance)"
+  printf 'web: https://github.com/example/web.git\n' > "$repo/codebases.yaml"
+  git -C "$repo" add codebases.yaml
+  git -C "$repo" commit -q -m "test: register acceptance owner"
+  git -C "$repo" push -q
   task_dir="$(start_task acceptance "$repo")"
-  printf 'web: https://github.com/example/web.git\n' > "$task_dir/codebases.yaml"
+  printf 'web: https://github.com/attacker/forged.git\n' > "$task_dir/codebases.yaml"
   run_task_in_dir acceptance "$task_dir" deliverable declare --id web-pr --owner web \
     --kind codebase-pr --external-ref https://github.com/example/web/pull/7 \
     --revision abc123 --format json >/dev/null
@@ -1006,8 +1144,11 @@ test_kernel_probe_acceptance_is_revision_and_owner_bound() {
 test_accepted_deliverable_revision_reset_preserves_append_only_receipts() {
   local repo task_dir actual out rc
   repo="$(setup_workbench acceptance_reset)"
+  printf 'web: https://github.com/example/web.git\n' > "$repo/codebases.yaml"
+  git -C "$repo" add codebases.yaml
+  git -C "$repo" commit -q -m "test: register reset owner"
+  git -C "$repo" push -q
   task_dir="$(start_task acceptance_reset "$repo")"
-  printf 'web: https://github.com/example/web.git\n' > "$task_dir/codebases.yaml"
   run_task_in_dir acceptance_reset "$task_dir" deliverable declare --id web-pr --owner web \
     --kind codebase-pr --external-ref https://github.com/example/web/pull/7 \
     --revision abc123 --format json >/dev/null
@@ -1358,8 +1499,11 @@ test_required_check_waive_is_reasoned_revision_bound_and_idempotent() {
 test_submitted_and_failed_deliverables_block_verification() {
   local repo task_dir out
   repo="$(setup_workbench blocked_verify)"
+  printf 'api: https://github.com/example/api.git\n' > "$repo/codebases.yaml"
+  git -C "$repo" add codebases.yaml
+  git -C "$repo" commit -q -m "test: register blocked owner"
+  git -C "$repo" push -q
   task_dir="$(start_task blocked_verify "$repo")"
-  printf 'api: https://github.com/example/api.git\n' > "$task_dir/codebases.yaml"
   run_task_in_dir blocked_verify "$task_dir" deliverable declare --id api-pr --owner api \
     --kind codebase-pr --external-ref https://github.com/example/api/pull/8 --revision abc123 --format json >/dev/null
   run_task_in_dir blocked_verify "$task_dir" deliverable update --id api-pr --state submitted --format json >/dev/null
@@ -1924,6 +2068,83 @@ assert [row[-1] for row in rows if row[0] == "effect-owner" and row[3] == sys.ar
 PY
 }
 
+test_writer_binds_protected_registry_and_rejects_cache_origin() {
+  local task_dir expected_origin hostile out actual operation protected_revision protected_digest
+  setup_writer_workbench writer_registry
+  prepare_writer_task writer_registry 29 registry; task_dir="$WRITER_TASK_DIR"
+  expected_origin="$TMPDIR/writer_registry/shared-api.git"
+  hostile="$TMPDIR/writer_registry/hostile-shared-api.git"
+  git init -q --bare "$hostile"
+  git -C "$WRITER_REPO/.codebases/shared-api" remote set-url origin "$hostile"
+  out="$TMPDIR/writer_registry/origin-mismatch.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_registry "$task_dir" add-repo shared-api --format json >"$out" 2>&1; then
+    fail "writer add-repo trusted a mutable cache clone origin"
+  fi
+  assert_file_contains "$out" 'codebase-origin-mismatch: shared-api'
+  if git --git-dir="$TMPDIR/writer_registry/origin.git" \
+    show-ref --verify --quiet refs/heads/workbench-coordination/writer-claims; then
+    fail "cache origin mismatch published a remote writer claim"
+  fi
+
+  git -C "$WRITER_REPO/.codebases/shared-api" remote set-url origin "$expected_origin"
+  printf '%s\n' 'shared-api: /caller/forged/origin.git' > "$task_dir/codebases.yaml"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_registry "$task_dir" add-repo shared-api --format json)"
+  assert_contains "$actual" '"changed":true'
+  operation="$(find "$task_dir/task/.workbench/writer-operations" -name '*.json' -type f)"
+  protected_revision="$(git -C "$WRITER_REPO" rev-parse origin/main)"
+  protected_digest="sha256:$(git -C "$WRITER_REPO" show \
+    "$protected_revision:codebases.yaml" | shasum -a 256 | awk '{print $1}')"
+  python3 - "$operation" "$expected_origin" "$protected_revision" "$protected_digest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    operation = json.load(handle)
+assert operation["codebase_origin_url"] == sys.argv[2]
+assert operation["registry_revision"] == sys.argv[3]
+assert operation["registry_digest"] == sys.argv[4]
+PY
+}
+
+test_writer_conflict_uses_complete_legacy_and_v2_union() {
+  local task_dir observation adapter revision actual
+  setup_writer_workbench writer_legacy_union
+  prepare_writer_task writer_legacy_union 29 union; task_dir="$WRITER_TASK_DIR"
+  revision="$(git -C "$WRITER_REPO" rev-parse origin/main)"
+  observation="$TMPDIR/writer_legacy_union/legacy-observation.json"
+  write_active_legacy_observation "$observation" "$revision" \
+    "$(git -C "$WRITER_REPO" remote get-url origin)" shared-api \
+    "$TMPDIR/writer_legacy_union/shared-api.git"
+  adapter="$TMPDIR/writer_legacy_union/bin/active-legacy-adapter"
+  write_fake_legacy_adapter "$adapter" "$observation"
+
+  actual="$(WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_legacy_union "$task_dir" add-repo shared-api --format json)"
+  ACTUAL="$actual" python3 - <<'PY'
+import json
+import os
+
+value = json.loads(os.environ["ACTUAL"])
+assert value["changed"] is True
+assert len(value["conflicts"]) == 1
+conflict = value["conflicts"][0]
+assert conflict["source"] == "legacy-v1"
+assert conflict["operation_id"] is None
+assert conflict["task_claim_id"] == "legacy-task-17"
+assert conflict["owner"] == "shared-api"
+assert conflict["context_policy_set_digest"] is None
+assert conflict["source_revision"] is not None
+assert conflict["lifecycle_digest"].startswith("sha256:")
+assert value["action_instance_id"] is not None
+PY
+}
+
 test_writer_zero_history_recovery_rebinds_before_once_only_owner_acquire() {
   local task_dir out first operation claim operation_id common old_clone new_clone actual ledger ref
   setup_writer_workbench writer_zero_history
@@ -1976,7 +2197,7 @@ PY
 
 test_cleanup_retires_consumed_writer_before_local_deletion() {
   local task_dir actual operation_id claim_id ledger ref comments operation gitdir marker backup out
-  local observation revision
+  local observation revision legacy_adapter
   setup_writer_workbench writer_cleanup
   printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
   git -C "$WRITER_REPO" add .workbench/policy.conf
@@ -2050,8 +2271,10 @@ PY
   write_empty_legacy_observation "$observation" "$revision" \
     "$(git -C "$WRITER_REPO" remote get-url origin)" shared-api \
     "$TMPDIR/writer_cleanup/shared-api.git"
+  legacy_adapter="$TMPDIR/writer_cleanup/bin/legacy-adapter"
+  write_fake_legacy_adapter "$legacy_adapter" "$observation"
   out="$TMPDIR/writer_cleanup/status-unreconciled.out"
-  if WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+  if WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_task writer_cleanup "$WRITER_REPO" status --format json >"$out" 2>&1; then
     fail "status must fail closed for a consumed writer with no ownership marker"
   fi
@@ -2067,7 +2290,7 @@ PY
     git -C "$task_dir" commit -q -m "test: persist writer terminal state"
   fi
   git -C "$task_dir" push -q
-  actual="$(WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+  actual="$(WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_task writer_cleanup "$WRITER_REPO" status --format json)"
   assert_contains "$actual" "\"claim_id\":\"$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")\""
   assert_contains "$actual" '"task_contract":"workbench-task/v2"'
@@ -2114,7 +2337,7 @@ PY
 }
 
 test_status_reports_concurrent_writer_conflicts() {
-  local repo first second actual observation revision
+  local repo first second actual observation revision legacy_adapter
   setup_writer_workbench writer_conflicts
   repo="$WRITER_REPO"
   prepare_writer_task writer_conflicts 29 a; first="$WRITER_TASK_DIR"
@@ -2131,8 +2354,10 @@ test_status_reports_concurrent_writer_conflicts() {
   write_empty_legacy_observation "$observation" "$revision" \
     "$(git -C "$repo" remote get-url origin)" shared-api \
     "$TMPDIR/writer_conflicts/shared-api.git"
+  legacy_adapter="$TMPDIR/writer_conflicts/bin/legacy-adapter"
+  write_fake_legacy_adapter "$legacy_adapter" "$observation"
 
-  actual="$(WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+  actual="$(WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_task writer_conflicts "$repo" status --format json)"
   python3 - "$actual" <<'PY'
 import json
@@ -2193,6 +2418,8 @@ run_case test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion
 run_case test_v2_cleanup_requires_terminal_outcome_even_with_force
 run_case test_writer_claim_cas_retry_rechecks_conflict_before_local_creation
 run_case test_writer_local_failure_releases_remote_claim_before_new_id
+run_case test_writer_binds_protected_registry_and_rejects_cache_origin
+run_case test_writer_conflict_uses_complete_legacy_and_v2_union
 run_case test_writer_zero_history_recovery_rebinds_before_once_only_owner_acquire
 run_case test_cleanup_retires_consumed_writer_before_local_deletion
 run_case test_status_reports_concurrent_writer_conflicts
