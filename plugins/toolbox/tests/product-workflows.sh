@@ -70,6 +70,26 @@ expect_failure "already belongs to repository 'web'" toolbox product repository 
 expect_failure "must be workspace-relative" toolbox product repository set alpha \
   --id escaped --path ../outside --role work
 
+mkdir -p "$wb/codebases" "$tmp/outside-repository"
+ln -s "$tmp/outside-repository" "$wb/codebases/escaped-link"
+expect_failure "repository path must not be a symbolic link" \
+  toolbox product repository set alpha --id symlink-escape \
+    --path codebases/escaped-link/checkout --role work
+
+future_repository="$(toolbox product repository set alpha --id future \
+  --path codebases/future/checkout --role reference)" \
+  || fail "absent repository leaf should be allowed"
+python3 - "$future_repository" <<'PY'
+import json
+import sys
+repository = json.loads(sys.argv[1])["repository"]
+assert repository == {
+    "id": "future",
+    "path": "codebases/future/checkout",
+    "role": "reference",
+}
+PY
+
 autonomy="$(toolbox product autonomy set alpha \
   --action task.complete --decision allow)" || fail "autonomy set failed"
 python3 - "$autonomy" <<'PY'

@@ -15,6 +15,9 @@ contracts = {
         ".profile.language",
         "toolbox product status <product-id>",
         "read-only",
+        "continue-active-scenario",
+        "existing workbench task",
+        "does not authorize a new run plan",
     ],
     "product-run": [
         "docs-query",

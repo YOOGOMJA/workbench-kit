@@ -1,4 +1,4 @@
 interface:
   display_name: "Build a TDD Slice"
   short_description: "Deliver one scenario slice test first"
-  default_prompt: "Use -slice to implement one minimal vertical scenario slice with evidence."
+  default_prompt: "Use $tdd-slice to implement one minimal vertical scenario slice with evidence."

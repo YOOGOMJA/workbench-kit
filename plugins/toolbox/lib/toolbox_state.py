@@ -510,6 +510,7 @@ def set_repository(
 ) -> tuple[bool, dict[str, Any]]:
     validate_product_id(repository_id)
     validate_repository_path(path)
+    safe_state_path(workspace, workspace / path, "repository path")
     bundle = load_product(workspace, product_id)
     validate_product_bundle(product_id, bundle)
     repository = {"id": repository_id, "path": path, "role": role}
@@ -976,12 +977,14 @@ def product_status(workspace: pathlib.Path, product_id: str) -> dict[str, Any]:
         for item in candidate_scenarios(workspace, product_id)
     ]
     blockers = scenario_blockers(bundle, index)
-    if len(active) == 1:
+    if bundle["product"]["status"] in ("completed", "archived"):
+        next_action = "none"
+    elif blockers:
+        next_action = "resolve-blocker"
+    elif len(active) == 1:
         next_action = "continue-active-scenario"
     elif candidates:
         next_action = "start-ready-scenario"
-    elif blockers:
-        next_action = "resolve-blocker"
     else:
         next_action = "none"
     return {
@@ -1042,6 +1045,10 @@ def product_run_plan(
     portfolio, index = check_portfolio(workspace)
     bundle = get_product_bundle(portfolio, product_id)
     product_ref = f"toolbox:product/{product_id}"
+    blockers = scenario_blockers(bundle, index)
+    if blockers:
+        blocker = blockers[0]
+        raise StateError(f"{blocker['code']}: {blocker['ref']}")
     active = sorted(
         (item for item in bundle["scenarios"] if item["status"] == "active"),
         key=lambda item: item["id"],
@@ -1075,10 +1082,6 @@ def product_run_plan(
     else:
         candidates = candidate_scenarios(workspace, product_id)
         if not candidates:
-            blockers = scenario_blockers(bundle, index)
-            if blockers:
-                blocker = blockers[0]
-                raise StateError(f"{blocker['code']}: {blocker['ref']}")
             raise StateError(f"no-ready-scenario: {product_ref}")
         candidate = index[candidates[0]["scenario_id"]][1]
     return build_run_plan(bundle, candidate, "product", [], [])
@@ -1096,26 +1099,23 @@ def portfolio_run_plan(workspace: pathlib.Path) -> dict[str, Any]:
     for bundle in portfolio["products"]:
         product_id = bundle["product"]["id"]
         product_ref = f"toolbox:product/{product_id}"
+        blockers = scenario_blockers(bundle, index)
         active = sorted(
             (item for item in bundle["scenarios"] if item["status"] == "active"),
             key=lambda item: item["id"],
         )
-        if active:
+        if blockers:
+            reasons = blockers
+        elif active:
             reasons = [{
                 "code": "active-scenario-exists",
                 "ref": f"toolbox:scenario/{active[0]['id']}",
             }]
-        elif bundle["product"]["status"] == "paused":
-            reasons = [{"code": "product-paused", "ref": product_ref}]
-        elif bundle["product"]["status"] in ("completed", "archived"):
-            reasons = [{"code": "product-terminal", "ref": product_ref}]
         elif candidates_by_product.get(product_id):
             eligible.extend(candidates_by_product[product_id])
             continue
         else:
-            reasons = scenario_blockers(bundle, index)
-            if not reasons:
-                reasons = [{"code": "no-ready-scenario", "ref": product_ref}]
+            reasons = [{"code": "no-ready-scenario", "ref": product_ref}]
         skipped.append({"product_ref": product_ref, "reasons": reasons[:1]})
 
     if not eligible:

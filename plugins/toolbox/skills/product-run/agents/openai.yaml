@@ -1,4 +1,4 @@
 interface:
   display_name: "Run a Product Scenario"
   short_description: "Execute one governed product scenario"
-  default_prompt: "Use -run to execute one ready toolbox scenario through the workbench lifecycle."
+  default_prompt: "Use $product-run to execute one ready toolbox scenario through the workbench lifecycle."

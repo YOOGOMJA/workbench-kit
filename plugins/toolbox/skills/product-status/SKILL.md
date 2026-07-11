@@ -29,3 +29,6 @@ Report derived facts without changing product or task state.
   before deriving status.
 - Do not claim delivery, acceptance, or completion from a ready or active
   scenario.
+- `continue-active-scenario` means resume the existing workbench task through
+  its lifecycle. It does not authorize a new run plan; product-run rejects a
+  product that already has an active scenario.
