@@ -1,0 +1,10 @@
+{
+  "workspace_kind": "unrecognized",
+  "classification": "unrecognized",
+  "workspace_schema": "workbench/v1",
+  "doctor_ready": false,
+  "materialize": null,
+  "embedded_state": "absent",
+  "blockers": [],
+  "route": null
+}

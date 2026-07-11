@@ -1,0 +1,10 @@
+{
+  "workspace_kind": "generated-minimal",
+  "classification": "generated-minimal",
+  "workspace_schema": "workbench/v1",
+  "doctor_ready": false,
+  "materialize": "runtime-generated",
+  "embedded_state": "absent",
+  "blockers": [],
+  "route": "implicit-v1"
+}

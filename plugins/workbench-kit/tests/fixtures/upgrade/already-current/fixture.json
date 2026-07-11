@@ -1,0 +1,10 @@
+{
+  "workspace_kind": "already-current",
+  "classification": "already-current",
+  "workspace_schema": "workbench/v2",
+  "doctor_ready": true,
+  "materialize": null,
+  "embedded_state": "absent",
+  "blockers": [],
+  "route": "current-v2"
+}
