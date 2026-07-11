@@ -76,3 +76,27 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-06-13 12:15:18] lint · update skills/docs-query/SKILL.md | extends 표면화를 outgoing/incoming 양방향으로 정정
 ## [2026-06-13 12:15:18] lint · update docs/runbooks/autonomous-session-loop.md | 자동 진행 가능 범위를 제출 전 준비로 제한
 ## [2026-06-17 09:40:00] edit · update workbench-knowledge-ecosystem.md | 영문화(정본 EN), 한국어 원문은 .ko.md로 보존·상호링크
+
+## [2026-07-11 02:25:00] extract · create workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Published the normative v2 lifecycle, policy, state, capability-pack, compound-knowledge, compatibility, and migration contracts
+
+## [2026-07-11 02:25:00] extract · update index.md, decisions/index.md | Added the v2 governance contract and decision to framework consumption surfaces
+
+## [2026-07-11 02:31:00] extract · create decisions/0018-separation-architecture.md | Preserved the historical separation decision in English and recorded its explicit supersession by ADR 0024
+
+## [2026-07-11 02:49:13] edit · create workbench-v2-cli-contract.md | Added exact public commands, records, authorization binding, and exit semantics after specification review
+
+## [2026-07-11 02:49:13] edit · update workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Closed reviewed gaps in task legacy detection, lifecycle serialization, multi-context boundaries, profile discovery, and compound applicability
+
+## [2026-07-11 03:13:03] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Removed the action-revision metadata cycle and specified strict JSON input, governed cleanup, sealed harvest disposition, and repeatable context policy provenance
+
+## [2026-07-11 08:18:03] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Bound actions to complete canonical policy manifests, sealed owner context, authority-backed acceptance, terminal content freeze, revision-safe evidence, durable cleanup recovery, and enforced writer claims
+
+## [2026-07-11 09:11:15] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Pinned remote workspace policy authority, per-participant receipts, single-effect deliverable transitions, CAS writer claims, and the frozen v1 action registry
+
+## [2026-07-11 09:44:02] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Defined skeleton-only v2 start, protected-default authority descriptors, legacy-aware crash-safe writer recovery, declaration-bound pack ownership, and read-only doctor permission checks
+
+## [2026-07-11 10:04:43] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Added per-effect post-CAS revalidation and compensation, terminal writer reconciliation, closed legacy-home enumeration, exact start syntax, and lowercase manifest booleans
+
+## [2026-07-11 10:42:46] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Bound authorizations to exact action intent, added effect-owner handoff and cursor recovery, separated abandonment revision, preserved submitted-v1 writers through PR ancestry, and froze cleanup removal plans
+
+## [2026-07-11 13:08:05] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Added applied-effect-first recovery, receipt-first governed pack acceptance, ungoverned kernel acceptance, zero-history writer rebind, and mandatory pre-CAS release state

@@ -23,6 +23,29 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   can't pollute a published version's notes. `RELEASING.md` documents the hazard; covered
   by `tests/check-changelog-section-guard.sh` (#21).
 
+### Changed
+
+- **Workbench v2 governance contract** - framework documentation now defines the generic
+  multi-deliverable lifecycle, exact public CLI/JSON records, revision-bound evidence,
+  replay-safe policy authorization, task-level legacy detection, living-state and
+  compound-knowledge boundaries, governed cleanup, a sealed harvest ledger, repeatable
+  context-policy provenance, authority-backed acceptance receipts, terminal content freeze,
+  revision-safe task evidence, protected-default workspace authority descriptors,
+  per-participant authority receipts, declaration-bound pack ownership, single-effect governed
+  deliverable updates, skeleton-only v2 start/resume, durable cleanup recovery, legacy-v1
+  writer projection over a closed home registry (including submitted PR ancestry and origin
+  replacement proofs), a crash-safe fixed-ref CAS writer/effect-owner ledger with no-effect
+  cancellation, cursor-based compensation, explicit cross-device handoff, exact action-intent
+  payload digests, applied-effect-first crash reconciliation with exact durable provenance,
+  receipt-first governed pack acceptance, ungoverned/null-provenance kernel PR acceptance,
+  zero-history-only device rebind, mandatory pre-CAS `release-pending`, a dedicated abandonment
+  revision, stable PR-acceptance subjects, exact cleanup removal plans and owner-event recovery,
+  terminal writer reconciliation, lowercase manifest booleans, a frozen kernel action registry,
+  strict JSON inputs, capability-pack rules, profile language, and machine-readable compatibility
+  shared by the engine, migration flow, and optional packs (#25). This change defines the
+  contract only; CLI and migration
+  implementation remain in follow-up issues.
+
 ### Fixed
 
 - **Task commit subject policy enforcement** — the `workbench` plugin now rejects
