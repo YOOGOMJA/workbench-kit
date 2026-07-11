@@ -31,12 +31,23 @@ authorization, evidence, acceptance, harvest, and cleanup.
    --format json`, then `workbench task policy-context seal --format json`.
    Registration requires explicit owner authorization. Stop at an unresolved `ask`
    or `deny`; resume only with authorization for that exact action instance.
-3. For each selected repository owner, attach only the required work codebase.
-   Declare its output with `workbench task deliverable declare`; use multiple
-   deliverables when needed, never multiple primary work refs.
-4. Translate every required run-plan check with
-   `workbench task required-check declare`. Do not fabricate deliverable state,
-   revision, evidence, or acceptance.
+3. For each `repository_owners` entry, attach only the required work codebase and
+   derive the deterministic deliverable ID `<owner>-pr`. Declare it exactly once:
+
+   ```text
+   workbench task deliverable declare --id <deliverable-id> --owner <owner> --kind codebase-pr --required true --format json
+   ```
+
+   Use multiple deliverables when needed, never multiple primary work refs.
+4. For every `required_quality_checks` entry, consume `check.owner` exactly and
+   bind it to that owner's `<owner>-pr` deliverable:
+
+   ```text
+   workbench task required-check declare --id <check-id> --owner <check.owner> --deliverable-id <check.owner>-pr --format json
+   ```
+
+   Do not guess a repository from the check command or name. Do not fabricate
+   deliverable state, revision, evidence, or acceptance.
 
 ## Deliver
 

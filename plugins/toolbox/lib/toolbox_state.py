@@ -451,6 +451,17 @@ def validate_product_bundle(product_id: str, bundle: dict[str, Any]) -> None:
     check_ids = [item["id"] for item in bundle["quality"]["checks"]]
     if len(check_ids) != len(set(check_ids)):
         raise StateError(f"product '{product_id}' contains duplicate quality check IDs")
+    repositories = {item["id"]: item for item in product["repositories"]}
+    for quality_check in bundle["quality"]["checks"]:
+        owner = quality_check["owner"]
+        if owner not in repositories:
+            raise StateError(
+                f"quality check '{quality_check['id']}' references unknown repository owner '{owner}'"
+            )
+        if repositories[owner]["role"] == "reference":
+            raise StateError(
+                f"quality check '{quality_check['id']}' references non-writable repository owner '{owner}'"
+            )
 
     local_scenario_ids: set[str] = set()
     for scenario in bundle["scenarios"]:
@@ -618,6 +629,7 @@ def set_quality_check(
     workspace: pathlib.Path,
     product_id: str,
     check_id: str,
+    owner: str,
     kind: str,
     required: bool,
     command: list[str],
@@ -627,6 +639,7 @@ def set_quality_check(
     validate_product_bundle(product_id, bundle)
     quality_check = {
         "id": check_id,
+        "owner": owner,
         "kind": kind,
         "command": command,
         "required": required,
@@ -915,7 +928,12 @@ def build_run_plan(
     )
     checks = sorted(
         (
-            {"id": item["id"], "kind": item["kind"], "command": item["command"]}
+            {
+                "id": item["id"],
+                "owner": item["owner"],
+                "kind": item["kind"],
+                "command": item["command"],
+            }
             for item in bundle["quality"]["checks"]
             if item["required"]
         ),

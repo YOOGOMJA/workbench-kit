@@ -168,7 +168,11 @@ assert actual["contract_version"] == "toolbox-run-plan/v1"
 assert actual["selection_scope"] == "portfolio"
 assert actual["product_ref"] == "toolbox:product/alpha"
 assert actual["scenario_ref"] == "toolbox:scenario/SCN-ALPHA-READY"
-assert actual["repository_owners"] == ["alpha-web"]
+assert actual["repository_owners"] == ["alpha-api", "alpha-web"]
+assert [(item["id"], item["owner"]) for item in actual["required_quality_checks"]] == [
+    ("api-contract", "alpha-api"),
+    ("unit", "alpha-web"),
+]
 assert [item["product_ref"] for item in actual["skipped_products"]] == [
     "toolbox:product/beta",
     "toolbox:product/delta",

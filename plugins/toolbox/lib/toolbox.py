@@ -303,6 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     quality_check_set = quality_check_commands.add_parser("set", help="Set a quality check")
     quality_check_set.add_argument("product_id")
     quality_check_set.add_argument("--id", required=True, dest="check_id")
+    quality_check_set.add_argument("--owner", required=True)
     quality_check_set.add_argument(
         "--kind",
         choices=(
@@ -467,6 +468,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     workspace,
                     parsed.product_id,
                     parsed.check_id,
+                    parsed.owner,
                     parsed.kind,
                     parsed.required,
                     parsed.command_parts,

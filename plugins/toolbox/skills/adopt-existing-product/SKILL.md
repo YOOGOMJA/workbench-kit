@@ -24,8 +24,10 @@ values in canonical English.
 1. Only after compatibility is established, run `toolbox product init` once.
 2. Register each repository with `toolbox product repository set`, preserving its
    real workspace-relative path and `owner`, `work`, or `reference` role.
-3. Register existing executable checks through `toolbox product quality check
-   set`; do not invent commands that have not run.
+3. Register each existing executable check through `toolbox product quality check
+   set ... --owner <repository-id>`. The owner must be the writable repository
+   where the command runs; do not infer it from a check name or invent commands
+   that have not run.
 4. Sync policy with `toolbox product policy sync`, validate the product, and use
    `scenario-refine` for the first bounded future outcome. Historical work is not
    backfilled as completed scenarios without evidence.
