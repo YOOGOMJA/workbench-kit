@@ -18,10 +18,12 @@ require_python() {
 }
 
 require_schema() {
-  local root="$1" expected="$2" marker="$1/.workbench/schema" value
+  local root="$1" expected="$2" marker="$1/.workbench/schema" value helper
   if [ ! -e "$marker" ]; then value=workbench/v1
   elif [ -f "$marker" ]; then
-    value="$(cat "$marker")"
+    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+    value="$(python3 "$helper" schema "$marker")" \
+      || state_error "workspace schema marker is invalid"
   else
     state_error "workspace schema marker is unreadable"
   fi
@@ -30,10 +32,12 @@ require_schema() {
 }
 
 require_supported_caller_schema() {
-  local root="$1" marker="$1/.workbench/schema" value
+  local root="$1" marker="$1/.workbench/schema" value helper
   [ -e "$marker" ] || return 0
   [ -f "$marker" ] || state_error "workspace schema marker is unreadable"
-  value="$(cat "$marker")"
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  value="$(python3 "$helper" schema "$marker")" \
+    || state_error "workspace schema marker is invalid"
   case "$value" in workbench/v1|workbench/v2) return 0 ;; esac
   state_error "workspace schema marker is invalid"
 }

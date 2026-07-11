@@ -58,15 +58,23 @@ parse_id() {
   esac
   echo "$ISSUE" | grep -Eq '^[0-9]+$' || die "잘못된 ID: $id (이슈 번호가 숫자가 아님)"
   if [ -n "$HOME_REPO" ]; then
-    if echo "$HOME_REPO" | grep -Eq '^[0-9]+$'; then
-      die "repo 이름은 순수 숫자 불가: $HOME_REPO"
-    fi
+    validate_home_name "$HOME_REPO" || die "잘못된 ID: $id (repo 이름이 비정규)"
   fi
 }
 
 slugify() {
   echo "$1" | tr '[:upper:]' '[:lower:]' \
     | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -d- -f1-4
+}
+
+validate_home_name() {
+  local value="$1"
+  printf '%s\n' "$value" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
+    && ! printf '%s\n' "$value" | grep -Eq '^[0-9]+$'
+}
+
+validate_slug() {
+  printf '%s\n' "$1" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+){0,3}$'
 }
 
 branch_to_dir() { echo "${1//\//__}"; }
@@ -88,15 +96,13 @@ json_nullable() {
 }
 
 workspace_schema() {
-  local root="$1" marker first second
+  local root="$1" marker helper
   marker="$root/.workbench/schema"
   if [ ! -e "$marker" ]; then printf '%s\n' workbench/v1; return 0; fi
   [ -f "$marker" ] || die "invalid workspace schema marker: $marker"
-  IFS= read -r first < "$marker" || true
-  second="$(sed -n '2p' "$marker")"
-  [ -n "$first" ] && [ -z "$second" ] \
-    || die "workspace schema marker must contain exactly one schema ID"
-  case "$first" in workbench/v1|workbench/v2) printf '%s\n' "$first" ;; *) die "unsupported workspace schema: $first" ;; esac
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  python3 "$helper" schema "$marker" \
+    || die "workspace schema marker must contain exactly one supported schema ID"
 }
 
 contract_helper() {
@@ -533,6 +539,7 @@ cmd_start() {
     [ -n "$title" ] || die "이슈 제목 조회 실패 — slug를 직접 지정할 것: task start $id <slug>"
     slug="$(slugify "$title")"
   fi
+  validate_slug "$slug" || die "invalid task slug: $slug"
 
   local branch="task/${HOME_REPO:+$HOME_REPO/}${parent:+$parent/}${ISSUE}-${slug}"
   local dir="$root/.worktrees/$(branch_to_dir "$branch")"
@@ -699,6 +706,7 @@ cmd_add_repo_v1() {
     esac
   done
   [ -n "$name" ] || die "usage: workbench task add-repo <name> [--ref <base>] [--role work|reference]"
+  validate_home_name "$name" || die "invalid codebase home: $name"
   require_task_worktree
   [ -f "$TASK_DIR/task/index.md" ] || die "task/index.md 없음"
 
@@ -5078,7 +5086,6 @@ cmd_status_json() {
   while IFS= read -r index; do
     [ -f "$index" ] || continue
     task_path="${index%/task/index.md}"
-    [ -f "$task_path/task/.workbench/terminal" ] && continue
     claim_id="$(sed -n '/^---$/,/^---$/p' "$index" | sed -n 's/^claim_id: *//p' | head -1)"
     task_contract="$(sed -n '/^---$/,/^---$/p' "$index" | sed -n 's/^task_contract: *//p' | head -1)"; [ -n "$task_contract" ] || task_contract=workbench-task/v1
     branch="$(sed -n '/^---$/,/^---$/p' "$index" | sed -n 's/^branch: *//p' | head -1)"

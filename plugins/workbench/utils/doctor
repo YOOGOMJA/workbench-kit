@@ -37,8 +37,9 @@ cmd_show() {
   root="$(workspace_root)"; marker="$root/.workbench/schema"; schema=workbench/v1
   if [ -e "$marker" ]; then
     [ -f "$marker" ] || usage_error "workspace schema marker is unreadable"
-    schema="$(cat "$marker")"
-    case "$schema" in workbench/v1|workbench/v2) ;; *) usage_error "workspace schema marker is invalid" ;; esac
+    contract_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+    schema="$(python3 "$contract_helper" schema "$marker")" \
+      || usage_error "workspace schema marker is invalid"
   fi
   lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
   doctor_helper="$lib/workbench_doctor.py"; contract_helper="$lib/workbench_contract.py"

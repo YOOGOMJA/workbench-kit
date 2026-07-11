@@ -522,8 +522,13 @@ EOF
 }
 
 test_v1_rejects_v2_mutation_but_keeps_legacy_start() {
-  local repo task_dir out
+  local repo task_dir out invalid
   repo="$(setup_workbench v1_compat '')"
+  invalid="$TMPDIR/v1_compat/invalid-home.out"
+  if run_task v1_compat "$repo" start '../escape#31' safe-slug >"$invalid" 2>&1; then
+    fail "v1 start must reject a noncanonical reference home"
+  fi
+  assert_file_contains "$invalid" "잘못된 ID"
   task_dir="$(start_task v1_compat "$repo")"
   assert_file_contains "$TMPDIR/v1_compat/comments/29.comments" "workbench-task-lifecycle:v1"
   out="$TMPDIR/v1_compat/refs.out"
@@ -531,6 +536,26 @@ test_v1_rejects_v2_mutation_but_keeps_legacy_start() {
     fail "v1 workspace must reject v2 task mutation"
   fi
   assert_file_contains "$out" "workbench/v1"
+}
+
+test_start_rejects_noncanonical_schema_slug_and_home() {
+  local repo out
+  repo="$(setup_workbench start_validation)"
+  out="$TMPDIR/start_validation/invalid.out"
+  for slug in '../escape' 'Upper-Case' 'trailing-' 'too-many-slug-words-here'; do
+    if run_task start_validation "$repo" start 29 "$slug" --format json >"$out" 2>&1; then
+      fail "v2 start accepted noncanonical slug: $slug"
+    fi
+  done
+  if run_task start_validation "$repo" start '../shared-api#29' safe-slug \
+    --format json >"$out" 2>&1; then
+    fail "v2 start accepted a noncanonical reference home"
+  fi
+  printf 'workbench/v2\n\n' > "$repo/.workbench/schema"
+  if run_task start_validation "$repo" start 29 safe-slug --format json >"$out" 2>&1; then
+    fail "task entrypoint accepted a schema marker with a trailing blank line"
+  fi
+  [ ! -e "$repo/.worktrees/task__29-safe-slug" ] || fail "invalid start created a task workspace"
 }
 
 test_v2_start_and_resume_are_authority_bound_skeletons() {
@@ -1958,6 +1983,10 @@ PY
     git -C "$task_dir" commit -q -m "test: persist writer terminal state"
   fi
   git -C "$task_dir" push -q
+  actual="$(WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+    run_task writer_cleanup "$WRITER_REPO" status --format json)"
+  assert_contains "$actual" "\"claim_id\":\"$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")\""
+  assert_contains "$actual" '"task_contract":"workbench-task/v2"'
 
   actual="$(run_task writer_cleanup "$WRITER_REPO" done 29 --format json)"
   assert_contains "$actual" '"outcome":"cleaned"'
@@ -2058,6 +2087,7 @@ run_case() {
 }
 
 run_case test_v1_rejects_v2_mutation_but_keeps_legacy_start
+run_case test_start_rejects_noncanonical_schema_slug_and_home
 run_case test_v2_start_and_resume_are_authority_bound_skeletons
 run_case test_refs_are_opaque_and_duplicate_active_work_is_rejected
 run_case test_deliverables_and_revision_bound_evidence
