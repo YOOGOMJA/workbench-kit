@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import re
 import sys
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from workbench_intent import intent_manifest, load_request, parse_line_payload
+from workbench_lifecycle import load_comment_observation, parse_index
+from workbench_terminal import ACTION_FIELDS, read_exact_record, validate_terminal_record
 from workbench_writer import current_claim_state, latest_effect, read_ledger
 
 
@@ -56,6 +61,7 @@ DISPOSITIONS = {
     "release-handoff",
 }
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+ACTION_ID = re.compile(r"act_[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 RFC3339_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
@@ -256,6 +262,8 @@ def validate_journal(value: Any) -> Mapping[str, Any]:
         raise ValueError("unsupported cleanup journal contract")
     for field in ("journal_id", "task_id", "claim_id", "branch", "action_instance_id"):
         require_text(value[field], field)
+    if ACTION_ID.fullmatch(value["action_instance_id"]) is None:
+        raise ValueError("cleanup action instance ID is invalid")
     if value["journal_id"] != "cleanup-" + value["claim_id"]:
         raise ValueError("cleanup journal ID does not bind the claim")
     if value["stage"] not in STAGES:
@@ -420,6 +428,130 @@ def cmd_find(args: argparse.Namespace) -> None:
     write_json(reduce_prefix(values))
 
 
+def cmd_find_observation(args: argparse.Namespace) -> None:
+    values: List[Mapping[str, Any]] = []
+    provenance_digests: List[str] = []
+    comments = load_comment_observation(
+        args.observation_file, args.repository_origin_url, args.issue
+    )
+    for comment in comments:
+        body = comment["body"]
+        matches = list(MARKER.finditer(body))
+        if body.count("<!-- workbench-task-cleanup:v1") != len(matches):
+            raise ValueError("malformed cleanup journal marker")
+        for match in matches:
+            value = validate_journal(
+                json.loads(match.group(1), object_pairs_hook=unique_object)
+            )
+            if value["task_id"] != args.task_id or value["branch"] != args.branch:
+                continue
+            if comment["author_identity"] != args.expected_author:
+                raise PermissionError("cleanup journal author is not authenticated")
+            values.append(value)
+            provenance_digests.append(sha256((match.group(1) + "\n").encode("utf-8")))
+    reduced = reduce_prefix(values)
+    Path(args.provenance_file).write_text(
+        "".join(item + "\n" for item in provenance_digests), encoding="utf-8"
+    )
+    write_json(reduced)
+
+
+def cmd_validate_snapshot(args: argparse.Namespace) -> None:
+    journal = validate_journal(load_json(args.journal_file))
+    task_dir = Path(args.task_dir)
+    index = parse_index(str(task_dir / "task/index.md"), args.branch)
+    if (
+        index["id"] != journal["task_id"]
+        or index["claim_id"] != journal["claim_id"]
+        or index["task_contract"] != "workbench-task/v2"
+    ):
+        raise ValueError("cleanup journal does not join the task index")
+    now = datetime.datetime.strptime(args.now, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc
+    )
+    terminal = validate_terminal_record(
+        task_dir,
+        task_dir / "task/.workbench/terminal",
+        journal["claim_id"],
+        now,
+    )
+    if terminal["revision"] != journal["revision"]:
+        raise ValueError("cleanup journal does not join the terminal revision")
+
+    state = task_dir / "task/.workbench"
+    action_file = state / "actions" / (journal["action_instance_id"] + ".record")
+    request_file = state / "actions" / (journal["action_instance_id"] + ".request.json")
+    payload = (
+        "workbench-task-cleanup-intent/v1\n"
+        "terminal_revision\t{}\n"
+        "removal_plan_digest\t{}\n"
+    ).format(journal["revision"], journal["removal_plan_digest"])
+    request = {
+        "contract_version": "workbench-action-request/v1",
+        "action_id": "task.cleanup",
+        "task_claim_id": journal["claim_id"],
+        "target_ref": "workbench:task/" + journal["claim_id"],
+        "revision": journal["revision"],
+        "payload_contract": "workbench-task-cleanup-intent/v1",
+        "payload": payload,
+    }
+    payload_digest = sha256(payload.encode("utf-8"))
+    if sha256(intent_manifest(request, payload_digest)) != journal["intent_digest"]:
+        raise ValueError("cleanup journal intent does not bind its immutable request")
+
+    if not action_file.exists() and not request_file.exists():
+        if not args.allow_missing_private_action:
+            raise ValueError("cleanup private action provenance is missing")
+        return
+    if not action_file.is_file() or not request_file.is_file():
+        raise ValueError("cleanup private action provenance is incomplete")
+
+    action = read_exact_record(action_file, ACTION_FIELDS)
+    manifest = validate_policy_manifest(journal["policy_manifest"])
+    expected = {
+        "id": journal["action_instance_id"],
+        "action_id": "task.cleanup",
+        "task_claim_id": journal["claim_id"],
+        "target_ref": "workbench:task/" + journal["claim_id"],
+        "revision": journal["revision"],
+        "intent_digest": journal["intent_digest"],
+        "policy_manifest_digest": manifest["digest"],
+        "authorization_ref": "" if journal["authorization_ref"] is None else journal["authorization_ref"],
+    }
+    for field, value in expected.items():
+        if action[field] != value:
+            raise ValueError("cleanup action does not join journal field {}".format(field))
+    if action["status"] not in ("authorized", "consumed"):
+        raise ValueError("cleanup action is not authorized or consumed")
+
+    stored_request = load_request(str(request_file))
+    if (
+        stored_request["action_id"] != "task.cleanup"
+        or stored_request["task_claim_id"] != journal["claim_id"]
+        or stored_request["target_ref"] != "workbench:task/" + journal["claim_id"]
+        or stored_request["revision"] != journal["revision"]
+        or stored_request["intent_digest"] != journal["intent_digest"]
+    ):
+        raise ValueError("cleanup request does not join the journal")
+    payload_fields = parse_line_payload(
+        stored_request["payload_contract"], stored_request["payload"]
+    )
+    if (
+        payload_fields["terminal_revision"] != journal["revision"]
+        or payload_fields["removal_plan_digest"] != journal["removal_plan_digest"]
+    ):
+        raise ValueError("cleanup request payload does not join the removal plan")
+    if action["status"] == "consumed":
+        provenance = Path(args.provenance_file).read_text(encoding="utf-8").splitlines()
+        if (
+            not provenance
+            or len(provenance) != len(set(provenance))
+            or any(DIGEST.fullmatch(item) is None for item in provenance)
+            or action["consumed_provenance_digest"] not in provenance
+        ):
+            raise ValueError("consumed cleanup action does not join the journal bytes")
+
+
 def cmd_field(args: argparse.Namespace) -> None:
     value = validate_journal(load_json(args.file))
     item = value[args.field]
@@ -576,6 +708,23 @@ def parser() -> argparse.ArgumentParser:
     find.add_argument("--task-id", required=True)
     find.add_argument("--branch", required=True)
     find.set_defaults(func=cmd_find)
+    observed = commands.add_parser("find-observation")
+    observed.add_argument("--observation-file", required=True)
+    observed.add_argument("--repository-origin-url", required=True)
+    observed.add_argument("--issue", type=int, required=True)
+    observed.add_argument("--task-id", required=True)
+    observed.add_argument("--branch", required=True)
+    observed.add_argument("--expected-author", required=True)
+    observed.add_argument("--provenance-file", required=True)
+    observed.set_defaults(func=cmd_find_observation)
+    snapshot = commands.add_parser("validate-snapshot")
+    snapshot.add_argument("--journal-file", required=True)
+    snapshot.add_argument("--task-dir", required=True)
+    snapshot.add_argument("--branch", required=True)
+    snapshot.add_argument("--now", required=True)
+    snapshot.add_argument("--provenance-file", required=True)
+    snapshot.add_argument("--allow-missing-private-action", action="store_true")
+    snapshot.set_defaults(func=cmd_validate_snapshot)
 
     field = commands.add_parser("field")
     field.add_argument("file")
@@ -605,6 +754,9 @@ def main() -> int:
     except LookupError as exc:
         print("error: {}".format(exc), file=sys.stderr)
         return 1
+    except PermissionError as exc:
+        print("error: {}".format(exc), file=sys.stderr)
+        return 3
     except (OSError, UnicodeError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print("error: {}".format(exc), file=sys.stderr)
         return 2

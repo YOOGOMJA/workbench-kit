@@ -263,7 +263,9 @@ def parse_comment(body: str, author: str, issue: int) -> List[Dict[str, Any]]:
     return [item for _, item in parsed]
 
 
-def load_observation(path: str, repository_origin: str, issue: int) -> List[Dict[str, Any]]:
+def load_comment_observation(
+    path: str, repository_origin: str, issue: int
+) -> List[Dict[str, Any]]:
     with open(path, encoding="utf-8") as handle:
         value = json.load(handle, object_pairs_hook=unique_object)
     require_fields(value, OBSERVATION_FIELDS, "lifecycle observation")
@@ -286,8 +288,19 @@ def load_observation(path: str, repository_origin: str, issue: int) -> List[Dict
     result: List[Dict[str, Any]] = []
     for comment in value["comments"]:
         require_fields(comment, COMMENT_FIELDS, "lifecycle comment")
-        author = require_text(comment["author_identity"], "author_identity")
-        result.extend(parse_comment(comment["body"], author, issue))
+        result.append(
+            {
+                "author_identity": require_text(comment["author_identity"], "author_identity"),
+                "body": comment["body"],
+            }
+        )
+    return result
+
+
+def load_observation(path: str, repository_origin: str, issue: int) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for comment in load_comment_observation(path, repository_origin, issue):
+        result.extend(parse_comment(comment["body"], comment["author_identity"], issue))
     return result
 
 

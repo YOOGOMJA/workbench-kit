@@ -5923,20 +5923,33 @@ cleanup_contract_helper() {
 }
 
 cleanup_journal_latest() {
-  local root="$1" home="$2" issue="$3" task_id="$4" branch="$5" dir comments output rc helper
+  local root="$1" home="$2" issue="$3" task_id="$4" branch="$5" expected_author="$6"
+  local dir adapter origin observation output rc helper
   dir="$(lifecycle_issue_dir "$root" "$home")"
   [ -d "$dir" ] || return 2
-  comments="$(mktemp "${TMPDIR:-/tmp}/workbench-cleanup-comments.XXXXXX")"
-  if ! (cd "$dir" && gh issue view "$issue" --json comments --jq '.comments[].body') > "$comments" 2>/dev/null; then
-    rm -f "$comments"; return 2
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] || return 2
+  origin="$(git -C "$dir" remote get-url origin 2>/dev/null)" || return 2
+  observation="$(mktemp "${TMPDIR:-/tmp}/workbench-cleanup-observation.XXXXXX")"
+  [ -z "${CLEANUP_JOURNAL_PROVENANCE_FILE:-}" ] \
+    || rm -f "$CLEANUP_JOURNAL_PROVENANCE_FILE"
+  CLEANUP_JOURNAL_PROVENANCE_FILE="$(mktemp \
+    "${TMPDIR:-/tmp}/workbench-cleanup-provenance.XXXXXX")" || return 2
+  if ! (cd "$dir" && "$adapter" lifecycle --repository "$dir" --issue "$issue" --format json) \
+    > "$observation" 2>/dev/null; then
+    rm -f "$observation"; return 2
   fi
   helper="$(cleanup_contract_helper)"
-  if output="$(python3 "$helper" find --comments-file "$comments" \
-    --task-id "$task_id" --branch "$branch" 2>/dev/null)"; then
-    rm -f "$comments"; printf '%s\n' "$output"; return 0
+  if output="$(python3 "$helper" find-observation --observation-file "$observation" \
+    --repository-origin-url "$origin" --issue "$issue" --task-id "$task_id" \
+    --branch "$branch" --expected-author "$expected_author" \
+    --provenance-file "$CLEANUP_JOURNAL_PROVENANCE_FILE" 2>/dev/null)"; then
+    rm -f "$observation"; printf '%s\n' "$output"; return 0
   else
-    rc=$?; rm -f "$comments"
+    rc=$?; rm -f "$observation" "$CLEANUP_JOURNAL_PROVENANCE_FILE"
+    CLEANUP_JOURNAL_PROVENANCE_FILE=""
     [ "$rc" -eq 1 ] && return 1
+    [ "$rc" -eq 3 ] && return 3
     return 2
   fi
 }
@@ -5982,6 +5995,54 @@ cleanup_load_plan() {
     CLEANUP_PLAN_PATHS[$CLEANUP_PLAN_COUNT]="$path"
     CLEANUP_PLAN_COUNT=$((CLEANUP_PLAN_COUNT + 1))
   done < <(python3 "$helper" list "$journal_file" codebase_worktrees)
+}
+
+CLEANUP_SNAPSHOT_DIR=""
+CLEANUP_SNAPSHOT_TEMP=""
+CLEANUP_JOURNAL_PROVENANCE_FILE=""
+
+cleanup_snapshot_dispose() {
+  [ -z "${CLEANUP_SNAPSHOT_TEMP:-}" ] || rm -rf "$CLEANUP_SNAPSHOT_TEMP"
+  CLEANUP_SNAPSHOT_DIR=""; CLEANUP_SNAPSHOT_TEMP=""
+}
+
+cleanup_materialize_snapshot() {
+  local root="$1" dir="$2" branch="$3" origin oid
+  cleanup_snapshot_dispose
+  if [ -d "$dir" ]; then CLEANUP_SNAPSHOT_DIR="$dir"; return 0; fi
+  origin="$(canonical_workspace_origin_url "$root")" || return 1
+  oid="$(writer_remote_task_oid "$origin" "$branch")" || return 1
+  git -C "$root" fetch --quiet --no-tags --no-write-fetch-head "$origin" "$oid" \
+    >/dev/null 2>&1 || return 1
+  [ "$(git -C "$root" cat-file -t "$oid" 2>/dev/null)" = commit ] || return 1
+  CLEANUP_SNAPSHOT_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/workbench-cleanup-snapshot.XXXXXX")" \
+    || return 1
+  writer_materialize_context_snapshot "$root" "$oid" "$CLEANUP_SNAPSHOT_TEMP" \
+    || { cleanup_snapshot_dispose; return 1; }
+  CLEANUP_SNAPSHOT_DIR="$CLEANUP_SNAPSHOT_TEMP"
+}
+
+cleanup_validate_retry_snapshot() {
+  local root="$1" dir="$2" branch="$3" journal_file="$4" claim descriptor terminal
+  local missing_private=""
+  [ -d "$dir" ] || missing_private=--allow-missing-private-action
+  cleanup_materialize_snapshot "$root" "$dir" "$branch" || return 1
+  if ! python3 "$(cleanup_contract_helper)" validate-snapshot \
+    --journal-file "$journal_file" --task-dir "$CLEANUP_SNAPSHOT_DIR" \
+    --branch "$branch" --now "$(utc_now)" \
+    --provenance-file "$CLEANUP_JOURNAL_PROVENANCE_FILE" $missing_private >/dev/null; then
+    cleanup_snapshot_dispose; rm -f "$CLEANUP_JOURNAL_PROVENANCE_FILE"
+    CLEANUP_JOURNAL_PROVENANCE_FILE=""; return 1
+  fi
+  claim="$(python3 "$(cleanup_contract_helper)" field "$journal_file" claim_id)" \
+    || { cleanup_snapshot_dispose; return 1; }
+  descriptor="$(sed -n 's/^workspace_authority_descriptor_digest: *//p' \
+    "$CLEANUP_SNAPSHOT_DIR/task/index.md")"
+  terminal="$CLEANUP_SNAPSHOT_DIR/task/.workbench/terminal"
+  terminal_lifecycle_state "$root" "$HOME_REPO" "$ISSUE" "$branch" "$claim" \
+    "$descriptor" "$terminal" || { cleanup_snapshot_dispose; return 1; }
+  cleanup_snapshot_dispose; rm -f "$CLEANUP_JOURNAL_PROVENANCE_FILE"
+  CLEANUP_JOURNAL_PROVENANCE_FILE=""
 }
 
 cleanup_emit_owner_event() {
@@ -6055,6 +6116,75 @@ cleanup_verify_owned_effects() {
   esac
 }
 
+cleanup_worktree_descriptor() {
+  local root="$1" origin="$2" dir="$3" wt="$4" clone="$5" operation_file="$6"
+  python3 "$(writer_helper)" cleanup-descriptor --workspace-root "$root" \
+    --workspace-origin-url "$origin" --task-dir "$dir" --worktree "$wt" \
+    --clone "$clone" --operation-file "$operation_file" \
+    --codebase-branch "$WRITER_CODEBASE_BRANCH"
+}
+
+cleanup_remove_local_writer_effects() {
+  local root="$1" dir="$2" branch="$3" origin operation_file row record_count owner_rows
+  local wt clone descriptor final_descriptor i
+  CLEANUP_WRITER_BLOCKER=""
+  origin="$(canonical_workspace_origin_url "$root")" || return 1
+  TASK_DIR="$dir"; CURRENT_BRANCH="$branch"; CURRENT_CLAIM_ID="$CLEANUP_CLAIM_ID"
+  for ((i=0; i<CLEANUP_PLAN_WRITER_COUNT; i++)); do
+    operation_file="$dir/task/.workbench/writer-operations/${CLEANUP_PLAN_OPERATION_IDS[$i]}.json"
+    [ -f "$operation_file" ] || return 1
+    writer_load_operation_final "$operation_file" || return 1
+    [ "$WRITER_OPERATION_ID" = "${CLEANUP_PLAN_OPERATION_IDS[$i]}" ] \
+      && [ "$WRITER_CLAIM_ID" = "${CLEANUP_PLAN_WRITER_IDS[$i]}" ] \
+      && [ "$WRITER_OPERATION_TASK_CLAIM_ID" = "$CLEANUP_CLAIM_ID" ] || return 1
+    cleanup_load_remote_writer "$root" "$origin" "$operation_file" || return 1
+    [ "$CLEANUP_REMOTE_CLAIM" = active ] && [ "$CLEANUP_REMOTE_EFFECT" = acquired ] \
+      || return 1
+    [ "$CLEANUP_REMOTE_DEVICE" = "$WRITER_DEVICE_ID" ] \
+      && [ "$CLEANUP_REMOTE_CLONE" = "$WRITER_CLONE_ID" ] || return 1
+
+    row="$dir/task/.workbench/writer-rows/$WRITER_OWNER.record"
+    record_count="$(repos_block | grep -Fxc -- "- $WRITER_OWNER | $WRITER_CODEBASE_BRANCH | work" || true)"
+    owner_rows="$(repos_block | grep -c "^- $WRITER_OWNER |" || true)"
+    if [ "$WRITER_OPERATION_RECORD_OWNERSHIP" != none ]; then
+      writer_row_matches_final "$row" \
+        && [ "$record_count" = 1 ] && [ "$owner_rows" = 1 ] \
+        || { CLEANUP_WRITER_BLOCKER=cleanup-ownership-mismatch; return 1; }
+    else
+      [ ! -e "$row" ] && [ ! -L "$row" ] \
+        && ! repos_block | grep -Fq -- "- $WRITER_OWNER |" \
+        || { CLEANUP_WRITER_BLOCKER=cleanup-ownership-mismatch; return 1; }
+    fi
+
+    wt="$dir/$WRITER_OPERATION_EXPECTED_PATH"; clone="$root/.codebases/$WRITER_OWNER"
+    WRITER_WORKTREE="$wt"; WRITER_CLONE="$clone"
+    [ ! -L "$clone" ] || { CLEANUP_WRITER_BLOCKER=cleanup-ownership-mismatch; return 1; }
+    if [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" != none ]; then
+      if [ -e "$wt" ] || [ -L "$wt" ]; then
+        descriptor="$(cleanup_worktree_descriptor "$root" "$origin" "$dir" "$wt" \
+          "$clone" "$operation_file")" \
+          || { CLEANUP_WRITER_BLOCKER=cleanup-ownership-mismatch; return 1; }
+        if [ -n "${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" ]; then
+          "$WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK" "$wt" \
+            "$WRITER_CODEBASE_ORIGIN" "$WRITER_CODEBASE_BRANCH" || return 1
+        fi
+        final_descriptor="$(cleanup_worktree_descriptor "$root" "$origin" "$dir" "$wt" \
+          "$clone" "$operation_file")" \
+          || { CLEANUP_WRITER_BLOCKER=cleanup-ownership-mismatch; return 1; }
+        [ "$final_descriptor" = "$descriptor" ] \
+          || { CLEANUP_WRITER_BLOCKER=cleanup-ownership-mismatch; return 1; }
+        git -C "$clone" worktree remove "$wt" >/dev/null 2>&1 || return 1
+      fi
+      { [ ! -e "$wt" ] && [ ! -L "$wt" ]; } || return 1
+      ! git -C "$clone" worktree list --porcelain | grep -Fqx "worktree $wt" || return 1
+      ! git -C "$clone" worktree list --porcelain \
+        | grep -Fqx "branch refs/heads/$WRITER_CODEBASE_BRANCH" || return 1
+    else
+      [ ! -e "$wt" ] && [ ! -L "$wt" ] || return 1
+    fi
+  done
+}
+
 cleanup_reconcile_writer_operations() {
   local root="$1" dir="$2" journal_file="$3" origin operation_file disposition i event
   origin="$(canonical_workspace_origin_url "$root")" || return 1
@@ -6105,7 +6235,19 @@ cleanup_reconcile_writer_operations() {
       if [ "$CLEANUP_REMOTE_EFFECT" = acquired ]; then
         [ "$CLEANUP_REMOTE_DEVICE" = "$WRITER_DEVICE_ID" ] \
           && [ "$CLEANUP_REMOTE_CLONE" = "$WRITER_CLONE_ID" ] || return 1
-        cleanup_verify_owned_effects "$dir" "$WRITER_CODEBASE_ORIGIN" || return 1
+        row="$dir/task/.workbench/writer-rows/$WRITER_OWNER.record"
+        if [ "$WRITER_OPERATION_RECORD_OWNERSHIP" = none ]; then
+          [ ! -e "$row" ] && [ ! -L "$row" ] \
+            && ! repos_block | grep -Fq -- "- $WRITER_OWNER |" || return 1
+        else
+          writer_row_matches_final "$row" \
+            && [ "$(repos_block | grep -Fxc -- "- $WRITER_OWNER | $WRITER_CODEBASE_BRANCH | work" || true)" = 1 ] \
+            && [ "$(repos_block | grep -c "^- $WRITER_OWNER |" || true)" = 1 ] \
+            || return 1
+        fi
+        [ ! -e "$dir/$WRITER_OPERATION_EXPECTED_PATH" ] || return 1
+        ! git -C "$root/.codebases/$WRITER_OWNER" worktree list --porcelain \
+          | grep -Fqx "worktree $dir/$WRITER_OPERATION_EXPECTED_PATH" || return 1
         cleanup_emit_owner_event "$journal_file" "$root" "$WRITER_OPERATION_ID" \
           "$WRITER_CLAIM_ID" "$WRITER_DEVICE_ID" "$WRITER_CLONE_ID" acquired intended \
           "$CLEANUP_REMOTE_EVENT" || return 1
@@ -6150,15 +6292,6 @@ cleanup_reconcile_writer_operations() {
     else
       [ "$CLEANUP_REMOTE_CLAIM" = released ] && [ "$CLEANUP_REMOTE_EFFECT" != acquired ] || return 1
     fi
-    if [ "$CLEANUP_REMOTE_EFFECT" = released ]; then
-      writer_operation_update "$operation_file" --stage released --effect-owner-state released \
-        --coordination-oid "$CLEANUP_REMOTE_COORDINATION_OID" --clear-compensation
-    elif [ -n "$CLEANUP_REMOTE_COORDINATION_OID" ]; then
-      writer_operation_update "$operation_file" --stage released \
-        --coordination-oid "$CLEANUP_REMOTE_COORDINATION_OID" --clear-compensation
-    else
-      writer_operation_update "$operation_file" --stage released --clear-compensation
-    fi
     CLEANUP_REMOVED_OPERATION_IDS[$CLEANUP_REMOVED_WRITER_COUNT]="$WRITER_OPERATION_ID"
     CLEANUP_REMOVED_WRITER_IDS[$CLEANUP_REMOVED_WRITER_COUNT]="$WRITER_CLAIM_ID"
     CLEANUP_REMOVED_WRITER_COUNT=$((CLEANUP_REMOVED_WRITER_COUNT + 1))
@@ -6182,32 +6315,30 @@ cleanup_verify_external_writer_operations() {
 }
 
 cleanup_apply_removal_plan() {
-  local root="$1" dir="$2" branch="$3" journal_file="$4" i name wt common clone operation_file
+  local root="$1" dir="$2" branch="$3" journal_file="$4" i name
   CLEANUP_REMOVED_WRITER_COUNT=0; CLEANUP_REMOVED_COUNT=0
   CLEANUP_REMOVED_OPERATION_IDS=(); CLEANUP_REMOVED_WRITER_IDS=(); CLEANUP_REMOVED_NAMES=()
   CLEANUP_TASK_WORKSPACE_REMOVED=false; CLEANUP_LOCAL_BRANCH_REMOVED=false
+  if [ -L "$dir" ]; then
+    cleanup_add_blocker cleanup-ownership-mismatch "$dir"
+    return 1
+  fi
 
   if [ "$CLEANUP_PLAN_WRITER_COUNT" -gt 0 ]; then
     if [ -d "$dir" ]; then
-      cleanup_reconcile_writer_operations "$root" "$dir" "$journal_file"
+      cleanup_remove_local_writer_effects "$root" "$dir" "$branch" \
+        && cleanup_reconcile_writer_operations "$root" "$dir" "$journal_file"
     else
       cleanup_verify_external_writer_operations "$root" "$journal_file"
     fi || {
-      cleanup_add_blocker writer-recovery-blocked refs/heads/workbench-coordination/writer-claims
+      cleanup_add_blocker "${CLEANUP_WRITER_BLOCKER:-writer-recovery-blocked}" \
+        refs/heads/workbench-coordination/writer-claims
       return 1
     }
   fi
 
   for ((i=0; i<CLEANUP_PLAN_COUNT; i++)); do
-    name="${CLEANUP_PLAN_NAMES[$i]}"; wt="$dir/${CLEANUP_PLAN_PATHS[$i]}"
-    if [ -d "$wt" ]; then
-      operation_file="$dir/task/.workbench/writer-operations/${CLEANUP_PLAN_WORKTREE_OPERATION_IDS[$i]}.json"
-      writer_load_operation_final "$operation_file" || return 1
-      writer_marker_matches "$wt" "$WRITER_CODEBASE_ORIGIN" || return 1
-      common="$(cd "$wt" && git rev-parse --git-common-dir)" || return 1
-      clone="$(dirname "$(cd "$common" && pwd)")"
-      git -C "$clone" worktree remove "$wt" || return 1
-    fi
+    name="${CLEANUP_PLAN_NAMES[$i]}"
     CLEANUP_REMOVED_NAMES[$CLEANUP_REMOVED_COUNT]="$name"
     CLEANUP_REMOVED_COUNT=$((CLEANUP_REMOVED_COUNT + 1))
   done
@@ -6242,7 +6373,7 @@ cleanup_mark_completed_plan() {
 
 cmd_done_v2() {
   local id="$1" parent="$2" branch="$3" dir="$4" instance_id="$5" authorization_file="$6"
-  local root latest event terminal revision="" outcome target action_id="" wt name journal_rc stage helper
+  local root latest event lifecycle_actor terminal revision="" outcome target action_id="" wt name journal_rc stage helper
   local journal_file policy_file plan_file payload_file completed_file dirty
   local task_workspace=false local_branch=false intent="" manifest="" authorization_ref="" removal_plan=""
   local primary_digest stored_plan
@@ -6255,26 +6386,28 @@ cmd_done_v2() {
   CLEANUP_PLAN_OPERATION_IDS=(); CLEANUP_PLAN_WRITER_IDS=(); CLEANUP_PLAN_DISPOSITIONS=()
   journal_file="$(mktemp "${TMPDIR:-/tmp}/workbench-cleanup-journal.XXXXXX")"
 
-  if cleanup_journal_latest "$root" "$HOME_REPO" "$ISSUE" "$id" "$branch" > "$journal_file"; then
-    journal_rc=0
-  else
-    journal_rc=$?
-  fi
-  if [ "$journal_rc" -eq 2 ]; then
-    latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")" || {
-      cleanup_add_blocker lifecycle-write-failed "$branch"
-      rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
-    }
-    CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
-    cleanup_add_blocker cleanup-journal-unavailable "$branch"
-    rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
-  fi
-
   latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")" || {
     cleanup_add_blocker lifecycle-write-failed "$branch"
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
   }
   event="$(lifecycle_field "$latest" event)"
+  lifecycle_actor="$(lifecycle_field "$latest" actor)"
+  if cleanup_journal_latest "$root" "$HOME_REPO" "$ISSUE" "$id" "$branch" \
+    "$lifecycle_actor" > "$journal_file"; then
+    journal_rc=0
+  else
+    journal_rc=$?
+  fi
+  if [ "$journal_rc" -eq 3 ]; then
+    CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
+    cleanup_add_blocker cleanup-journal-untrusted "$branch"
+    rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
+  fi
+  if [ "$journal_rc" -eq 2 ]; then
+    CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
+    cleanup_add_blocker cleanup-journal-unavailable "$branch"
+    rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
+  fi
   if [ "$journal_rc" -eq 0 ]; then
     CLEANUP_CLAIM_ID="$(python3 "$helper" field "$journal_file" claim_id)"
     revision="$(python3 "$helper" field "$journal_file" revision)"
@@ -6285,6 +6418,11 @@ cmd_done_v2() {
     removal_plan="$(python3 "$helper" field "$journal_file" removal_plan_digest)"
     stage="$(python3 "$helper" field "$journal_file" stage)"
     cleanup_load_plan "$journal_file"
+    if ! cleanup_validate_retry_snapshot "$root" "$dir" "$branch" "$journal_file"; then
+      cleanup_add_blocker cleanup-journal-unreconciled "$branch"
+      rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
+        "$authorization_ref" "$revision" "$removal_plan" false false; return 1
+    fi
     if [ "$stage" = completed ]; then
       if [ -d "$dir" ] || git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
         cleanup_add_blocker cleanup-reconciliation-failed "$branch"

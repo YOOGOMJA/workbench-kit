@@ -1408,6 +1408,187 @@ def cmd_operation(args: argparse.Namespace) -> None:
             sys.stdout.write("{}={}\n".format(key, item))
 
 
+def exact_managed_path(root: Path, raw: str, field: str) -> Tuple[str, str]:
+    if not os.path.isabs(raw):
+        raise ValueError("{} must be an absolute path".format(field))
+    normalized = os.path.normpath(raw)
+    lexical = Path(normalized)
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("{} is outside the managed workspace".format(field)) from exc
+    current = root
+    if current.is_symlink():
+        raise ValueError("{} contains a symlink component".format(field))
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("{} contains a symlink component".format(field))
+    try:
+        root_real = root.resolve(strict=True)
+        real = lexical.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("{} is unavailable".format(field)) from exc
+    expected_real = root_real.joinpath(relative)
+    if real != expected_real:
+        raise ValueError("{} lexical and real paths do not match".format(field))
+    return normalized, str(real)
+
+
+def exact_git_path(root: Path, repository: str, argument: str, field: str) -> Tuple[str, str]:
+    raw = git_value(Path(repository), "rev-parse", argument)
+    if not os.path.isabs(raw):
+        raw = os.path.normpath(os.path.join(repository, raw))
+    try:
+        relative = Path(raw).resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise ValueError("{} is outside the managed workspace".format(field)) from exc
+    return exact_managed_path(root, str(root.joinpath(relative)), field)
+
+
+def exact_worktree_record(clone: str, worktree: str, branch: str) -> None:
+    raw = subprocess.check_output(
+        ["git", "-C", clone, "worktree", "list", "--porcelain", "-z"],
+        stderr=subprocess.DEVNULL,
+    )
+    matches = []
+    branch_matches = []
+    for block in raw.split(b"\0\0"):
+        fields: Dict[str, Optional[str]] = {}
+        for encoded in block.strip(b"\0").split(b"\0"):
+            if not encoded:
+                continue
+            key_raw, separator, value_raw = encoded.partition(b" ")
+            key = key_raw.decode("ascii")
+            if key in fields:
+                raise ValueError("duplicate worktree porcelain field")
+            fields[key] = value_raw.decode("utf-8") if separator else None
+        if not fields:
+            continue
+        candidate = fields.get("worktree")
+        if isinstance(candidate, str) and os.path.realpath(candidate) == os.path.realpath(worktree):
+            matches.append(fields)
+        if fields.get("branch") == "refs/heads/" + branch:
+            branch_matches.append(fields)
+    if len(matches) != 1 or len(branch_matches) != 1 or matches[0] is not branch_matches[0]:
+        raise ValueError("cleanup worktree is not the exact pinned attachment")
+    record = matches[0]
+    if set(record) - {"worktree", "HEAD", "branch"}:
+        raise ValueError("cleanup worktree has an unsupported attachment state")
+
+
+def cmd_cleanup_descriptor(args: argparse.Namespace) -> None:
+    operation = load_operation(args.operation_file)
+    if not os.path.isabs(args.workspace_root):
+        raise ValueError("workspace root must be absolute")
+    root_raw = os.path.normpath(args.workspace_root)
+    root = Path(root_raw)
+    task_expected = os.path.join(
+        root_raw, ".worktrees", operation["branch"].replace("/", "__")
+    )
+    worktree_expected = os.path.join(task_expected, operation["expected_path"])
+    clone_expected = os.path.join(root_raw, ".codebases", operation["owner"])
+    task_arg = os.path.normpath(args.task_dir)
+    worktree_arg = os.path.normpath(args.worktree)
+    clone_arg = os.path.normpath(args.clone)
+    if task_arg != task_expected or worktree_arg != worktree_expected:
+        raise ValueError("cleanup worktree path does not bind the operation")
+    if clone_arg != clone_expected:
+        raise ValueError("cleanup clone path does not bind the registered owner")
+
+    task_lexical, task_real = exact_managed_path(root, task_arg, "task workspace")
+    worktree_lexical, worktree_real = exact_managed_path(root, worktree_arg, "worktree")
+    clone_lexical, clone_real = exact_managed_path(root, clone_arg, "clone")
+    task_common, task_common_real = exact_git_path(
+        root, task_arg, "--git-common-dir", "task common directory"
+    )
+    root_common, root_common_real = exact_git_path(
+        root, root_raw, "--git-common-dir", "workspace common directory"
+    )
+    if (task_common, task_common_real) != (root_common, root_common_real):
+        raise ValueError("cleanup task does not use the workspace common directory")
+    clone_common, clone_common_real = exact_git_path(
+        root, clone_arg, "--git-common-dir", "clone common directory"
+    )
+    clone_git_dir, clone_git_dir_real = exact_git_path(
+        root, clone_arg, "--absolute-git-dir", "clone git directory"
+    )
+    if (clone_common, clone_common_real) != (clone_git_dir, clone_git_dir_real):
+        raise ValueError("cleanup clone common directory is not its pinned admin directory")
+    worktree_common, worktree_common_real = exact_git_path(
+        root, worktree_arg, "--git-common-dir", "worktree common directory"
+    )
+    if (worktree_common, worktree_common_real) != (clone_common, clone_common_real):
+        raise ValueError("cleanup worktree does not use the pinned clone common directory")
+    worktree_git_dir, worktree_git_dir_real = exact_git_path(
+        root, worktree_arg, "--git-dir", "worktree git directory"
+    )
+
+    if git_value(Path(task_arg), "symbolic-ref", "--short", "HEAD") != operation["branch"]:
+        raise ValueError("cleanup task branch does not bind the operation")
+    if git_value(Path(task_arg), "remote", "get-url", "origin") != args.workspace_origin_url:
+        raise ValueError("cleanup task origin does not bind workspace authority")
+    if git_value(Path(clone_arg), "remote", "get-url", "origin") != operation["codebase_origin_url"]:
+        raise ValueError("cleanup clone origin does not bind the operation")
+    if git_value(Path(worktree_arg), "remote", "get-url", "origin") != operation["codebase_origin_url"]:
+        raise ValueError("cleanup worktree origin does not bind the operation")
+    if git_value(Path(worktree_arg), "symbolic-ref", "--short", "HEAD") != args.codebase_branch:
+        raise ValueError("cleanup worktree branch does not bind the task identity")
+    exact_worktree_record(clone_arg, worktree_arg, args.codebase_branch)
+
+    marker_path = os.path.join(worktree_git_dir, "workbench-writer-owner.json")
+    marker_lexical, marker_real = exact_managed_path(root, marker_path, "ownership marker")
+    raw_marker = Path(marker_path).read_bytes()
+    if not raw_marker.endswith(b"\n") or b"\r" in raw_marker:
+        raise ValueError("ownership marker is not canonical UTF-8 JSON")
+    marker = json.loads(raw_marker.decode("utf-8"), object_pairs_hook=unique_object)
+    expected_marker = {
+        "contract_version": "workbench-writer-worktree-owner/v1",
+        "operation_id": operation["operation_id"],
+        "claim_id": operation["claim_id"],
+        "task_claim_id": operation["task_claim_id"],
+        "expected_path": operation["expected_path"],
+        "branch": args.codebase_branch,
+        "codebase_origin_url": operation["codebase_origin_url"],
+    }
+    if marker != expected_marker or list(marker) != list(expected_marker):
+        raise ValueError("ownership marker does not bind the cleanup operation")
+
+    descriptor = {
+        "contract_version": "workbench-cleanup-worktree-ownership/v1",
+        "lexical_path": worktree_lexical,
+        "real_path": worktree_real,
+        "task_workspace": task_lexical,
+        "task_workspace_real": task_real,
+        "task_common_dir": task_common,
+        "task_common_dir_real": task_common_real,
+        "workspace_common_dir": root_common,
+        "workspace_common_dir_real": root_common_real,
+        "clone_path": clone_lexical,
+        "clone_real_path": clone_real,
+        "clone_common_dir": clone_common,
+        "clone_common_dir_real": clone_common_real,
+        "clone_git_dir": clone_git_dir,
+        "clone_git_dir_real": clone_git_dir_real,
+        "worktree_common_dir": worktree_common,
+        "worktree_common_dir_real": worktree_common_real,
+        "worktree_git_dir": worktree_git_dir,
+        "worktree_git_dir_real": worktree_git_dir_real,
+        "task_branch": operation["branch"],
+        "branch": args.codebase_branch,
+        "workspace_origin_url": args.workspace_origin_url,
+        "origin_url": operation["codebase_origin_url"],
+        "operation_id": operation["operation_id"],
+        "claim_id": operation["claim_id"],
+        "task_claim_id": operation["task_claim_id"],
+        "expected_path": operation["expected_path"],
+        "marker_path": marker_lexical,
+        "marker_real_path": marker_real,
+        "marker_digest": sha256(raw_marker),
+    }
+    write_json(descriptor)
+
+
 def parse_worktree_porcelain(file: str) -> List[Dict[str, Any]]:
     with open(file, "rb") as handle:
         raw = handle.read()
@@ -1517,6 +1698,15 @@ def parser() -> argparse.ArgumentParser:
     operation.add_argument("file")
     operation.add_argument("--format", choices=("json", "shell"), required=True)
     operation.set_defaults(func=cmd_operation)
+    cleanup_descriptor = commands.add_parser("cleanup-descriptor")
+    cleanup_descriptor.add_argument("--workspace-root", required=True)
+    cleanup_descriptor.add_argument("--workspace-origin-url", required=True)
+    cleanup_descriptor.add_argument("--task-dir", required=True)
+    cleanup_descriptor.add_argument("--worktree", required=True)
+    cleanup_descriptor.add_argument("--clone", required=True)
+    cleanup_descriptor.add_argument("--operation-file", required=True)
+    cleanup_descriptor.add_argument("--codebase-branch", required=True)
+    cleanup_descriptor.set_defaults(func=cmd_cleanup_descriptor)
     operation_status = commands.add_parser("operation-status")
     operation_status.add_argument("--operation-file", required=True)
     operation_status.add_argument("--ledger-file", required=True)

@@ -142,6 +142,17 @@ case "${1:-} ${2:-}" in
     fi
     cat "$body_file" >> "$GH_COMMENTS_DIR/$issue.comments"
     printf '\n' >> "$GH_COMMENTS_DIR/$issue.comments"
+    if [ -n "${GH_CLEANUP_RACE_DIRTY_WORKTREE:-}" ] \
+      && grep -Fq '"stage":"prepared"' "$body_file"; then
+      printf '%s\n' dirty-after-prepared > "$GH_CLEANUP_RACE_DIRTY_WORKTREE/RACE.txt"
+    fi
+    if [ -n "${GH_CLEANUP_RACE_SYMLINK_WORKTREE:-}" ] \
+      && [ -n "${GH_CLEANUP_RACE_SYMLINK_TARGET:-}" ] \
+      && grep -Fq '"stage":"prepared"' "$body_file"; then
+      mv "$GH_CLEANUP_RACE_SYMLINK_WORKTREE" \
+        "$GH_CLEANUP_RACE_SYMLINK_WORKTREE.original"
+      ln -s "$GH_CLEANUP_RACE_SYMLINK_TARGET" "$GH_CLEANUP_RACE_SYMLINK_WORKTREE"
+    fi
     ;;
   "pr view")
     if [[ "$*" == *"--json state,headRefOid,mergeCommit"* ]]; then
@@ -223,6 +234,7 @@ if [ "$command" = lifecycle ]; then
   python3 - "$repository" "$issue" "${GH_COMMENTS_DIR:-}/$issue.comments" <<'PY'
 import json
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -232,12 +244,30 @@ origin = subprocess.check_output(
 ).strip()
 comments = pathlib.Path(sys.argv[3])
 body = comments.read_text(encoding="utf-8") if comments.exists() else ""
+fixture_comments = list(re.finditer(
+    r"<!-- fixture-comment-author:([^\r\n ]+) -->\n(.*?)<!-- fixture-comment-end -->\n?",
+    body,
+    re.DOTALL,
+))
+trusted_body = re.sub(
+    r"<!-- fixture-comment-author:[^\r\n ]+ -->\n.*?<!-- fixture-comment-end -->\n?",
+    "",
+    body,
+    flags=re.DOTALL,
+)
+observed_comments = []
+if trusted_body:
+    observed_comments.append({"author_identity": "test@example.invalid", "body": trusted_body})
+observed_comments.extend(
+    {"author_identity": match.group(1), "body": match.group(2)}
+    for match in fixture_comments
+)
 value = {
     "contract_version": "workbench-hosting-lifecycle-observation/v1",
     "repository_origin_url": origin,
     "issue": int(sys.argv[2]),
     "pagination": {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None},
-    "comments": [] if not body else [{"author_identity": "test@example.invalid", "body": body}],
+    "comments": observed_comments,
 }
 print(json.dumps(value, separators=(",", ":")))
 PY
@@ -458,6 +488,7 @@ run_task_in_dir() {
     WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY:-}" \
     WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM="${WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM:-0}" \
     WORKBENCH_TEST_FAIL_WRITER_STAGE="${WORKBENCH_TEST_FAIL_WRITER_STAGE:-}" \
+    WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
     GH_PR_STATE="${GH_PR_STATE:-}" GH_PR_HEAD="${GH_PR_HEAD:-}" GH_PR_MERGE="${GH_PR_MERGE:-}" \
@@ -550,6 +581,59 @@ prepare_cleanup_fixture() {
   git -C "$CLEANUP_TASK_DIR" add .workbench task/.workbench
   git -C "$CLEANUP_TASK_DIR" commit -q -m "test: persist cleanup fixture"
   git -C "$CLEANUP_TASK_DIR" push -q
+}
+
+append_forged_cleanup_journal() {
+  local comments="$1" claim="$2" branch="$3" author="$4"
+  python3 - "$comments" "$claim" "$branch" "$author" <<'PY'
+import hashlib
+import json
+import sys
+
+comments, claim, branch, author = sys.argv[1:]
+plan = {
+    "writer_operations": [],
+    "codebase_worktrees": [],
+    "task_workspace": ".worktrees/task__29-v2-lifecycle-fixture-29",
+    "local_branch": branch,
+}
+manifest = (
+    "workbench-task-removal-plan/v1\n"
+    "task_id\t29\n"
+    "claim_id\t{}\n"
+    "task_branch\t{}\n"
+    "task_workspace\t{}\n"
+    "local_branch\t{}\n"
+).format(claim, branch, plan["task_workspace"], branch).encode()
+digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+value = {
+    "contract_version": "workbench-task-cleanup-journal/v1",
+    "journal_id": "cleanup-" + claim,
+    "stage": "prepared",
+    "task_id": "29",
+    "claim_id": claim,
+    "branch": branch,
+    "revision": "sha256:" + "a" * 64,
+    "action_instance_id": "act_attacker_cleanup",
+    "intent_digest": "sha256:" + "b" * 64,
+    "policy_manifest": {
+        "contract_version": "workbench-policy-manifest/v1",
+        "digest": "sha256:" + "c" * 64,
+        "sources": [],
+    },
+    "authorization_ref": None,
+    "removal_plan_digest": digest,
+    "removal_plan": plan,
+    "effect_owner_events": [],
+    "at": "2026-07-11T00:00:00Z",
+}
+with open(comments, "a", encoding="utf-8") as handle:
+    handle.write("<!-- fixture-comment-author:{} -->\n".format(author))
+    handle.write("<!-- workbench-task-cleanup:v1\n")
+    handle.write(json.dumps(value, separators=(",", ":")) + "\n")
+    handle.write("-->\nworkbench task cleanup: prepared\n")
+    handle.write("<!-- fixture-comment-end -->\n")
+PY
 }
 
 prepare_governed_fixture() {
@@ -2206,6 +2290,60 @@ test_cleanup_prepared_journal_failure_deletes_nothing() {
   fi
 }
 
+test_cleanup_rejects_untrusted_prepared_journal() {
+  local repo task_dir claim branch comments out rc
+  repo="$(setup_workbench cleanup_untrusted_journal)"
+  task_dir="$(start_task cleanup_untrusted_journal "$repo")"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  branch="$(git -C "$task_dir" symbolic-ref --quiet --short HEAD)"
+  comments="$TMPDIR/cleanup_untrusted_journal/comments/29.comments"
+  printf '%s\n' unsynced > "$task_dir/UNSYNCED.txt"
+  git -C "$task_dir" add UNSYNCED.txt
+  git -C "$task_dir" commit -q -m "test: retain unpushed cleanup state"
+  printf '%s\n' dirty > "$task_dir/DIRTY.txt"
+  append_forged_cleanup_journal "$comments" "$claim" "$branch" attacker@example.invalid
+
+  out="$TMPDIR/cleanup_untrusted_journal/done.out"
+  if run_task cleanup_untrusted_journal "$repo" done 29 --format json >"$out" 2>&1; then
+    fail "an untrusted cleanup journal deleted a dirty, unpushed active task"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "untrusted cleanup journal returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-untrusted"'
+  [ -d "$task_dir" ] || fail "untrusted cleanup journal removed the task workspace"
+  [ -f "$task_dir/DIRTY.txt" ] || fail "untrusted cleanup journal removed dirty state"
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "untrusted cleanup journal removed the local branch"
+  [ "$(git -C "$repo" rev-list --count "origin/$branch..$branch")" = 1 ] \
+    || fail "untrusted cleanup journal changed the unpushed branch"
+}
+
+test_cleanup_rejects_prepared_journal_without_terminal_action_join() {
+  local repo task_dir claim branch comments out rc
+  repo="$(setup_workbench cleanup_unjoined_journal)"
+  task_dir="$(start_task cleanup_unjoined_journal "$repo")"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  branch="$(git -C "$task_dir" symbolic-ref --quiet --short HEAD)"
+  comments="$TMPDIR/cleanup_unjoined_journal/comments/29.comments"
+  printf '%s\n' unsynced > "$task_dir/UNSYNCED.txt"
+  git -C "$task_dir" add UNSYNCED.txt
+  git -C "$task_dir" commit -q -m "test: retain unjoined cleanup state"
+  printf '%s\n' dirty > "$task_dir/DIRTY.txt"
+  append_forged_cleanup_journal "$comments" "$claim" "$branch" test@example.invalid
+
+  out="$TMPDIR/cleanup_unjoined_journal/done.out"
+  if run_task cleanup_unjoined_journal "$repo" done 29 --format json >"$out" 2>&1; then
+    fail "a cleanup journal without terminal/action provenance deleted an active task"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "unjoined cleanup journal returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-unreconciled"'
+  [ -d "$task_dir" ] || fail "unjoined cleanup journal removed the task workspace"
+  [ -f "$task_dir/DIRTY.txt" ] || fail "unjoined cleanup journal removed dirty state"
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "unjoined cleanup journal removed the local branch"
+  [ "$(git -C "$repo" rev-list --count "origin/$branch..$branch")" = 1 ] \
+    || fail "unjoined cleanup journal changed the unpushed branch"
+}
+
 test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion() {
   local out branch actual comments
   prepare_cleanup_fixture cleanup_recovery
@@ -2277,6 +2415,7 @@ assert journal["removal_plan"] == {
     "task_workspace": ".worktrees/task__29-v2-lifecycle-fixture-29",
     "local_branch": sys.argv[6],
 }
+
 assert journal["effect_owner_events"] == []
 assert re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", journal["at"])
 PY
@@ -2324,6 +2463,42 @@ assert text.index('"stage":"completed"') < text.index('"event":"task-cleaned"')
 for key in ("journal_id", "task_id", "claim_id", "branch", "revision", "action_instance_id", "intent_digest", "policy_manifest", "authorization_ref", "removal_plan_digest", "removal_plan", "effect_owner_events"):
     assert journals[0][key] == journals[1][key]
 PY
+}
+
+test_cleanup_deleted_retry_rejects_tampered_immutable_intent() {
+  local out comments rc
+  prepare_cleanup_fixture cleanup_tampered_retry
+  out="$TMPDIR/cleanup_tampered_retry/completed-failure.out"
+  if GH_FAIL_CLEANUP_STAGE=completed \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_tampered_retry "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>/dev/null; then
+    fail "cleanup fixture must stop after deleting the workspace"
+  fi
+  [ ! -d "$CLEANUP_TASK_DIR" ] || fail "tampered retry fixture retained its workspace"
+  comments="$TMPDIR/cleanup_tampered_retry/comments/29.comments"
+  python3 - "$comments" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text, count = re.subn(
+    r'(<!-- workbench-task-cleanup:v1\n[^\r\n]*"intent_digest":")sha256:[0-9a-f]{64}("[^\r\n]*\n-->)',
+    lambda match: match.group(1) + 'sha256:' + 'f' * 64 + match.group(2),
+    text,
+)
+assert count == 1, count
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(text)
+PY
+  out="$TMPDIR/cleanup_tampered_retry/retry.out"
+  if run_task cleanup_tampered_retry "$CLEANUP_REPO" done 29 --format json >"$out" 2>&1; then
+    fail "deleted cleanup retry accepted an intent-tampered authenticated journal"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "tampered deleted retry returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-unreconciled"'
 }
 
 test_v2_cleanup_requires_terminal_outcome_even_with_force() {
@@ -3410,7 +3585,7 @@ PY
 
 test_cleanup_retires_consumed_writer_before_local_deletion() {
   local task_dir actual operation_id claim_id ledger ref comments operation gitdir marker backup out
-  local observation revision legacy_adapter
+  local observation revision legacy_adapter frozen_task_oid
   setup_writer_workbench writer_cleanup
   printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
   git -C "$WRITER_REPO" add .workbench/policy.conf
@@ -3503,6 +3678,7 @@ PY
     git -C "$task_dir" commit -q -m "test: persist writer terminal state"
   fi
   git -C "$task_dir" push -q
+  frozen_task_oid="$(git -C "$task_dir" rev-parse HEAD)"
   actual="$(WORKBENCH_TRUSTED_LEGACY_ADAPTER="$legacy_adapter" \
     run_task writer_cleanup "$WRITER_REPO" status --format json)"
   assert_contains "$actual" "\"claim_id\":\"$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")\""
@@ -3515,6 +3691,9 @@ PY
   fi
   assert_file_contains "$out" '"code":"cleanup-journal-unavailable"'
   [ ! -d "$task_dir" ] || fail "prepared writer cleanup did not remove the task workspace"
+  [ "$(git --git-dir="$TMPDIR/writer_cleanup/origin.git" \
+    rev-parse refs/heads/task/29-v2-lifecycle-fixture-29)" = "$frozen_task_oid" ] \
+    || fail "cleanup rewrote frozen terminal task content"
   out="$TMPDIR/writer_cleanup/retry-after-deletion.out"
   if run_task writer_cleanup "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
     actual="$(cat "$out")"
@@ -3558,6 +3737,292 @@ assert [(item["state"], item["phase"]) for item in events] == [
 assert all(item["operation_id"] == sys.argv[2] and item["claim_id"] == sys.argv[3] for item in events)
 for previous, current in zip(documents, documents[1:]):
     assert current["effect_owner_events"][:len(previous["effect_owner_events"])] == previous["effect_owner_events"]
+PY
+}
+
+test_cleanup_removal_failure_keeps_remote_claim_reserved() {
+  local task_dir actual operation_id claim_id worktree out rc ledger ref
+  setup_writer_workbench cleanup_removal_failure
+  printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
+  git -C "$WRITER_REPO" add .workbench/policy.conf
+  git -C "$WRITER_REPO" commit -q -m "test: allow cleanup removal failure fixture"
+  git -C "$WRITER_REPO" push -q
+  prepare_writer_task cleanup_removal_failure 29 cleanup; task_dir="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir cleanup_removal_failure "$task_dir" add-repo shared-api --format json)"
+  operation_id="$(json_get "$actual" operation_id)"
+  claim_id="$(json_get "$actual" claim_id)"
+  worktree="$task_dir/task/codebases/shared-api"
+  run_task_in_dir cleanup_removal_failure "$task_dir" abandon \
+    --reason-code superseded --reason-ref issue:78 --format json >/dev/null
+  git -C "$task_dir" add task
+  if ! git -C "$task_dir" diff --cached --quiet; then
+    git -C "$task_dir" commit -q -m "test: persist removal failure terminal"
+  fi
+  git -C "$task_dir" push -q
+
+  out="$TMPDIR/cleanup_removal_failure/done.out"
+  if GH_CLEANUP_RACE_DIRTY_WORKTREE="$worktree" \
+    run_task cleanup_removal_failure "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
+    fail "cleanup unexpectedly removed a worktree changed after its prepared journal"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "cleanup removal failure returned $rc"
+  [ -d "$task_dir" ] || fail "cleanup removal failure removed the outer task workspace"
+  [ -f "$worktree/RACE.txt" ] || fail "cleanup removal race did not reach the worktree"
+
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/cleanup_removal_failure/writer-claims.tsv"
+  git --git-dir="$TMPDIR/cleanup_removal_failure/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert claims[-1][-1] == "active", claims
+assert effects[-1][-1] == "acquired", effects
+PY
+}
+
+test_cleanup_rejects_symlinked_external_worktree_with_copied_marker() {
+  local task_dir actual operation_id claim_id worktree external original_gitdir external_gitdir
+  local out rc ledger ref
+  setup_writer_workbench cleanup_symlink_ownership
+  printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
+  git -C "$WRITER_REPO" add .workbench/policy.conf
+  git -C "$WRITER_REPO" commit -q -m "test: allow cleanup ownership fixture"
+  git -C "$WRITER_REPO" push -q
+  prepare_writer_task cleanup_symlink_ownership 29 cleanup; task_dir="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir cleanup_symlink_ownership "$task_dir" add-repo shared-api --format json)"
+  operation_id="$(json_get "$actual" operation_id)"
+  claim_id="$(json_get "$actual" claim_id)"
+  worktree="$task_dir/task/codebases/shared-api"
+  external="$TMPDIR/cleanup_symlink_ownership/external-shared-api"
+  git clone -q "$TMPDIR/cleanup_symlink_ownership/shared-api.git" "$external"
+  git -C "$external" switch -q -c task/29-v2-lifecycle-fixture-29 origin/main
+  original_gitdir="$(git -C "$worktree" rev-parse --git-dir)"
+  external_gitdir="$(git -C "$external" rev-parse --git-dir)"
+  case "$original_gitdir" in /*) ;; *) original_gitdir="$worktree/$original_gitdir" ;; esac
+  case "$external_gitdir" in /*) ;; *) external_gitdir="$external/$external_gitdir" ;; esac
+  cp "$original_gitdir/workbench-writer-owner.json" \
+    "$external_gitdir/workbench-writer-owner.json"
+  run_task_in_dir cleanup_symlink_ownership "$task_dir" abandon \
+    --reason-code superseded --reason-ref issue:79 --format json >/dev/null
+  git -C "$task_dir" add task
+  if ! git -C "$task_dir" diff --cached --quiet; then
+    git -C "$task_dir" commit -q -m "test: persist ownership terminal"
+  fi
+  git -C "$task_dir" push -q
+
+  out="$TMPDIR/cleanup_symlink_ownership/done.out"
+  if GH_CLEANUP_RACE_SYMLINK_WORKTREE="$worktree" \
+    GH_CLEANUP_RACE_SYMLINK_TARGET="$external" \
+    run_task cleanup_symlink_ownership "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
+    fail "cleanup accepted a symlinked external worktree with a copied marker"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "symlinked cleanup ownership returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-ownership-mismatch"'
+  [ -L "$worktree" ] || fail "cleanup ownership check replaced the attack symlink"
+  [ -d "$external" ] || fail "cleanup ownership check removed the external worktree"
+  [ -d "$worktree.original" ] || fail "cleanup ownership check removed the owned worktree"
+
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/cleanup_symlink_ownership/writer-claims.tsv"
+  git --git-dir="$TMPDIR/cleanup_symlink_ownership/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert claims[-1][-1] == "active", claims
+assert effects[-1][-1] == "acquired", effects
+PY
+}
+
+test_cleanup_revalidates_exact_descriptor_before_removal() {
+  local task_dir actual operation_id claim_id worktree hook out rc ledger ref
+  setup_writer_workbench cleanup_descriptor_race
+  printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
+  git -C "$WRITER_REPO" add .workbench/policy.conf
+  git -C "$WRITER_REPO" commit -q -m "test: allow cleanup descriptor fixture"
+  git -C "$WRITER_REPO" push -q
+  prepare_writer_task cleanup_descriptor_race 29 cleanup; task_dir="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir cleanup_descriptor_race "$task_dir" add-repo shared-api --format json)"
+  operation_id="$(json_get "$actual" operation_id)"
+  claim_id="$(json_get "$actual" claim_id)"
+  worktree="$task_dir/task/codebases/shared-api"
+  hook="$TMPDIR/cleanup_descriptor_race/replace-worktree"
+  cat > "$hook" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+worktree="$1"
+origin="$2"
+branch="$3"
+original_gitdir="$(git -C "$worktree" rev-parse --git-dir)"
+case "$original_gitdir" in /*) ;; *) original_gitdir="$worktree/$original_gitdir" ;; esac
+mv "$worktree" "$worktree.original"
+git clone -q "$origin" "$worktree"
+git -C "$worktree" switch -q -c "$branch" origin/main
+replacement_gitdir="$(git -C "$worktree" rev-parse --git-dir)"
+case "$replacement_gitdir" in /*) ;; *) replacement_gitdir="$worktree/$replacement_gitdir" ;; esac
+cp "$original_gitdir/workbench-writer-owner.json" \
+  "$replacement_gitdir/workbench-writer-owner.json"
+EOF
+  chmod +x "$hook"
+  run_task_in_dir cleanup_descriptor_race "$task_dir" abandon \
+    --reason-code superseded --reason-ref issue:80 --format json >/dev/null
+  git -C "$task_dir" add task
+  if ! git -C "$task_dir" diff --cached --quiet; then
+    git -C "$task_dir" commit -q -m "test: persist descriptor terminal"
+  fi
+  git -C "$task_dir" push -q
+
+  out="$TMPDIR/cleanup_descriptor_race/done.out"
+  if WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="$hook" \
+    run_task cleanup_descriptor_race "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
+    fail "cleanup accepted a worktree replaced after its ownership snapshot"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "descriptor replacement returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-ownership-mismatch"'
+  [ -d "$worktree" ] || fail "descriptor mismatch removed the replacement worktree"
+  [ -d "$worktree.original" ] || fail "descriptor mismatch removed the owned worktree"
+
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/cleanup_descriptor_race/writer-claims.tsv"
+  git --git-dir="$TMPDIR/cleanup_descriptor_race/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert claims[-1][-1] == "active", claims
+assert effects[-1][-1] == "acquired", effects
+PY
+}
+
+test_cleanup_descriptor_pins_task_and_clone_common_dirs() {
+  local task_dir actual operation_id operation worktree clone workspace_origin codebase_branch
+  local helper alien_task alien_clone task_gitfile clone_admin out
+  setup_writer_workbench cleanup_common_dirs
+  prepare_writer_task cleanup_common_dirs 29 cleanup; task_dir="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir cleanup_common_dirs "$task_dir" add-repo shared-api --format json)"
+  operation_id="$(json_get "$actual" operation_id)"
+  operation="$task_dir/task/.workbench/writer-operations/$operation_id.json"
+  worktree="$task_dir/task/codebases/shared-api"
+  clone="$WRITER_REPO/.codebases/shared-api"
+  workspace_origin="$(git -C "$WRITER_REPO" remote get-url origin)"
+  codebase_branch="$(git -C "$worktree" symbolic-ref --short HEAD)"
+  helper="$WRITER_REPO/lib/workbench_writer.py"
+  python3 "$helper" cleanup-descriptor --workspace-root "$WRITER_REPO" \
+    --workspace-origin-url "$workspace_origin" --task-dir "$task_dir" \
+    --worktree "$worktree" --clone "$clone" --operation-file "$operation" \
+    --codebase-branch "$codebase_branch" >/dev/null \
+    || fail "canonical cleanup descriptor fixture was rejected"
+
+  git -C "$worktree" switch -q -c cleanup-wrong-branch
+  out="$TMPDIR/cleanup_common_dirs/wrong-branch.out"
+  if python3 "$helper" cleanup-descriptor --workspace-root "$WRITER_REPO" \
+    --workspace-origin-url "$workspace_origin" --task-dir "$task_dir" \
+    --worktree "$worktree" --clone "$clone" --operation-file "$operation" \
+    --codebase-branch "$codebase_branch" >"$out" 2>&1; then
+    fail "cleanup descriptor accepted the wrong worktree branch"
+  fi
+  git -C "$worktree" switch -q "$codebase_branch"
+  git -C "$worktree" branch -D cleanup-wrong-branch >/dev/null
+
+  git -C "$worktree" remote set-url origin "$TMPDIR/cleanup_common_dirs/wrong-origin.git"
+  out="$TMPDIR/cleanup_common_dirs/wrong-origin.out"
+  if python3 "$helper" cleanup-descriptor --workspace-root "$WRITER_REPO" \
+    --workspace-origin-url "$workspace_origin" --task-dir "$task_dir" \
+    --worktree "$worktree" --clone "$clone" --operation-file "$operation" \
+    --codebase-branch "$codebase_branch" >"$out" 2>&1; then
+    fail "cleanup descriptor accepted the wrong worktree origin"
+  fi
+  git -C "$worktree" remote set-url origin "$TMPDIR/cleanup_common_dirs/shared-api.git"
+
+  alien_task="$TMPDIR/cleanup_common_dirs/alien-task"
+  git clone -q "$TMPDIR/cleanup_common_dirs/origin.git" "$alien_task"
+  git -C "$alien_task" switch -q -c task/29-v2-lifecycle-fixture-29 \
+    origin/task/29-v2-lifecycle-fixture-29
+  task_gitfile="$task_dir/.git"
+  cp "$task_gitfile" "$task_gitfile.saved"
+  printf 'gitdir: %s/.git\n' "$alien_task" > "$task_gitfile"
+  out="$TMPDIR/cleanup_common_dirs/task-common.out"
+  if python3 "$helper" cleanup-descriptor --workspace-root "$WRITER_REPO" \
+    --workspace-origin-url "$workspace_origin" --task-dir "$task_dir" \
+    --worktree "$worktree" --clone "$clone" --operation-file "$operation" \
+    --codebase-branch "$codebase_branch" >"$out" 2>&1; then
+    fail "cleanup descriptor accepted a task detached from the workspace common directory"
+  fi
+  mv "$task_gitfile.saved" "$task_gitfile"
+
+  alien_clone="$TMPDIR/cleanup_common_dirs/alien-clone-admin"
+  clone_admin="$clone/.git"
+  mv "$clone_admin" "$alien_clone"
+  printf 'gitdir: %s\n' "$alien_clone" > "$clone_admin"
+  out="$TMPDIR/cleanup_common_dirs/clone-common.out"
+  if python3 "$helper" cleanup-descriptor --workspace-root "$WRITER_REPO" \
+    --workspace-origin-url "$workspace_origin" --task-dir "$task_dir" \
+    --worktree "$worktree" --clone "$clone" --operation-file "$operation" \
+    --codebase-branch "$codebase_branch" >"$out" 2>&1; then
+    fail "cleanup descriptor accepted a clone detached from its pinned admin directory"
+  fi
+}
+
+test_cleanup_rejects_broken_symlink_worktree() {
+  local task_dir actual operation_id claim_id worktree missing out rc ledger ref
+  setup_writer_workbench cleanup_broken_symlink
+  printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
+  git -C "$WRITER_REPO" add .workbench/policy.conf
+  git -C "$WRITER_REPO" commit -q -m "test: allow broken symlink cleanup fixture"
+  git -C "$WRITER_REPO" push -q
+  prepare_writer_task cleanup_broken_symlink 29 cleanup; task_dir="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir cleanup_broken_symlink "$task_dir" add-repo shared-api --format json)"
+  operation_id="$(json_get "$actual" operation_id)"
+  claim_id="$(json_get "$actual" claim_id)"
+  worktree="$task_dir/task/codebases/shared-api"
+  missing="$TMPDIR/cleanup_broken_symlink/missing-target"
+  run_task_in_dir cleanup_broken_symlink "$task_dir" abandon \
+    --reason-code superseded --reason-ref issue:81 --format json >/dev/null
+  git -C "$task_dir" add task
+  if ! git -C "$task_dir" diff --cached --quiet; then
+    git -C "$task_dir" commit -q -m "test: persist broken symlink terminal"
+  fi
+  git -C "$task_dir" push -q
+
+  out="$TMPDIR/cleanup_broken_symlink/done.out"
+  if GH_CLEANUP_RACE_SYMLINK_WORKTREE="$worktree" \
+    GH_CLEANUP_RACE_SYMLINK_TARGET="$missing" \
+    run_task cleanup_broken_symlink "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
+    fail "cleanup treated a broken worktree symlink as an absent owned effect"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "broken symlink cleanup returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-ownership-mismatch"'
+  [ -L "$worktree" ] || fail "cleanup removed the broken worktree symlink"
+  [ -d "$worktree.original" ] || fail "cleanup removed the owned worktree behind the symlink"
+
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/cleanup_broken_symlink/writer-claims.tsv"
+  git --git-dir="$TMPDIR/cleanup_broken_symlink/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert claims[-1][-1] == "active", claims
+assert effects[-1][-1] == "acquired", effects
 PY
 }
 
@@ -3982,7 +4447,10 @@ run_case test_terminal_outcome_freezes_mutations_and_verification_is_read_only
 run_case test_terminal_lifecycle_rejects_post_terminal_reactivation
 run_case test_forged_local_terminal_has_no_freeze_or_outcome_authority
 run_case test_cleanup_prepared_journal_failure_deletes_nothing
+run_case test_cleanup_rejects_untrusted_prepared_journal
+run_case test_cleanup_rejects_prepared_journal_without_terminal_action_join
 run_case test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion
+run_case test_cleanup_deleted_retry_rejects_tampered_immutable_intent
 run_case test_v2_cleanup_requires_terminal_outcome_even_with_force
 run_case test_writer_claim_cas_retry_rechecks_conflict_before_local_creation
 run_case test_writer_local_failure_releases_remote_claim_before_new_id
@@ -4003,6 +4471,11 @@ run_case test_writer_persists_allow_replacement_before_first_effect
 run_case test_writer_authority_revalidation_fails_closed_without_compensation
 run_case test_terminal_writer_verification_joins_exact_record_and_lifecycle_provenance
 run_case test_cleanup_retires_consumed_writer_before_local_deletion
+run_case test_cleanup_removal_failure_keeps_remote_claim_reserved
+run_case test_cleanup_rejects_symlinked_external_worktree_with_copied_marker
+run_case test_cleanup_revalidates_exact_descriptor_before_removal
+run_case test_cleanup_descriptor_pins_task_and_clone_common_dirs
+run_case test_cleanup_rejects_broken_symlink_worktree
 run_case test_status_reports_concurrent_writer_conflicts
 run_case test_v2_submit_reconciles_durable_submission_without_v1_fallback
 run_case test_lifecycle_parser_is_strict_trusted_and_key_order_independent
