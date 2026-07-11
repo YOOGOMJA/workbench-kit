@@ -27,6 +27,7 @@ root_tests=(
   tests/check-marketplace-parity-guard.sh
   tests/check-plugin-suite-guard.sh
   tests/check-reader-docs.sh
+  tests/check-release-gate.sh
   tests/check-repository-gate-guard.sh
 )
 
