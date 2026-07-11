@@ -191,6 +191,7 @@ expected_supported = {
     "policy_authority_receipt_contracts": ["workbench-policy-authority-receipt/v1"],
     "context_policy_contracts": ["workbench-context-policy-registration/v1", "workbench-context-policy-set/v1"],
     "authorization_contracts": ["workbench-authorization/v1"],
+    "applied_effect_contracts": ["workbench-applied-action-provenance/v1"],
     "action_intent_contracts": [
         "workbench-action-request/v1", "workbench-action-intent/v1",
         "workbench-task-complete-intent/v1", "workbench-task-abandon-intent/v1",
@@ -228,6 +229,7 @@ expected_supported = {
 }
 expected_capabilities = [
     "engine.manifest/v1", "knowledge.applicability/v1", "policy.authority/v1", "policy.authorization/v1",
+    "policy.applied-effect-recovery/v1",
     "policy.context-set/v1", "policy.intent/v1", "policy.resolve/v1",
     "profile.language/v1", "task.acceptance/v1", "task.abandonment/v1",
     "task.cleanup/v1", "task.completion/v1", "task.contract/v2",
@@ -327,6 +329,64 @@ for item in nodes:
         assert item["digest"] == "sha256:" + hashlib.sha256(target.encode("utf-8")).hexdigest()
     else:
         assert item["node_type"] == "directory" and item["link_target"] is None
+PY
+}
+
+test_engine_manifest_rejects_links_and_path_swap() {
+  local repo bundle external out err rc
+  repo="$(make_workspace engine_manifest_links workbench/v2)"
+  bundle="$TMPDIR/engine-manifest-bundle"
+  cp -R "$ROOT" "$bundle"
+  external="$TMPDIR/external-engine-bytes"
+  printf '%s\n' external > "$external"
+  ln "$external" "$bundle/external-hardlink"
+  out="$TMPDIR/engine-manifest-hardlink.out"; err="$TMPDIR/engine-manifest-hardlink.err"
+  if (cd "$repo" && CLAUDE_PLUGIN_ROOT="$bundle" "$bundle/bin/workbench" \
+    engine-manifest show --format json) >"$out" 2>"$err"; then
+    fail "engine manifest must reject a file hardlinked outside the bundle"
+  else rc=$?; fi
+  assert_eq 1 "$rc" "hardlink rejection is a state failure"
+  [ ! -s "$out" ] || fail "hardlink rejection must emit no partial manifest"
+  rm "$bundle/external-hardlink"
+
+  printf '%s\n' first > "$bundle/first-link"
+  ln "$bundle/first-link" "$bundle/second-link"
+  if (cd "$repo" && CLAUDE_PLUGIN_ROOT="$bundle" "$bundle/bin/workbench" \
+    engine-manifest show --format json) >"$out" 2>"$err"; then
+    fail "engine manifest must reject two names for one in-bundle inode"
+  fi
+  [ ! -s "$out" ] || fail "same-tree hardlink rejection must emit no partial manifest"
+  rm "$bundle/first-link" "$bundle/second-link"
+
+  PYTHONPATH="$bundle/lib" python3 - "$bundle" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+import workbench_manifest
+
+root = Path(sys.argv[1])
+target = root / "skills-lock.json"
+replacement = root / ".replacement-skills-lock"
+replacement.write_text('{"replacement":true}\n', encoding="utf-8")
+real_open = workbench_manifest.os.open
+swapped = False
+
+def racing_open(path, flags, *args, **kwargs):
+    global swapped
+    if Path(path) == target and not swapped:
+        swapped = True
+        os.replace(replacement, target)
+    return real_open(path, flags, *args, **kwargs)
+
+workbench_manifest.os.open = racing_open
+try:
+    workbench_manifest.manifest(root)
+except ValueError:
+    pass
+else:
+    raise AssertionError("lstat-to-open path replacement was accepted")
+assert swapped
 PY
 }
 
@@ -1330,6 +1390,7 @@ test_policy_uses_canonical_authority_from_a_linked_worktree() {
 
 test_contract_show_rejects_invalid_inputs_without_partial_json() {
   local repo out err outside rc
+  local -a args
   repo="$(make_workspace invalid_schema workbench/v3)"
   out="$TMPDIR/invalid-schema.out"; err="$TMPDIR/invalid-schema.err"
   if run_workbench "$repo" contract show --format json >"$out" 2>"$err"; then
@@ -1352,6 +1413,20 @@ test_contract_show_rejects_invalid_inputs_without_partial_json() {
   else rc=$?; fi
   assert_eq 2 "$rc" "every physical line after the schema ID is invalid"
   [ ! -s "$out" ] || fail "three-line marker must emit no partial JSON"
+
+  printf 'workbench/v2\n\n' > "$repo/.workbench/schema"
+  for entrypoint in profile doctor legacy-inventory; do
+    case "$entrypoint" in
+      profile) args=(profile show --format json) ;;
+      doctor) args=(doctor --format json) ;;
+      legacy-inventory) args=(legacy-inventory show --format json) ;;
+    esac
+    if run_workbench "$repo" "${args[@]}" >"$out" 2>"$err"; then
+      fail "$entrypoint accepted a schema marker with a trailing blank line"
+    fi
+    assert_file_contains "$err" "schema marker"
+    [ ! -s "$out" ] || fail "$entrypoint schema failure emitted partial JSON"
+  done
 
   repo="$(make_workspace invalid_format workbench/v2)"
   if run_workbench "$repo" contract show --format yaml >"$out" 2>"$err"; then
@@ -1670,6 +1745,7 @@ run_case test_fixture_reuse_fails_before_git_mutation
 run_case test_contract_show_reads_implicit_v1
 run_case test_contract_show_advertises_the_frozen_g0_surface
 run_case test_public_engine_manifest_is_complete_and_canonical
+run_case test_engine_manifest_rejects_links_and_path_swap
 run_case test_workspace_authority_descriptor_binds_workspace_home
 run_case test_action_request_binds_the_exact_effect_intent
 run_case test_applied_effect_reducer_recovers_without_reauthorization

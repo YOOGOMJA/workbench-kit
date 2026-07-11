@@ -51,12 +51,58 @@ def require_path_text(value: str, field: str) -> None:
         raise ValueError("{} contains an unsupported path value".format(field))
 
 
-def plugin_version(root: Path) -> str:
+def secure_regular_bytes(path: Path, before: os.stat_result) -> bytes:
+    if before.st_nlink != 1:
+        raise ValueError("regular plugin files must have exactly one link: {}".format(path))
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("platform does not support no-follow plugin inspection")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            stat.S_IFMT(value.st_mode),
+            stat.S_IMODE(value.st_mode),
+            value.st_nlink,
+        )
+        if identity(opened) != identity(before) or not stat.S_ISREG(opened.st_mode):
+            raise ValueError("plugin file changed between lstat and no-follow open")
+        signature = lambda value: (
+            *identity(value),
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if signature(after) != signature(opened):
+            raise ValueError("plugin file changed while being hashed")
+        current = path.lstat()
+        if signature(current) != signature(after):
+            raise ValueError("plugin file path changed while being hashed")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def plugin_version(root: Path, nodes: Sequence[Dict[str, Any]]) -> str:
+    by_path = {node["path"]: node for node in nodes}
     versions = []
     for relative in (".claude-plugin/plugin.json", ".codex-plugin/plugin.json"):
         path = root / relative
-        with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle, object_pairs_hook=unique_object)
+        raw = secure_regular_bytes(path, path.lstat())
+        if by_path.get(relative, {}).get("digest") != sha256(raw):
+            raise ValueError("{} changed during manifest inspection".format(relative))
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
         if not isinstance(value, dict) or value.get("name") != PLUGIN_NAME:
             raise ValueError("{} does not identify the workbench plugin".format(relative))
         version = value.get("version")
@@ -89,7 +135,7 @@ def scan_node(root: Path, relative: str) -> Tuple[Dict[str, Any], List[Dict[str,
     info = path.lstat()
     if stat.S_ISREG(info.st_mode):
         node_type = "file"
-        digest = sha256(path.read_bytes())
+        digest = sha256(secure_regular_bytes(path, info))
         link_target = None
         descendants: List[Dict[str, Any]] = []
     elif stat.S_ISLNK(info.st_mode):
@@ -141,9 +187,9 @@ def scan_node(root: Path, relative: str) -> Tuple[Dict[str, Any], List[Dict[str,
 def manifest(root: Path) -> Dict[str, Any]:
     if not root.is_dir():
         raise ValueError("plugin root is not a directory")
-    version = plugin_version(root)
     root_node, descendants = scan_node(root, ".")
     nodes = sorted([root_node, *descendants], key=lambda item: item["path"])
+    version = plugin_version(root, nodes)
     excluded_paths = [
         {"path": path, "match": match} for path, match in EXCLUDED_PATHS
     ]
@@ -187,7 +233,10 @@ def cmd_show(args: argparse.Namespace) -> None:
 
 
 def cmd_version(args: argparse.Namespace) -> None:
-    sys.stdout.write(plugin_version(Path(args.plugin_root).resolve()) + "\n")
+    root = Path(args.plugin_root).resolve()
+    root_node, descendants = scan_node(root, ".")
+    nodes = sorted([root_node, *descendants], key=lambda item: item["path"])
+    sys.stdout.write(plugin_version(root, nodes) + "\n")
 
 
 def parser() -> argparse.ArgumentParser:

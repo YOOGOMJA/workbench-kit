@@ -1039,6 +1039,7 @@ def cmd_contract(args: argparse.Namespace) -> None:
                 "workbench-context-policy-set/v1",
             ],
             "authorization_contracts": ["workbench-authorization/v1"],
+            "applied_effect_contracts": ["workbench-applied-action-provenance/v1"],
             "action_intent_contracts": [
                 "workbench-action-request/v1",
                 "workbench-action-intent/v1",
@@ -1113,6 +1114,7 @@ def cmd_contract(args: argparse.Namespace) -> None:
             "knowledge.applicability/v1",
             "policy.authority/v1",
             "policy.authorization/v1",
+            "policy.applied-effect-recovery/v1",
             "policy.context-set/v1",
             "policy.intent/v1",
             "policy.resolve/v1",
