@@ -59,6 +59,12 @@ jobs:
       - name: Plugin version sync
         run: bash scripts/check-version-sync.sh
 
+      - name: Marketplace parity
+        run: bash tests/check-marketplace-parity.sh
+
+      - name: Marketplace parity guard tests
+        run: bash tests/check-marketplace-parity-guard.sh
+
       - name: ShellCheck
         run: |
           files=()

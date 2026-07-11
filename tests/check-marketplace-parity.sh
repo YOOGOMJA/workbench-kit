@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 - "$ROOT" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 
@@ -54,10 +55,26 @@ def entries_by_name(document, relative):
 
 
 expected = {"workbench", "workbench-kit", "toolbox"}
+expected_marketplace = "workbench-kit"
+semver = re.compile(
+    r"^(0|[1-9][0-9]*)\."
+    r"(0|[1-9][0-9]*)\."
+    r"(0|[1-9][0-9]*)"
+    r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
 claude_path = ".claude-plugin/marketplace.json"
 codex_path = ".agents/plugins/marketplace.json"
-claude = entries_by_name(load_json(claude_path), claude_path)
-codex = entries_by_name(load_json(codex_path), codex_path)
+claude_document = load_json(claude_path)
+codex_document = load_json(codex_path)
+
+for relative, document in ((claude_path, claude_document), (codex_path, codex_document)):
+    if document.get("name") != expected_marketplace:
+        raise SystemExit(f"{relative}: marketplace name must be {expected_marketplace}")
+
+claude = entries_by_name(claude_document, claude_path)
+codex = entries_by_name(codex_document, codex_path)
 
 for relative, actual in ((claude_path, set(claude)), (codex_path, set(codex))):
     if actual != expected:
@@ -65,6 +82,7 @@ for relative, actual in ((claude_path, set(claude)), (codex_path, set(codex))):
         extra = sorted(actual - expected)
         raise SystemExit(f"{relative}: plugin parity mismatch; missing={missing}, extra={extra}")
 
+versions = {}
 for name in sorted(expected):
     plugin_root = f"./plugins/{name}"
     if claude[name].get("source") != plugin_root:
@@ -79,11 +97,20 @@ for name in sorted(expected):
         manifest = load_json(str(manifest_path))
         if manifest.get("name") != name:
             raise SystemExit(f"{manifest_path}: manifest name must be {name}")
+        version = manifest.get("version")
+        if not isinstance(version, str) or semver.fullmatch(version) is None:
+            raise SystemExit(f"{manifest_path}: version must be valid SemVer")
+        versions[str(manifest_path)] = version
+
+unique_versions = set(versions.values())
+if len(versions) != 6 or len(unique_versions) != 1:
+    details = ", ".join(f"{path}={version}" for path, version in sorted(versions.items()))
+    raise SystemExit(f"plugin manifest versions must match across all six files: {details}")
 
 if not claude["toolbox"].get("description", "").startswith("Optional"):
     raise SystemExit(f"{claude_path}: toolbox must be described as optional")
 if not codex["toolbox"].get("description", "").startswith("Optional"):
     raise SystemExit(f"{codex_path}: toolbox must be described as optional")
 
-print("OK marketplace parity: 3 plugins, 6 manifests")
+print(f"OK marketplace parity: 3 plugins, 6 manifests at {unique_versions.pop()}")
 PY

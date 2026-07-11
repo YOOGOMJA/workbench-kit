@@ -14,6 +14,7 @@ grep -q '## \[Unreleased\]' CHANGELOG.md || { echo "CHANGELOG.md has no [Unrelea
 echo "== bump =="      ; bash scripts/bump-version.sh "$V"
 echo "== checks =="
 bash scripts/check-version-sync.sh
+bash tests/check-marketplace-parity.sh
 bash tests/check-skill-frontmatter.sh
 bash tests/check-install-model.sh
 bash plugins/workbench-kit/tests/run.sh >/dev/null
