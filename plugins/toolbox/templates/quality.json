@@ -1,0 +1,8 @@
+{
+  "schema": "toolbox-quality/v1",
+  "development": {
+    "tdd": "required",
+    "designSystem": "required"
+  },
+  "checks": []
+}

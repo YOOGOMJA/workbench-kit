@@ -12,6 +12,11 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ### Added
 
+- **Optional `toolbox` foundation** — adds cross-tool plugin manifests, a public
+  workbench/profile compatibility adapter, profile-bound product language,
+  caller-contained strict JSON state, and deterministic product, scenario, and portfolio
+  validation (#28). Marketplace registration and full product-delivery workflows remain
+  follow-up work.
 - **Frozen released-section guard** — a CI `changelog-frozen` job
   (`scripts/check-changelog-section.sh`) fails any PR that adds a CHANGELOG entry under an
   already-released `## [X.Y.Z]` section instead of `## [Unreleased]`, so an in-flight PR
@@ -40,6 +45,13 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   shared by the engine, migration flow, and optional packs (#25). This change defines the
   contract only; CLI and migration
   implementation remain in follow-up issues.
+
+### Fixed
+
+- **Task commit subject policy enforcement** — the `workbench` plugin now rejects
+  invalid `workbench task commit` subjects and audits raw/bypassed task commits in
+  `workbench task check`, restoring current workbench Conventional Commits behavior while
+  keeping the policy logic in one extension point (#22).
 
 ## [0.1.1] - 2026-06-17
 

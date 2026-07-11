@@ -1,0 +1,4 @@
+interface:
+  display_name: "Start a Product"
+  short_description: "Initialize governed toolbox product state"
+  default_prompt: "Use $product-start to initialize a product in this workbench."

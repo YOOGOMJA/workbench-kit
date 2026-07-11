@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# toolbox - stable dispatcher for the optional product-delivery capability pack.
+set -euo pipefail
+
+ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PYTHON="${TOOLBOX_PYTHON:-python3}"
+
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+  echo "toolbox: Python 3.9 or newer is required (command not found: $PYTHON)" >&2
+  exit 1
+fi
+
+if ! "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)'; then
+  echo "toolbox: Python 3.9 or newer is required" >&2
+  exit 1
+fi
+
+export TOOLBOX_PLUGIN_ROOT="$ROOT"
+exec "$PYTHON" -B "$ROOT/lib/toolbox.py" "$@"
