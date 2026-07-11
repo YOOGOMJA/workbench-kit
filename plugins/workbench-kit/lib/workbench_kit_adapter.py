@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 from collections.abc import Sequence
 from typing import Any
@@ -263,6 +264,310 @@ def run_public_json(
         completed.returncode,
         source_digest(completed.stdout),
     )
+
+
+def _git_read(
+    workspace: pathlib.Path,
+    argv: Sequence[str],
+    allowed_exits: set[int] = {0},
+) -> tuple[bytes, int]:
+    environment = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(workspace), *argv],
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+    except OSError as error:
+        raise AdapterError("public-state-unavailable", "git " + " ".join(argv)) from error
+    if completed.returncode not in allowed_exits:
+        raise AdapterError("public-state-unavailable", "git " + " ".join(argv))
+    return completed.stdout, completed.returncode
+
+
+def _worktree_manifest(root: pathlib.Path) -> dict[str, tuple[str, int, bytes | str | None]]:
+    manifest: dict[str, tuple[str, int, bytes | str | None]] = {}
+
+    def visit(directory: pathlib.Path, prefix: pathlib.PurePosixPath) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError as error:
+            raise AdapterError("public-state-unavailable", str(directory)) from error
+        for entry in entries:
+            if not prefix.parts and entry.name == ".git":
+                continue
+            relative_path = prefix / entry.name
+            relative = relative_path.as_posix()
+            path = pathlib.Path(entry.path)
+            try:
+                node = os.lstat(path)
+            except OSError as error:
+                raise AdapterError("public-state-unavailable", relative) from error
+            mode = stat.S_IMODE(node.st_mode)
+            if stat.S_ISLNK(node.st_mode):
+                try:
+                    target = os.readlink(path)
+                except OSError as error:
+                    raise AdapterError("public-state-unavailable", relative) from error
+                manifest[relative] = ("symlink", mode, target)
+            elif stat.S_ISREG(node.st_mode):
+                try:
+                    content = path.read_bytes()
+                    verified = os.lstat(path)
+                except OSError as error:
+                    raise AdapterError("public-state-unavailable", relative) from error
+                if (
+                    (node.st_dev, node.st_ino, node.st_size, node.st_mtime_ns)
+                    != (verified.st_dev, verified.st_ino, verified.st_size, verified.st_mtime_ns)
+                    or len(content) != node.st_size
+                ):
+                    raise AdapterError("public-state-unavailable", relative)
+                manifest[relative] = ("file", mode, content)
+            elif stat.S_ISDIR(node.st_mode):
+                manifest[relative] = ("directory", mode, None)
+                visit(path, relative_path)
+            else:
+                raise AdapterError("public-state-unavailable", relative)
+
+    visit(root, pathlib.PurePosixPath())
+    return manifest
+
+
+def _git_file(path: pathlib.Path) -> tuple[bool, int | None, bytes | None]:
+    try:
+        node = os.lstat(path)
+    except FileNotFoundError:
+        return False, None, None
+    except OSError as error:
+        raise AdapterError("public-state-unavailable", str(path)) from error
+    if not stat.S_ISREG(node.st_mode) or stat.S_ISLNK(node.st_mode):
+        raise AdapterError("public-state-unavailable", str(path))
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise AdapterError("public-state-unavailable", str(path)) from error
+    return True, stat.S_IMODE(node.st_mode), content
+
+
+def _parse_refs(raw: bytes) -> dict[str, tuple[str, str | None]]:
+    refs: dict[str, tuple[str, str | None]] = {}
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise AdapterError("public-state-unavailable", "git refs") from error
+    for line in text.splitlines():
+        parts = line.split("\0")
+        if len(parts) != 3 or not parts[0] or not parts[1] or parts[0] in refs:
+            raise AdapterError("public-state-unavailable", "git refs")
+        refs[parts[0]] = (parts[1], parts[2] or None)
+    return refs
+
+
+def _capture_caller_state(workspace: pathlib.Path) -> dict[str, Any]:
+    git_dir_raw, _ = _git_read(workspace, ("rev-parse", "--absolute-git-dir"))
+    try:
+        git_dir = pathlib.Path(git_dir_raw.decode("utf-8", errors="strict").strip()).resolve()
+    except UnicodeDecodeError as error:
+        raise AdapterError("public-state-unavailable", "git directory") from error
+    symbolic, symbolic_status = _git_read(
+        workspace, ("symbolic-ref", "--quiet", "HEAD"), {0, 1}
+    )
+    head, head_status = _git_read(
+        workspace, ("rev-parse", "--verify", "HEAD"), {0, 128}
+    )
+    refs_raw, _ = _git_read(
+        workspace,
+        ("for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"),
+    )
+    porcelain, _ = _git_read(
+        workspace, ("status", "--porcelain=v2", "--untracked-files=all")
+    )
+    return {
+        "root_mode": stat.S_IMODE(os.lstat(workspace).st_mode),
+        "worktree": _worktree_manifest(workspace),
+        "git_dir": str(git_dir),
+        "head_symbolic": symbolic if symbolic_status == 0 else None,
+        "head_oid": head if head_status == 0 else None,
+        "refs": _parse_refs(refs_raw),
+        "porcelain": porcelain,
+        "index": _git_file(git_dir / "index"),
+        "fetch_head": _git_file(git_dir / "FETCH_HEAD"),
+    }
+
+
+def _remove_node(path: pathlib.Path) -> None:
+    node = os.lstat(path)
+    if stat.S_ISDIR(node.st_mode) and not stat.S_ISLNK(node.st_mode):
+        os.chmod(path, 0o700)
+        for child in list(path.iterdir()):
+            _remove_node(child)
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _restore_worktree(workspace: pathlib.Path, state: dict[str, Any]) -> None:
+    os.chmod(workspace, 0o700)
+    manifest = state["worktree"]
+    current = _worktree_manifest(workspace)
+    for relative in sorted(
+        (
+            path
+            for path, value in current.items()
+            if path not in manifest or manifest[path][0] != value[0]
+        ),
+        key=lambda path: (path.count("/"), path),
+        reverse=True,
+    ):
+        target = workspace.joinpath(*pathlib.PurePosixPath(relative).parts)
+        try:
+            _remove_node(target)
+        except FileNotFoundError:
+            pass
+    directories = sorted(
+        (path for path, value in manifest.items() if value[0] == "directory"),
+        key=lambda path: (path.count("/"), path),
+    )
+    for relative in directories:
+        target = workspace.joinpath(*pathlib.PurePosixPath(relative).parts)
+        if not target.exists():
+            target.mkdir()
+    for relative, (kind, mode, payload) in sorted(manifest.items()):
+        if kind == "directory":
+            continue
+        target = workspace.joinpath(*pathlib.PurePosixPath(relative).parts)
+        if current.get(relative) == (kind, mode, payload):
+            continue
+        try:
+            _remove_node(target)
+        except FileNotFoundError:
+            pass
+        if kind == "file":
+            target.write_bytes(payload)
+            os.chmod(target, mode)
+        else:
+            os.symlink(payload, target)
+    for relative in reversed(directories):
+        _, mode, _ = manifest[relative]
+        os.chmod(workspace.joinpath(*pathlib.PurePosixPath(relative).parts), mode)
+    os.chmod(workspace, state["root_mode"])
+
+
+def _git_write(workspace: pathlib.Path, argv: Sequence[str]) -> None:
+    _git_read(workspace, argv)
+
+
+def _restore_git_state(workspace: pathlib.Path, state: dict[str, Any]) -> None:
+    refs = state["refs"]
+    for ref, (oid, symref) in sorted(refs.items()):
+        if symref is None:
+            _git_write(workspace, ("update-ref", ref, oid))
+        else:
+            _git_write(workspace, ("symbolic-ref", ref, symref))
+    symbolic = state["head_symbolic"]
+    if symbolic is not None:
+        target = symbolic.decode("utf-8", errors="strict").strip()
+        _git_write(workspace, ("symbolic-ref", "HEAD", target))
+    elif state["head_oid"] is not None:
+        oid_value = state["head_oid"].decode("ascii").strip()
+        _git_write(workspace, ("update-ref", "--no-deref", "HEAD", oid_value))
+    current_raw, _ = _git_read(
+        workspace,
+        ("for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"),
+    )
+    for ref in sorted(set(_parse_refs(current_raw)) - set(refs)):
+        _git_write(workspace, ("update-ref", "-d", ref))
+    git_dir = pathlib.Path(state["git_dir"])
+    for name, snapshot in (
+        ("index", state["index"]),
+        ("FETCH_HEAD", state["fetch_head"]),
+    ):
+        path = git_dir / name
+        exists, mode, content = snapshot
+        if exists:
+            path.write_bytes(content)
+            os.chmod(path, mode)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _restore_caller_state(workspace: pathlib.Path, state: dict[str, Any]) -> None:
+    try:
+        _restore_worktree(workspace, state)
+        _restore_git_state(workspace, state)
+        if _capture_caller_state(workspace) != state:
+            raise AdapterError("public-adapter-restore-failed", str(workspace))
+    except AdapterError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise AdapterError("public-adapter-restore-failed", str(workspace)) from error
+
+
+def _task_claim(document: dict[str, Any], branch: str) -> dict[str, Any]:
+    ref = "workbench task status"
+    if document.get("contract_version") != "workbench-task-status/v2":
+        raise AdapterError("public-task-status-invalid", ref)
+    tasks = require_array(document.get("tasks"), f"{ref}.tasks")
+    blockers = require_array(
+        document.get("writer_integrity_blockers"),
+        f"{ref}.writer_integrity_blockers",
+    )
+    require_array(document.get("writer_conflicts"), f"{ref}.writer_conflicts")
+    if blockers:
+        raise AdapterError("public-task-status-invalid", f"{ref}.writer_integrity_blockers")
+    required = (
+        "claim_id",
+        "task_contract",
+        "branch",
+        "workspace_authority_descriptor_digest",
+        "context_ref",
+        "work_ref",
+        "work_owners",
+    )
+    normalized = []
+    for offset, value in enumerate(tasks):
+        task = require_object(value, f"{ref}.tasks[{offset}]")
+        if any(field not in task for field in required):
+            raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}]")
+        for field in ("claim_id", "branch"):
+            if (
+                not isinstance(task[field], str)
+                or not task[field]
+                or any(ord(char) < 32 or ord(char) == 127 for char in task[field])
+            ):
+                raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].{field}")
+        if task["task_contract"] != "workbench-task/v2":
+            raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].task_contract")
+        if (
+            not isinstance(task["workspace_authority_descriptor_digest"], str)
+            or SHA256.fullmatch(task["workspace_authority_descriptor_digest"]) is None
+        ):
+            raise AdapterError(
+                "public-task-status-invalid",
+                f"{ref}.tasks[{offset}].workspace_authority_descriptor_digest",
+            )
+        for field in ("context_ref", "work_ref"):
+            if task[field] is not None and (
+                not isinstance(task[field], str)
+                or not task[field]
+                or any(ord(char) < 32 or ord(char) == 127 for char in task[field])
+            ):
+                raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].{field}")
+        owners = require_array(task["work_owners"], f"{ref}.tasks[{offset}].work_owners")
+        if (
+            any(not isinstance(owner, str) or not owner for owner in owners)
+            or owners != sorted(set(owners))
+        ):
+            raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].work_owners")
+        normalized.append({field: task[field] for field in required})
+    matches = [task for task in normalized if task["branch"] == branch]
+    if len(matches) != 1:
+        raise AdapterError("public-task-status-invalid", branch)
+    return matches[0]
 
 
 def validate_contract(
@@ -803,7 +1108,7 @@ def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> N
         raise AdapterError("public-contract-invalid", f"{ref}.digest")
 
 
-def inspect_public_kernel(
+def _inspect_public_kernel(
     workspace: pathlib.Path,
     authority_approval_file: pathlib.Path | None = None,
     inventory_mode: str | None = None,
@@ -894,4 +1199,54 @@ def inspect_public_kernel(
             "content_revision": manifest["source"]["revision"],
             "manifest_digest": manifest["digest"],
         }
+    if schema == "workbench/v2" and doctor["ready"]:
+        task_status, _, task_status_source_digest = run_public_json(
+            binary, ("task", "status", "--format", "json"), workspace, {0}
+        )
+        branch_raw, _ = _git_read(
+            workspace, ("symbolic-ref", "--quiet", "--short", "HEAD")
+        )
+        try:
+            branch = branch_raw.decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError as error:
+            raise AdapterError("public-task-status-invalid", "HEAD") from error
+        snapshot["task_status"] = task_status
+        snapshot["task_status_projection"] = {
+            "contract_version": task_status.get("contract_version"),
+            "object_digest": canonical_digest(task_status),
+            "source_digest": task_status_source_digest,
+        }
+        snapshot["migration_task_claim"] = _task_claim(task_status, branch)
     return snapshot
+
+
+def inspect_public_kernel(
+    workspace: pathlib.Path,
+    authority_approval_file: pathlib.Path | None = None,
+    inventory_mode: str | None = None,
+    include_engine_manifest: bool = False,
+) -> dict[str, Any]:
+    workspace = workspace.resolve()
+    before = _capture_caller_state(workspace)
+    result: dict[str, Any] | None = None
+    failure: BaseException | None = None
+    try:
+        result = _inspect_public_kernel(
+            workspace,
+            authority_approval_file,
+            inventory_mode,
+            include_engine_manifest,
+        )
+    except BaseException as error:
+        failure = error
+    try:
+        after = _capture_caller_state(workspace)
+    except BaseException:
+        after = None
+    if after != before:
+        _restore_caller_state(workspace, before)
+        raise AdapterError("public-adapter-mutated", str(workspace)) from failure
+    if failure is not None:
+        raise failure
+    assert result is not None
+    return result

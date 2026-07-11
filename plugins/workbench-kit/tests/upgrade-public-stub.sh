@@ -18,6 +18,14 @@ if [ "$(cat .workbench/schema 2>/dev/null || true)" = "workbench/v2" ]; then
   workspace_source=marker
 fi
 
+if [ "$mode" = mutate-state ] && [ "$*" = "contract show --format json" ]; then
+  printf 'public adapter mutation\n' > adapter-mutation
+  git add adapter-mutation
+  git update-ref refs/heads/adapter-mutation HEAD
+  git symbolic-ref HEAD refs/heads/adapter-mutation
+  printf 'mutated fetch state\n' > "$(git rev-parse --absolute-git-dir)/FETCH_HEAD"
+fi
+
 case "$*" in
   "contract show --format json")
     root="$PWD"
@@ -82,8 +90,24 @@ case "$*" in
       failure='{"code":"pagination-incomplete","ref":"workbench:home/workbench","cursor":"cursor-2"}'
       status=1
     fi
-    printf '{"contract_version":"workbench-legacy-inventory/v1","source_revision":"1111111111111111111111111111111111111111","authority":{"authority_identity":"github:example/workbench","default_ref":"refs/heads/main","default_revision":"1111111111111111111111111111111111111111","descriptor_digest":"%s","bootstrap_revision":"0000000000000000000000000000000000000000"},"home_set":{"contract_version":"workbench-legacy-home-set/v1","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_revision":"1111111111111111111111111111111111111111"},"homes":[{"home":"workbench","origin_url":"https://github.com/example/workbench.git","membership":"current","pagination":{"complete":%s,"pages_fetched":1,"end_cursor":null,"failure":%s},"claims":[{"claim_id":"task__workbench__40-cleaned","task_claim_id":"task__workbench__40-cleaned","task_contract":"workbench-task/v1","issue":40,"home":"workbench","parent":null,"branch":"task/40-cleaned","lifecycle_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","lifecycle_state":"task-cleaned","classification":"cleaned-v1","submission":null,"source_revision":null,"pr_head_revision":null,"ancestry_complete":false,"repos":[]},{"claim_id":"task__workbench__55-legacy","task_claim_id":"task__workbench__55-legacy","task_contract":"workbench-task/v1","issue":55,"home":"workbench","parent":null,"branch":"task/55-legacy","lifecycle_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","lifecycle_state":"task-claimed","classification":"active-v1","submission":null,"source_revision":"2222222222222222222222222222222222222222","pr_head_revision":null,"ancestry_complete":true,"repos":[]}]}],"active_claims":[],"origin_replacements":[{"home":"workbench","previous_origin_url":"https://github.com/example/workbench.git","current_origin_url":"https://github.com/example/workbench.git","status":"unchanged"}],"complete":%s,"blockers":%s}\n' \
+    printf '{"contract_version":"workbench-legacy-inventory/v1","source_revision":"1111111111111111111111111111111111111111","authority":{"authority_identity":"github:example/workbench","default_ref":"refs/heads/main","default_revision":"1111111111111111111111111111111111111111","descriptor_digest":"%s","bootstrap_revision":"0000000000000000000000000000000000000000"},"home_set":{"contract_version":"workbench-legacy-home-set/v1","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_revision":"1111111111111111111111111111111111111111"},"homes":[{"home":"workbench","origin_url":"https://github.com/example/workbench.git","membership":"current","pagination":{"complete":%s,"pages_fetched":1,"end_cursor":null,"failure":%s},"claims":[{"claim_id":"a-cleaned-40","task_claim_id":"a-cleaned-40","task_contract":"workbench-task/v1","issue":40,"home":"workbench","parent":null,"branch":"task/40-cleaned","lifecycle_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","lifecycle_state":"task-cleaned","classification":"cleaned-v1","submission":null,"source_revision":null,"pr_head_revision":null,"ancestry_complete":false,"repos":[]},{"claim_id":"claim-27","task_claim_id":"claim-27","task_contract":"workbench-task/v1","issue":27,"home":"workbench","parent":null,"branch":"task/27-upgrade","lifecycle_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","lifecycle_state":"task-claimed","classification":"active-v1","submission":null,"source_revision":"2222222222222222222222222222222222222222","pr_head_revision":null,"ancestry_complete":true,"repos":[]}]}],"active_claims":[],"origin_replacements":[{"home":"workbench","previous_origin_url":"https://github.com/example/workbench.git","current_origin_url":"https://github.com/example/workbench.git","status":"unchanged"}],"complete":%s,"blockers":%s}\n' \
       "$descriptor_digest" "$pagination_complete" "$failure" "$complete" "$blockers"
+    exit "$status"
+    ;;
+  "task status --format json")
+    [ "$workspace_schema" = workbench/v2 ] || exit 92
+    branch="$(git symbolic-ref --quiet --short HEAD)"
+    row='{"claim_id":"claim-27","task_contract":"workbench-task/v2","branch":"'"$branch"'","workspace_authority_descriptor_digest":"'"$descriptor_digest"'","context_ref":null,"work_ref":null,"work_owners":[],"future_task_field":true}'
+    tasks="[$row]"
+    blockers='[]'
+    status=0
+    [ "$mode" != task-status-duplicate ] || tasks="[$row,$row]"
+    if [ "$mode" = task-status-blocker ]; then
+      blockers='[{"code":"task-status-identity-unreconciled","ref":"task/index.md"}]'
+      status=1
+    fi
+    printf '{"contract_version":"workbench-task-status/v2","tasks":%s,"writer_conflicts":[],"writer_integrity_blockers":%s,"future_status_field":true}\n' \
+      "$tasks" "$blockers"
     exit "$status"
     ;;
   "engine-manifest show --format json")

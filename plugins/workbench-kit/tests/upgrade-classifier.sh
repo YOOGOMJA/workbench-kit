@@ -335,6 +335,41 @@ with tempfile.TemporaryDirectory(prefix="workbench-classifier-") as temporary:
     assert result["language"] == "en"
     assert diagnose(root, "workbench/v2", False)["classification"] == "indeterminate"
 
+    root = base / "generic-current"
+    generic_descriptor = {
+        **descriptor,
+        "hosting_adapter": None,
+        "hosting_ref": None,
+    }
+    write(root, ".workbench/schema", b"workbench/v2\n")
+    write(
+        root,
+        ".workbench/profile.conf",
+        b"# operator preference\n\nlanguage=ko\nschema=workbench-profile/v1\n",
+    )
+    write(
+        root,
+        ".workbench/policy.conf",
+        (
+            b"# conservative workspace policy\n"
+            b"action.task.cleanup=deny\n\n"
+            b"schema=workbench-policy/v1\n"
+            b"action.task.complete=allow\n"
+            b"action.task.concurrent-write=ask\n"
+        ),
+    )
+    write(
+        root,
+        ".workbench/authority.json",
+        json.dumps(
+            dict(reversed(list(generic_descriptor.items()))),
+            separators=(",", ":"),
+        ).encode() + b"\n",
+    )
+    result = diagnose(root, "workbench/v2", True)
+    assert result["classification"] == "already-current", result
+    assert result["language"] == "ko"
+
     root = base / "current-generation-provenance"
     migration = migration_candidate(root)
     (root / ".workbench/migration.json").unlink()

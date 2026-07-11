@@ -395,15 +395,24 @@ def normalized_object(value: dict[str, Any], fields: Iterable[str]) -> dict[str,
     return {field: value[field] for field in fields}
 
 
-def validate_descriptor(value: Any) -> dict[str, Any]:
+def validate_descriptor(
+    value: Any, *, require_hosting: bool = False
+) -> dict[str, Any]:
     descriptor = exact_object(value, DESCRIPTOR_FIELDS, "proposed_descriptor")
     if descriptor["contract_version"] != "workbench-workspace-authority/v1":
         fail("proposed_descriptor.contract_version")
     for field in (
         "authority_identity", "origin_url", "default_ref", "workspace_home",
-        "hosting_adapter", "hosting_ref",
     ):
         text(descriptor[field], f"proposed_descriptor.{field}", ascii_only=True)
+    hosting = (descriptor["hosting_adapter"], descriptor["hosting_ref"])
+    if (hosting[0] is None) != (hosting[1] is None):
+        fail("proposed_descriptor.hosting_adapter")
+    if require_hosting and hosting[0] is None:
+        fail("proposed_descriptor.hosting_adapter")
+    if hosting[0] is not None:
+        text(hosting[0], "proposed_descriptor.hosting_adapter", ascii_only=True)
+        text(hosting[1], "proposed_descriptor.hosting_ref", ascii_only=True)
     default_ref = descriptor["default_ref"]
     if DEFAULT_REF.fullmatch(default_ref) is None or ".." in default_ref or "//" in default_ref:
         fail("proposed_descriptor.default_ref")
@@ -423,7 +432,9 @@ def validate_authority_approval(value: Any) -> dict[str, Any]:
     if approval["contract_version"] != "workbench-bootstrap-authority-approval/v1":
         fail("bootstrap-authority-approval.contract_version")
     text(approval["approval_id"], "approval_id", ascii_only=True)
-    descriptor = validate_descriptor(approval["proposed_descriptor"])
+    descriptor = validate_descriptor(
+        approval["proposed_descriptor"], require_hosting=True
+    )
     revision = oid(approval["default_revision"], "default_revision")
     protection = exact_object(approval["protection"], PROTECTION_FIELDS, "protection")
     if protection["ref"] != descriptor["default_ref"]:
@@ -450,8 +461,6 @@ def validate_authority_approval(value: Any) -> dict[str, Any]:
 
 def parse_authority_approval(raw: bytes) -> dict[str, Any]:
     receipt = validate_authority_approval(strict_load(raw, "bootstrap-authority-approval"))
-    if raw != canonical_bytes(receipt):
-        fail("bootstrap-authority-approval", "canonical-source-required")
     return {
         "receipt": receipt,
         "object_digest": canonical_digest(receipt),
@@ -844,18 +853,12 @@ def validate_receipt_input(
     value: Any,
     ref: str,
     receipt_validator: Any,
-    *,
-    canonical_source_required: bool = False,
 ) -> dict[str, Any]:
     projection = exact_object(value, RECEIPT_INPUT_FIELDS, ref)
     receipt = receipt_validator(projection["receipt"])
     if digest(projection["object_digest"], f"{ref}.object_digest") != canonical_digest(receipt):
         fail(f"{ref}.object_digest")
-    source_digest = digest(projection["source_digest"], f"{ref}.source_digest")
-    if canonical_source_required and source_digest != canonical_digest(
-        canonical_bytes(receipt), raw=True
-    ):
-        fail(f"{ref}.source_digest")
+    digest(projection["source_digest"], f"{ref}.source_digest")
     projection["receipt"] = receipt
     return projection
 
@@ -1266,7 +1269,6 @@ def validate_plan(value: Any) -> dict[str, Any]:
             inputs["bootstrap_authority_approval"],
             "inputs.bootstrap_authority_approval",
             validate_authority_approval,
-            canonical_source_required=True,
         )
         if (
             inputs["bootstrap_authority_approval"]["receipt"]["default_revision"]

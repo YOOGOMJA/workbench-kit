@@ -199,7 +199,21 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
                 "descriptor_digest": canonical_digest(authority["proposed_descriptor"]),
             }
         },
-        "active_v1_tasks": [],
+        "active_v1_tasks": [{
+            "source": "legacy-inventory:homes[].claims",
+            "home": "workbench",
+            "claim_id": "claim-27",
+            "task_claim_id": "claim-27",
+            "task_contract": "workbench-task/v1",
+            "issue": 27,
+            "parent": None,
+            "branch": "task/27-upgrade",
+            "lifecycle_state": "task-claimed",
+            "lifecycle_digest": "sha256:" + "9" * 64,
+            "source_revision": "2" * 40,
+            "pr_head_revision": None,
+            "ancestry_complete": True,
+        }],
     }
     planner = {
         "contract_version": "workbench-kit-planner/v1",
@@ -706,6 +720,30 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
     old_binary = os.environ.get("WORKBENCH_KIT_WORKBENCH_BIN")
     old_approval = os.environ.get("UPGRADE_STUB_APPROVAL_FILE")
     old_descriptor = os.environ.get("UPGRADE_STUB_DESCRIPTOR_DIGEST")
+    missing_binary = str(pathlib.Path(temporary).resolve() / "missing-workbench")
+    os.environ["WORKBENCH_KIT_WORKBENCH_BIN"] = missing_binary
+    indeterminate_before = workspace_digest(cli_root)
+    indeterminate = dry_run_upgrade(cli_request, cli_bundle)
+    assert indeterminate == {
+        "contract_version": "workbench-kit-diagnosis/v1",
+        "classification": "indeterminate",
+        "embedded_engine": {
+            "state": "indeterminate",
+            "equivalence_receipt_digest": None,
+        },
+        "provenance": {
+            "kind": None,
+            "state": "indeterminate",
+            "receipt_digest": None,
+            "ref": None,
+        },
+        "language": None,
+        "blockers": [{
+            "code": "kernel-readiness-indeterminate",
+            "ref": missing_binary,
+        }],
+    }
+    assert workspace_digest(cli_root) == indeterminate_before
     os.environ["WORKBENCH_KIT_WORKBENCH_BIN"] = str(stub)
     os.environ["UPGRADE_STUB_APPROVAL_FILE"] = str(authority_path)
     os.environ["UPGRADE_STUB_DESCRIPTOR_DIGEST"] = canonical_digest(

@@ -293,7 +293,6 @@ def build_migration_plan(
             authority_input,
             "authority_input",
             validate_authority_approval,
-            canonical_source_required=True,
         )
         language = validate_language(language)
         migration_task = exact_object(

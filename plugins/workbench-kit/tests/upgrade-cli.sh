@@ -210,7 +210,41 @@ with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
         "---\n\n# Task\n"
     ).encode()
     (workspace / "task/index.md").write_bytes(index)
-    task = read_migration_task(workspace, "implicit-v1")
+    subprocess.run(["git", "-C", str(workspace), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "user.name", "Fixture"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "user.email", "fixture@example.invalid"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(workspace), "add", "task/index.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "commit", "-qm", "fixture: task index"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "switch", "-qc", "task/27-upgrade"],
+        check=True,
+    )
+    legacy_claim = {
+        "source": "legacy-inventory:homes[].claims",
+        "home": "workbench",
+        "claim_id": "claim-27",
+        "task_claim_id": "claim-27",
+        "task_contract": "workbench-task/v1",
+        "issue": 27,
+        "parent": None,
+        "branch": "task/27-upgrade",
+        "lifecycle_state": "task-claimed",
+        "lifecycle_digest": "sha256:" + "a" * 64,
+        "source_revision": "1" * 40,
+        "pr_head_revision": None,
+        "ancestry_complete": True,
+    }
+    public_v1 = {"active_v1_tasks": [legacy_claim]}
+    task = read_migration_task(workspace, "implicit-v1", public_v1)
     assert task == {
         "task_id": "workbench#27",
         "claim_id": "claim-27",
@@ -218,9 +252,19 @@ with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
         "branch": "task/27-upgrade",
         "index_digest": canonical_digest(index, raw=True),
     }
+    (workspace / "task/index.md").write_bytes(
+        index.replace(b"claim_id: claim-27", b"claim_id: forged-claim")
+    )
+    try:
+        read_migration_task(workspace, "implicit-v1", public_v1)
+    except CliError as error:
+        assert error.code == "migration-task-identity-invalid", error.code
+    else:
+        raise AssertionError("forged local v1 task identity was accepted")
+    (workspace / "task/index.md").write_bytes(index)
     rejected_task = False
     try:
-        read_migration_task(workspace, "current-v2")
+        read_migration_task(workspace, "current-v2", public_v1)
     except CliError as error:
         rejected_task = error.code == "migration-task-contract-invalid"
     assert rejected_task
@@ -230,9 +274,34 @@ with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
         b"claim_id: claim-27\ntask_contract: workbench-task/v2\n",
     )
     (workspace / "task/index.md").write_bytes(v2_index)
-    assert read_migration_task(workspace, "current-v2")["task_contract"] == (
+    public_v2 = {
+        "migration_task_claim": {
+            "claim_id": "claim-27",
+            "task_contract": "workbench-task/v2",
+            "branch": "task/27-upgrade",
+            "workspace_authority_descriptor_digest": "sha256:" + "b" * 64,
+            "context_ref": None,
+            "work_ref": None,
+            "work_owners": [],
+        },
+        "doctor": {
+            "writer_coordination": {
+                "descriptor_digest": "sha256:" + "b" * 64,
+            }
+        },
+    }
+    assert read_migration_task(workspace, "current-v2", public_v2)["task_contract"] == (
         "workbench-task/v2"
     )
+    forged = v2_index.replace(b"claim_id: claim-27", b"claim_id: forged-claim")
+    (workspace / "task/index.md").write_bytes(forged)
+    try:
+        read_migration_task(workspace, "current-v2", public_v2)
+    except CliError as error:
+        assert error.code == "migration-task-identity-invalid", error.code
+    else:
+        raise AssertionError("forged local v2 task identity was accepted")
+    (workspace / "task/index.md").write_bytes(v2_index)
 
     authority = {
         "contract_version": "workbench-bootstrap-authority-approval/v1",

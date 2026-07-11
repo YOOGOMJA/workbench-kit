@@ -70,12 +70,35 @@ authority = {
     "approved_at": "2026-07-11T00:00:00Z",
     "source_ref": "github:repository/example/workbench",
 }
-authority_raw = canonical_bytes(authority)
-authority_input = parse_authority_approval(authority_raw)
-assert authority_input["receipt"] == authority
-assert authority_input["source_digest"] == canonical_digest(authority_raw, raw=True)
-assert authority_input["object_digest"] == canonical_digest(authority)
-rejected(lambda: parse_authority_approval(json.dumps(authority, indent=2).encode() + b"\n"))
+authority_sources = [
+    json.dumps(authority, separators=(",", ":")).encode() + b"\n",
+    canonical_bytes(authority),
+    json.dumps(
+        dict(reversed(list(authority.items()))), separators=(",", ":")
+    ).encode() + b"\n",
+]
+authority_inputs = [parse_authority_approval(raw) for raw in authority_sources]
+authority_input = authority_inputs[1]
+assert all(item["receipt"] == authority for item in authority_inputs)
+assert {
+    item["object_digest"] for item in authority_inputs
+} == {canonical_digest(authority)}
+assert {
+    item["source_digest"] for item in authority_inputs
+} == {
+    canonical_digest(raw, raw=True) for raw in authority_sources
+}
+assert len({item["source_digest"] for item in authority_inputs}) == 3
+duplicate = authority_sources[0].replace(
+    b'{"contract_version":',
+    b'{"approval_id":"duplicate","contract_version":',
+    1,
+)
+rejected(lambda: parse_authority_approval(duplicate))
+nullable = copy.deepcopy(authority)
+nullable["proposed_descriptor"]["hosting_adapter"] = None
+nullable["proposed_descriptor"]["hosting_ref"] = None
+rejected(lambda: parse_authority_approval(canonical_bytes(nullable)))
 bad = copy.deepcopy(authority)
 bad["proposed_descriptor"]["default_ref"] = "refs/heads/a//b"
 rejected(lambda: parse_authority_approval(canonical_bytes(bad)))

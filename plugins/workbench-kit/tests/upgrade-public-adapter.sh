@@ -139,12 +139,12 @@ assert snapshot["legacy_inventory_projection"] == expected_inventory_projection,
 assert snapshot["active_v1_tasks"] == [{
     "source": "legacy-inventory:homes[].claims",
     "home": "workbench",
-    "claim_id": "task__workbench__55-legacy",
-    "task_claim_id": "task__workbench__55-legacy",
+    "claim_id": "claim-27",
+    "task_claim_id": "claim-27",
     "task_contract": "workbench-task/v1",
-    "issue": 55,
+    "issue": 27,
     "parent": None,
-    "branch": "task/55-legacy",
+    "branch": "task/27-upgrade",
     "lifecycle_state": "task-claimed",
     "lifecycle_digest": "sha256:" + "c" * 64,
     "source_revision": "2" * 40,
@@ -174,10 +174,20 @@ import sys
 snapshot = json.loads(sys.argv[1])
 assert snapshot["contract"]["workspace"]["schema"] == "workbench/v2"
 assert snapshot["legacy_inventory_command"] == "show"
+assert snapshot["migration_task_claim"]["claim_id"] == "claim-27"
+assert snapshot["migration_task_claim"]["task_contract"] == "workbench-task/v2"
+assert snapshot["migration_task_claim"]["branch"]
+assert snapshot["migration_task_claim"]["workspace_authority_descriptor_digest"].startswith(
+    "sha256:"
+)
+assert snapshot["migration_task_claim"]["context_ref"] is None
+assert snapshot["migration_task_claim"]["work_ref"] is None
+assert snapshot["migration_task_claim"]["work_owners"] == []
 PY
 expected_v2="$current_workspace"$'\t'"contract show --format json"$'\n'
 expected_v2+="$current_workspace"$'\t'"doctor --format json"$'\n'
 expected_v2+="$current_workspace"$'\t'"legacy-inventory show --format json"
+expected_v2+=$'\n'"$current_workspace"$'\t'"task status --format json"
 [ "$(cat "$tmp/v2-ok.log")" = "$expected_v2" ] || fail=1
 [ "${fail:-0}" -eq 0 ] || { cat "$tmp/v2-ok.log" >&2; exit 1; }
 
@@ -292,6 +302,7 @@ expected_removal="$current_workspace"$'\t'"contract show --format json"$'\n'
 expected_removal+="$current_workspace"$'\t'"doctor --format json"$'\n'
 expected_removal+="$current_workspace"$'\t'"legacy-inventory show --format json"$'\n'
 expected_removal+="$current_workspace"$'\t'"engine-manifest show --format json"
+expected_removal+=$'\n'"$current_workspace"$'\t'"task status --format json"
 [ "$(cat "$tmp/removal.log")" = "$expected_removal" ] || {
   cat "$tmp/removal.log" >&2
   exit 1
@@ -312,7 +323,7 @@ from workbench_kit_adapter import AdapterError, validate_inventory
 
 valid = json.loads(sys.argv[2])
 tasks = validate_inventory(valid, 0, "show")
-assert len(tasks) == 1 and tasks[0]["issue"] == 55
+assert len(tasks) == 1 and tasks[0]["issue"] == 27
 assert valid["homes"][0]["claims"][0]["classification"] == "cleaned-v1"
 assert valid["homes"][0]["claims"][0]["ancestry_complete"] is False
 
@@ -334,7 +345,7 @@ rejected(lambda value: value["authority"].update({
     "default_ref": "refs/heads/a//b"
 }))
 rejected(lambda value: value["homes"][0]["claims"][1].update({
-    "task_claim_id": "task__workbench__55-mismatch"
+    "task_claim_id": "claim-mismatch"
 }))
 rejected(lambda value: value["homes"][0]["claims"][1].update({
     "ancestry_complete": False
@@ -379,6 +390,15 @@ expect_failure no-approval bootstrap-authority-approval-required "$legacy_worksp
 expect_failure missing-manifest-contract public-contract-missing "$current_workspace" - show true
 expect_failure missing-manifest-capability public-capability-missing "$current_workspace" - show true
 expect_failure manifest-bad-digest public-contract-invalid "$current_workspace" - show true
+expect_failure task-status-duplicate public-task-status-invalid "$current_workspace" - show
+expect_failure task-status-blocker public-adapter-exit "$current_workspace" - show
+
+mutating_before="$(git_state_digest "$current_workspace")"
+expect_failure mutate-state public-adapter-mutated "$current_workspace" - show
+[ "$mutating_before" = "$(git_state_digest "$current_workspace")" ] || {
+  echo "mutating public adapter was not fully restored" >&2
+  exit 1
+}
 
 if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' \
   "$ROOT/lib/workbench_kit_adapter.py" 2>/dev/null; then

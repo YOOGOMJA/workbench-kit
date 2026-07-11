@@ -12,7 +12,6 @@ from typing import Any, Iterable
 from workbench_kit_contracts import (
     BCP47,
     ContractError,
-    canonical_bytes,
     canonical_digest,
     node_digest,
     strict_load,
@@ -40,6 +39,20 @@ NORMATIVE_PATHS = (
     ".workbench/policy.conf",
     ".workbench/authority.json",
 )
+POLICY_ACTIONS = {
+    "task.complete",
+    "task.abandon",
+    "task.deliverable.accept",
+    "task.deliverable.waive",
+    "task.deliverable.reject",
+    "task.deliverable.weaken",
+    "task.required-check.waive",
+    "task.harvest.dispose",
+    "task.policy-context.register",
+    "task.policy-context.seal",
+    "task.concurrent-write",
+    "task.cleanup",
+}
 
 
 class InspectionError(RuntimeError):
@@ -333,8 +346,6 @@ def _receipt_provenance(
         receipt = validator(strict_load(node["content"], path))
     except ContractError:
         return {"kind": kind, "state": "invalid", "receipt_digest": None, "ref": path}
-    if node["content"] != canonical_bytes(receipt):
-        return {"kind": kind, "state": "invalid", "receipt_digest": None, "ref": path}
     receipt_digest = receipt["candidate_basis_digest"]
     if kind == "generation":
         known_generators = {
@@ -410,6 +421,26 @@ def _receipt_provenance(
     }
 
 
+def _source_rows(content: bytes, *, ascii_only: bool) -> dict[str, str] | None:
+    try:
+        decoded = content.decode("ascii" if ascii_only else "utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not decoded.endswith("\n") or "\r" in decoded:
+        return None
+    rows: dict[str, str] = {}
+    for line in decoded[:-1].split("\n"):
+        if not line or line.startswith("#"):
+            continue
+        if line.count("=") != 1:
+            return None
+        key, value = line.split("=", 1)
+        if not key or not value or key in rows:
+            return None
+        rows[key] = value
+    return rows
+
+
 def _normative_v2(root: pathlib.Path) -> tuple[bool, str | None]:
     schema = _inspect_node(root, ".workbench/schema")
     profile = _inspect_node(root, ".workbench/profile.conf")
@@ -421,28 +452,31 @@ def _normative_v2(root: pathlib.Path) -> tuple[bool, str | None]:
         return False, None
     if schema["content"] != b"workbench/v2\n":
         return False, None
-    try:
-        profile_text = profile["content"].decode("ascii")
-    except UnicodeDecodeError:
+    profile_rows = _source_rows(profile["content"], ascii_only=True)
+    if profile_rows is None or set(profile_rows) != {"schema", "language"}:
         return False, None
-    lines = profile_text.splitlines(keepends=True)
-    if (
-        len(lines) != 2
-        or lines[0] != "schema=workbench-profile/v1\n"
-        or not lines[1].startswith("language=")
-        or not lines[1].endswith("\n")
-    ):
+    if profile_rows["schema"] != "workbench-profile/v1":
         return False, None
-    language = lines[1][len("language=") : -1]
+    language = profile_rows["language"]
     if BCP47.fullmatch(language) is None:
         return False, None
-    if policy["content"] != b"schema=workbench-policy/v1\n":
+    policy_rows = _source_rows(policy["content"], ascii_only=False)
+    if policy_rows is None or policy_rows.get("schema") != "workbench-policy/v1":
         return False, None
+    for key, value in policy_rows.items():
+        if key == "schema":
+            continue
+        if (
+            not key.startswith("action.")
+            or key[len("action.") :] not in POLICY_ACTIONS
+            or value not in {"allow", "ask", "deny"}
+        ):
+            return False, None
     try:
-        descriptor = validate_descriptor(strict_load(authority["content"], ".workbench/authority.json"))
+        descriptor = validate_descriptor(
+            strict_load(authority["content"], ".workbench/authority.json")
+        )
     except ContractError:
-        return False, None
-    if authority["content"] != canonical_bytes(descriptor):
         return False, None
     return True, language
 

@@ -7,6 +7,7 @@ import datetime
 import os
 import pathlib
 import stat
+import subprocess
 from typing import Any
 
 from workbench_kit_adapter import AdapterError, inspect_public_kernel
@@ -55,6 +56,13 @@ COMPOSE_SEPARATOR = (
     "\n<!-- ===== YOUR PERSONA (edit AGENTS.overlay.md, then recompose) ===== -->\n\n"
 ).encode("utf-8")
 MAX_EXTERNAL_INPUT_BYTES = 64 * 1024 * 1024
+INDETERMINATE_ADAPTER_ERRORS = {
+    "public-adapter-unavailable",
+    "public-adapter-stderr",
+    "public-adapter-exit",
+    "public-json-invalid",
+    "public-state-unavailable",
+}
 
 
 def _resolve_workspace(value: str | pathlib.Path) -> pathlib.Path:
@@ -96,7 +104,9 @@ def _frontmatter(raw: bytes) -> dict[str, str]:
 
 
 def read_migration_task(
-    workspace: pathlib.Path, route: str
+    workspace: pathlib.Path,
+    route: str,
+    public_snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     root = _resolve_workspace(workspace)
     try:
@@ -116,6 +126,57 @@ def read_migration_task(
         raise CliError(
             "migration-task-contract-invalid", "task/index.md"
         )
+    try:
+        branch_result = subprocess.run(
+            ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True,
+            check=False,
+        )
+        current_branch = branch_result.stdout.decode("utf-8", errors="strict").strip()
+    except (OSError, UnicodeDecodeError) as error:
+        raise CliError("migration-task-identity-invalid", "HEAD") from error
+    if branch_result.returncode != 0 or current_branch != values["branch"]:
+        raise CliError("migration-task-identity-invalid", "HEAD")
+    if expected == "workbench-task/v1":
+        active = public_snapshot.get("active_v1_tasks")
+        if not isinstance(active, list):
+            raise CliError("migration-task-identity-invalid", "legacy-inventory")
+        matches = [
+            claim for claim in active
+            if isinstance(claim, dict) and claim.get("branch") == current_branch
+        ]
+        if len(matches) != 1:
+            raise CliError("migration-task-identity-invalid", "legacy-inventory")
+        claim = matches[0]
+        expected_id = f"{claim.get('home')}#{claim.get('issue')}"
+        valid_ids = {expected_id, str(claim.get("issue"))}
+        local_parent = values.get("parent", "")
+        public_parent = claim.get("parent")
+        identity_matches = (
+            claim.get("claim_id") == values["claim_id"]
+            and claim.get("task_claim_id") == values["claim_id"]
+            and claim.get("task_contract") == expected
+            and values["id"] in valid_ids
+            and values.get("issue", str(claim.get("issue")))
+            == str(claim.get("issue"))
+            and values.get("home", claim.get("home")) in ("", claim.get("home"))
+            and local_parent
+            == ("" if public_parent is None else str(public_parent))
+        )
+    else:
+        claim = public_snapshot.get("migration_task_claim")
+        coordination = public_snapshot.get("doctor", {}).get("writer_coordination", {})
+        identity_matches = (
+            isinstance(claim, dict)
+            and claim.get("claim_id") == values["claim_id"]
+            and claim.get("task_contract") == expected
+            and claim.get("branch") == current_branch
+            and claim.get("workspace_authority_descriptor_digest")
+            == coordination.get("descriptor_digest")
+            and isinstance(claim.get("workspace_authority_descriptor_digest"), str)
+        )
+    if not identity_matches:
+        raise CliError("migration-task-identity-invalid", "task/index.md")
     return {
         "task_id": values["id"],
         "claim_id": values["claim_id"],
@@ -330,7 +391,7 @@ def plan_from_snapshot(
         diagnosis, public_snapshot["contract"]["workspace"]["schema"]
     )
     validate_route_flags(request, route)
-    migration_task = read_migration_task(root, route)
+    migration_task = read_migration_task(root, route, public_snapshot)
     if receipt_inputs is None:
         authority_input = _optional_projection(
             request,
@@ -472,6 +533,26 @@ def dry_run_upgrade(
             include_engine_manifest=include_manifest,
         )
     except AdapterError as error:
+        if error.code in INDETERMINATE_ADAPTER_ERRORS:
+            return {
+                "contract_version": "workbench-kit-diagnosis/v1",
+                "classification": "indeterminate",
+                "embedded_engine": {
+                    "state": "indeterminate",
+                    "equivalence_receipt_digest": None,
+                },
+                "provenance": {
+                    "kind": None,
+                    "state": "indeterminate",
+                    "receipt_digest": None,
+                    "ref": None,
+                },
+                "language": None,
+                "blockers": [{
+                    "code": "kernel-readiness-indeterminate",
+                    "ref": error.ref,
+                }],
+            }
         raise CliError(error.code, error.ref) from error
     return plan_from_snapshot(
         root,

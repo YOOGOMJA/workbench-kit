@@ -167,7 +167,7 @@ def render_policy() -> bytes:
 
 
 def render_authority(descriptor: dict[str, Any]) -> bytes:
-    return canonical_bytes(validate_descriptor(descriptor))
+    return canonical_bytes(validate_descriptor(descriptor, require_hosting=True))
 
 
 def compose_agents(generator_receipt: dict[str, Any], overlay: bytes) -> bytes:
