@@ -31,9 +31,13 @@ case "$*" in
     [ "$mode" != missing-bootstrap-contract ] || bootstrap_supported=''
     bootstrap_capability=',"workspace.legacy-inventory-bootstrap/v1"'
     [ "$mode" != missing-bootstrap-capability ] || bootstrap_capability=''
-    printf '{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"%s","source":"%s"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"legacy_inventory_contracts":["workbench-legacy-inventory/v1"]%s},"capabilities":["workspace.schema/v1","workspace.doctor/v1","workspace.legacy-inventory/v1"%s]%s}\n' \
+    manifest_supported=',"engine_manifest_contracts":["workbench-plugin-manifest/v1"]'
+    [ "$mode" != missing-manifest-contract ] || manifest_supported=''
+    manifest_capability=',"engine.manifest/v1"'
+    [ "$mode" != missing-manifest-capability ] || manifest_capability=''
+    printf '{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"%s","source":"%s"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"legacy_inventory_contracts":["workbench-legacy-inventory/v1"]%s%s},"capabilities":["workspace.schema/v1","workspace.doctor/v1","workspace.legacy-inventory/v1"%s%s]%s}\n' \
       "$root" "$workspace_schema" "$workspace_source" "$bootstrap_supported" \
-      "$bootstrap_capability" "$extra"
+      "$manifest_supported" "$bootstrap_capability" "$manifest_capability" "$extra"
     ;;
   "doctor --format json")
     if [ "$mode" = doctor-bad-exit ]; then
@@ -80,6 +84,12 @@ case "$*" in
     printf '{"contract_version":"workbench-legacy-inventory/v1","source_revision":"1111111111111111111111111111111111111111","authority":{"authority_identity":"github:example/workbench","default_ref":"refs/heads/main","default_revision":"1111111111111111111111111111111111111111","descriptor_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bootstrap_revision":"0000000000000000000000000000000000000000"},"home_set":{"contract_version":"workbench-legacy-home-set/v1","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_revision":"1111111111111111111111111111111111111111"},"homes":[{"home":"workbench","origin_url":"https://github.com/example/workbench.git","membership":"current","pagination":{"complete":%s,"pages_fetched":1,"end_cursor":null,"failure":%s},"claims":[{"claim_id":"task__workbench__40-cleaned","task_claim_id":"task__workbench__40-cleaned","task_contract":"workbench-task/v1","issue":40,"home":"workbench","parent":null,"branch":"task/40-cleaned","lifecycle_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","lifecycle_state":"task-cleaned","classification":"cleaned-v1","submission":null,"source_revision":null,"pr_head_revision":null,"ancestry_complete":false,"repos":[]},{"claim_id":"task__workbench__55-legacy","task_claim_id":"task__workbench__55-legacy","task_contract":"workbench-task/v1","issue":55,"home":"workbench","parent":null,"branch":"task/55-legacy","lifecycle_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","lifecycle_state":"task-claimed","classification":"active-v1","submission":null,"source_revision":"2222222222222222222222222222222222222222","pr_head_revision":null,"ancestry_complete":true,"repos":[]}]}],"active_claims":[],"origin_replacements":[{"home":"workbench","previous_origin_url":"https://github.com/example/workbench.git","current_origin_url":"https://github.com/example/workbench.git","status":"unchanged"}],"complete":%s,"blockers":%s}\n' \
       "$pagination_complete" "$failure" "$complete" "$blockers"
     exit "$status"
+    ;;
+  "engine-manifest show --format json")
+    manifest_digest='sha256:1659a4f52b10d9625abcf858087a31410f6fcf4f2a4020664c3ee7092411054c'
+    [ "$mode" != manifest-bad-digest ] \
+      || manifest_digest='sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+    printf '{"contract_version":"workbench-plugin-manifest/v1","plugin":{"name":"workbench","version":"0.2.0"},"source":{"ref":"https://github.com/YOOGOMJA/workbench-kit#plugins/workbench","revision":"sha256:cade951752ca28da3780da58da4b7a35e27d1c84d97dffe348f8c5a60f304c08"},"included_paths":["."],"excluded_paths":[{"path":".DS_Store","match":"exact"},{"path":".git/","match":"prefix"},{"path":"lib/__pycache__/","match":"prefix"}],"nodes":[{"path":".","node_type":"directory","mode":"040755","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","link_target":null},{"path":"bin","node_type":"directory","mode":"040755","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","link_target":null},{"path":"bin/workbench","node_type":"file","mode":"100755","digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333","link_target":null}],"digest":"%s"}\n' "$manifest_digest"
     ;;
   *) exit 92 ;;
 esac

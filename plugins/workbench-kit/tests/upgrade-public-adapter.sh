@@ -62,12 +62,13 @@ PY
 
 probe() {
   local mode="$1" workspace="$2" authority_file="${3:--}" \
-    inventory_mode="${4:--}"
+    inventory_mode="${4:--}" include_manifest="${5:-false}"
   UPGRADE_STUB_MODE="$mode" \
   UPGRADE_STUB_LOG="$tmp/$mode.log" \
   UPGRADE_STUB_APPROVAL_FILE="$approval" \
   WORKBENCH_KIT_WORKBENCH_BIN="$ROOT/tests/upgrade-public-stub.sh" \
-  python3 - "$ROOT/lib" "$workspace" "$authority_file" "$inventory_mode" <<'PY'
+  python3 - "$ROOT/lib" "$workspace" "$authority_file" "$inventory_mode" \
+    "$include_manifest" <<'PY'
 import json
 import pathlib
 import sys
@@ -78,7 +79,9 @@ from workbench_kit_adapter import AdapterError, inspect_public_kernel
 try:
     approval = None if sys.argv[3] == "-" else pathlib.Path(sys.argv[3])
     inventory_mode = None if sys.argv[4] == "-" else sys.argv[4]
-    snapshot = inspect_public_kernel(pathlib.Path(sys.argv[2]), approval, inventory_mode)
+    snapshot = inspect_public_kernel(
+        pathlib.Path(sys.argv[2]), approval, inventory_mode, sys.argv[5] == "true"
+    )
 except AdapterError as error:
     print(json.dumps({"code": error.code, "ref": error.ref}, sort_keys=True))
     raise SystemExit(1)
@@ -164,6 +167,25 @@ expected_staged+="$current_workspace"$'\t'"legacy-inventory bootstrap-show --aut
   exit 1
 }
 
+removal="$(probe removal "$current_workspace" - show true)" \
+  || { echo "$removal" >&2; exit 1; }
+python3 - "$removal" <<'PY'
+import json
+import sys
+snapshot = json.loads(sys.argv[1])
+assert snapshot["engine_manifest"]["plugin"] == {
+    "name": "workbench", "version": "0.2.0"
+}
+PY
+expected_removal="$current_workspace"$'\t'"contract show --format json"$'\n'
+expected_removal+="$current_workspace"$'\t'"doctor --format json"$'\n'
+expected_removal+="$current_workspace"$'\t'"legacy-inventory show --format json"$'\n'
+expected_removal+="$current_workspace"$'\t'"engine-manifest show --format json"
+[ "$(cat "$tmp/removal.log")" = "$expected_removal" ] || {
+  cat "$tmp/removal.log" >&2
+  exit 1
+}
+
 inventory="$({
   cd "$current_workspace"
   UPGRADE_STUB_MODE=v2-ok UPGRADE_STUB_APPROVAL_FILE="$approval" \
@@ -214,9 +236,11 @@ PY
 
 expect_failure() {
   local mode="$1" code="$2" workspace="${3:-$legacy_workspace}" \
-    authority_file="${4:-$approval}" output status
+    authority_file="${4:-$approval}" inventory_mode="${5:--}" \
+    include_manifest="${6:-false}" output status
   set +e
-  output="$(probe "$mode" "$workspace" "$authority_file" 2>/dev/null)"
+  output="$(probe "$mode" "$workspace" "$authority_file" "$inventory_mode" \
+    "$include_manifest" 2>/dev/null)"
   status=$?
   set -e
   [ "$status" -eq 1 ] || { echo "expected $mode failure" >&2; exit 1; }
@@ -235,6 +259,9 @@ expect_failure inventory-incomplete legacy-inventory-unavailable
 expect_failure missing-bootstrap-contract public-contract-missing
 expect_failure missing-bootstrap-capability public-capability-missing
 expect_failure no-approval bootstrap-authority-approval-required "$legacy_workspace" -
+expect_failure missing-manifest-contract public-contract-missing "$current_workspace" - show true
+expect_failure missing-manifest-capability public-capability-missing "$current_workspace" - show true
+expect_failure manifest-bad-digest public-contract-invalid "$current_workspace" - show true
 
 if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' "$ROOT/lib" 2>/dev/null; then
   echo "workbench-kit adapter references private/runtime workbench state" >&2
