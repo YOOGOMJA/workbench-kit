@@ -294,9 +294,9 @@ def _embedded_fingerprint(
     present = False
     actual_paths: set[str] = set()
     for owned_root in receipt["allowed_roots"]:
-        root_present, found = _enumerate_owned_root(root, owned_root)
-        present = present or root_present
+        _, found = _enumerate_owned_root(root, owned_root)
         actual_paths.update(found)
+    present = bool(actual_paths)
     for link in receipt["discovery_links"]:
         if _inspect_node(root, link["path"])["node_type"] != "absent":
             present = True

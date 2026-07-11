@@ -819,5 +819,50 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
     assert replayed["applied"] == []
     assert replayed["transaction"]["resumed"] is True
 
+    subprocess.run(["git", "-C", str(cli_root), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(cli_root), "commit", "-qm", "fixture: staged migration"],
+        check=True,
+    )
+    staged_request = parse_request([
+        "--workspace", str(cli_root),
+        "upgrade-workbench", "--dry-run",
+        "--authority-approval-file", str(authority_path),
+        "--format", "json",
+    ])
+    staged_receipt_before = (cli_root / ".workbench/migration.json").read_bytes()
+    staged_before = workspace_digest(cli_root)
+    staged_environment = {
+        name: os.environ.get(name)
+        for name in (
+            "WORKBENCH_KIT_WORKBENCH_BIN",
+            "UPGRADE_STUB_APPROVAL_FILE",
+            "UPGRADE_STUB_DESCRIPTOR_DIGEST",
+            "UPGRADE_STUB_MODE",
+        )
+    }
+    os.environ["WORKBENCH_KIT_WORKBENCH_BIN"] = str(stub)
+    os.environ["UPGRADE_STUB_APPROVAL_FILE"] = str(authority_path)
+    os.environ["UPGRADE_STUB_DESCRIPTOR_DIGEST"] = canonical_digest(
+        authority["proposed_descriptor"]
+    )
+    os.environ["UPGRADE_STUB_MODE"] = "staged-v2"
+    try:
+        staged_noop = dry_run_upgrade(staged_request, cli_bundle)
+    finally:
+        for name, value in staged_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    assert staged_noop["classification_before"] == "migration-staged"
+    assert staged_noop["target_classification"] == "migration-staged"
+    assert staged_noop["changed"] is False
+    assert staged_noop["actionable"] is False
+    assert staged_noop["operations"] == []
+    assert staged_noop["artifacts"] == []
+    assert (cli_root / ".workbench/migration.json").read_bytes() == staged_receipt_before
+    assert workspace_digest(cli_root) == staged_before
+
 print("PASS: deterministic migration planner and preservation manifest")
 PY

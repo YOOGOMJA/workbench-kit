@@ -424,6 +424,13 @@ with tempfile.TemporaryDirectory(prefix="workbench-classifier-") as temporary:
     result = diagnose(root, "workbench/v2", True)
     assert result["classification"] == "already-current"
     assert result["embedded_engine"]["state"] == "present-verified"
+    write(root, "user-owned.txt", b"preserve\n")
+    (root / engine_node["path"]).unlink()
+    result = diagnose(root, "workbench/v2", True)
+    assert result["classification"] == "already-current", result
+    assert result["embedded_engine"]["state"] == "absent", result
+    assert (root / "legacy-engine").is_dir()
+    assert (root / "user-owned.txt").read_bytes() == b"preserve\n"
 
     root = base / "staged"
     staged_root = root

@@ -6,7 +6,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" <<'PY'
 import base64
 import copy
 import json
+import pathlib
+import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, sys.argv[1])
 from workbench_kit_contracts import ContractError, canonical_bytes, canonical_digest
@@ -73,6 +76,12 @@ rejected(lambda: merge_gitignore(b"!**/*\n"))
 rejected(lambda: merge_gitignore(b"mixed\r\nnewline\n"))
 rejected(lambda: merge_gitignore(b"nul\x00byte\n"))
 rejected(lambda: merge_gitignore(b"\xff\n"))
+effective_gitignore = merge_gitignore(
+    b".worktrees/\n!**/.worktrees/\n"
+)
+assert effective_gitignore.rfind(b".worktrees/\n") > effective_gitignore.rfind(
+    b"!**/.worktrees/\n"
+)
 
 attributes = b"*.bin binary\ndocs/log.md merge=union\ndocs/log.md merge=union\n"
 merged_attributes = merge_gitattributes(attributes)
@@ -83,6 +92,30 @@ assert merge_gitattributes(merged_attributes) == merged_attributes
 rejected(lambda: merge_gitattributes(b"docs/log.md merge=ours\n"))
 rejected(lambda: merge_gitattributes(b"task/log.md -merge\n"))
 rejected(lambda: merge_gitattributes(b"docs/log.md union-macro\n"))
+effective_attributes = merge_gitattributes(
+    b"docs/log.md merge=union\ndocs/** -merge\n"
+)
+assert effective_attributes.rfind(
+    b"docs/log.md merge=union\n"
+) > effective_attributes.rfind(b"docs/** -merge\n")
+
+with tempfile.TemporaryDirectory(prefix="workbench-render-git-") as temporary:
+    repository = pathlib.Path(temporary)
+    subprocess.run(["git", "-C", str(repository), "init", "-q"], check=True)
+    (repository / ".gitignore").write_bytes(effective_gitignore)
+    (repository / ".gitattributes").write_bytes(effective_attributes)
+    (repository / ".worktrees").mkdir()
+    (repository / ".worktrees/probe").write_text("ignored\n")
+    (repository / "docs").mkdir()
+    (repository / "docs/log.md").write_text("log\n")
+    status = subprocess.check_output(
+        ["git", "-C", str(repository), "status", "--porcelain", "--untracked-files=all"]
+    )
+    assert b".worktrees/probe" not in status
+    attribute = subprocess.check_output([
+        "git", "-C", str(repository), "check-attr", "merge", "--", "docs/log.md"
+    ])
+    assert attribute.endswith(b"merge: union\n"), attribute
 
 descriptor = {
     "contract_version": "workbench-workspace-authority/v1",

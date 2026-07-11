@@ -104,25 +104,19 @@ def _gitignore_negation_conflicts(line: str) -> bool:
 def merge_gitignore(raw: bytes | None) -> bytes:
     lines, newline = _text_lines(raw, ".gitignore")
     output = []
-    seen = set()
     for line in lines:
         if _gitignore_negation_conflicts(line):
             fail(line, "structured-merge-conflict")
         if line in GITIGNORE_REQUIRED:
-            if line in seen:
-                continue
-            seen.add(line)
+            continue
         output.append(line)
-    for required in GITIGNORE_REQUIRED:
-        if required not in seen:
-            output.append(required)
+    output.extend(GITIGNORE_REQUIRED)
     return (newline.join(output) + newline).encode("utf-8")
 
 
 def merge_gitattributes(raw: bytes | None) -> bytes:
     lines, newline = _text_lines(raw, ".gitattributes")
     output = []
-    seen = set()
     required_by_path = {
         row.split(" ", 1)[0]: row for row in GITATTRIBUTES_REQUIRED
     }
@@ -138,13 +132,7 @@ def merge_gitattributes(raw: bytes | None) -> bytes:
             continue
         if stripped != required:
             fail(fields[0], "structured-merge-conflict")
-        if required in seen:
-            continue
-        seen.add(required)
-        output.append(required)
-    for required in GITATTRIBUTES_REQUIRED:
-        if required not in seen:
-            output.append(required)
+    output.extend(GITATTRIBUTES_REQUIRED)
     return (newline.join(output) + newline).encode("utf-8")
 
 

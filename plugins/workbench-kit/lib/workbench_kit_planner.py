@@ -394,6 +394,56 @@ def build_migration_plan(
         active_tasks["digest"] = canonical_digest(active_tasks, null_field="digest")
         active_tasks = validate_active_tasks(active_tasks)
 
+        embedded = {
+            "before": embedded_state,
+            "after": embedded_after,
+            "equivalence_receipt_digest": diagnosis["embedded_engine"][
+                "equivalence_receipt_digest"
+            ],
+        }
+        if (
+            diagnosis["classification"] == "migration-staged"
+            and not remove_embedded
+        ):
+            plan = {
+                "contract_version": "workbench-kit-upgrade-plan/v1",
+                "plan_digest": None,
+                "classification_before": "migration-staged",
+                "target_classification": "migration-staged",
+                "embedded_engine": embedded,
+                "provenance_before": diagnosis["provenance"],
+                "provenance_after": diagnosis["provenance"],
+                "workspace": {
+                    "root": str(root),
+                    "source_revision": source_revision,
+                    "default_revision": legacy["authority_revision"],
+                    "source_tree_digest": source_tree_digest,
+                    "migration_task": migration_task,
+                },
+                "planner": planner,
+                "doctor": doctor,
+                "legacy_inventory": legacy,
+                "inputs": {
+                    "language": language,
+                    "bootstrap_authority_approval": authority_input,
+                    "reviewed_overlay": reviewed_overlay_input,
+                },
+                "engine_manifest": engine_manifest_projection,
+                "plugin_equivalence": plugin_equivalence_input,
+                "removal_plan_basis_digest": None,
+                "removal_approval": None,
+                "active_v1_tasks": active_tasks,
+                "preserved": _preserved_nodes(root, set()),
+                "parent_directories": [],
+                "artifacts": [],
+                "operations": [],
+                "blockers": [],
+                "changed": False,
+                "actionable": False,
+            }
+            plan["plan_digest"] = canonical_digest(plan, null_field="plan_digest")
+            return validate_plan(plan)
+
         if reviewed_overlay_input is None:
             overlay_node = _inspect_node(root, "AGENTS.overlay.md")
             if overlay_node["node_type"] != "file" or overlay_node["mode"] != "100644":
@@ -437,13 +487,6 @@ def build_migration_plan(
                 overlay, "input:reviewed-overlay#content"
             )
 
-        embedded = {
-            "before": embedded_state,
-            "after": embedded_after,
-            "equivalence_receipt_digest": diagnosis["embedded_engine"][
-                "equivalence_receipt_digest"
-            ],
-        }
         receipt_artifacts = [
             _manifest_node(path, content)
             for path, (content, _) in sorted(targets.items())
