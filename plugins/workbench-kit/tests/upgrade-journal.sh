@@ -28,9 +28,9 @@ from workbench_kit_contracts import (
 )
 from workbench_kit_journal import (
     JournalError,
-    build_prepared_journal,
+    build_prepared_journal as _build_prepared_journal,
     execute_upgrade,
-    install_prepared_journal,
+    install_prepared_journal as _install_prepared_journal,
     load_journal,
     resolve_journal_location,
 )
@@ -39,6 +39,21 @@ from workbench_kit_journal import (
 OID = "1" * 40
 SHA = "sha256:" + "a" * 64
 CREATED_AT = "2026-07-11T00:00:00Z"
+PLANS_BY_DIGEST = {}
+
+
+def build_prepared_journal(plan, plan_source_digest, created_at):
+    journal = _build_prepared_journal(
+        plan, plan_source_digest, created_at
+    )
+    PLANS_BY_DIGEST[journal["plan_digest"]] = plan
+    return journal
+
+
+def install_prepared_journal(journal, location):
+    return _install_prepared_journal(
+        journal, location, PLANS_BY_DIGEST[journal["plan_digest"]]
+    )
 
 
 def rejected(callable_, code):
@@ -446,6 +461,9 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     plan_source_digest = canonical_digest(raw_plan, raw=True)
     first = build_prepared_journal(plan, plan_source_digest, CREATED_AT)
     second = build_prepared_journal(plan, plan_source_digest, CREATED_AT)
+    assert journal_module._maximum_lifecycle_journal_size(
+        first, plan
+    ) > len(canonical_bytes(first))
     assert journal_module.MAX_JOURNAL_BYTES == 64 * 1024 * 1024
     journal_module._require_journal_size(
         journal_module.MAX_JOURNAL_BYTES - 1, "below-limit"
@@ -458,6 +476,28 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
             journal_module.MAX_JOURNAL_BYTES + 1, "above-limit"
         ),
         "journal-too-large",
+    )
+    assert journal_module._timestamp_prefix_valid(b"2026-07")
+    assert journal_module._timestamp_prefix_valid(
+        b"2026-07-11T00:20:55.123Z"
+    )
+    assert journal_module._timestamp_prefix_valid(
+        b"2024-02-29T00:20:55Z"
+    )
+    assert not journal_module._timestamp_prefix_valid(b"2026-19")
+    assert not journal_module._timestamp_prefix_valid(
+        b"2026-07-11T29"
+    )
+    assert not journal_module._timestamp_prefix_valid(
+        b"2026-02-31T00:20:55Z"
+    )
+    assert not journal_module._timestamp_prefix_valid(
+        b"2026-02-29T00:20:55Z"
+    )
+    invalid_calendar_successor = copy.deepcopy(first)
+    invalid_calendar_successor["updated_at"] = "2026-02-31T00:20:55Z"
+    assert not journal_module._replacement_prefix_matches(
+        canonical_bytes(invalid_calendar_successor), first, plan
     )
     assert canonical_bytes(first) == canonical_bytes(second)
     assert validate_journal(first, plan) == first
@@ -499,22 +539,72 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         / "owner.json"
     )
     original_journal_limit = journal_module.MAX_JOURNAL_BYTES
-    journal_module.MAX_JOURNAL_BYTES = len(canonical_bytes(first)) - 1
     try:
-        rejected(
-            lambda: build_prepared_journal(
-                plan, plan_source_digest, CREATED_AT
-            ),
-            "journal-too-large",
-        )
-        rejected(
-            lambda: install_prepared_journal(first, location),
-            "journal-too-large",
-        )
+        for admitted_limit in (
+            len(canonical_bytes(first)) - 1,
+            len(canonical_bytes(first)),
+        ):
+            journal_module.MAX_JOURNAL_BYTES = admitted_limit
+            rejected(
+                lambda: build_prepared_journal(
+                    plan, plan_source_digest, CREATED_AT
+                ),
+                "journal-too-large",
+            )
+            rejected(
+                lambda: install_prepared_journal(first, location),
+                "journal-too-large",
+            )
+            assert not location["owner"].exists()
+            assert not location["journal"].exists()
     finally:
         journal_module.MAX_JOURNAL_BYTES = original_journal_limit
     assert not location["owner"].exists()
     assert not location["journal"].exists()
+
+    exact_root = pathlib.Path(temporary) / "exact-limit-workbench"
+    exact_root.mkdir()
+    exact_root = exact_root.resolve()
+    exact_plan, _, exact_after = fixture_plan(exact_root)
+    exact_source = canonical_digest(canonical_bytes(exact_plan), raw=True)
+    exact_journal = build_prepared_journal(
+        exact_plan, exact_source, CREATED_AT
+    )
+    exact_location = resolve_journal_location(
+        exact_root,
+        exact_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    exact_limit = journal_module._maximum_lifecycle_journal_size(
+        exact_journal, exact_plan
+    )
+    journal_module.MAX_JOURNAL_BYTES = exact_limit
+    try:
+        install_prepared_journal(exact_journal, exact_location)
+        exact_result = execute_upgrade(
+            exact_plan,
+            exact_location,
+            plan_source_digest=exact_source,
+            updated_at="2026-07-11T00:00:30Z",
+            validate_after=passed_validation,
+        )
+        exact_replay = execute_upgrade(
+            exact_plan,
+            exact_location,
+            plan_source_digest=exact_source,
+            updated_at="2026-07-11T00:00:45Z",
+            validate_after=passed_validation,
+        )
+    finally:
+        journal_module.MAX_JOURNAL_BYTES = original_journal_limit
+    assert exact_result["transaction"]["stage"] == "completed"
+    assert exact_result["changed"] is True
+    assert exact_replay["transaction"]["stage"] == "completed"
+    assert exact_replay["changed"] is False
+    assert (exact_root / ".workbench/schema").read_bytes() == exact_after
+    assert len(exact_location["journal"].read_bytes()) <= exact_limit
+
     installed = install_prepared_journal(first, location)
     assert installed == location["journal"]
     installed_stat = os.lstat(installed)
@@ -1281,6 +1371,73 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     }]
     assert (validation_root / ".workbench/schema").read_bytes() == validation_before
 
+    validation_budget_root = (
+        pathlib.Path(temporary) / "validation-budget-workbench"
+    )
+    validation_budget_root.mkdir()
+    validation_budget_root = validation_budget_root.resolve()
+    validation_budget_plan, validation_budget_before, _ = fixture_plan(
+        validation_budget_root
+    )
+    validation_budget_source = canonical_digest(
+        canonical_bytes(validation_budget_plan), raw=True
+    )
+    validation_budget_journal = build_prepared_journal(
+        validation_budget_plan, validation_budget_source, CREATED_AT
+    )
+    validation_budget_location = resolve_journal_location(
+        validation_budget_root,
+        validation_budget_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    validation_budget_limit = (
+        journal_module._maximum_lifecycle_journal_size(
+            validation_budget_journal, validation_budget_plan
+        )
+    )
+
+    def oversized_failed_validation(_plan):
+        validation = {
+            "status": "failed",
+            "classification_after": None,
+            "basis_kind": None,
+            "basis_digest": None,
+            "blockers": [{
+                "code": "candidate-static-invalid",
+                "ref": "x" * validation_budget_limit,
+            }],
+            "digest": None,
+        }
+        validation["digest"] = canonical_digest(
+            validation, null_field="digest"
+        )
+        return validation
+
+    original_journal_limit = journal_module.MAX_JOURNAL_BYTES
+    journal_module.MAX_JOURNAL_BYTES = validation_budget_limit
+    try:
+        install_prepared_journal(
+            validation_budget_journal, validation_budget_location
+        )
+        validation_budget_result = execute_upgrade(
+            validation_budget_plan,
+            validation_budget_location,
+            plan_source_digest=validation_budget_source,
+            updated_at="2026-07-11T00:17:15Z",
+            validate_after=oversized_failed_validation,
+        )
+    finally:
+        journal_module.MAX_JOURNAL_BYTES = original_journal_limit
+    assert validation_budget_result["transaction"]["stage"] == "rolled-back"
+    assert validation_budget_result["blockers"] == [{
+        "code": "candidate-validation-too-large",
+        "ref": str(validation_budget_root),
+    }]
+    assert (
+        validation_budget_root / ".workbench/schema"
+    ).read_bytes() == validation_budget_before
+
     validation_edit_root = (
         pathlib.Path(temporary) / "validation-edit-workbench"
     )
@@ -1526,7 +1683,15 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert (exchange_root / ".workbench/schema").read_bytes() == exchange_after
 
     partial_time = "2026-07-11T00:20:55Z"
-    partial_specs = ("empty", "short", "mid-utf8", "last-byte", "full")
+    partial_retry_time = "2026-07-11T00:20:56Z"
+    partial_specs = (
+        "empty",
+        "short",
+        "mid-utf8",
+        "mid-timestamp",
+        "last-byte",
+        "full",
+    )
     for partial_spec in partial_specs:
         partial_root = (
             pathlib.Path(temporary)
@@ -1562,6 +1727,9 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         elif partial_spec == "mid-utf8":
             utf8_start = successor_bytes.index("교체".encode("utf-8"))
             prefix_length = utf8_start + 1
+        elif partial_spec == "mid-timestamp":
+            timestamp_start = successor_bytes.index(partial_time.encode("ascii"))
+            prefix_length = timestamp_start + 7
         elif partial_spec == "last-byte":
             prefix_length = len(successor_bytes) - 1
         else:
@@ -1573,7 +1741,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
             partial_plan,
             partial_location,
             plan_source_digest=partial_source,
-            updated_at=partial_time,
+            updated_at=partial_retry_time,
             validate_after=passed_validation,
         )
         assert partial_result["transaction"]["stage"] == "completed"

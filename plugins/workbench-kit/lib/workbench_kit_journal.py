@@ -827,12 +827,13 @@ def _release_owner(
 
 
 def install_prepared_journal(
-    journal: dict[str, Any], location: dict[str, pathlib.Path]
+    journal: dict[str, Any],
+    location: dict[str, pathlib.Path],
+    plan: dict[str, Any],
 ) -> pathlib.Path:
-    normalized = validate_journal(journal)
-    _require_journal_size(
-        len(canonical_bytes(normalized)), "prepared-journal"
-    )
+    normalized_plan = validate_plan(plan)
+    normalized = validate_journal(journal, normalized_plan)
+    _require_lifecycle_journal_size(normalized, normalized_plan)
     root = pathlib.Path(normalized["workspace"]["root"]).resolve(strict=True)
     with _workspace_lock(root, location) as root_fd:
         _require_effect_temps_absent(
@@ -960,6 +961,110 @@ def _direct_journal_successor(
     return False
 
 
+def _timestamp_prefix_valid(raw: bytes) -> bool:
+    template = b"0000-00-00T00:00:00"
+    fixed = raw[: len(template)]
+    if not all(
+        (48 <= observed <= 57) if expected == 48 else observed == expected
+        for observed, expected in zip(fixed, template)
+    ):
+        return False
+
+    def feasible_component(
+        start: int, stop: int, minimum: int, maximum: int
+    ) -> bool:
+        observed = fixed[start : min(len(fixed), stop)]
+        if not observed:
+            return True
+        width = stop - start
+        return any(
+            f"{value:0{width}d}".encode("ascii").startswith(observed)
+            for value in range(minimum, maximum + 1)
+        )
+
+    def feasible_day() -> bool:
+        observed = fixed[8 : min(len(fixed), 10)]
+        if not observed:
+            return True
+        if len(fixed) < 7:
+            maximum = 31
+        else:
+            year = int(fixed[:4])
+            month = int(fixed[5:7])
+            leap_year = year % 4 == 0 and (
+                year % 100 != 0 or year % 400 == 0
+            )
+            if month == 2:
+                maximum = 29 if leap_year else 28
+            elif month in (4, 6, 9, 11):
+                maximum = 30
+            else:
+                maximum = 31
+        return any(
+            f"{value:02d}".encode("ascii").startswith(observed)
+            for value in range(1, maximum + 1)
+        )
+
+    if not all((
+        feasible_component(5, 7, 1, 12),
+        feasible_day(),
+        feasible_component(11, 13, 0, 23),
+        feasible_component(14, 16, 0, 59),
+        feasible_component(17, 19, 0, 59),
+    )):
+        return False
+    if len(raw) <= len(template):
+        return True
+    suffix = raw[len(template) :]
+    if suffix == b"Z":
+        return True
+    if not suffix.startswith(b"."):
+        return False
+    fractional = suffix[1:]
+    if not fractional:
+        return True
+    if fractional.endswith(b"Z"):
+        fractional = fractional[:-1]
+        if not fractional:
+            return False
+    return all(48 <= character <= 57 for character in fractional)
+
+
+def _replacement_prefix_matches(
+    temporary_raw: bytes,
+    expected: dict[str, Any],
+    plan: dict[str, Any] | None,
+) -> bool:
+    expected_payload = canonical_bytes(expected)
+    if expected_payload.startswith(temporary_raw):
+        return True
+    marker = b'"updated_at":"'
+    marker_start = expected_payload.find(marker)
+    if marker_start < 0:
+        return False
+    value_start = marker_start + len(marker)
+    if len(temporary_raw) <= value_start:
+        return expected_payload.startswith(temporary_raw)
+    if temporary_raw[:value_start] != expected_payload[:value_start]:
+        return False
+    value_end = temporary_raw.find(b'"', value_start)
+    if value_end < 0:
+        return _timestamp_prefix_valid(temporary_raw[value_start:])
+    observed_raw = temporary_raw[value_start:value_end]
+    if not observed_raw.endswith(b"Z") or not _timestamp_prefix_valid(
+        observed_raw
+    ):
+        return False
+    try:
+        observed_timestamp = observed_raw.decode("ascii", errors="strict")
+        observed_expected = copy.deepcopy(expected)
+        observed_expected["updated_at"] = observed_timestamp
+        observed_expected = validate_journal(observed_expected, plan)
+    except (UnicodeError, ValueError):
+        return False
+    return canonical_bytes(observed_expected).startswith(temporary_raw)
+
+
 def _reconcile_replace_temp(
     location: dict[str, pathlib.Path],
     plan: dict[str, Any] | None = None,
@@ -990,10 +1095,11 @@ def _reconcile_replace_temp(
                 return
             raise JournalError("journal-unsafe", str(temporary)) from error
         normalized_expected = validate_journal(expected, plan)
-        expected_payload = canonical_bytes(normalized_expected)
         if (
             not _direct_journal_successor(current, normalized_expected)
-            or not expected_payload.startswith(temporary_raw)
+            or not _replacement_prefix_matches(
+                temporary_raw, normalized_expected, plan
+            )
         ):
             raise JournalError("journal-unsafe", str(temporary)) from error
         os.unlink(temporary)
@@ -2146,6 +2252,127 @@ def _terminal_replay(
     return validate_result(result)
 
 
+def _result_operations(journal: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "op": effect["kind"],
+            "path": effect["path"],
+            "before_digest": effect["before"]["digest"],
+            "after_digest": effect["after"]["digest"],
+        }
+        for effect in journal["effects"]
+        if effect["kind"] != "ensure-directory"
+    ]
+
+
+def _budget_validation(
+    *,
+    status: str,
+    classification: str | None,
+    basis_kind: str | None,
+    basis_digest: str | None,
+    blockers: list[dict[str, str]],
+) -> dict[str, Any]:
+    validation = {
+        "status": status,
+        "classification_after": classification,
+        "basis_kind": basis_kind,
+        "basis_digest": basis_digest,
+        "blockers": blockers,
+        "digest": None,
+    }
+    validation["digest"] = canonical_digest(
+        validation, null_field="digest"
+    )
+    return validate_validation(validation)
+
+
+def _terminal_budget_candidate(
+    journal: dict[str, Any],
+    plan: dict[str, Any],
+    *,
+    completed: bool,
+    failed_validation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    candidate = copy.deepcopy(journal)
+    if completed:
+        _set_cursor(
+            candidate, len(candidate["effects"]), candidate["updated_at"]
+        )
+        basis_digest = plan["removal_plan_basis_digest"]
+        basis_kind = "removal-plan"
+        if basis_digest is None:
+            basis_kind = "migration-candidate"
+            basis_digest = plan["provenance_after"]["receipt_digest"]
+        if basis_digest is None:
+            basis_digest = "sha256:" + "0" * 64
+        candidate["validation"] = _budget_validation(
+            status="passed",
+            classification=plan["target_classification"],
+            basis_kind=basis_kind,
+            basis_digest=basis_digest,
+            blockers=[],
+        )
+        candidate["stage"] = "completed"
+        candidate["direction"] = "none"
+        applied = _result_operations(candidate)
+        result_stage = "completed"
+    else:
+        _set_cursor(candidate, 0, candidate["updated_at"])
+        if failed_validation is None:
+            possible_refs = [
+                plan["workspace"]["root"],
+                *(effect["path"] for effect in candidate["effects"]),
+            ]
+            budget_ref = max(
+                possible_refs,
+                key=lambda value: len(canonical_bytes({"ref": value})),
+            )
+            failed_validation = _budget_validation(
+                status="failed",
+                classification=None,
+                basis_kind=None,
+                basis_digest=None,
+                blockers=[{
+                    "code": "candidate-validation-too-large",
+                    "ref": budget_ref,
+                }],
+            )
+        candidate["validation"] = copy.deepcopy(failed_validation)
+        candidate["stage"] = "rolled-back"
+        candidate["direction"] = "none"
+        applied = []
+        result_stage = "rolled-back"
+    candidate["completion_result"] = _result(
+        plan,
+        candidate,
+        stage=result_stage,
+        resumed=False,
+        applied=applied,
+    )
+    return validate_journal(candidate, plan)
+
+
+def _maximum_lifecycle_journal_size(
+    journal: dict[str, Any], plan: dict[str, Any]
+) -> int:
+    candidates = (
+        journal,
+        _terminal_budget_candidate(journal, plan, completed=True),
+        _terminal_budget_candidate(journal, plan, completed=False),
+    )
+    return max(len(canonical_bytes(candidate)) for candidate in candidates)
+
+
+def _require_lifecycle_journal_size(
+    journal: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    _require_journal_size(
+        _maximum_lifecycle_journal_size(journal, plan),
+        "journal-lifecycle",
+    )
+
+
 def _complete_rollback(
     plan: dict[str, Any],
     journal: dict[str, Any],
@@ -2355,6 +2582,23 @@ def execute_upgrade(
             )
             _require_workspace_binding(root_fd, root)
             if journal["validation"]["status"] != "passed":
+                failed_terminal = _terminal_budget_candidate(
+                    journal,
+                    normalized_plan,
+                    completed=False,
+                    failed_validation=journal["validation"],
+                )
+                if len(canonical_bytes(failed_terminal)) > MAX_JOURNAL_BYTES:
+                    journal["validation"] = _budget_validation(
+                        status="failed",
+                        classification=None,
+                        basis_kind=None,
+                        basis_digest=None,
+                        blockers=[{
+                            "code": "candidate-validation-too-large",
+                            "ref": str(root),
+                        }],
+                    )
                 journal["stage"] = "rolling-back"
                 journal["direction"] = "reverse"
                 journal["updated_at"] = updated_at
@@ -2429,16 +2673,7 @@ def execute_upgrade(
         journal["stage"] = "completed"
         journal["direction"] = "none"
         journal["updated_at"] = updated_at
-        applied = [
-            {
-                "op": effect["kind"],
-                "path": effect["path"],
-                "before_digest": effect["before"]["digest"],
-                "after_digest": effect["after"]["digest"],
-            }
-            for effect in journal["effects"]
-            if effect["kind"] != "ensure-directory"
-        ]
+        applied = _result_operations(journal)
         result = _result(
             normalized_plan,
             journal,
@@ -2662,7 +2897,7 @@ def build_prepared_journal(
         "updated_at": created_at,
     }
     normalized_journal = validate_journal(journal, normalized_plan)
-    _require_journal_size(
-        len(canonical_bytes(normalized_journal)), "prepared-journal"
+    _require_lifecycle_journal_size(
+        normalized_journal, normalized_plan
     )
     return normalized_journal

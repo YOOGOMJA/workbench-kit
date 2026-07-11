@@ -848,7 +848,7 @@ def apply_upgrade(
             journal = build_prepared_journal(
                 plan, plan_source_digest, _utc_now()
             )
-            install_prepared_journal(journal, location)
+            install_prepared_journal(journal, location, plan)
         return execute_upgrade(
             plan,
             location,
