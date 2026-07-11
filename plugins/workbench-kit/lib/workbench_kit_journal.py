@@ -11,7 +11,7 @@ import os
 import pathlib
 import pwd
 import stat
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -311,22 +311,22 @@ def _journal_location(
         "owner": workspace_coordination / "owner.json",
         "owner_temp": workspace_coordination / "owner.initial.tmp",
         "coordination": workspace_coordination,
-        "lock": workspace_coordination / "apply.lock",
         "workspace_root": root,
         "workspace_device": workspace_device,
         "workspace_inode": workspace_inode,
     }
 
 
-def resolve_journal_location(
-    workspace: pathlib.Path,
+def resolve_journal_location_locked(
+    root: pathlib.Path,
+    root_fd: int,
     plan_digest: str,
     *,
     journal_dir: pathlib.Path | None = None,
     environment: dict[str, str] | None = None,
 ) -> dict[str, pathlib.Path]:
-    root = pathlib.Path(workspace).resolve(strict=True)
-    workspace_node = _lstat_directory(root, "workspace-unsafe")
+    _require_workspace_binding(root_fd, root)
+    workspace_node = os.fstat(root_fd)
     _workspace_git_directory(root)
     if journal_dir is None:
         journal_root = _default_journal_root(
@@ -367,20 +367,39 @@ def resolve_journal_location(
         journal_root,
         coordination,
     )
-    with _workspace_lock(root, location):
-        owner = _read_owner(location)
-        if owner is None or owner["plan_digest"] != plan_digest:
-            return location
-        if not _owner_workspace_matches(owner, location):
-            raise JournalError(
-                "transaction-in-progress", owner["journal_path"]
-            )
-        owner_location = _location_from_owner(location, owner)
-        owner_journal = load_journal(
-            owner_location, defer_replace_partial=True
+    _require_location_binding(root_fd, root, location)
+    owner = _read_owner(location)
+    if owner is None or owner["plan_digest"] != plan_digest:
+        return location
+    if not _owner_workspace_matches(owner, location):
+        raise JournalError(
+            "transaction-in-progress", owner["journal_path"]
         )
-        _require_owner_journal_binding(owner, owner_journal, owner_location)
-        return owner_location
+    owner_location = _location_from_owner(location, owner)
+    owner_journal = load_journal(
+        owner_location, defer_replace_partial=True
+    )
+    _require_owner_journal_binding(owner, owner_journal, owner_location)
+    _require_location_binding(root_fd, root, owner_location)
+    return owner_location
+
+
+def resolve_journal_location(
+    workspace: pathlib.Path,
+    plan_digest: str,
+    *,
+    journal_dir: pathlib.Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> dict[str, pathlib.Path]:
+    root = pathlib.Path(workspace).resolve(strict=True)
+    with workspace_lock(root) as root_fd:
+        return resolve_journal_location_locked(
+            root,
+            root_fd,
+            plan_digest,
+            journal_dir=journal_dir,
+            environment=environment,
+        )
 
 
 def _fsync_directory(path: pathlib.Path) -> None:
@@ -827,33 +846,47 @@ def _release_owner(
     _fsync_directory(location["owner_directory"])
 
 
+def install_prepared_journal_locked(
+    journal: dict[str, Any],
+    location: dict[str, pathlib.Path],
+    plan: dict[str, Any],
+    root_fd: int,
+) -> pathlib.Path:
+    normalized_plan = validate_plan(plan)
+    normalized = validate_journal(journal, normalized_plan)
+    _require_lifecycle_journal_size(normalized, normalized_plan)
+    root = pathlib.Path(normalized["workspace"]["root"]).resolve(strict=True)
+    _require_location_binding(root_fd, root, location)
+    _require_effect_temps_absent(
+        root_fd,
+        root,
+        normalized["effects"],
+        code="operation-temp-stale",
+    )
+    created_owner = _claim_owner(normalized, location)
+    try:
+        installed = _install_prepared_journal_unlocked(
+            normalized, location
+        )
+        _require_location_binding(root_fd, root, location)
+        return installed
+    except BaseException:
+        if created_owner and _existing_file(location["journal"]) is None:
+            _release_owner(normalized, location)
+        raise
+
+
 def install_prepared_journal(
     journal: dict[str, Any],
     location: dict[str, pathlib.Path],
     plan: dict[str, Any],
 ) -> pathlib.Path:
     normalized_plan = validate_plan(plan)
-    normalized = validate_journal(journal, normalized_plan)
-    _require_lifecycle_journal_size(normalized, normalized_plan)
-    root = pathlib.Path(normalized["workspace"]["root"]).resolve(strict=True)
-    with _workspace_lock(root, location) as root_fd:
-        _require_effect_temps_absent(
-            root_fd,
-            root,
-            normalized["effects"],
-            code="operation-temp-stale",
+    root = pathlib.Path(normalized_plan["workspace"]["root"]).resolve(strict=True)
+    with workspace_lock(root) as root_fd:
+        return install_prepared_journal_locked(
+            journal, location, normalized_plan, root_fd
         )
-        created_owner = _claim_owner(normalized, location)
-        try:
-            installed = _install_prepared_journal_unlocked(
-                normalized, location
-            )
-            _require_workspace_binding(root_fd, root)
-            return installed
-        except BaseException:
-            if created_owner and _existing_file(location["journal"]) is None:
-                _release_owner(normalized, location)
-            raise
 
 
 def _decode_journal_payload(
@@ -1160,30 +1193,6 @@ def _replace_journal(
     return normalized
 
 
-def _open_coordination_lock(location: dict[str, pathlib.Path]) -> int:
-    coordination = location["coordination"]
-    _require_owned_safe_directory(
-        coordination, "coordination-root-unsafe", private=True
-    )
-    path = location["lock"]
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
-    node = os.lstat(path)
-    opened = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(node.st_mode)
-        or node.st_uid != os.getuid()
-        or stat.S_IMODE(node.st_mode) != 0o600
-        or node.st_nlink != 1
-        or (opened.st_dev, opened.st_ino) != (node.st_dev, node.st_ino)
-        or opened.st_uid != node.st_uid
-        or opened.st_nlink != 1
-    ):
-        os.close(descriptor)
-        raise JournalError("coordination-lock-unsafe", str(path))
-    return descriptor
-
-
 def _workspace_binding_valid(
     root_fd: int, root: pathlib.Path
 ) -> bool:
@@ -1204,44 +1213,47 @@ def _require_workspace_binding(root_fd: int, root: pathlib.Path) -> None:
         raise JournalError("workspace-binding-stale", str(root))
 
 
+def require_workspace_binding(root_fd: int, root: pathlib.Path) -> None:
+    _require_workspace_binding(root_fd, root)
+
+
 @contextmanager
-def _workspace_lock(
-    root: pathlib.Path, location: dict[str, pathlib.Path]
-) -> Iterator[int]:
+def workspace_lock(root: pathlib.Path) -> Iterator[int]:
     node = _lstat_directory(root, "workspace-unsafe")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root_descriptor = os.open(root, flags)
     try:
-        coordination_descriptor = _open_coordination_lock(location)
+        opened = os.fstat(root_descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (node.st_dev, node.st_ino)
+            or opened.st_uid != os.getuid()
+        ):
+            raise JournalError("workspace-unsafe", str(root))
         try:
-            opened = os.fstat(root_descriptor)
-            if (
-                (opened.st_dev, opened.st_ino) != (node.st_dev, node.st_ino)
-                or opened.st_uid != os.getuid()
-            ):
-                raise JournalError("workspace-unsafe", str(root))
-            if (
-                opened.st_dev != location["workspace_device"]
-                or opened.st_ino != location["workspace_inode"]
-            ):
-                raise JournalError("workspace-binding-stale", str(root))
-            try:
-                fcntl.flock(
-                    coordination_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
-                )
-                fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except (BlockingIOError, OSError) as error:
-                raise JournalError("apply-in-progress", str(root)) from error
+            fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as error:
+            raise JournalError("apply-in-progress", str(root)) from error
+        try:
             _require_workspace_binding(root_descriptor, root)
             yield root_descriptor
         finally:
-            try:
-                fcntl.flock(root_descriptor, fcntl.LOCK_UN)
-                fcntl.flock(coordination_descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(coordination_descriptor)
+            fcntl.flock(root_descriptor, fcntl.LOCK_UN)
     finally:
         os.close(root_descriptor)
+
+
+def _require_location_binding(
+    root_fd: int,
+    root: pathlib.Path,
+    location: dict[str, pathlib.Path],
+) -> None:
+    _require_workspace_binding(root_fd, root)
+    opened = os.fstat(root_fd)
+    if (
+        opened.st_dev != location["workspace_device"]
+        or opened.st_ino != location["workspace_inode"]
+    ):
+        raise JournalError("workspace-binding-stale", str(root))
 
 
 def _image_for_path(
@@ -2371,11 +2383,18 @@ def execute_upgrade(
     updated_at: str,
     validate_after: Callable[[dict[str, Any]], dict[str, Any]],
     fault_hook: Callable[[str, dict[str, Any], str], None] | None = None,
+    _root_fd: int | None = None,
 ) -> dict[str, Any]:
     normalized_plan = validate_plan(plan)
     root = pathlib.Path(normalized_plan["workspace"]["root"]).resolve(strict=True)
     hook = fault_hook or (lambda _point, _effect, _direction: None)
-    with _workspace_lock(root, location) as root_fd:
+    lock_context = (
+        workspace_lock(root)
+        if _root_fd is None
+        else nullcontext(_root_fd)
+    )
+    with lock_context as root_fd:
+        _require_location_binding(root_fd, root, location)
         journal = load_journal(
             location,
             normalized_plan,
@@ -2630,6 +2649,27 @@ def execute_upgrade(
         _release_owner(journal, location)
         _require_workspace_binding(root_fd, root)
         return journal["completion_result"]
+
+
+def execute_upgrade_locked(
+    plan: dict[str, Any],
+    location: dict[str, pathlib.Path],
+    root_fd: int,
+    *,
+    plan_source_digest: str,
+    updated_at: str,
+    validate_after: Callable[[dict[str, Any]], dict[str, Any]],
+    fault_hook: Callable[[str, dict[str, Any], str], None] | None = None,
+) -> dict[str, Any]:
+    return execute_upgrade(
+        plan,
+        location,
+        plan_source_digest=plan_source_digest,
+        updated_at=updated_at,
+        validate_after=validate_after,
+        fault_hook=fault_hook,
+        _root_fd=root_fd,
+    )
 
 
 def _absent_image() -> dict[str, Any]:

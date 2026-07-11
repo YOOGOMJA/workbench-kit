@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" <<'PY'
 import base64
+import fcntl
 import hashlib
+import multiprocessing
 import os
 import pathlib
 import subprocess
@@ -12,6 +14,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, sys.argv[1])
+import workbench_kit_upgrade as upgrade_module
 from workbench_kit_contracts import (
     canonical_bytes,
     canonical_digest,
@@ -58,6 +61,35 @@ def workspace_digest(root):
             elif path.is_file():
                 rows.append(("file", relative, hashlib.sha256(path.read_bytes()).hexdigest()))
     return hashlib.sha256(canonical_bytes(rows)).hexdigest()
+
+
+def hold_workspace_lock(path, ready, release):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        ready.send(True)
+        release.recv()
+    finally:
+        os.close(descriptor)
+
+
+def try_locked_workspace_edit(path, result):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            pass
+        if acquired:
+            subprocess.run(
+                ["git", "-C", path, "config", "upgrade.race", "won"],
+                check=True,
+            )
+        result.send(acquired)
+    finally:
+        os.close(descriptor)
 
 
 header = b"# Workbench\n\n"
@@ -733,7 +765,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
         },
         "provenance": {
             "kind": None,
-            "state": "indeterminate",
+            "state": "absent",
             "receipt_digest": None,
             "ref": None,
         },
@@ -801,6 +833,79 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
     )
     os.environ["UPGRADE_STUB_MODE"] = "staged-v2"
     os.environ["XDG_STATE_HOME"] = str(xdg_state)
+
+    alternate_journal_dir = external_root / "alternate-upgrade-journals"
+    alternate_journal_dir.mkdir(mode=0o700)
+    alternate_apply_request = parse_request([
+        "--workspace", str(cli_root),
+        "upgrade-workbench", "--apply",
+        "--plan-file", str(plan_path),
+        "--language", "en",
+        "--authority-approval-file", str(authority_path),
+        "--journal-dir", str(alternate_journal_dir),
+        "--format", "json",
+    ])
+    context = multiprocessing.get_context("fork")
+    ready_parent, ready_child = context.Pipe(duplex=False)
+    release_child, release_parent = context.Pipe(duplex=False)
+    lock_process = context.Process(
+        target=hold_workspace_lock,
+        args=(str(cli_root), ready_child, release_child),
+    )
+    lock_process.start()
+    assert ready_parent.recv() is True
+    try:
+        for blocked_request, operation in (
+            (cli_request, dry_run_upgrade),
+            (apply_request, apply_upgrade),
+            (alternate_apply_request, apply_upgrade),
+        ):
+            try:
+                operation(blocked_request, cli_bundle)
+            except CliError as error:
+                assert error.code == "apply-in-progress", error.code
+            else:
+                raise AssertionError("workspace flock contention was ignored")
+    finally:
+        release_parent.send(True)
+        lock_process.join(5)
+        assert lock_process.exitcode == 0
+    assert not any(journal_dir.iterdir())
+    assert not any(alternate_journal_dir.iterdir())
+
+    original_inspect = upgrade_module.inspect_public_kernel
+    race_result_parent, race_result_child = context.Pipe(duplex=False)
+
+    def racing_inspect(*args, **kwargs):
+        race_process = context.Process(
+            target=try_locked_workspace_edit,
+            args=(str(cli_root), race_result_child),
+        )
+        race_process.start()
+        race_process.join(5)
+        assert race_process.exitcode == 0
+        return original_inspect(*args, **kwargs)
+
+    upgrade_module.inspect_public_kernel = racing_inspect
+    os.environ["UPGRADE_STUB_MODE"] = "mutate-state"
+    try:
+        try:
+            dry_run_upgrade(cli_request, cli_bundle)
+        except CliError as error:
+            assert error.code == "public-adapter-mutated", error.code
+        else:
+            raise AssertionError("mutating public adapter was accepted")
+    finally:
+        upgrade_module.inspect_public_kernel = original_inspect
+        os.environ["UPGRADE_STUB_MODE"] = "staged-v2"
+    assert race_result_parent.recv() is False
+    race_config = subprocess.run(
+        ["git", "-C", str(cli_root), "config", "--get", "upgrade.race"],
+        capture_output=True,
+        check=False,
+    )
+    assert race_config.returncode == 1
+
     try:
         applied = apply_upgrade(apply_request, cli_bundle)
         replayed = apply_upgrade(apply_request, cli_bundle)
@@ -866,3 +971,8 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
 
 print("PASS: deterministic migration planner and preservation manifest")
 PY
+
+if find "$ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi

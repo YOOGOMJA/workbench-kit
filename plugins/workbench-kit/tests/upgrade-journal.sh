@@ -2991,3 +2991,8 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
 
 print("PASS: deterministic full-preimage upgrade journal preparation")
 PY
+
+if find "$ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi

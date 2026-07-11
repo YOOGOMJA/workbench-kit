@@ -36,9 +36,11 @@ from workbench_kit_planner import (
 from workbench_kit_journal import (
     JournalError,
     build_prepared_journal,
-    execute_upgrade,
-    install_prepared_journal,
-    resolve_journal_location,
+    execute_upgrade_locked,
+    install_prepared_journal_locked,
+    require_workspace_binding,
+    resolve_journal_location_locked,
+    workspace_lock,
 )
 
 
@@ -107,6 +109,8 @@ def read_migration_task(
     workspace: pathlib.Path,
     route: str,
     public_snapshot: dict[str, Any],
+    *,
+    workspace_home: str | None = None,
 ) -> dict[str, Any]:
     root = _resolve_workspace(workspace)
     try:
@@ -144,6 +148,10 @@ def read_migration_task(
     if branch_result.returncode != 0 or current_branch != values["branch"]:
         raise CliError("migration-task-identity-invalid", "HEAD")
     if expected == "workbench-task/v1":
+        if not isinstance(workspace_home, str) or not workspace_home:
+            raise CliError(
+                "migration-task-identity-invalid", "workspace_home"
+            )
         active = public_snapshot.get("active_v1_tasks")
         if not isinstance(active, list):
             raise CliError("migration-task-identity-invalid", "legacy-inventory")
@@ -154,8 +162,17 @@ def read_migration_task(
         if len(matches) != 1:
             raise CliError("migration-task-identity-invalid", "legacy-inventory")
         claim = matches[0]
-        expected_id = f"{claim.get('home')}#{claim.get('issue')}"
-        valid_ids = {expected_id, str(claim.get("issue"))}
+        claim_home = claim.get("home")
+        expected_id = f"{claim_home}#{claim.get('issue')}"
+        workspace_claim = claim_home == workspace_home
+        valid_ids = (
+            {expected_id, str(claim.get("issue"))}
+            if workspace_claim
+            else {expected_id}
+        )
+        valid_homes = (
+            ("", claim_home) if workspace_claim else (claim_home,)
+        )
         local_parent = values.get("parent", "")
         public_parent = claim.get("parent")
         identity_matches = (
@@ -165,7 +182,7 @@ def read_migration_task(
             and values["id"] in valid_ids
             and values.get("issue", str(claim.get("issue")))
             == str(claim.get("issue"))
-            and values.get("home", claim.get("home")) in ("", claim.get("home"))
+            and values.get("home", claim_home) in valid_homes
             and local_parent
             == ("" if public_parent is None else str(public_parent))
         )
@@ -411,7 +428,6 @@ def plan_from_snapshot(
         diagnosis, public_snapshot["contract"]["workspace"]["schema"]
     )
     validate_route_flags(request, route)
-    migration_task = read_migration_task(root, route, public_snapshot)
     if receipt_inputs is None:
         authority_input = _optional_projection(
             request,
@@ -435,6 +451,17 @@ def plan_from_snapshot(
         authority_input = receipt_inputs["authority"]
         reviewed_overlay_input = receipt_inputs["reviewed_overlay"]
         removal_approval_input = receipt_inputs["removal_approval"]
+    workspace_home = (
+        authority_input["receipt"]["proposed_descriptor"]["workspace_home"]
+        if authority_input is not None
+        else None
+    )
+    migration_task = read_migration_task(
+        root,
+        route,
+        public_snapshot,
+        workspace_home=workspace_home,
+    )
     embedded_verified = (
         diagnosis["embedded_engine"]["state"] == "present-verified"
     )
@@ -510,12 +537,13 @@ def _embedded_candidate_present(
     return False
 
 
-def dry_run_upgrade(
-    request: dict[str, Any], bundle: dict[str, Any]
+def _dry_run_upgrade_locked(
+    request: dict[str, Any],
+    bundle: dict[str, Any],
+    root: pathlib.Path,
+    root_fd: int,
 ) -> dict[str, Any]:
-    if request["mode"] != "dry-run":
-        raise CliError("mode-invalid", request["mode"])
-    root = _resolve_workspace(request["workspace"])
+    require_workspace_binding(root_fd, root)
     receipt_inputs = {
         "authority": _optional_projection(
             request,
@@ -554,7 +582,7 @@ def dry_run_upgrade(
         )
     except AdapterError as error:
         if error.code in INDETERMINATE_ADAPTER_ERRORS:
-            return {
+            diagnosis = {
                 "contract_version": "workbench-kit-diagnosis/v1",
                 "classification": "indeterminate",
                 "embedded_engine": {
@@ -563,7 +591,7 @@ def dry_run_upgrade(
                 },
                 "provenance": {
                     "kind": None,
-                    "state": "indeterminate",
+                    "state": "absent",
                     "receipt_digest": None,
                     "ref": None,
                 },
@@ -573,14 +601,33 @@ def dry_run_upgrade(
                     "ref": error.ref,
                 }],
             }
+            require_workspace_binding(root_fd, root)
+            return diagnosis
         raise CliError(error.code, error.ref) from error
-    return plan_from_snapshot(
+    plan = plan_from_snapshot(
         root,
         request=request,
         bundle=bundle,
         public_snapshot=public_snapshot,
         receipt_inputs=receipt_inputs,
     )
+    require_workspace_binding(root_fd, root)
+    return plan
+
+
+def dry_run_upgrade(
+    request: dict[str, Any], bundle: dict[str, Any]
+) -> dict[str, Any]:
+    if request["mode"] != "dry-run":
+        raise CliError("mode-invalid", request["mode"])
+    root = _resolve_workspace(request["workspace"])
+    try:
+        with workspace_lock(root) as root_fd:
+            return _dry_run_upgrade_locked(
+                request, bundle, root, root_fd
+            )
+    except JournalError as error:
+        raise CliError(error.code, error.ref) from error
 
 
 def load_runtime_bundle(plugin_root: pathlib.Path) -> dict[str, Any]:
@@ -908,19 +955,21 @@ def _utc_now() -> str:
     )
 
 
-def apply_upgrade(
-    request: dict[str, Any], bundle: dict[str, Any]
+def _apply_upgrade_locked(
+    request: dict[str, Any],
+    bundle: dict[str, Any],
+    root: pathlib.Path,
+    root_fd: int,
 ) -> dict[str, Any]:
-    if request["mode"] != "apply":
-        raise CliError("mode-invalid", request["mode"])
-    root = _resolve_workspace(request["workspace"])
+    require_workspace_binding(root_fd, root)
     plan, plan_source_digest = _load_plan(request, root)
     _apply_inputs(request, root, plan)
     if plan["blockers"] or not plan["actionable"]:
         raise CliError("plan-not-actionable", plan["plan_digest"])
     try:
-        location = resolve_journal_location(
+        location = resolve_journal_location_locked(
             root,
+            root_fd,
             plan["plan_digest"],
             journal_dir=(
                 pathlib.Path(request["journal_dir"])
@@ -943,19 +992,39 @@ def apply_upgrade(
                     plan["removal_plan_basis_digest"] is not None
                 ),
             })
-            regenerated = dry_run_upgrade(dry_request, bundle)
+            regenerated = _dry_run_upgrade_locked(
+                dry_request, bundle, root, root_fd
+            )
             if canonical_bytes(regenerated) != canonical_bytes(plan):
                 raise CliError("plan-stale", plan["plan_digest"])
             journal = build_prepared_journal(
                 plan, plan_source_digest, _utc_now()
             )
-            install_prepared_journal(journal, location, plan)
-        return execute_upgrade(
+            install_prepared_journal_locked(
+                journal, location, plan, root_fd
+            )
+        return execute_upgrade_locked(
             plan,
             location,
+            root_fd,
             plan_source_digest=plan_source_digest,
             updated_at=_utc_now(),
             validate_after=_candidate_validator(request, bundle),
         )
+    except JournalError as error:
+        raise CliError(error.code, error.ref) from error
+
+
+def apply_upgrade(
+    request: dict[str, Any], bundle: dict[str, Any]
+) -> dict[str, Any]:
+    if request["mode"] != "apply":
+        raise CliError("mode-invalid", request["mode"])
+    root = _resolve_workspace(request["workspace"])
+    try:
+        with workspace_lock(root) as root_fd:
+            return _apply_upgrade_locked(
+                request, bundle, root, root_fd
+            )
     except JournalError as error:
         raise CliError(error.code, error.ref) from error

@@ -244,7 +244,9 @@ with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
         "ancestry_complete": True,
     }
     public_v1 = {"active_v1_tasks": [legacy_claim]}
-    task = read_migration_task(workspace, "implicit-v1", public_v1)
+    task = read_migration_task(
+        workspace, "implicit-v1", public_v1, workspace_home="workbench"
+    )
     assert task == {
         "task_id": "workbench#27",
         "claim_id": "claim-27",
@@ -256,7 +258,9 @@ with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
         index.replace(b"claim_id: claim-27", b"claim_id: forged-claim")
     )
     try:
-        read_migration_task(workspace, "implicit-v1", public_v1)
+        read_migration_task(
+            workspace, "implicit-v1", public_v1, workspace_home="workbench"
+        )
     except CliError as error:
         assert error.code == "migration-task-identity-invalid", error.code
     else:
@@ -268,6 +272,35 @@ with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
     except CliError as error:
         rejected_task = error.code == "migration-task-contract-invalid"
     assert rejected_task
+
+    codebase_claim = {**legacy_claim, "home": "my-app"}
+    numeric_codebase = index.replace(
+        b"id: workbench#27\n", b"id: 27\n"
+    )
+    (workspace / "task/index.md").write_bytes(numeric_codebase)
+    try:
+        read_migration_task(
+            workspace,
+            "implicit-v1",
+            {"active_v1_tasks": [codebase_claim]},
+            workspace_home="workbench",
+        )
+    except CliError as error:
+        assert error.code == "migration-task-identity-invalid", error.code
+    else:
+        raise AssertionError("numeric/blank-home codebase identity was accepted")
+    exact_codebase = numeric_codebase.replace(
+        b"id: 27\n", b"id: my-app#27\n"
+    ).replace(
+        b"home: \n", b"home: my-app\n"
+    )
+    (workspace / "task/index.md").write_bytes(exact_codebase)
+    assert read_migration_task(
+        workspace,
+        "implicit-v1",
+        {"active_v1_tasks": [codebase_claim]},
+        workspace_home="workbench",
+    )["task_id"] == "my-app#27"
 
     descriptor_digest = "sha256:" + "b" * 64
     v2_index = index.replace(
@@ -553,7 +586,8 @@ grep -q 'mode-required: --dry-run/--apply' /tmp/workbench-kit-cli.stderr \
   || { echo "FAIL: invalid CLI diagnostic mismatch" >&2; exit 1; }
 rm -f /tmp/workbench-kit-cli.stdout /tmp/workbench-kit-cli.stderr
 
-runtime_tmp="$(cd /tmp && pwd -P)"
+runtime_tmp="$(mktemp -d "${TMPDIR:-/tmp}/workbench-kit-cli-runtime.XXXXXX")"
+runtime_tmp="$(cd "$runtime_tmp" && pwd -P)"
 missing_plan="$runtime_tmp/workbench-kit-missing-plan-$$.json"
 set +e
 "$BIN" --workspace "$runtime_tmp" upgrade-workbench --apply \
@@ -582,5 +616,11 @@ grep -q 'workspace-invalid:' /tmp/workbench-kit-cli.stderr \
 ! grep -q 'Traceback' /tmp/workbench-kit-cli.stderr \
   || { echo "FAIL: missing workspace leaked traceback" >&2; exit 1; }
 rm -f /tmp/workbench-kit-cli.stdout /tmp/workbench-kit-cli.stderr
+rm -rf "$runtime_tmp"
 
 echo "PASS: packaged workbench-kit CLI entrypoint"
+
+if find "$ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi
