@@ -9,6 +9,7 @@ import fcntl
 import multiprocessing
 import pathlib
 import os
+import pwd
 import stat
 import sys
 import tempfile
@@ -428,6 +429,15 @@ def hold_workspace_lock(path, ready, release):
 
 
 with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
+    system_account_home = pathlib.Path(
+        pwd.getpwuid(os.getuid()).pw_dir
+    ).resolve()
+    assert journal_module._account_home() == system_account_home
+    account_home = pathlib.Path(temporary) / "account-home"
+    account_home.mkdir(mode=0o700)
+    account_home = account_home.resolve()
+    journal_module._account_home = lambda: account_home
+
     root = pathlib.Path(temporary) / "workbench"
     root.mkdir()
     root = root.resolve()
@@ -469,7 +479,12 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert location["directory"].parent == journal_root
     assert location["directory"].name == first["workspace_id"]
     assert location["journal"].name == plan["plan_digest"][7:] + ".json"
-    assert location["owner"].parent.parent.parent.parent == root / ".git"
+    assert location["owner"] == (
+        account_home
+        / ".local/state/workbench-kit/upgrade-coordination"
+        / first["workspace_id"]
+        / "owner.json"
+    )
     installed = install_prepared_journal(first, location)
     assert installed == location["journal"]
     installed_stat = os.lstat(installed)
@@ -509,25 +524,29 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     xdg = pathlib.Path(temporary) / "xdg"
     xdg.mkdir(mode=0o700)
     xdg = xdg.resolve()
+    xdg_workspace = pathlib.Path(temporary) / "xdg-workbench"
+    xdg_workspace.mkdir()
+    xdg_workspace = xdg_workspace.resolve()
+    xdg_plan, _, _ = fixture_plan(xdg_workspace)
     default_location = resolve_journal_location(
-        root,
-        plan["plan_digest"],
+        xdg_workspace,
+        xdg_plan["plan_digest"],
         environment={"XDG_STATE_HOME": str(xdg)},
     )
     assert default_location["root"] == xdg / "workbench-kit/upgrades"
     assert stat.S_IMODE(os.lstat(default_location["root"]).st_mode) == 0o700
     rejected(
         lambda: resolve_journal_location(
-            root,
-            plan["plan_digest"],
+            xdg_workspace,
+            xdg_plan["plan_digest"],
             environment={"XDG_STATE_HOME": "relative"},
         ),
         "journal-root-invalid",
     )
     rejected(
         lambda: resolve_journal_location(
-            root,
-            plan["plan_digest"],
+            xdg_workspace,
+            xdg_plan["plan_digest"],
             environment={"HOME": ""},
         ),
         "journal-root-invalid",
@@ -883,6 +902,137 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert not temp_effect_path.exists()
     assert (temp_root / ".workbench/schema").read_bytes() == temp_after
 
+    preclaimed_root = pathlib.Path(temporary) / "preclaimed-temp-workbench"
+    preclaimed_root.mkdir()
+    preclaimed_root = preclaimed_root.resolve()
+    preclaimed_plan, _, _ = fixture_plan(preclaimed_root)
+    preclaimed_journal_id = (
+        "upgrade-" + preclaimed_plan["plan_digest"].removeprefix("sha256:")
+    )
+    preclaimed_temp = (
+        preclaimed_root
+        / ".workbench"
+        / (
+            ".workbench-kit."
+            + preclaimed_journal_id
+            + ".effect-0001.tmp"
+        )
+    )
+    preclaimed_temp.write_bytes(b"")
+    preclaimed_temp.chmod(0o600)
+    rejected(
+        lambda: build_prepared_journal(
+            preclaimed_plan,
+            canonical_digest(canonical_bytes(preclaimed_plan), raw=True),
+            CREATED_AT,
+        ),
+        "operation-temp-stale",
+    )
+    assert preclaimed_temp.read_bytes() == b""
+
+    prepared_temp_root = pathlib.Path(temporary) / "prepared-temp-workbench"
+    prepared_temp_root.mkdir()
+    prepared_temp_root = prepared_temp_root.resolve()
+    prepared_temp_plan, prepared_temp_before, _ = fixture_plan(
+        prepared_temp_root
+    )
+    prepared_temp_source = canonical_digest(
+        canonical_bytes(prepared_temp_plan), raw=True
+    )
+    prepared_temp_journal = build_prepared_journal(
+        prepared_temp_plan, prepared_temp_source, CREATED_AT
+    )
+    prepared_temp_location = resolve_journal_location(
+        prepared_temp_root,
+        prepared_temp_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(
+        prepared_temp_journal, prepared_temp_location
+    )
+    prepared_temp = (
+        prepared_temp_root
+        / prepared_temp_journal["effects"][0]["temp_path"]
+    )
+    prepared_temp.write_bytes(b"")
+    prepared_temp.chmod(0o600)
+    rejected(
+        lambda: execute_upgrade(
+            prepared_temp_plan,
+            prepared_temp_location,
+            plan_source_digest=prepared_temp_source,
+            updated_at="2026-07-11T00:12:15Z",
+            validate_after=passed_validation,
+        ),
+        "operation-temp-stale",
+    )
+    assert prepared_temp.read_bytes() == b""
+    assert load_journal(
+        prepared_temp_location, prepared_temp_plan
+    )["stage"] == "prepared"
+    assert (
+        prepared_temp_root / ".workbench/schema"
+    ).read_bytes() == prepared_temp_before
+
+    temp_failure_root = pathlib.Path(temporary) / "temp-failure-workbench"
+    temp_failure_root.mkdir()
+    temp_failure_root = temp_failure_root.resolve()
+    temp_failure_plan, temp_failure_before, _ = fixture_plan(
+        temp_failure_root
+    )
+    temp_failure_source = canonical_digest(
+        canonical_bytes(temp_failure_plan), raw=True
+    )
+    temp_failure_journal = build_prepared_journal(
+        temp_failure_plan, temp_failure_source, CREATED_AT
+    )
+    temp_failure_location = resolve_journal_location(
+        temp_failure_root,
+        temp_failure_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(temp_failure_journal, temp_failure_location)
+    failed_temp_create = False
+
+    def fail_after_temp_create(point, _effect, direction):
+        global failed_temp_create
+        if (
+            point == "after-temp-create"
+            and direction == "forward"
+            and not failed_temp_create
+        ):
+            failed_temp_create = True
+            raise OSError("injected temp construction failure")
+
+    temp_failure_result = execute_upgrade(
+        temp_failure_plan,
+        temp_failure_location,
+        plan_source_digest=temp_failure_source,
+        updated_at="2026-07-11T00:12:30Z",
+        validate_after=passed_validation,
+        fault_hook=fail_after_temp_create,
+    )
+    assert temp_failure_result["transaction"]["stage"] == "rolled-back"
+    temp_failure_temp = (
+        temp_failure_root
+        / temp_failure_journal["effects"][0]["temp_path"]
+    )
+    assert not temp_failure_temp.exists()
+    assert (
+        temp_failure_root / ".workbench/schema"
+    ).read_bytes() == temp_failure_before
+    temp_failure_replay = execute_upgrade(
+        temp_failure_plan,
+        temp_failure_location,
+        plan_source_digest=temp_failure_source,
+        updated_at="2026-07-11T00:12:45Z",
+        validate_after=passed_validation,
+    )
+    assert temp_failure_replay["transaction"]["stage"] == "rolled-back"
+    assert temp_failure_replay["transaction"]["resumed"] is True
+
     link_root = pathlib.Path(temporary) / "link-crash-workbench"
     link_root.mkdir()
     link_root = link_root.resolve()
@@ -963,7 +1113,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
             updated_at="2026-07-11T00:15:00Z",
             validate_after=passed_validation,
         ),
-        "transaction-state-mismatch",
+        "operation-temp-stale",
     )
     assert unsafe_temp.is_symlink()
 
@@ -1052,6 +1202,68 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     }]
     assert (validation_root / ".workbench/schema").read_bytes() == validation_before
 
+    validation_edit_root = (
+        pathlib.Path(temporary) / "validation-edit-workbench"
+    )
+    validation_edit_root.mkdir()
+    validation_edit_root = validation_edit_root.resolve()
+    (
+        validation_edit_plan,
+        _,
+        validation_edit_after,
+    ) = fixture_plan(validation_edit_root)
+    validation_edit_source = canonical_digest(
+        canonical_bytes(validation_edit_plan), raw=True
+    )
+    validation_edit_journal = build_prepared_journal(
+        validation_edit_plan, validation_edit_source, CREATED_AT
+    )
+    validation_edit_location = resolve_journal_location(
+        validation_edit_root,
+        validation_edit_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(
+        validation_edit_journal, validation_edit_location
+    )
+
+    def edit_after_validation(point, _effect, direction):
+        if point == "after-validation" and direction == "forward":
+            (validation_edit_root / ".workbench/schema").write_bytes(
+                b"edit after validation\n"
+            )
+
+    rejected(
+        lambda: execute_upgrade(
+            validation_edit_plan,
+            validation_edit_location,
+            plan_source_digest=validation_edit_source,
+            updated_at="2026-07-11T00:17:30Z",
+            validate_after=passed_validation,
+            fault_hook=edit_after_validation,
+        ),
+        "transaction-state-mismatch",
+    )
+    assert load_journal(
+        validation_edit_location, validation_edit_plan
+    )["stage"] == "validating"
+    assert validation_edit_location["owner"].is_file()
+    assert (
+        validation_edit_root / ".workbench/schema"
+    ).read_bytes() == b"edit after validation\n"
+    (validation_edit_root / ".workbench/schema").write_bytes(
+        validation_edit_after
+    )
+    validation_edit_replay = execute_upgrade(
+        validation_edit_plan,
+        validation_edit_location,
+        plan_source_digest=validation_edit_source,
+        updated_at="2026-07-11T00:17:45Z",
+        validate_after=passed_validation,
+    )
+    assert validation_edit_replay["transaction"]["stage"] == "completed"
+
     reverse_root = pathlib.Path(temporary) / "reverse-temp-workbench"
     reverse_root.mkdir()
     reverse_root = reverse_root.resolve()
@@ -1121,7 +1333,9 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         environment={},
     )
     install_prepared_journal(replace_journal, replace_location)
-    replace_location["replace_temp"].write_bytes(b"foreign replace journal")
+    replace_location["replace_temp"].write_bytes(
+        replace_location["journal"].read_bytes()
+    )
     replace_location["replace_temp"].chmod(0o600)
     replace_recovered = execute_upgrade(
         replace_plan,
@@ -1131,11 +1345,106 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         validate_after=passed_validation,
     )
     assert replace_recovered["transaction"]["stage"] == "completed"
-    assert (
-        replace_location["replace_temp"].read_bytes()
-        == b"foreign replace journal"
-    )
+    assert not replace_location["replace_temp"].exists()
     assert (replace_root / ".workbench/schema").read_bytes() == replace_after
+
+    foreign_replace_root = pathlib.Path(temporary) / "foreign-replace-workbench"
+    foreign_replace_root.mkdir()
+    foreign_replace_root = foreign_replace_root.resolve()
+    foreign_replace_plan, foreign_replace_before, _ = fixture_plan(
+        foreign_replace_root
+    )
+    foreign_replace_source = canonical_digest(
+        canonical_bytes(foreign_replace_plan), raw=True
+    )
+    foreign_replace_journal = build_prepared_journal(
+        foreign_replace_plan, foreign_replace_source, CREATED_AT
+    )
+    foreign_replace_location = resolve_journal_location(
+        foreign_replace_root,
+        foreign_replace_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(
+        foreign_replace_journal, foreign_replace_location
+    )
+    foreign_replace_location["replace_temp"].write_bytes(
+        b"foreign replace journal"
+    )
+    foreign_replace_location["replace_temp"].chmod(0o600)
+    rejected(
+        lambda: execute_upgrade(
+            foreign_replace_plan,
+            foreign_replace_location,
+            plan_source_digest=foreign_replace_source,
+            updated_at="2026-07-11T00:20:30Z",
+            validate_after=passed_validation,
+        ),
+        "journal-unsafe",
+    )
+    assert foreign_replace_location["replace_temp"].read_bytes() == (
+        b"foreign replace journal"
+    )
+    assert (
+        foreign_replace_root / ".workbench/schema"
+    ).read_bytes() == foreign_replace_before
+
+    exchange_root = pathlib.Path(temporary) / "exchange-crash-workbench"
+    exchange_root.mkdir()
+    exchange_root = exchange_root.resolve()
+    exchange_plan, _, exchange_after = fixture_plan(exchange_root)
+    exchange_source = canonical_digest(
+        canonical_bytes(exchange_plan), raw=True
+    )
+    exchange_journal = build_prepared_journal(
+        exchange_plan, exchange_source, CREATED_AT
+    )
+    exchange_location = resolve_journal_location(
+        exchange_root,
+        exchange_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(exchange_journal, exchange_location)
+    original_exchange = journal_module._rename_exchange
+    exchange_interrupted = False
+
+    def crash_after_journal_exchange(directory_fd, first_name, second_name):
+        global exchange_interrupted
+        original_exchange(directory_fd, first_name, second_name)
+        if not exchange_interrupted:
+            exchange_interrupted = True
+            raise Crash()
+
+    journal_module._rename_exchange = crash_after_journal_exchange
+    try:
+        try:
+            execute_upgrade(
+                exchange_plan,
+                exchange_location,
+                plan_source_digest=exchange_source,
+                updated_at="2026-07-11T00:20:45Z",
+                validate_after=passed_validation,
+            )
+        except Crash:
+            pass
+        else:
+            raise AssertionError("journal exchange crash was not injected")
+    finally:
+        journal_module._rename_exchange = original_exchange
+    assert exchange_interrupted is True
+    assert exchange_location["replace_temp"].is_file()
+    exchange_replay = execute_upgrade(
+        exchange_plan,
+        exchange_location,
+        plan_source_digest=exchange_source,
+        updated_at="2026-07-11T00:20:50Z",
+        validate_after=passed_validation,
+    )
+    assert exchange_replay["transaction"]["stage"] == "completed"
+    assert not exchange_location["replace_temp"].exists()
+    assert (exchange_root / ".workbench/schema").read_bytes() == exchange_after
 
     umask_root = pathlib.Path(temporary) / "umask-workbench"
     umask_root.mkdir()
@@ -1165,6 +1474,71 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         os.umask(previous_umask)
     assert umask_result["transaction"]["stage"] == "completed"
     assert stat.S_IMODE(os.lstat(umask_root / ".workbench").st_mode) == 0o755
+
+    umask_crash_root = pathlib.Path(temporary) / "umask-crash-workbench"
+    umask_crash_root.mkdir()
+    umask_crash_root = umask_crash_root.resolve()
+    umask_crash_plan, umask_crash_after = fixture_create_plan(
+        umask_crash_root
+    )
+    umask_crash_source = canonical_digest(
+        canonical_bytes(umask_crash_plan), raw=True
+    )
+    umask_crash_journal = build_prepared_journal(
+        umask_crash_plan, umask_crash_source, CREATED_AT
+    )
+    umask_crash_location = resolve_journal_location(
+        umask_crash_root,
+        umask_crash_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(
+        umask_crash_journal, umask_crash_location
+    )
+
+    def crash_after_directory_create(point, effect, direction):
+        if (
+            point == "after-directory-create"
+            and direction == "forward"
+            and effect["kind"] == "ensure-directory"
+        ):
+            raise Crash()
+
+    previous_umask = os.umask(0o077)
+    try:
+        try:
+            execute_upgrade(
+                umask_crash_plan,
+                umask_crash_location,
+                plan_source_digest=umask_crash_source,
+                updated_at="2026-07-11T00:21:15Z",
+                validate_after=passed_validation,
+                fault_hook=crash_after_directory_create,
+            )
+        except Crash:
+            pass
+        else:
+            raise AssertionError("directory create crash was not injected")
+    finally:
+        os.umask(previous_umask)
+    assert stat.S_IMODE(
+        os.lstat(umask_crash_root / ".workbench").st_mode
+    ) == 0o700
+    umask_crash_replay = execute_upgrade(
+        umask_crash_plan,
+        umask_crash_location,
+        plan_source_digest=umask_crash_source,
+        updated_at="2026-07-11T00:21:30Z",
+        validate_after=passed_validation,
+    )
+    assert umask_crash_replay["transaction"]["stage"] == "completed"
+    assert stat.S_IMODE(
+        os.lstat(umask_crash_root / ".workbench").st_mode
+    ) == 0o755
+    assert (
+        umask_crash_root / ".workbench/schema"
+    ).read_bytes() == umask_crash_after
 
     noop_root = pathlib.Path(temporary) / "noop-workbench"
     noop_root.mkdir()
@@ -1296,6 +1670,31 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     )
     journal_alias.unlink()
 
+    journal_race_alias = hardlink_location["directory"] / "journal-race-alias"
+    original_read = journal_module.os.read
+    journal_read_mutated = False
+
+    def mutate_journal_after_read(descriptor, count):
+        global journal_read_mutated
+        chunk = original_read(descriptor, count)
+        if chunk and not journal_read_mutated:
+            journal_read_mutated = True
+            os.link(hardlink_location["journal"], journal_race_alias)
+            hardlink_location["journal"].chmod(0o644)
+        return chunk
+
+    journal_module.os.read = mutate_journal_after_read
+    try:
+        rejected(
+            lambda: load_journal(hardlink_location, hardlink_plan),
+            "journal-unsafe",
+        )
+    finally:
+        journal_module.os.read = original_read
+        hardlink_location["journal"].chmod(0o600)
+        journal_race_alias.unlink()
+    assert journal_read_mutated is True
+
     initial_root = pathlib.Path(temporary) / "initial-temp-workbench"
     initial_root.mkdir()
     initial_root = initial_root.resolve()
@@ -1370,9 +1769,140 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
             updated_at="2026-07-11T00:25:00Z",
             validate_after=passed_validation,
         ),
-        "transaction-state-mismatch",
+        "operation-temp-stale",
     )
     assert foreign_temp.read_bytes() == b"foreign complete-looking temp\n"
+
+    terminal_owner_root = pathlib.Path(temporary) / "terminal-owner-workbench"
+    terminal_owner_root.mkdir()
+    terminal_owner_root = terminal_owner_root.resolve()
+    terminal_owner_plan, _, terminal_owner_after = fixture_plan(
+        terminal_owner_root
+    )
+    terminal_owner_source = canonical_digest(
+        canonical_bytes(terminal_owner_plan), raw=True
+    )
+    terminal_owner_journal = build_prepared_journal(
+        terminal_owner_plan, terminal_owner_source, CREATED_AT
+    )
+    terminal_owner_store_a = pathlib.Path(temporary) / "terminal-owner-store-a"
+    terminal_owner_store_a.mkdir(mode=0o700)
+    terminal_owner_location_a = resolve_journal_location(
+        terminal_owner_root,
+        terminal_owner_plan["plan_digest"],
+        journal_dir=terminal_owner_store_a.resolve(),
+        environment={"HOME": str(pathlib.Path(temporary) / "ignored-home-a")},
+    )
+    install_prepared_journal(
+        terminal_owner_journal, terminal_owner_location_a
+    )
+    terminal_owner_bytes = terminal_owner_location_a["owner"].read_bytes()
+    terminal_owner_result = execute_upgrade(
+        terminal_owner_plan,
+        terminal_owner_location_a,
+        plan_source_digest=terminal_owner_source,
+        updated_at="2026-07-11T00:25:15Z",
+        validate_after=passed_validation,
+    )
+    assert terminal_owner_result["transaction"]["stage"] == "completed"
+    assert not terminal_owner_location_a["owner"].exists()
+    terminal_owner_location_a["owner"].write_bytes(terminal_owner_bytes)
+    terminal_owner_location_a["owner"].chmod(0o600)
+    terminal_owner_store_b = pathlib.Path(temporary) / "terminal-owner-store-b"
+    terminal_owner_store_b.mkdir(mode=0o700)
+    terminal_owner_xdg_b = pathlib.Path(temporary) / "terminal-owner-xdg-b"
+    terminal_owner_xdg_b.mkdir(mode=0o700)
+    terminal_owner_location_b = resolve_journal_location(
+        terminal_owner_root,
+        terminal_owner_plan["plan_digest"],
+        journal_dir=terminal_owner_store_b.resolve(),
+        environment={"XDG_STATE_HOME": str(terminal_owner_xdg_b.resolve())},
+    )
+    assert (
+        terminal_owner_location_b["journal"]
+        == terminal_owner_location_a["journal"]
+    )
+    terminal_owner_replay = execute_upgrade(
+        terminal_owner_plan,
+        terminal_owner_location_b,
+        plan_source_digest=terminal_owner_source,
+        updated_at="2026-07-11T00:25:30Z",
+        validate_after=passed_validation,
+    )
+    assert terminal_owner_replay["changed"] is False
+    assert terminal_owner_replay["transaction"]["resumed"] is True
+    assert not terminal_owner_location_a["owner"].exists()
+    assert (
+        terminal_owner_root / ".workbench/schema"
+    ).read_bytes() == terminal_owner_after
+
+    owner_takeover_root = pathlib.Path(temporary) / "owner-takeover-workbench"
+    owner_takeover_root.mkdir()
+    owner_takeover_root = owner_takeover_root.resolve()
+    owner_takeover_plan_a = fixture_noop_plan(owner_takeover_root)
+    owner_takeover_plan_b = copy.deepcopy(owner_takeover_plan_a)
+    owner_takeover_plan_b["plan_digest"] = None
+    owner_takeover_plan_b["planner"]["planner_revision"] = "8" * 40
+    owner_takeover_plan_b["plan_digest"] = canonical_digest(
+        owner_takeover_plan_b, null_field="plan_digest"
+    )
+    owner_takeover_plan_b = validate_plan(owner_takeover_plan_b)
+    owner_takeover_source_a = canonical_digest(
+        canonical_bytes(owner_takeover_plan_a), raw=True
+    )
+    owner_takeover_source_b = canonical_digest(
+        canonical_bytes(owner_takeover_plan_b), raw=True
+    )
+    owner_takeover_journal_a = build_prepared_journal(
+        owner_takeover_plan_a, owner_takeover_source_a, CREATED_AT
+    )
+    owner_takeover_journal_b = build_prepared_journal(
+        owner_takeover_plan_b, owner_takeover_source_b, CREATED_AT
+    )
+    owner_takeover_store_a = pathlib.Path(temporary) / "owner-takeover-store-a"
+    owner_takeover_store_b = pathlib.Path(temporary) / "owner-takeover-store-b"
+    owner_takeover_store_a.mkdir(mode=0o700)
+    owner_takeover_store_b.mkdir(mode=0o700)
+    owner_takeover_location_a = resolve_journal_location(
+        owner_takeover_root,
+        owner_takeover_plan_a["plan_digest"],
+        journal_dir=owner_takeover_store_a.resolve(),
+        environment={},
+    )
+    owner_takeover_location_b = resolve_journal_location(
+        owner_takeover_root,
+        owner_takeover_plan_b["plan_digest"],
+        journal_dir=owner_takeover_store_b.resolve(),
+        environment={"XDG_STATE_HOME": str(terminal_owner_xdg_b.resolve())},
+    )
+    install_prepared_journal(
+        owner_takeover_journal_a, owner_takeover_location_a
+    )
+    owner_takeover_bytes = owner_takeover_location_a["owner"].read_bytes()
+    execute_upgrade(
+        owner_takeover_plan_a,
+        owner_takeover_location_a,
+        plan_source_digest=owner_takeover_source_a,
+        updated_at="2026-07-11T00:25:45Z",
+        validate_after=passed_validation,
+    )
+    owner_takeover_location_a["owner"].write_bytes(owner_takeover_bytes)
+    owner_takeover_location_a["owner"].chmod(0o600)
+    install_prepared_journal(
+        owner_takeover_journal_b, owner_takeover_location_b
+    )
+    takeover_record = journal_module.strict_load(
+        owner_takeover_location_b["owner"].read_bytes(), "owner"
+    )
+    assert takeover_record["plan_digest"] == owner_takeover_plan_b["plan_digest"]
+    owner_takeover_result = execute_upgrade(
+        owner_takeover_plan_b,
+        owner_takeover_location_b,
+        plan_source_digest=owner_takeover_source_b,
+        updated_at="2026-07-11T00:25:50Z",
+        validate_after=passed_validation,
+    )
+    assert owner_takeover_result["transaction"]["stage"] == "completed"
 
     owner_root = pathlib.Path(temporary) / "owner-workbench"
     owner_root.mkdir()
@@ -1435,6 +1965,80 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         lambda: install_prepared_journal(owner_journal_b, owner_location_b),
         "transaction-in-progress",
     )
+
+    replaced_owner_root = (
+        pathlib.Path(temporary) / "replaced-owner-workbench"
+    )
+    replaced_owner_root.mkdir()
+    replaced_owner_root = replaced_owner_root.resolve()
+    replaced_owner_plan_a, _, _ = fixture_plan(replaced_owner_root)
+    replaced_owner_source_a = canonical_digest(
+        canonical_bytes(replaced_owner_plan_a), raw=True
+    )
+    replaced_owner_journal_a = build_prepared_journal(
+        replaced_owner_plan_a, replaced_owner_source_a, CREATED_AT
+    )
+    replaced_owner_store_a = pathlib.Path(temporary) / "replaced-owner-store-a"
+    replaced_owner_store_a.mkdir(mode=0o700)
+    replaced_owner_location_a = resolve_journal_location(
+        replaced_owner_root,
+        replaced_owner_plan_a["plan_digest"],
+        journal_dir=replaced_owner_store_a.resolve(),
+        environment={},
+    )
+    install_prepared_journal(
+        replaced_owner_journal_a, replaced_owner_location_a
+    )
+    try:
+        execute_upgrade(
+            replaced_owner_plan_a,
+            replaced_owner_location_a,
+            plan_source_digest=replaced_owner_source_a,
+            updated_at="2026-07-11T00:26:15Z",
+            validate_after=passed_validation,
+            fault_hook=crash_before_owner_effect,
+        )
+    except Crash:
+        pass
+    else:
+        raise AssertionError("replaced owner plan A did not stop nonterminal")
+    replaced_owner_detached = replaced_owner_root.with_name(
+        replaced_owner_root.name + "-detached"
+    )
+    os.rename(replaced_owner_root, replaced_owner_detached)
+    replaced_owner_root.mkdir()
+    replaced_owner_plan_b, _, _ = fixture_plan(replaced_owner_root)
+    replaced_owner_plan_b["plan_digest"] = None
+    replaced_owner_plan_b["planner"]["planner_revision"] = "6" * 40
+    replaced_owner_plan_b["plan_digest"] = canonical_digest(
+        replaced_owner_plan_b, null_field="plan_digest"
+    )
+    replaced_owner_plan_b = validate_plan(replaced_owner_plan_b)
+    replaced_owner_source_b = canonical_digest(
+        canonical_bytes(replaced_owner_plan_b), raw=True
+    )
+    replaced_owner_journal_b = build_prepared_journal(
+        replaced_owner_plan_b, replaced_owner_source_b, CREATED_AT
+    )
+    replaced_owner_store_b = pathlib.Path(temporary) / "replaced-owner-store-b"
+    replaced_owner_store_b.mkdir(mode=0o700)
+    replaced_owner_location_b = resolve_journal_location(
+        replaced_owner_root,
+        replaced_owner_plan_b["plan_digest"],
+        journal_dir=replaced_owner_store_b.resolve(),
+        environment={"HOME": str(pathlib.Path(temporary) / "ignored-home-b")},
+    )
+    assert (
+        replaced_owner_location_b["owner"]
+        == replaced_owner_location_a["owner"]
+    )
+    rejected(
+        lambda: install_prepared_journal(
+            replaced_owner_journal_b, replaced_owner_location_b
+        ),
+        "transaction-in-progress",
+    )
+    assert not replaced_owner_location_b["journal"].exists()
 
     owner_prefix_root = pathlib.Path(temporary) / "owner-prefix-workbench"
     owner_prefix_root.mkdir()
@@ -1922,7 +2526,9 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         journal_dir=journal_root,
         environment={},
     )
-    assert worktree_git in linked_location["owner"].parents
+    assert linked_location["owner"].is_relative_to(
+        account_home / ".local/state/workbench-kit/upgrade-coordination"
+    )
     (worktree_git / "gitdir").write_text(
         str(pathlib.Path(temporary) / "other/.git") + "\n",
         encoding="utf-8",

@@ -9,7 +9,7 @@ import errno
 import fcntl
 import os
 import pathlib
-import secrets
+import pwd
 import stat
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
@@ -71,15 +71,20 @@ def _require_owned_safe_directory(
     return node
 
 
-def _ensure_private_child(parent: pathlib.Path, name: str) -> pathlib.Path:
+def _ensure_private_child(
+    parent: pathlib.Path,
+    name: str,
+    *,
+    code: str = "journal-root-unsafe",
+) -> pathlib.Path:
     target = parent / name
     try:
         os.mkdir(target, 0o700)
     except FileExistsError:
         pass
     except OSError as error:
-        raise JournalError("journal-root-unsafe", str(target)) from error
-    _require_owned_safe_directory(target, "journal-root-unsafe", private=True)
+        raise JournalError(code, str(target)) from error
+    _require_owned_safe_directory(target, code, private=True)
     return target
 
 
@@ -118,6 +123,47 @@ def _default_journal_root(environment: dict[str, str]) -> pathlib.Path:
         base = state_root
     kit = _ensure_private_child(base, "workbench-kit")
     return _ensure_private_child(kit, "upgrades")
+
+
+def _account_home() -> pathlib.Path:
+    try:
+        raw_home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError) as error:
+        raise JournalError("coordination-root-unsafe", "account-home") from error
+    requested = pathlib.Path(raw_home)
+    if not requested.is_absolute():
+        raise JournalError("coordination-root-unsafe", raw_home)
+    home = _walk_existing_directories(
+        requested, "coordination-root-unsafe"
+    )
+    _require_owned_safe_directory(
+        home, "coordination-root-unsafe", private=False
+    )
+    return home
+
+
+def _fixed_coordination_root() -> pathlib.Path:
+    home = _account_home()
+    local = home / ".local"
+    state = local / "state"
+    for directory in (local, state):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise JournalError(
+                "coordination-root-unsafe", str(directory)
+            ) from error
+        _require_owned_safe_directory(
+            directory, "coordination-root-unsafe", private=False
+        )
+    kit = _ensure_private_child(
+        state, "workbench-kit", code="coordination-root-unsafe"
+    )
+    return _ensure_private_child(
+        kit, "upgrade-coordination", code="coordination-root-unsafe"
+    )
 
 
 def _read_safe_pointer_file(path: pathlib.Path) -> bytes:
@@ -232,10 +278,35 @@ def _workspace_git_directory(root: pathlib.Path) -> pathlib.Path:
     return _read_git_directory_file(root, marker)
 
 
-def _workspace_coordination_root(root: pathlib.Path) -> pathlib.Path:
-    git_directory = _workspace_git_directory(root)
-    kit = _ensure_private_child(git_directory, "workbench-kit")
-    return _ensure_private_child(kit, "upgrade-coordination")
+def _journal_location(
+    root: pathlib.Path,
+    workspace_device: int,
+    workspace_inode: int,
+    workspace_id: str,
+    plan_digest: str,
+    journal_root: pathlib.Path,
+    coordination: pathlib.Path,
+) -> dict[str, Any]:
+    directory = _ensure_private_child(journal_root, workspace_id)
+    workspace_coordination = _ensure_private_child(
+        coordination, workspace_id, code="coordination-root-unsafe"
+    )
+    digest_hex = plan_digest.removeprefix("sha256:")
+    return {
+        "root": journal_root,
+        "directory": directory,
+        "journal": directory / f"{digest_hex}.json",
+        "initial_temp": directory / f"{digest_hex}.initial.tmp",
+        "replace_temp": directory / f"{digest_hex}.replace.tmp",
+        "owner_directory": workspace_coordination,
+        "owner": workspace_coordination / "owner.json",
+        "owner_temp": workspace_coordination / "owner.initial.tmp",
+        "coordination": workspace_coordination,
+        "lock": workspace_coordination / "apply.lock",
+        "workspace_root": root,
+        "workspace_device": workspace_device,
+        "workspace_inode": workspace_inode,
+    }
 
 
 def resolve_journal_location(
@@ -247,6 +318,7 @@ def resolve_journal_location(
 ) -> dict[str, pathlib.Path]:
     root = pathlib.Path(workspace).resolve(strict=True)
     workspace_node = _lstat_directory(root, "workspace-unsafe")
+    _workspace_git_directory(root)
     if journal_dir is None:
         journal_root = _default_journal_root(
             dict(os.environ) if environment is None else environment
@@ -270,27 +342,34 @@ def resolve_journal_location(
         or root in journal_root.parents
     ):
         raise JournalError("journal-root-unsafe", str(journal_root))
-    workspace_id = workspace_identifier(str(root))
-    directory = _ensure_private_child(journal_root, workspace_id)
-    canonical_coordination = _workspace_coordination_root(root)
-    owners = _ensure_private_child(canonical_coordination, "owners")
     digest_hex = plan_digest.removeprefix("sha256:")
     if len(digest_hex) != 64 or any(
         character not in "0123456789abcdef" for character in digest_hex
     ):
         raise JournalError("plan-digest-invalid", plan_digest)
-    return {
-        "root": journal_root,
-        "directory": directory,
-        "journal": directory / f"{digest_hex}.json",
-        "initial_temp": directory / f"{digest_hex}.initial.tmp",
-        "replace_temp": directory / f"{digest_hex}.replace.tmp",
-        "owner_directory": owners,
-        "owner": owners / f"{workspace_id}.json",
-        "owner_temp": owners / f"{workspace_id}.initial.tmp",
-        "coordination": canonical_coordination,
-        "lock": canonical_coordination / "apply.lock",
-    }
+    workspace_id = workspace_identifier(str(root))
+    coordination = _fixed_coordination_root()
+    location = _journal_location(
+        root,
+        workspace_node.st_dev,
+        workspace_node.st_ino,
+        workspace_id,
+        plan_digest,
+        journal_root,
+        coordination,
+    )
+    with _workspace_lock(root, location):
+        owner = _read_owner(location)
+        if owner is None or owner["plan_digest"] != plan_digest:
+            return location
+        if not _owner_workspace_matches(owner, location):
+            raise JournalError(
+                "transaction-in-progress", owner["journal_path"]
+            )
+        owner_location = _location_from_owner(location, owner)
+        owner_journal = load_journal(owner_location)
+        _require_owner_journal_binding(owner, owner_journal, owner_location)
+        return owner_location
 
 
 def _fsync_directory(path: pathlib.Path) -> None:
@@ -414,7 +493,10 @@ def _install_prepared_journal_unlocked(
 
 
 def _read_regular_file(
-    path: pathlib.Path, *, allowed_links: tuple[int, ...] = (1,)
+    path: pathlib.Path,
+    *,
+    allowed_links: tuple[int, ...] = (1,),
+    max_bytes: int = 64 * 1024 * 1024,
 ) -> bytes:
     node = _existing_file(path)
     if node is None:
@@ -436,15 +518,40 @@ def _read_regular_file(
             or stat.S_IMODE(opened.st_mode) != 0o600
             or opened.st_nlink not in allowed_links
             or (opened.st_dev, opened.st_ino) != (node.st_dev, node.st_ino)
+            or opened.st_size != node.st_size
+            or opened.st_size > max_bytes
         ):
             raise JournalError("journal-unsafe", str(path))
         chunks = []
+        total = 0
         while True:
             chunk = os.read(descriptor, 65536)
             if not chunk:
                 break
+            total += len(chunk)
+            if total > max_bytes:
+                raise JournalError("journal-unsafe", str(path))
             chunks.append(chunk)
-        return b"".join(chunks)
+        verified = os.fstat(descriptor)
+        snapshot_fields = (
+            "st_dev",
+            "st_ino",
+            "st_uid",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(verified, field) != getattr(opened, field)
+            for field in snapshot_fields
+        ):
+            raise JournalError("journal-unsafe", str(path))
+        payload = b"".join(chunks)
+        if len(payload) != opened.st_size:
+            raise JournalError("journal-unsafe", str(path))
+        return payload
     finally:
         os.close(descriptor)
 
@@ -458,16 +565,43 @@ def _decode_owner(raw: bytes, path: pathlib.Path) -> dict[str, Any]:
         "contract_version",
         "owner_id",
         "workspace_id",
+        "workspace_device",
+        "workspace_inode",
         "plan_digest",
         "plan_source_digest",
         "journal_path",
         "created_at",
     )
+
+    def hexadecimal(value: Any, prefix: str) -> bool:
+        if not isinstance(value, str) or not value.startswith(prefix):
+            return False
+        suffix = value[len(prefix) :]
+        return len(suffix) == 64 and all(
+            character in "0123456789abcdef" for character in suffix
+        )
+
     if (
         not isinstance(record, dict)
         or set(record) != set(fields)
         or record.get("contract_version")
-        != "workbench-kit-upgrade-owner/v1"
+        != "workbench-kit-upgrade-owner/v2"
+        or not isinstance(record.get("workspace_device"), int)
+        or isinstance(record.get("workspace_device"), bool)
+        or record.get("workspace_device", -1) < 0
+        or not isinstance(record.get("workspace_inode"), int)
+        or isinstance(record.get("workspace_inode"), bool)
+        or record.get("workspace_inode", -1) < 0
+        or not hexadecimal(record.get("owner_id"), "upgrade-")
+        or not hexadecimal(record.get("workspace_id"), "ws-")
+        or not hexadecimal(record.get("plan_digest"), "sha256:")
+        or not hexadecimal(
+            record.get("plan_source_digest"), "sha256:"
+        )
+        or not isinstance(record.get("journal_path"), str)
+        or not record.get("journal_path")
+        or not isinstance(record.get("created_at"), str)
+        or not record.get("created_at")
         or raw != canonical_bytes({field: record[field] for field in fields})
     ):
         raise JournalError("owner-corrupt", str(path))
@@ -485,14 +619,85 @@ def _owner_record(
     journal: dict[str, Any], location: dict[str, pathlib.Path]
 ) -> dict[str, Any]:
     return {
-        "contract_version": "workbench-kit-upgrade-owner/v1",
+        "contract_version": "workbench-kit-upgrade-owner/v2",
         "owner_id": journal["journal_id"],
         "workspace_id": journal["workspace_id"],
+        "workspace_device": location["workspace_device"],
+        "workspace_inode": location["workspace_inode"],
         "plan_digest": journal["plan_digest"],
         "plan_source_digest": journal["plan_source_digest"],
         "journal_path": str(location["journal"].resolve(strict=False)),
         "created_at": journal["created_at"],
     }
+
+
+def _owner_workspace_matches(
+    owner: dict[str, Any], location: dict[str, Any]
+) -> bool:
+    return (
+        owner["workspace_id"]
+        == workspace_identifier(str(location["workspace_root"]))
+        and owner["workspace_device"] == location["workspace_device"]
+        and owner["workspace_inode"] == location["workspace_inode"]
+    )
+
+
+def _location_from_owner(
+    location: dict[str, Any], owner: dict[str, Any]
+) -> dict[str, Any]:
+    requested = pathlib.Path(owner["journal_path"])
+    canonical = pathlib.Path(os.path.abspath(requested))
+    if not requested.is_absolute() or requested != canonical:
+        raise JournalError("owner-unsafe", owner["journal_path"])
+    expected_name = owner["plan_digest"].removeprefix("sha256:") + ".json"
+    if requested.name != expected_name:
+        raise JournalError("owner-unsafe", owner["journal_path"])
+    directory = _walk_existing_directories(
+        requested.parent, "owner-unsafe"
+    )
+    _require_owned_safe_directory(directory, "owner-unsafe", private=True)
+    if directory.name != owner["workspace_id"]:
+        raise JournalError("owner-unsafe", owner["journal_path"])
+    journal_root = _walk_existing_directories(
+        directory.parent, "owner-unsafe"
+    )
+    _require_owned_safe_directory(
+        journal_root, "owner-unsafe", private=False
+    )
+    root = location["workspace_root"]
+    if root == journal_root or root in journal_root.parents:
+        raise JournalError("owner-unsafe", owner["journal_path"])
+    resolved = _journal_location(
+        root,
+        owner["workspace_device"],
+        owner["workspace_inode"],
+        owner["workspace_id"],
+        owner["plan_digest"],
+        journal_root,
+        location["coordination"].parent,
+    )
+    resolved["workspace_device"] = owner["workspace_device"]
+    resolved["workspace_inode"] = owner["workspace_inode"]
+    if resolved["journal"] != requested:
+        raise JournalError("owner-unsafe", owner["journal_path"])
+    return resolved
+
+
+def _require_owner_journal_binding(
+    owner: dict[str, Any],
+    journal: dict[str, Any],
+    location: dict[str, Any],
+) -> None:
+    if (
+        owner["owner_id"] != journal["journal_id"]
+        or owner["workspace_id"] != journal["workspace_id"]
+        or owner["plan_digest"] != journal["plan_digest"]
+        or owner["plan_source_digest"] != journal["plan_source_digest"]
+        or owner["created_at"] != journal["created_at"]
+        or owner["journal_path"]
+        != str(location["journal"].resolve(strict=False))
+    ):
+        raise JournalError("owner-mismatch", str(location["owner"]))
 
 
 def _reconcile_owner_temp(
@@ -542,21 +747,25 @@ def _claim_owner(
 ) -> bool:
     _reconcile_owner_temp(journal, location)
     existing = _read_owner(location)
-    expected_path = str(location["journal"].resolve(strict=False))
     expected_record = _owner_record(journal, location)
     if existing is not None:
-        if (
-            existing["workspace_id"] != journal["workspace_id"]
-            or existing["plan_digest"] != journal["plan_digest"]
-            or existing["plan_source_digest"] != journal["plan_source_digest"]
-            or existing["journal_path"] != expected_path
-        ):
+        if existing == expected_record:
+            return False
+        if not _owner_workspace_matches(existing, location):
             raise JournalError(
                 "transaction-in-progress", existing["journal_path"]
             )
-        if existing != expected_record:
-            raise JournalError("owner-mismatch", str(location["owner"]))
-        return False
+        existing_location = _location_from_owner(location, existing)
+        existing_journal = load_journal(existing_location)
+        _require_owner_journal_binding(
+            existing, existing_journal, existing_location
+        )
+        if existing_journal["stage"] not in ("completed", "rolled-back"):
+            raise JournalError(
+                "transaction-in-progress", existing["journal_path"]
+            )
+        os.unlink(location["owner"])
+        _fsync_directory(location["owner_directory"])
     record = expected_record
     payload = canonical_bytes(record)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -609,6 +818,12 @@ def install_prepared_journal(
     normalized = validate_journal(journal)
     root = pathlib.Path(normalized["workspace"]["root"]).resolve(strict=True)
     with _workspace_lock(root, location) as root_fd:
+        _require_effect_temps_absent(
+            root_fd,
+            root,
+            normalized["effects"],
+            code="operation-temp-stale",
+        )
         created_owner = _claim_owner(normalized, location)
         try:
             installed = _install_prepared_journal_unlocked(
@@ -622,20 +837,149 @@ def install_prepared_journal(
             raise
 
 
+def _decode_journal_payload(
+    raw: bytes,
+    path: pathlib.Path,
+    plan: dict[str, Any] | None,
+    *,
+    code: str,
+) -> dict[str, Any]:
+    try:
+        journal = validate_journal(strict_load(raw, str(path)), plan)
+    except Exception as error:
+        raise JournalError(code, str(path)) from error
+    if raw != canonical_bytes(journal):
+        raise JournalError(code, str(path))
+    return journal
+
+
+def _same_replacement_identity(
+    first: dict[str, Any], second: dict[str, Any]
+) -> bool:
+    immutable = (
+        "contract_version",
+        "journal_id",
+        "workspace_id",
+        "plan_digest",
+        "plan_source_digest",
+        "workspace",
+        "effects",
+        "created_at",
+    )
+    return all(first[field] == second[field] for field in immutable)
+
+
+def _same_except_updated_at(
+    first: dict[str, Any], second: dict[str, Any]
+) -> bool:
+    first_copy = copy.deepcopy(first)
+    second_copy = copy.deepcopy(second)
+    first_copy["updated_at"] = None
+    second_copy["updated_at"] = None
+    return first_copy == second_copy
+
+
+def _direct_journal_successor(
+    previous: dict[str, Any], following: dict[str, Any]
+) -> bool:
+    if not _same_replacement_identity(previous, following):
+        return False
+    if _same_except_updated_at(previous, following):
+        return True
+    previous_stage = previous["stage"]
+    following_stage = following["stage"]
+    previous_cursor = previous["cursor"]
+    following_cursor = following["cursor"]
+    effect_count = len(previous["effects"])
+    if previous_stage == "prepared":
+        return (
+            following_stage == "applying"
+            and previous_cursor == following_cursor == 0
+            and previous["validation"] == following["validation"]
+            and following["completion_result"] is None
+        )
+    if previous_stage == "applying":
+        if following_stage == "applying":
+            return (
+                following_cursor == previous_cursor + 1
+                and previous["validation"] == following["validation"]
+                and following["completion_result"] is None
+            )
+        if following_stage == "validating":
+            return (
+                previous_cursor == following_cursor == effect_count
+                and previous["validation"] == following["validation"]
+            )
+        if following_stage == "rolling-back":
+            return (
+                following_cursor in (
+                    previous_cursor,
+                    min(previous_cursor + 1, effect_count),
+                )
+                and following["validation"]["status"] == "failed"
+            )
+        return False
+    if previous_stage == "validating":
+        if following_stage == "rolling-back":
+            return (
+                following_cursor == previous_cursor
+                and following["validation"]["status"] == "failed"
+            )
+        if following_stage == "completed":
+            return (
+                previous_cursor == following_cursor == effect_count
+                and following["validation"]["status"] == "passed"
+                and following["completion_result"] is not None
+            )
+        return False
+    if previous_stage == "rolling-back":
+        if following_stage == "rolling-back":
+            return following_cursor == previous_cursor - 1
+        if following_stage == "rolled-back":
+            return (
+                previous_cursor == following_cursor == 0
+                and following["completion_result"] is not None
+            )
+    return False
+
+
+def _reconcile_replace_temp(
+    location: dict[str, pathlib.Path],
+    plan: dict[str, Any] | None = None,
+) -> None:
+    temporary = location["replace_temp"]
+    if _existing_file(temporary) is None:
+        return
+    directory = location["directory"]
+    _require_owned_safe_directory(directory, "journal-unsafe", private=True)
+    try:
+        current_raw = _read_regular_file(location["journal"])
+        temporary_raw = _read_regular_file(temporary)
+        current = _decode_journal_payload(
+            current_raw, location["journal"], plan, code="journal-unsafe"
+        )
+        candidate = _decode_journal_payload(
+            temporary_raw, temporary, plan, code="journal-unsafe"
+        )
+    except JournalError as error:
+        raise JournalError("journal-unsafe", str(temporary)) from error
+    if not (
+        _direct_journal_successor(current, candidate)
+        or _direct_journal_successor(candidate, current)
+    ):
+        raise JournalError("journal-unsafe", str(temporary))
+    os.unlink(temporary)
+    _fsync_directory(directory)
+
+
 def load_journal(
     location: dict[str, pathlib.Path], plan: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    _reconcile_replace_temp(location, plan)
     raw = _read_regular_file(location["journal"])
-    try:
-        journal = validate_journal(
-            strict_load(raw, str(location["journal"])), plan
-        )
-    except Exception as error:
-        if isinstance(error, JournalError):
-            raise
-        raise JournalError("journal-corrupt", str(location["journal"])) from error
-    if raw != canonical_bytes(journal):
-        raise JournalError("journal-corrupt", str(location["journal"]))
+    journal = _decode_journal_payload(
+        raw, location["journal"], plan, code="journal-corrupt"
+    )
     if location["journal"].name != (
         journal["plan_digest"].removeprefix("sha256:") + ".json"
     ):
@@ -669,9 +1013,7 @@ def _replace_journal(
     ):
         os.close(directory_fd)
         raise JournalError("journal-unsafe", str(directory))
-    temporary_name = (
-        f".{location['journal'].stem}.replace.{secrets.token_hex(16)}.tmp"
-    )
+    temporary_name = location["replace_temp"].name
     temporary = directory / temporary_name
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -716,12 +1058,10 @@ def _replace_journal(
         os.fsync(directory_fd)
         os.unlink(temporary_name, dir_fd=directory_fd)
         os.fsync(directory_fd)
-    except BaseException:
+    except Exception:
         if _existing_file(temporary) is not None:
             try:
-                if _read_regular_file(temporary) == payload:
-                    os.unlink(temporary_name, dir_fd=directory_fd)
-                    os.fsync(directory_fd)
+                _reconcile_replace_temp(location, plan)
             except JournalError:
                 pass
         raise
@@ -790,6 +1130,11 @@ def _workspace_lock(
                 or opened.st_uid != os.getuid()
             ):
                 raise JournalError("workspace-unsafe", str(root))
+            if (
+                opened.st_dev != location["workspace_device"]
+                or opened.st_ino != location["workspace_inode"]
+            ):
+                raise JournalError("workspace-binding-stale", str(root))
             try:
                 fcntl.flock(
                     coordination_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
@@ -872,6 +1217,59 @@ def _verify_preserved(
             for field in ("node_type", "mode", "digest", "link_target")
         ):
             raise JournalError("preserved-node-stale", preserved["path"])
+
+
+def _verify_parent_directories(
+    root_fd: int,
+    root: pathlib.Path,
+    plan: dict[str, Any],
+    *,
+    completed: bool,
+) -> None:
+    for parent in plan["parent_directories"]:
+        observed = _image_for_path(root_fd, root, parent["path"])
+        expected_type = (
+            parent["after_type"] if completed else parent["before_type"]
+        )
+        expected_mode = (
+            parent["after_mode"] if completed else parent["before_mode"]
+        )
+        if expected_type is None:
+            matches = observed["node_type"] == "absent"
+        else:
+            matches = (
+                observed["node_type"] == expected_type
+                and observed["mode"] == expected_mode
+            )
+        if not matches:
+            raise JournalError(
+                "transaction-state-mismatch", parent["path"]
+            )
+
+
+def _verify_terminal_snapshot(
+    root_fd: int,
+    root: pathlib.Path,
+    plan: dict[str, Any],
+    journal: dict[str, Any],
+    *,
+    completed: bool,
+) -> None:
+    _require_workspace_binding(root_fd, root)
+    _verify_preserved(root_fd, root, plan)
+    _verify_parent_directories(
+        root_fd, root, plan, completed=completed
+    )
+    expected_prefix = len(journal["effects"]) if completed else 0
+    if _observed_prefix(root_fd, root, journal["effects"]) != expected_prefix:
+        raise JournalError("transaction-state-mismatch", str(root))
+    _require_effect_temps_absent(
+        root_fd,
+        root,
+        journal["effects"],
+        code="transaction-state-mismatch",
+    )
+    _require_workspace_binding(root_fd, root)
 
 
 def _mode_permissions(mode: str) -> int:
@@ -1213,7 +1611,7 @@ def _transition_effect(
             return
         if target_image["node_type"] == "directory":
             os.mkdir(target_name, 0o755, dir_fd=directory_fd)
-            fault_hook("after-target-install", effect, direction)
+            fault_hook("after-directory-create", effect, direction)
             _require_workspace_binding(root_fd, root)
             if not _parent_binding_valid(directory_fd, parent_path):
                 raise JournalError("node-parent-unsafe", effect["path"])
@@ -1236,6 +1634,7 @@ def _transition_effect(
                 raise JournalError("node-parent-unsafe", effect["path"])
             if not _image_matches_at(directory_fd, target_name, target_image):
                 raise JournalError("transaction-state-mismatch", effect["path"])
+            fault_hook("after-target-install", effect, direction)
             return
 
         _install_image_temp_at(
@@ -1315,6 +1714,114 @@ def _stat_at(directory_fd: int, name: str) -> os.stat_result | None:
         return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
+
+
+def _require_effect_temps_absent(
+    root_fd: int,
+    root: pathlib.Path,
+    effects: list[dict[str, Any]],
+    *,
+    code: str,
+) -> None:
+    for effect in effects:
+        temp_path = effect["temp_path"]
+        if temp_path is None:
+            continue
+        try:
+            directory_fd, parent_path = _open_parent_fd(
+                root_fd, root, temp_path
+            )
+        except FileNotFoundError:
+            _require_workspace_binding(root_fd, root)
+            continue
+        except OSError as error:
+            raise JournalError(code, temp_path) from error
+        try:
+            _require_workspace_binding(root_fd, root)
+            if not _parent_binding_valid(directory_fd, parent_path):
+                raise JournalError(code, temp_path)
+            if _stat_at(
+                directory_fd, pathlib.PurePosixPath(temp_path).name
+            ) is not None:
+                raise JournalError(code, temp_path)
+        finally:
+            os.close(directory_fd)
+
+
+def _reconcile_partial_directory(
+    root_fd: int,
+    root: pathlib.Path,
+    journal: dict[str, Any],
+) -> None:
+    if journal["stage"] != "applying":
+        return
+    cursor = journal["cursor"]
+    if cursor >= len(journal["effects"]):
+        return
+    effect = journal["effects"][cursor]
+    if (
+        effect["kind"] != "ensure-directory"
+        or effect["before"]["node_type"] != "absent"
+        or effect["after"]["node_type"] != "directory"
+        or effect["after"]["mode"] != "040755"
+    ):
+        return
+    try:
+        directory_fd, parent_path = _open_parent_fd(
+            root_fd, root, effect["path"]
+        )
+    except FileNotFoundError:
+        _require_workspace_binding(root_fd, root)
+        return
+    name = pathlib.PurePosixPath(effect["path"]).name
+    try:
+        _require_workspace_binding(root_fd, root)
+        if not _parent_binding_valid(directory_fd, parent_path):
+            raise JournalError("node-parent-unsafe", effect["path"])
+        node = _stat_at(directory_fd, name)
+        if node is None or _image_matches_at(
+            directory_fd, name, effect["after"]
+        ):
+            return
+        if (
+            not stat.S_ISDIR(node.st_mode)
+            or stat.S_ISLNK(node.st_mode)
+            or node.st_uid != os.getuid()
+            or node.st_nlink != 2
+            or stat.S_IMODE(node.st_mode) != 0o700
+        ):
+            return
+        child_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        child_fd = os.open(name, child_flags, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(child_fd)
+            if (
+                (opened.st_dev, opened.st_ino)
+                != (node.st_dev, node.st_ino)
+                or opened.st_uid != node.st_uid
+                or opened.st_nlink != 2
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or os.listdir(child_fd)
+            ):
+                return
+            os.fchmod(child_fd, 0o755)
+            os.fsync(child_fd)
+        finally:
+            os.close(child_fd)
+        os.fsync(directory_fd)
+        _require_workspace_binding(root_fd, root)
+        if not _parent_binding_valid(directory_fd, parent_path):
+            raise JournalError("node-parent-unsafe", effect["path"])
+        if not _image_matches_at(directory_fd, name, effect["after"]):
+            raise JournalError(
+                "transaction-state-mismatch", effect["path"]
+            )
+    finally:
+        os.close(directory_fd)
 
 
 def _read_regular_at(
@@ -1631,6 +2138,9 @@ def _complete_rollback(
         plan, journal, stage="rolled-back", resumed=resumed, applied=[]
     )
     journal["completion_result"] = result
+    _verify_terminal_snapshot(
+        root_fd, root, plan, journal, completed=False
+    )
     journal = _replace_journal(journal, location, plan)
     _require_workspace_binding(root_fd, root)
     _release_owner(journal, location)
@@ -1662,25 +2172,44 @@ def execute_upgrade(
             if entry_stage in ("rolling-back", "rolled-back")
             else "forward"
         )
-        _reconcile_temp_residues(
-            root_fd,
-            root,
-            journal["effects"],
-            journal["journal_id"],
-            recovery_direction,
-        )
+        if entry_stage == "prepared":
+            _require_effect_temps_absent(
+                root_fd,
+                root,
+                journal["effects"],
+                code="operation-temp-stale",
+            )
+        else:
+            _reconcile_partial_directory(root_fd, root, journal)
+            _reconcile_temp_residues(
+                root_fd,
+                root,
+                journal["effects"],
+                journal["journal_id"],
+                recovery_direction,
+            )
         resumed = entry_stage != "prepared"
         prefix = _observed_prefix(root_fd, root, journal["effects"])
         if entry_stage == "completed":
-            if prefix != len(journal["effects"]):
-                raise JournalError("transaction-state-mismatch", str(root))
+            _verify_terminal_snapshot(
+                root_fd,
+                root,
+                normalized_plan,
+                journal,
+                completed=True,
+            )
             result = _terminal_replay(normalized_plan, journal)
             _release_owner(journal, location)
             _require_workspace_binding(root_fd, root)
             return result
         if entry_stage == "rolled-back":
-            if prefix != 0:
-                raise JournalError("transaction-state-mismatch", str(root))
+            _verify_terminal_snapshot(
+                root_fd,
+                root,
+                normalized_plan,
+                journal,
+                completed=False,
+            )
             result = _terminal_replay(normalized_plan, journal)
             _release_owner(journal, location)
             _require_workspace_binding(root_fd, root)
@@ -1784,6 +2313,14 @@ def execute_upgrade(
         except JournalError:
             raise
         except Exception:
+            if active_effect is not None and not validating_candidate:
+                _reconcile_temp_residue(
+                    root_fd,
+                    root,
+                    active_effect,
+                    journal["journal_id"],
+                    "forward",
+                )
             prefix = _observed_prefix(root_fd, root, journal["effects"])
             blocker_ref = (
                 str(root)
@@ -1825,7 +2362,6 @@ def execute_upgrade(
                 hook,
             )
 
-        _require_workspace_binding(root_fd, root)
         journal["stage"] = "completed"
         journal["direction"] = "none"
         journal["updated_at"] = updated_at
@@ -1847,6 +2383,13 @@ def execute_upgrade(
             applied=applied,
         )
         journal["completion_result"] = result
+        _verify_terminal_snapshot(
+            root_fd,
+            root,
+            normalized_plan,
+            journal,
+            completed=True,
+        )
         journal = _replace_journal(journal, location, normalized_plan)
         _require_workspace_binding(root_fd, root)
         _release_owner(journal, location)
@@ -2005,6 +2548,29 @@ def build_prepared_journal(
             "artifact_source_digest": planned["artifact_source_digest"],
             "equivalence_receipt_ref": planned["equivalence_receipt_ref"],
         })
+    root_node = _lstat_directory(root, "workspace-unsafe")
+    root_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd = os.open(root, root_flags)
+    try:
+        opened_root = os.fstat(root_fd)
+        if (
+            (opened_root.st_dev, opened_root.st_ino)
+            != (root_node.st_dev, root_node.st_ino)
+            or opened_root.st_uid != os.getuid()
+        ):
+            raise JournalError("workspace-unsafe", str(root))
+        _require_effect_temps_absent(
+            root_fd,
+            root,
+            effects,
+            code="operation-temp-stale",
+        )
+    finally:
+        os.close(root_fd)
     validation = {
         "status": "pending",
         "classification_after": None,
