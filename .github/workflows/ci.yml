@@ -67,6 +67,12 @@ jobs:
       - name: Engine lifecycle test
         run: bash plugins/workbench/tests/task-lifecycle.sh
 
+      - name: Engine public contract test
+        run: bash plugins/workbench/tests/contract.sh
+
+      - name: Engine v2 lifecycle test
+        run: bash plugins/workbench/tests/task-v2-lifecycle.sh
+
       - name: Install-model test
         run: bash tests/check-install-model.sh
 
