@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -35,6 +36,20 @@ KERNEL_ACTION_IDS = (
     "task.policy-context.seal",
     "task.required-check.waive",
 )
+AUTHORITY_RECEIPT_CONTRACT = "workbench-policy-authority-receipt/v1"
+AUTHORITY_RECEIPT_FIELDS = (
+    "contract_version",
+    "authority_identity",
+    "authority_ref",
+    "authority_revision",
+    "policy_ref",
+    "policy_digest",
+    "actor",
+    "issued_at",
+    "source_ref",
+)
+SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+AUTHORITY_REVISION = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64}|sha256:[0-9a-f]{64})$")
 
 
 class StateError(Exception):
@@ -578,12 +593,73 @@ def sync_policy(workspace: pathlib.Path, product_id: str) -> tuple[bool, str]:
     return True, policy_ref
 
 
+def validate_utc_timestamp(value: str, field: str) -> None:
+    if RFC3339_UTC.fullmatch(value) is None:
+        raise StateError(f"{field} must be an RFC 3339 UTC timestamp")
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise StateError(f"{field} must be an RFC 3339 UTC timestamp") from error
+
+
+def read_authority_receipt(path: pathlib.Path) -> dict[str, str]:
+    try:
+        payload = path.read_bytes().decode("utf-8")
+    except FileNotFoundError as error:
+        raise StateError(f"missing authority receipt: {path}") from error
+    except UnicodeDecodeError as error:
+        raise StateError(f"authority receipt is not valid UTF-8: {path}") from error
+    except OSError as error:
+        diagnostic = error.strerror or type(error).__name__
+        raise StateError(f"unable to read authority receipt {path}: {diagnostic}") from error
+    try:
+        value = strict_json_loads(payload)
+    except DuplicateJsonMember as error:
+        raise StateError(
+            f"duplicate JSON member '{error.member}' in authority receipt"
+        ) from error
+    except InvalidJsonConstant as error:
+        raise StateError(
+            f"invalid JSON constant '{error.constant}' in authority receipt"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise StateError(f"malformed authority receipt JSON: {error.msg}") from error
+    if not isinstance(value, dict):
+        raise StateError("authority receipt must contain an object")
+
+    missing = [field for field in AUTHORITY_RECEIPT_FIELDS if field not in value]
+    if missing:
+        raise StateError(f"authority receipt is missing required field '{missing[0]}'")
+    unknown = [field for field in value if field not in AUTHORITY_RECEIPT_FIELDS]
+    if unknown:
+        raise StateError(f"authority receipt contains unknown field '{unknown[0]}'")
+    for field in AUTHORITY_RECEIPT_FIELDS:
+        if not isinstance(value[field], str):
+            raise StateError(f"authority receipt field '{field}' must be a string")
+    if value["contract_version"] != AUTHORITY_RECEIPT_CONTRACT:
+        raise StateError(
+            f"unsupported authority receipt contract '{value['contract_version']}'"
+        )
+    for field in ("authority_identity", "authority_ref", "actor", "source_ref"):
+        item = value[field]
+        if not item or any(ord(character) < 0x20 or ord(character) > 0x7E for character in item):
+            raise StateError(
+                f"authority receipt field '{field}' must be nonempty printable ASCII"
+            )
+    if AUTHORITY_REVISION.fullmatch(value["authority_revision"]) is None:
+        raise StateError("authority receipt authority_revision is invalid")
+    if SHA256_DIGEST.fullmatch(value["policy_digest"]) is None:
+        raise StateError("authority receipt policy_digest is invalid")
+    validate_utc_timestamp(value["issued_at"], "authority receipt issued_at")
+    return {field: value[field] for field in AUTHORITY_RECEIPT_FIELDS}
+
+
 def context_registration(
     workspace: pathlib.Path,
     product_id: str,
     task_claim_id: str,
     actor: str,
-    authority_ref: str,
+    authority_receipt_file: pathlib.Path,
     registered_at: str,
 ) -> dict[str, Any]:
     bundle = load_product(workspace, product_id)
@@ -592,25 +668,26 @@ def context_registration(
         raise StateError("task-claim-id must not be empty")
     if not actor:
         raise StateError("actor must not be empty")
-    if not authority_ref:
-        raise StateError("authority-ref must not be empty")
-    if RFC3339_UTC.fullmatch(registered_at) is None:
-        raise StateError("registered-at must be an RFC 3339 UTC timestamp")
-    try:
-        datetime.datetime.strptime(registered_at, "%Y-%m-%dT%H:%M:%SZ")
-    except ValueError as error:
-        raise StateError("registered-at must be an RFC 3339 UTC timestamp") from error
+    validate_utc_timestamp(registered_at, "registered-at")
 
     policy_ref = f"products/{product_id}/policy.conf"
     policy_path = safe_state_path(workspace, workspace / policy_ref, "product policy")
     try:
-        policy = policy_path.read_text(encoding="utf-8")
+        policy_bytes = policy_path.read_bytes()
+        policy = policy_bytes.decode("utf-8")
     except FileNotFoundError as error:
         raise StateError("product policy must be synchronized before registration") from error
     except (OSError, UnicodeError) as error:
         raise StateError("product policy must be readable before registration") from error
     if policy != render_policy(bundle):
         raise StateError("product policy must be synchronized before registration")
+    policy_digest = "sha256:" + hashlib.sha256(policy_bytes).hexdigest()
+
+    authority_receipt = read_authority_receipt(authority_receipt_file)
+    if authority_receipt["policy_ref"] != policy_ref:
+        raise StateError("authority receipt policy_ref does not match the product policy")
+    if authority_receipt["policy_digest"] != policy_digest:
+        raise StateError("authority receipt policy_digest does not match the product policy")
 
     product_ref = f"toolbox:product/{product_id}"
     return {
@@ -618,8 +695,16 @@ def context_registration(
         "registration_id": f"ctxreg-toolbox-{product_id}",
         "task_claim_id": task_claim_id,
         "task_context_ref": product_ref,
-        "participants": [{"context_ref": product_ref, "policy_ref": policy_ref}],
-        "authority_ref": authority_ref,
+        "participants": [
+            {
+                "context_ref": product_ref,
+                "policy_ref": policy_ref,
+                "policy_digest": policy_digest,
+                "authority_ref": authority_receipt["authority_ref"],
+                "authority_receipt": authority_receipt,
+            }
+        ],
+        "task_policy": None,
         "actor": actor,
         "registered_at": registered_at,
     }

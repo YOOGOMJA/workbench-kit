@@ -232,8 +232,14 @@ def inspect_workbench_contract(
     }
 
 
-def write_json(document: Any) -> None:
-    json.dump(document, sys.stdout, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def write_json(document: Any, *, sort_keys: bool = True) -> None:
+    json.dump(
+        document,
+        sys.stdout,
+        ensure_ascii=False,
+        sort_keys=sort_keys,
+        separators=(",", ":"),
+    )
     sys.stdout.write("\n")
 
 
@@ -328,7 +334,9 @@ def build_parser() -> argparse.ArgumentParser:
     product_registration.add_argument("product_id")
     product_registration.add_argument("--task-claim-id", required=True)
     product_registration.add_argument("--actor", required=True)
-    product_registration.add_argument("--authority-ref", required=True)
+    product_registration.add_argument(
+        "--authority-receipt-file", required=True, type=pathlib.Path
+    )
     product_registration.add_argument("--registered-at", required=True)
     product_status_parser = product_commands.add_parser(
         "status", help="Derive product workflow status"
@@ -498,9 +506,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         parsed.product_id,
                         parsed.task_claim_id,
                         parsed.actor,
-                        parsed.authority_ref,
+                        parsed.authority_receipt_file,
                         parsed.registered_at,
-                    )
+                    ),
+                    sort_keys=False,
                 )
                 return 0
         if parsed.command == "scenario":

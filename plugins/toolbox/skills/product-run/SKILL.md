@@ -25,8 +25,19 @@ authorization, evidence, acceptance, harvest, and cleanup.
 
 ## Govern
 
-1. Run `toolbox product policy sync <product-id>`. Emit the owner assertion with
-   `toolbox product context-registration ...` into a temporary file.
+1. Run `toolbox product policy sync <product-id>`. Obtain a trusted owner receipt
+   from the registered authority adapter, then emit the registration into a
+   temporary file:
+
+   ```text
+   toolbox product context-registration <product-id> \
+     --task-claim-id <claim-id> --actor <actor> \
+     --registered-at <authorized-at> \
+     --authority-receipt-file <trusted-owner-receipt>
+   ```
+
+   Never fabricate an authority receipt. Toolbox checks its strict shape and
+   product-policy binding; the workbench authenticates it against the named owner.
 2. Call `workbench task policy-context register --registration-file <file>
    --format json`, then `workbench task policy-context seal --format json`.
    Registration requires explicit owner authorization. Stop at an unresolved `ask`
