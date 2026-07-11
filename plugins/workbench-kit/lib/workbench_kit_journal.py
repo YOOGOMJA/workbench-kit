@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import base64
 import copy
+import ctypes
+import errno
 import fcntl
 import os
 import pathlib
+import secrets
 import stat
 from contextlib import contextmanager
 from collections.abc import Callable, Iterator
@@ -123,6 +126,7 @@ def resolve_journal_location(
     *,
     journal_dir: pathlib.Path | None = None,
     environment: dict[str, str] | None = None,
+    coordination_root: pathlib.Path | None = None,
 ) -> dict[str, pathlib.Path]:
     root = pathlib.Path(workspace).resolve(strict=True)
     workspace_node = _lstat_directory(root, "workspace-unsafe")
@@ -151,6 +155,36 @@ def resolve_journal_location(
         raise JournalError("journal-root-unsafe", str(journal_root))
     workspace_id = workspace_identifier(str(root))
     directory = _ensure_private_child(journal_root, workspace_id)
+    if coordination_root is not None:
+        requested_coordination = pathlib.Path(coordination_root)
+        if not requested_coordination.is_absolute():
+            raise JournalError(
+                "journal-root-invalid", str(requested_coordination)
+            )
+        canonical_coordination = _walk_existing_directories(
+            requested_coordination, "journal-root-unsafe"
+        )
+        _require_owned_safe_directory(
+            canonical_coordination, "journal-root-unsafe", private=True
+        )
+    elif journal_dir is None:
+        canonical_coordination = _ensure_private_child(
+            journal_root.parent, "coordination"
+        )
+    elif environment is not None and not (
+        environment.get("XDG_STATE_HOME") or environment.get("HOME")
+    ):
+        canonical_coordination = _ensure_private_child(
+            journal_root, "coordination"
+        )
+    else:
+        canonical_upgrades = _default_journal_root(
+            dict(os.environ) if environment is None else environment
+        )
+        canonical_coordination = _ensure_private_child(
+            canonical_upgrades.parent, "coordination"
+        )
+    owners = _ensure_private_child(canonical_coordination, "owners")
     digest_hex = plan_digest.removeprefix("sha256:")
     if len(digest_hex) != 64 or any(
         character not in "0123456789abcdef" for character in digest_hex
@@ -162,8 +196,9 @@ def resolve_journal_location(
         "journal": directory / f"{digest_hex}.json",
         "initial_temp": directory / f"{digest_hex}.initial.tmp",
         "replace_temp": directory / f"{digest_hex}.replace.tmp",
-        "lock": journal_root / "apply.lock",
-        "lock_temp": journal_root / "apply.lock.replace.tmp",
+        "owner_directory": owners,
+        "owner": owners / f"{workspace_id}.json",
+        "owner_temp": owners / f"{workspace_id}.initial.tmp",
     }
 
 
@@ -194,7 +229,7 @@ def _existing_file(path: pathlib.Path) -> os.stat_result | None:
         raise JournalError("journal-unsafe", str(path)) from error
 
 
-def install_prepared_journal(
+def _install_prepared_journal_unlocked(
     journal: dict[str, Any], location: dict[str, pathlib.Path]
 ) -> pathlib.Path:
     normalized = validate_journal(journal)
@@ -206,6 +241,26 @@ def install_prepared_journal(
     if final.name != expected_name:
         raise JournalError("journal-identity-mismatch", str(final))
     existing = _existing_file(final)
+    temp_existing = _existing_file(temporary)
+    if existing is not None and temp_existing is not None:
+        if (
+            stat.S_ISREG(existing.st_mode)
+            and stat.S_ISREG(temp_existing.st_mode)
+            and existing.st_uid == os.getuid()
+            and temp_existing.st_uid == os.getuid()
+            and stat.S_IMODE(existing.st_mode) == 0o600
+            and stat.S_IMODE(temp_existing.st_mode) == 0o600
+            and existing.st_nlink == 2
+            and temp_existing.st_nlink == 2
+            and (existing.st_dev, existing.st_ino)
+            == (temp_existing.st_dev, temp_existing.st_ino)
+            and temporary.read_bytes() == canonical_bytes(normalized)
+        ):
+            _fsync_directory(directory)
+            os.unlink(temporary)
+            _fsync_directory(directory)
+            return final
+        raise JournalError("journal-unsafe", str(temporary))
     if existing is not None:
         if (
             stat.S_ISREG(existing.st_mode)
@@ -215,8 +270,26 @@ def install_prepared_journal(
         ):
             raise JournalError("journal-exists", str(final))
         raise JournalError("journal-unsafe", str(final))
-    if _existing_file(temporary) is not None:
-        raise JournalError("journal-unsafe", str(temporary))
+    if temp_existing is not None:
+        if (
+            not stat.S_ISREG(temp_existing.st_mode)
+            or temp_existing.st_uid != os.getuid()
+            or stat.S_IMODE(temp_existing.st_mode) != 0o600
+            or temp_existing.st_nlink != 1
+        ):
+            raise JournalError("journal-unsafe", str(temporary))
+        raw_temp = temporary.read_bytes()
+        if raw_temp == canonical_bytes(normalized):
+            try:
+                os.link(temporary, final, follow_symlinks=False)
+                _fsync_directory(directory)
+                os.unlink(temporary)
+                _fsync_directory(directory)
+                return final
+            except FileExistsError as error:
+                raise JournalError("journal-exists", str(final)) from error
+        os.unlink(temporary)
+        _fsync_directory(directory)
 
     payload = canonical_bytes(normalized)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -260,7 +333,13 @@ def _read_regular_file(path: pathlib.Path) -> bytes:
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
-        if (opened.st_dev, opened.st_ino) != (node.st_dev, node.st_ino):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (node.st_dev, node.st_ino)
+        ):
             raise JournalError("journal-unsafe", str(path))
         chunks = []
         while True:
@@ -271,6 +350,137 @@ def _read_regular_file(path: pathlib.Path) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _read_owner(location: dict[str, pathlib.Path]) -> dict[str, Any] | None:
+    path = location["owner"]
+    if _existing_file(path) is None:
+        return None
+    raw = _read_regular_file(path)
+    try:
+        record = strict_load(raw, str(path))
+    except Exception as error:
+        raise JournalError("owner-corrupt", str(path)) from error
+    fields = (
+        "contract_version",
+        "owner_id",
+        "workspace_id",
+        "plan_digest",
+        "plan_source_digest",
+        "journal_path",
+        "pid",
+        "created_at",
+    )
+    if (
+        not isinstance(record, dict)
+        or set(record) != set(fields)
+        or record.get("contract_version")
+        != "workbench-kit-upgrade-owner/v1"
+        or raw != canonical_bytes({field: record[field] for field in fields})
+    ):
+        raise JournalError("owner-corrupt", str(path))
+    return {field: record[field] for field in fields}
+
+
+def _reconcile_owner_temp(location: dict[str, pathlib.Path]) -> None:
+    temporary = location["owner_temp"]
+    node = _existing_file(temporary)
+    if node is None:
+        return
+    if (
+        not stat.S_ISREG(node.st_mode)
+        or node.st_uid != os.getuid()
+        or stat.S_IMODE(node.st_mode) != 0o600
+        or node.st_nlink != 1
+    ):
+        raise JournalError("owner-unsafe", str(temporary))
+    os.unlink(temporary)
+    _fsync_directory(location["owner_directory"])
+
+
+def _claim_owner(
+    journal: dict[str, Any], location: dict[str, pathlib.Path]
+) -> bool:
+    _reconcile_owner_temp(location)
+    existing = _read_owner(location)
+    expected_path = str(location["journal"].resolve(strict=False))
+    if existing is not None:
+        if (
+            existing["workspace_id"] != journal["workspace_id"]
+            or existing["plan_digest"] != journal["plan_digest"]
+            or existing["plan_source_digest"] != journal["plan_source_digest"]
+            or existing["journal_path"] != expected_path
+        ):
+            raise JournalError(
+                "transaction-in-progress", existing["journal_path"]
+            )
+        return False
+    record = {
+        "contract_version": "workbench-kit-upgrade-owner/v1",
+        "owner_id": "owner-" + secrets.token_hex(16),
+        "workspace_id": journal["workspace_id"],
+        "plan_digest": journal["plan_digest"],
+        "plan_source_digest": journal["plan_source_digest"],
+        "journal_path": expected_path,
+        "pid": os.getpid(),
+        "created_at": journal["created_at"],
+    }
+    payload = canonical_bytes(record)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(location["owner_temp"], flags, 0o600)
+    try:
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.link(
+            location["owner_temp"], location["owner"], follow_symlinks=False
+        )
+        _fsync_directory(location["owner_directory"])
+        os.unlink(location["owner_temp"])
+        _fsync_directory(location["owner_directory"])
+    except FileExistsError:
+        os.unlink(location["owner_temp"])
+        _fsync_directory(location["owner_directory"])
+        existing = _read_owner(location)
+        raise JournalError(
+            "transaction-in-progress",
+            existing["journal_path"] if existing else str(location["owner"]),
+        )
+    return True
+
+
+def _release_owner(
+    journal: dict[str, Any], location: dict[str, pathlib.Path]
+) -> None:
+    existing = _read_owner(location)
+    if existing is None:
+        return
+    if (
+        existing["workspace_id"] != journal["workspace_id"]
+        or existing["plan_digest"] != journal["plan_digest"]
+        or existing["journal_path"]
+        != str(location["journal"].resolve(strict=False))
+    ):
+        raise JournalError("owner-mismatch", str(location["owner"]))
+    os.unlink(location["owner"])
+    _fsync_directory(location["owner_directory"])
+
+
+def install_prepared_journal(
+    journal: dict[str, Any], location: dict[str, pathlib.Path]
+) -> pathlib.Path:
+    normalized = validate_journal(journal)
+    root = pathlib.Path(normalized["workspace"]["root"]).resolve(strict=True)
+    with _workspace_lock(root):
+        created_owner = _claim_owner(normalized, location)
+        try:
+            return _install_prepared_journal_unlocked(normalized, location)
+        except BaseException:
+            if created_owner and _existing_file(location["journal"]) is None:
+                _release_owner(normalized, location)
+            raise
 
 
 def load_journal(
@@ -403,39 +613,114 @@ def _mode_permissions(mode: str) -> int:
     raise JournalError("node-mode-invalid", mode)
 
 
-def _effect_paths(
-    root: pathlib.Path,
-    effect: dict[str, Any],
-    journal_id: str,
-    target_image: dict[str, Any],
-) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
-    target = root.joinpath(*pathlib.PurePosixPath(effect["path"]).parts)
-    parent = target.parent
-    temp_path = effect["temp_path"]
-    if temp_path is None and target_image["node_type"] in ("file", "symlink"):
-        temp_path = _temp_path(effect["path"], journal_id, effect["effect_id"])
-    temporary = (
-        root.joinpath(*pathlib.PurePosixPath(temp_path).parts)
-        if temp_path is not None
-        else target
+def _open_parent_fd(
+    root: pathlib.Path, relative: str
+) -> tuple[int, pathlib.Path]:
+    parts = pathlib.PurePosixPath(relative).parts
+    parent_parts = parts[:-1]
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
     )
-    _lstat_directory(parent, "node-parent-unsafe")
-    return target, parent, temporary
+    descriptor = os.open(root, flags)
+    parent_path = root
+    try:
+        for part in parent_parts:
+            next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            parent_path /= part
+        return descriptor, parent_path
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
-def _install_image_temp(
-    temporary: pathlib.Path,
+def _image_at(directory_fd: int, name: str) -> dict[str, Any]:
+    try:
+        node = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return _absent_image()
+    if stat.S_ISREG(node.st_mode):
+        if node.st_nlink != 1:
+            raise JournalError("node-hardlink", name)
+        permissions = stat.S_IMODE(node.st_mode)
+        mode = "100644" if permissions == 0o644 else "100755" if permissions == 0o755 else None
+        if mode is None:
+            raise JournalError("node-mode-invalid", name)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_nlink != 1
+                or opened.st_uid != node.st_uid
+                or (opened.st_dev, opened.st_ino) != (node.st_dev, node.st_ino)
+            ):
+                raise JournalError("node-unsafe", name)
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            content = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+        return {
+            "node_type": "file",
+            "mode": mode,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "link_target": None,
+            "digest": node_digest("file", mode, content=content),
+        }
+    if stat.S_ISLNK(node.st_mode):
+        target = os.readlink(name, dir_fd=directory_fd)
+        return {
+            "node_type": "symlink",
+            "mode": "120000",
+            "content_base64": None,
+            "link_target": target,
+            "digest": node_digest("symlink", "120000", link_target=target),
+        }
+    if stat.S_ISDIR(node.st_mode):
+        mode = f"04{stat.S_IMODE(node.st_mode):04o}"
+        return {
+            "node_type": "directory",
+            "mode": mode,
+            "content_base64": None,
+            "link_target": None,
+            "digest": node_digest("directory", mode),
+        }
+    raise JournalError("node-type-invalid", name)
+
+
+def _image_matches_at(
+    directory_fd: int, name: str, image: dict[str, Any]
+) -> bool:
+    return _image_at(directory_fd, name) == image
+
+
+def _install_image_temp_at(
+    directory_fd: int,
+    temporary_name: str,
     image: dict[str, Any],
     effect: dict[str, Any],
     direction: str,
     fault_hook: Callable[[str, dict[str, Any], str], None],
 ) -> None:
-    if _existing_file(temporary) is not None:
-        raise JournalError("transaction-state-mismatch", str(temporary))
+    if _image_at(directory_fd, temporary_name)["node_type"] != "absent":
+        raise JournalError("transaction-state-mismatch", temporary_name)
     if image["node_type"] == "file":
         content = base64.b64decode(image["content_base64"], validate=True)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary, flags, 0o600)
+        descriptor = os.open(
+            temporary_name, flags, 0o600, dir_fd=directory_fd
+        )
         try:
             fault_hook("after-temp-create", effect, direction)
             _write_all(descriptor, content)
@@ -446,11 +731,57 @@ def _install_image_temp(
         finally:
             os.close(descriptor)
     elif image["node_type"] == "symlink":
-        os.symlink(image["link_target"], temporary)
+        os.symlink(image["link_target"], temporary_name, dir_fd=directory_fd)
         fault_hook("after-temp-create", effect, direction)
         fault_hook("after-temp-fsync", effect, direction)
     else:
         raise JournalError("node-type-invalid", image["node_type"])
+
+
+def _rename_noreplace(
+    directory_fd: int, source_name: str, target_name: str
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(source_name)
+    target = os.fsencode(target_name)
+    if hasattr(libc, "renameatx_np"):
+        result = libc.renameatx_np(
+            directory_fd,
+            ctypes.c_char_p(source),
+            directory_fd,
+            ctypes.c_char_p(target),
+            0x00000004,
+        )
+    elif hasattr(libc, "renameat2"):
+        result = libc.renameat2(
+            directory_fd,
+            ctypes.c_char_p(source),
+            directory_fd,
+            ctypes.c_char_p(target),
+            0x00000001,
+        )
+    else:
+        raise JournalError("platform-atomic-rename-unavailable", source_name)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), target_name)
+        raise OSError(error_number, os.strerror(error_number), source_name)
+
+
+def _parent_binding_valid(
+    directory_fd: int, parent_path: pathlib.Path
+) -> bool:
+    opened = os.fstat(directory_fd)
+    try:
+        current = os.lstat(parent_path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and not stat.S_ISLNK(current.st_mode)
+        and (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+    )
 
 
 def _transition_effect(
@@ -462,61 +793,102 @@ def _transition_effect(
     direction: str,
     fault_hook: Callable[[str, dict[str, Any], str], None],
 ) -> None:
-    if not _image_matches(root, effect["path"], source):
-        raise JournalError("transaction-state-mismatch", effect["path"])
-    target, parent, temporary = _effect_paths(
-        root, effect, journal_id, target_image
-    )
-    if target_image["node_type"] == "absent":
-        if source["node_type"] == "directory":
-            os.rmdir(target)
-        else:
-            os.unlink(target)
-        fault_hook("after-target-install", effect, direction)
-        _fsync_directory(parent)
-        fault_hook("after-parent-fsync", effect, direction)
-        return
-    if target_image["node_type"] == "directory":
-        os.mkdir(target, 0o755)
-        fault_hook("after-target-install", effect, direction)
-        descriptor = os.open(
-            target,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            os.fchmod(descriptor, 0o755)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        _fsync_directory(parent)
-        fault_hook("after-parent-fsync", effect, direction)
-        if not _image_matches(root, effect["path"], target_image):
-            raise JournalError("transaction-state-mismatch", effect["path"])
-        return
-
-    _install_image_temp(
-        temporary, target_image, effect, direction, fault_hook
+    directory_fd, parent_path = _open_parent_fd(root, effect["path"])
+    target_name = pathlib.PurePosixPath(effect["path"]).name
+    temp_path = effect["temp_path"]
+    if temp_path is None and target_image["node_type"] in ("file", "symlink"):
+        temp_path = _temp_path(effect["path"], journal_id, effect["effect_id"])
+    temporary_name = pathlib.PurePosixPath(temp_path).name if temp_path else target_name
+    backup_name = (
+        f".workbench-kit.{journal_id}.{effect['effect_id']}.backup"
     )
     try:
+        if not _image_matches_at(directory_fd, target_name, source):
+            raise JournalError("transaction-state-mismatch", effect["path"])
+        if target_image["node_type"] == "absent":
+            if source["node_type"] == "directory":
+                os.rmdir(target_name, dir_fd=directory_fd)
+            else:
+                os.unlink(target_name, dir_fd=directory_fd)
+            fault_hook("after-target-install", effect, direction)
+            os.fsync(directory_fd)
+            fault_hook("after-parent-fsync", effect, direction)
+            return
+        if target_image["node_type"] == "directory":
+            os.mkdir(target_name, 0o755, dir_fd=directory_fd)
+            fault_hook("after-target-install", effect, direction)
+            child_fd = os.open(
+                target_name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                os.fchmod(child_fd, 0o755)
+                os.fsync(child_fd)
+            finally:
+                os.close(child_fd)
+            os.fsync(directory_fd)
+            fault_hook("after-parent-fsync", effect, direction)
+            if not _image_matches_at(directory_fd, target_name, target_image):
+                raise JournalError("transaction-state-mismatch", effect["path"])
+            return
+
+        _install_image_temp_at(
+            directory_fd,
+            temporary_name,
+            target_image,
+            effect,
+            direction,
+            fault_hook,
+        )
         if source["node_type"] == "absent":
-            os.link(temporary, target, follow_symlinks=False)
-            fault_hook("after-target-install", effect, direction)
-            os.unlink(temporary)
-            fault_hook("after-temp-unlink", effect, direction)
+            os.link(
+                temporary_name,
+                target_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
         else:
-            os.replace(temporary, target)
-            fault_hook("after-target-install", effect, direction)
-        _fsync_directory(parent)
+            if _image_at(directory_fd, backup_name)["node_type"] != "absent":
+                raise JournalError("transaction-state-mismatch", backup_name)
+            _rename_noreplace(directory_fd, target_name, backup_name)
+            if not _image_matches_at(directory_fd, backup_name, source):
+                try:
+                    _rename_noreplace(directory_fd, backup_name, target_name)
+                except FileExistsError:
+                    pass
+                os.unlink(temporary_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+                raise JournalError("transaction-state-mismatch", effect["path"])
+            try:
+                os.link(
+                    temporary_name,
+                    target_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as error:
+                raise JournalError(
+                    "transaction-state-mismatch", effect["path"]
+                ) from error
+        fault_hook("after-target-install", effect, direction)
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        fault_hook("after-temp-unlink", effect, direction)
+        os.fsync(directory_fd)
+        if source["node_type"] != "absent":
+            os.unlink(backup_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
         fault_hook("after-parent-fsync", effect, direction)
-    except OSError:
-        if _existing_file(temporary) is not None:
-            os.unlink(temporary)
-            _fsync_directory(parent)
-        raise
-    if not _image_matches(root, effect["path"], target_image):
-        raise JournalError("transaction-state-mismatch", effect["path"])
+        if not _image_matches_at(directory_fd, target_name, target_image):
+            raise JournalError("transaction-state-mismatch", effect["path"])
+        if not _parent_binding_valid(directory_fd, parent_path):
+            raise JournalError("node-parent-unsafe", effect["path"])
+    finally:
+        os.close(directory_fd)
 
 
 def _reconcile_temp_residue(
@@ -551,6 +923,46 @@ def _reconcile_temp_residue(
     ) or (
         expected_type == "symlink" and stat.S_ISLNK(residue.st_mode)
     )
+    residue_owned = False
+    if (
+        safe_type
+        and residue.st_uid == os.getuid()
+        and residue.st_nlink == 1
+    ):
+        if expected_type == "file":
+            permissions = stat.S_IMODE(residue.st_mode)
+            if permissions == 0o600:
+                residue_owned = True
+            elif permissions == _mode_permissions(target_image["mode"]):
+                descriptor = os.open(
+                    temporary,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    if (
+                        opened.st_nlink == 1
+                        and opened.st_uid == residue.st_uid
+                        and (opened.st_dev, opened.st_ino)
+                        == (residue.st_dev, residue.st_ino)
+                    ):
+                        chunks = []
+                        while True:
+                            chunk = os.read(descriptor, 65536)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                        residue_owned = node_digest(
+                            "file",
+                            target_image["mode"],
+                            content=b"".join(chunks),
+                        ) == target_image["digest"]
+                finally:
+                    os.close(descriptor)
+        else:
+            residue_owned = (
+                os.readlink(temporary) == target_image["link_target"]
+            )
     if source_image["node_type"] == "absent" and safe_type:
         try:
             target_node = os.lstat(target)
@@ -584,9 +996,7 @@ def _reconcile_temp_residue(
                 _fsync_directory(parent)
                 return
     target_source = _image_matches(root, effect["path"], source_image)
-    if target_source and (
-        safe_type and residue.st_uid == os.getuid() and residue.st_nlink == 1
-    ):
+    if target_source and residue_owned:
         os.unlink(temporary)
         _fsync_directory(parent)
         return
@@ -700,6 +1110,7 @@ def _complete_rollback(
     )
     journal["completion_result"] = result
     journal = _replace_journal(journal, location, plan)
+    _release_owner(journal, location)
     return journal["completion_result"]
 
 
@@ -718,6 +1129,7 @@ def execute_upgrade(
     with _workspace_lock(root):
         _reconcile_replace_temp(location)
         journal = load_journal(location, normalized_plan)
+        _claim_owner(journal, location)
         if journal["plan_source_digest"] != plan_source_digest:
             raise JournalError("plan-source-stale", "--plan-file")
         _verify_preserved(root, normalized_plan)
@@ -738,11 +1150,15 @@ def execute_upgrade(
         if entry_stage == "completed":
             if prefix != len(journal["effects"]):
                 raise JournalError("transaction-state-mismatch", str(root))
-            return _terminal_replay(normalized_plan, journal)
+            result = _terminal_replay(normalized_plan, journal)
+            _release_owner(journal, location)
+            return result
         if entry_stage == "rolled-back":
             if prefix != 0:
                 raise JournalError("transaction-state-mismatch", str(root))
-            return _terminal_replay(normalized_plan, journal)
+            result = _terminal_replay(normalized_plan, journal)
+            _release_owner(journal, location)
+            return result
         if entry_stage == "rolling-back":
             if prefix not in (journal["cursor"], journal["cursor"] - 1):
                 raise JournalError("transaction-state-mismatch", str(root))
@@ -892,6 +1308,7 @@ def execute_upgrade(
         )
         journal["completion_result"] = result
         journal = _replace_journal(journal, location, normalized_plan)
+        _release_owner(journal, location)
         return journal["completion_result"]
 
 

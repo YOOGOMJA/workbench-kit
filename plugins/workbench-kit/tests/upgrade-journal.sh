@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" <<'PY'
 import base64
+import copy
 import fcntl
 import multiprocessing
 import pathlib
@@ -1174,6 +1175,222 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert noop_result["transaction"]["cursor"] == 0
     assert noop_result["changed"] is False
     assert noop_result["applied"] == []
+
+    cas_root = pathlib.Path(temporary) / "cas-workbench"
+    cas_root.mkdir()
+    cas_root = cas_root.resolve()
+    cas_plan, _, _ = fixture_plan(cas_root)
+    cas_source = canonical_digest(canonical_bytes(cas_plan), raw=True)
+    cas_journal = build_prepared_journal(cas_plan, cas_source, CREATED_AT)
+    cas_location = resolve_journal_location(
+        cas_root,
+        cas_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(cas_journal, cas_location)
+
+    def concurrent_target_edit(point, _effect, direction):
+        if point == "after-temp-fsync" and direction == "forward":
+            (cas_root / ".workbench/schema").write_bytes(b"concurrent edit\n")
+
+    rejected(
+        lambda: execute_upgrade(
+            cas_plan,
+            cas_location,
+            plan_source_digest=cas_source,
+            updated_at="2026-07-11T00:23:00Z",
+            validate_after=passed_validation,
+            fault_hook=concurrent_target_edit,
+        ),
+        "transaction-state-mismatch",
+    )
+    assert (cas_root / ".workbench/schema").read_bytes() == b"concurrent edit\n"
+
+    parent_root = pathlib.Path(temporary) / "parent-swap-workbench"
+    parent_root.mkdir()
+    parent_root = parent_root.resolve()
+    parent_plan, _, parent_after = fixture_plan(parent_root)
+    parent_source = canonical_digest(canonical_bytes(parent_plan), raw=True)
+    parent_journal = build_prepared_journal(
+        parent_plan, parent_source, CREATED_AT
+    )
+    parent_location = resolve_journal_location(
+        parent_root,
+        parent_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(parent_journal, parent_location)
+    external_parent = pathlib.Path(temporary).resolve() / "external-parent"
+    external_parent.mkdir()
+    external_schema = external_parent / "schema"
+    external_schema.write_bytes(b"external sentinel\n")
+    swapped = False
+
+    def swap_parent(point, effect, direction):
+        global swapped
+        if point != "after-temp-fsync" or direction != "forward" or swapped:
+            return
+        swapped = True
+        original_parent = parent_root / ".workbench"
+        os.rename(original_parent, parent_root / ".workbench-real")
+        original_parent.symlink_to(external_parent, target_is_directory=True)
+        external_temp = external_parent / pathlib.PurePosixPath(
+            effect["temp_path"]
+        ).name
+        external_temp.write_bytes(parent_after)
+        external_temp.chmod(0o644)
+
+    try:
+        execute_upgrade(
+            parent_plan,
+            parent_location,
+            plan_source_digest=parent_source,
+            updated_at="2026-07-11T00:24:00Z",
+            validate_after=passed_validation,
+            fault_hook=swap_parent,
+        )
+    except Exception:
+        pass
+    assert swapped is True
+    assert external_schema.read_bytes() == b"external sentinel\n"
+
+    hardlink_root = pathlib.Path(temporary) / "journal-hardlink-workbench"
+    hardlink_root.mkdir()
+    hardlink_root = hardlink_root.resolve()
+    hardlink_plan, _, _ = fixture_plan(hardlink_root)
+    hardlink_source = canonical_digest(canonical_bytes(hardlink_plan), raw=True)
+    hardlink_journal = build_prepared_journal(
+        hardlink_plan, hardlink_source, CREATED_AT
+    )
+    hardlink_location = resolve_journal_location(
+        hardlink_root,
+        hardlink_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(hardlink_journal, hardlink_location)
+    journal_alias = hardlink_location["directory"] / "journal-alias"
+    os.link(hardlink_location["journal"], journal_alias)
+    rejected(
+        lambda: load_journal(hardlink_location, hardlink_plan),
+        "journal-unsafe",
+    )
+    journal_alias.unlink()
+
+    initial_root = pathlib.Path(temporary) / "initial-temp-workbench"
+    initial_root.mkdir()
+    initial_root = initial_root.resolve()
+    initial_plan, _, _ = fixture_plan(initial_root)
+    initial_source = canonical_digest(canonical_bytes(initial_plan), raw=True)
+    initial_journal = build_prepared_journal(
+        initial_plan, initial_source, CREATED_AT
+    )
+    initial_location = resolve_journal_location(
+        initial_root,
+        initial_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    initial_location["initial_temp"].write_bytes(b"partial initial journal")
+    initial_location["initial_temp"].chmod(0o600)
+    install_prepared_journal(initial_journal, initial_location)
+    assert initial_location["journal"].is_file()
+    assert not initial_location["initial_temp"].exists()
+
+    foreign_root = pathlib.Path(temporary) / "foreign-temp-workbench"
+    foreign_root.mkdir()
+    foreign_root = foreign_root.resolve()
+    foreign_plan, _, _ = fixture_plan(foreign_root)
+    foreign_source = canonical_digest(canonical_bytes(foreign_plan), raw=True)
+    foreign_journal = build_prepared_journal(
+        foreign_plan, foreign_source, CREATED_AT
+    )
+    foreign_location = resolve_journal_location(
+        foreign_root,
+        foreign_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(foreign_journal, foreign_location)
+    foreign_temp = foreign_root / foreign_journal["effects"][0]["temp_path"]
+    foreign_temp.write_bytes(b"foreign complete-looking temp\n")
+    foreign_temp.chmod(0o644)
+    rejected(
+        lambda: execute_upgrade(
+            foreign_plan,
+            foreign_location,
+            plan_source_digest=foreign_source,
+            updated_at="2026-07-11T00:25:00Z",
+            validate_after=passed_validation,
+        ),
+        "transaction-state-mismatch",
+    )
+    assert foreign_temp.read_bytes() == b"foreign complete-looking temp\n"
+
+    owner_root = pathlib.Path(temporary) / "owner-workbench"
+    owner_root.mkdir()
+    owner_root = owner_root.resolve()
+    owner_plan_a, _, _ = fixture_plan(owner_root)
+    owner_plan_b = copy.deepcopy(owner_plan_a)
+    owner_plan_b["plan_digest"] = None
+    owner_plan_b["planner"]["planner_revision"] = "4" * 40
+    owner_plan_b["plan_digest"] = canonical_digest(
+        owner_plan_b, null_field="plan_digest"
+    )
+    owner_plan_b = validate_plan(owner_plan_b)
+    owner_source_a = canonical_digest(canonical_bytes(owner_plan_a), raw=True)
+    owner_source_b = canonical_digest(canonical_bytes(owner_plan_b), raw=True)
+    owner_journal_a = build_prepared_journal(
+        owner_plan_a, owner_source_a, CREATED_AT
+    )
+    owner_journal_b = build_prepared_journal(
+        owner_plan_b, owner_source_b, CREATED_AT
+    )
+    owner_store_a = pathlib.Path(temporary).resolve() / "owner-store-a"
+    owner_store_b = pathlib.Path(temporary).resolve() / "owner-store-b"
+    owner_store_a.mkdir(mode=0o700)
+    owner_store_b.mkdir(mode=0o700)
+    owner_coordination = pathlib.Path(temporary).resolve() / "owner-coordination"
+    owner_coordination.mkdir(mode=0o700)
+    owner_location_a = resolve_journal_location(
+        owner_root,
+        owner_plan_a["plan_digest"],
+        journal_dir=owner_store_a,
+        environment={},
+        coordination_root=owner_coordination,
+    )
+    owner_location_b = resolve_journal_location(
+        owner_root,
+        owner_plan_b["plan_digest"],
+        journal_dir=owner_store_b,
+        environment={},
+        coordination_root=owner_coordination,
+    )
+    install_prepared_journal(owner_journal_a, owner_location_a)
+
+    def crash_before_owner_effect(point, _effect, direction):
+        if point == "before-effect" and direction == "forward":
+            raise Crash()
+
+    try:
+        execute_upgrade(
+            owner_plan_a,
+            owner_location_a,
+            plan_source_digest=owner_source_a,
+            updated_at="2026-07-11T00:26:00Z",
+            validate_after=passed_validation,
+            fault_hook=crash_before_owner_effect,
+        )
+    except Crash:
+        pass
+    else:
+        raise AssertionError("owner plan A did not stop nonterminal")
+    rejected(
+        lambda: install_prepared_journal(owner_journal_b, owner_location_b),
+        "transaction-in-progress",
+    )
 
 print("PASS: deterministic full-preimage upgrade journal preparation")
 PY
