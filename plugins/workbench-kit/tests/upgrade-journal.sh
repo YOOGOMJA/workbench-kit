@@ -376,6 +376,28 @@ def fixture_removal_plan(root):
     return validate_plan(plan), engine_bytes
 
 
+def fixture_noop_plan(root):
+    plan, before, _ = fixture_plan(root)
+    plan["plan_digest"] = None
+    plan["preserved"] = sorted(
+        plan["preserved"] + [{
+            "path": ".workbench/schema",
+            "node_type": "file",
+            "mode": "100644",
+            "digest": node_digest("file", "100644", content=before),
+            "link_target": None,
+        }],
+        key=lambda item: item["path"],
+    )
+    plan["parent_directories"] = []
+    plan["artifacts"] = []
+    plan["operations"] = []
+    plan["changed"] = False
+    plan["actionable"] = False
+    plan["plan_digest"] = canonical_digest(plan, null_field="plan_digest")
+    return validate_plan(plan)
+
+
 def hold_workspace_lock(path, ready, release):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -1014,6 +1036,144 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         "ref": ".workbench/schema",
     }]
     assert (validation_root / ".workbench/schema").read_bytes() == validation_before
+
+    reverse_root = pathlib.Path(temporary) / "reverse-temp-workbench"
+    reverse_root.mkdir()
+    reverse_root = reverse_root.resolve()
+    reverse_plan, reverse_before, _ = fixture_plan(reverse_root)
+    reverse_source = canonical_digest(canonical_bytes(reverse_plan), raw=True)
+    reverse_journal = build_prepared_journal(
+        reverse_plan, reverse_source, CREATED_AT
+    )
+    reverse_location = resolve_journal_location(
+        reverse_root,
+        reverse_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(reverse_journal, reverse_location)
+    reverse_forward_failed = False
+
+    def crash_reverse_temp(point, effect, direction):
+        global reverse_forward_failed
+        if point == "after-effect" and direction == "forward":
+            reverse_forward_failed = True
+            raise RuntimeError("start reverse")
+        if point == "after-temp-fsync" and direction == "reverse":
+            raise Crash()
+
+    try:
+        execute_upgrade(
+            reverse_plan,
+            reverse_location,
+            plan_source_digest=reverse_source,
+            updated_at="2026-07-11T00:18:00Z",
+            validate_after=passed_validation,
+            fault_hook=crash_reverse_temp,
+        )
+    except Crash:
+        pass
+    else:
+        raise AssertionError("reverse temp crash was not injected")
+    assert reverse_forward_failed is True
+    reverse_interrupted = load_journal(reverse_location, reverse_plan)
+    assert reverse_interrupted["stage"] == "rolling-back"
+    reverse_temp = reverse_root / reverse_journal["effects"][0]["temp_path"]
+    assert reverse_temp.is_file()
+    reverse_recovered = execute_upgrade(
+        reverse_plan,
+        reverse_location,
+        plan_source_digest=reverse_source,
+        updated_at="2026-07-11T00:19:00Z",
+        validate_after=passed_validation,
+    )
+    assert reverse_recovered["transaction"]["stage"] == "rolled-back"
+    assert not reverse_temp.exists()
+    assert (reverse_root / ".workbench/schema").read_bytes() == reverse_before
+
+    replace_root = pathlib.Path(temporary) / "replace-temp-workbench"
+    replace_root.mkdir()
+    replace_root = replace_root.resolve()
+    replace_plan, _, replace_after = fixture_plan(replace_root)
+    replace_source = canonical_digest(canonical_bytes(replace_plan), raw=True)
+    replace_journal = build_prepared_journal(
+        replace_plan, replace_source, CREATED_AT
+    )
+    replace_location = resolve_journal_location(
+        replace_root,
+        replace_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(replace_journal, replace_location)
+    replace_location["replace_temp"].write_bytes(b"partial replace journal")
+    replace_location["replace_temp"].chmod(0o600)
+    replace_recovered = execute_upgrade(
+        replace_plan,
+        replace_location,
+        plan_source_digest=replace_source,
+        updated_at="2026-07-11T00:20:00Z",
+        validate_after=passed_validation,
+    )
+    assert replace_recovered["transaction"]["stage"] == "completed"
+    assert not replace_location["replace_temp"].exists()
+    assert (replace_root / ".workbench/schema").read_bytes() == replace_after
+
+    umask_root = pathlib.Path(temporary) / "umask-workbench"
+    umask_root.mkdir()
+    umask_root = umask_root.resolve()
+    umask_plan, _ = fixture_create_plan(umask_root)
+    umask_source = canonical_digest(canonical_bytes(umask_plan), raw=True)
+    umask_journal = build_prepared_journal(
+        umask_plan, umask_source, CREATED_AT
+    )
+    umask_location = resolve_journal_location(
+        umask_root,
+        umask_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(umask_journal, umask_location)
+    previous_umask = os.umask(0o077)
+    try:
+        umask_result = execute_upgrade(
+            umask_plan,
+            umask_location,
+            plan_source_digest=umask_source,
+            updated_at="2026-07-11T00:21:00Z",
+            validate_after=passed_validation,
+        )
+    finally:
+        os.umask(previous_umask)
+    assert umask_result["transaction"]["stage"] == "completed"
+    assert stat.S_IMODE(os.lstat(umask_root / ".workbench").st_mode) == 0o755
+
+    noop_root = pathlib.Path(temporary) / "noop-workbench"
+    noop_root.mkdir()
+    noop_root = noop_root.resolve()
+    noop_plan = fixture_noop_plan(noop_root)
+    noop_source = canonical_digest(canonical_bytes(noop_plan), raw=True)
+    noop_journal = build_prepared_journal(noop_plan, noop_source, CREATED_AT)
+    assert noop_journal["effects"] == []
+    noop_location = resolve_journal_location(
+        noop_root,
+        noop_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(noop_journal, noop_location)
+    noop_result = execute_upgrade(
+        noop_plan,
+        noop_location,
+        plan_source_digest=noop_source,
+        updated_at="2026-07-11T00:22:00Z",
+        validate_after=passed_validation,
+    )
+    assert validate_result(noop_result) == noop_result
+    assert noop_result["transaction"]["stage"] == "completed"
+    assert noop_result["transaction"]["cursor"] == 0
+    assert noop_result["changed"] is False
+    assert noop_result["applied"] == []
 
 print("PASS: deterministic full-preimage upgrade journal preparation")
 PY

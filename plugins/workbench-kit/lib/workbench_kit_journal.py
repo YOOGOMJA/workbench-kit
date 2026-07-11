@@ -324,6 +324,22 @@ def _replace_journal(
     return normalized
 
 
+def _reconcile_replace_temp(location: dict[str, pathlib.Path]) -> None:
+    temporary = location["replace_temp"]
+    node = _existing_file(temporary)
+    if node is None:
+        return
+    if (
+        not stat.S_ISREG(node.st_mode)
+        or node.st_uid != os.getuid()
+        or stat.S_IMODE(node.st_mode) != 0o600
+        or node.st_nlink != 1
+    ):
+        raise JournalError("journal-unsafe", str(temporary))
+    os.unlink(temporary)
+    _fsync_directory(location["directory"])
+
+
 @contextmanager
 def _workspace_lock(root: pathlib.Path) -> Iterator[None]:
     node = _lstat_directory(root, "workspace-unsafe")
@@ -463,9 +479,21 @@ def _transition_effect(
     if target_image["node_type"] == "directory":
         os.mkdir(target, 0o755)
         fault_hook("after-target-install", effect, direction)
-        _fsync_directory(target)
+        descriptor = os.open(
+            target,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fchmod(descriptor, 0o755)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         _fsync_directory(parent)
         fault_hook("after-parent-fsync", effect, direction)
+        if not _image_matches(root, effect["path"], target_image):
+            raise JournalError("transaction-state-mismatch", effect["path"])
         return
 
     _install_image_temp(
@@ -492,26 +520,38 @@ def _transition_effect(
 
 
 def _reconcile_temp_residue(
-    root: pathlib.Path, effect: dict[str, Any]
+    root: pathlib.Path,
+    effect: dict[str, Any],
+    journal_id: str,
+    direction: str,
 ) -> None:
-    if effect["temp_path"] is None:
+    source_image = (
+        effect["after"] if direction == "reverse" else effect["before"]
+    )
+    target_image = (
+        effect["before"] if direction == "reverse" else effect["after"]
+    )
+    temp_path = effect["temp_path"]
+    if temp_path is None and target_image["node_type"] in ("file", "symlink"):
+        temp_path = _temp_path(effect["path"], journal_id, effect["effect_id"])
+    if temp_path is None:
         return
     target = root.joinpath(*pathlib.PurePosixPath(effect["path"]).parts)
     temporary = root.joinpath(
-        *pathlib.PurePosixPath(effect["temp_path"]).parts
+        *pathlib.PurePosixPath(temp_path).parts
     )
     residue = _existing_file(temporary)
     if residue is None:
         return
     parent = target.parent
     _lstat_directory(parent, "node-parent-unsafe")
-    expected_type = effect["after"]["node_type"]
+    expected_type = target_image["node_type"]
     safe_type = (
         expected_type == "file" and stat.S_ISREG(residue.st_mode)
     ) or (
         expected_type == "symlink" and stat.S_ISLNK(residue.st_mode)
     )
-    if effect["kind"] == "create" and safe_type:
+    if source_image["node_type"] == "absent" and safe_type:
         try:
             target_node = os.lstat(target)
         except FileNotFoundError:
@@ -525,40 +565,42 @@ def _reconcile_temp_residue(
         ):
             if expected_type == "file":
                 permissions = stat.S_IMODE(target_node.st_mode)
-                expected_permissions = _mode_permissions(effect["after"]["mode"])
+                expected_permissions = _mode_permissions(target_image["mode"])
                 target_matches = (
                     permissions == expected_permissions
                     and node_digest(
                         "file",
-                        effect["after"]["mode"],
+                        target_image["mode"],
                         content=target.read_bytes(),
                     )
-                    == effect["after"]["digest"]
+                    == target_image["digest"]
                 )
             else:
                 target_matches = (
-                    os.readlink(target) == effect["after"]["link_target"]
+                    os.readlink(target) == target_image["link_target"]
                 )
             if target_matches:
                 os.unlink(temporary)
                 _fsync_directory(parent)
                 return
-    target_before = _image_matches(root, effect["path"], effect["before"])
-    target_after = _image_matches(root, effect["path"], effect["after"])
-    if target_before and (
+    target_source = _image_matches(root, effect["path"], source_image)
+    if target_source and (
         safe_type and residue.st_uid == os.getuid() and residue.st_nlink == 1
     ):
         os.unlink(temporary)
         _fsync_directory(parent)
         return
-    raise JournalError("transaction-state-mismatch", effect["temp_path"])
+    raise JournalError("transaction-state-mismatch", temp_path)
 
 
 def _reconcile_temp_residues(
-    root: pathlib.Path, effects: list[dict[str, Any]]
+    root: pathlib.Path,
+    effects: list[dict[str, Any]],
+    journal_id: str,
+    direction: str,
 ) -> None:
     for effect in effects:
-        _reconcile_temp_residue(root, effect)
+        _reconcile_temp_residue(root, effect, journal_id, direction)
 
 
 def _set_cursor(
@@ -674,12 +716,23 @@ def execute_upgrade(
     root = pathlib.Path(normalized_plan["workspace"]["root"]).resolve(strict=True)
     hook = fault_hook or (lambda _point, _effect, _direction: None)
     with _workspace_lock(root):
+        _reconcile_replace_temp(location)
         journal = load_journal(location, normalized_plan)
         if journal["plan_source_digest"] != plan_source_digest:
             raise JournalError("plan-source-stale", "--plan-file")
         _verify_preserved(root, normalized_plan)
-        _reconcile_temp_residues(root, journal["effects"])
         entry_stage = journal["stage"]
+        recovery_direction = (
+            "reverse"
+            if entry_stage in ("rolling-back", "rolled-back")
+            else "forward"
+        )
+        _reconcile_temp_residues(
+            root,
+            journal["effects"],
+            journal["journal_id"],
+            recovery_direction,
+        )
         resumed = entry_stage != "prepared"
         prefix = _observed_prefix(root, journal["effects"])
         if entry_stage == "completed":
@@ -750,7 +803,8 @@ def execute_upgrade(
             journal["stage"] = "validating"
             journal["updated_at"] = updated_at
             journal = _replace_journal(journal, location, normalized_plan)
-            hook("before-validation", journal["effects"][-1], "forward")
+            if journal["effects"]:
+                hook("before-validation", journal["effects"][-1], "forward")
             validating_candidate = True
             journal["validation"] = validate_validation(
                 validate_after(normalized_plan)
@@ -771,7 +825,8 @@ def execute_upgrade(
                     resumed,
                     hook,
                 )
-            hook("after-validation", journal["effects"][-1], "forward")
+            if journal["effects"]:
+                hook("after-validation", journal["effects"][-1], "forward")
         except JournalError:
             raise
         except Exception:
