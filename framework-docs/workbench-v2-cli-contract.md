@@ -76,9 +76,11 @@ The exact `workbench-contract/v1` shape is defined in
 Capabilities add `task.contract/v2`, `profile.language/v1`, `task.acceptance/v1`,
 `task.abandonment/v1`, `task.required-checks/v1`, `task.harvest/v1`, `task.cleanup/v1`,
 `task.writer-conflicts/v1`, `task.writer-claims/v1`, `policy.authorization/v1`,
-`task.writer-handoff/v1`, `policy.authority/v1`, `policy.context-set/v1`, `policy.intent/v1`, `workspace.authority/v1`,
+`task.writer-handoff/v1`, `policy.applied-effect-recovery/v1`, `policy.authority/v1`,
+`policy.context-set/v1`, `policy.intent/v1`, `workspace.authority/v1`,
 `workspace.doctor/v1`, and `knowledge.applicability/v1`. Supported records add the workspace
-and policy-authority, authorization/action-intent, completion/abandonment revision, acceptance,
+and policy-authority, authorization/action-intent/applied-effect provenance,
+completion/abandonment revision, acceptance,
 stable and timestamped external-probe, writer-ledger/claim/effect-owner, doctor,
 cleanup-plan/journal, and frozen action-ID contracts defined below.
 
@@ -375,7 +377,7 @@ LF-terminated schema:
 
 ```text
 workbench-writer-claims/v1
-claim<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>TASK_CLAIM_ID<TAB>OWNER<TAB>BRANCH<TAB>EXPECTED_PATH<TAB>CODEBASE_ORIGIN_URL<TAB>CONTEXT_POLICY_SET_DIGEST<TAB>ACTION_INSTANCE_ID_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>active|released
+claim<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>TASK_CLAIM_ID<TAB>OWNER<TAB>BRANCH<TAB>EXPECTED_PATH<TAB>CODEBASE_ORIGIN_URL<TAB>CONTEXT_POLICY_SET_DIGEST<TAB>ACTION_INSTANCE_ID_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null<TAB>active|released
 effect-owner<TAB>EVENT_ID<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>DEVICE_ID<TAB>CLONE_ID<TAB>acquired|released
 ```
 
@@ -385,10 +387,11 @@ by every `effect-owner` row sorted by operation ID, claim ID, then event ID. An 
 pair has exactly one active claim row and at most one later released row; release repeats every
 other field. `EXPECTED_PATH` is the
 normalized workspace-relative `task/codebases/<NAME>` path, and `CODEBASE_ORIGIN_URL` is the
-canonical repository origin. Action, manifest, and intent fields are null only when the joined
-writer set had no conflict at publication. They preserve the claim-time binding; later
-re-resolution may replace the final task-local consumption binding without rewriting this
-append-only row.
+canonical repository origin. Action, manifest, and intent fields are all null only when the
+joined writer set had no conflict at publication. Authorization is also null then and may
+remain null for a conflict allowed by standing policy. These fields preserve the claim-time
+binding; later re-resolution may replace the final task-local consumption binding without
+rewriting this append-only row.
 A claim is current only when its active row has no release. Rows are never removed or
 rewritten. The canonical file is reserialized from the union after each append. The row
 carries enough task, path, branch, origin, context, and claim-time authorization identity to
@@ -442,6 +445,7 @@ disposable bookkeeping:
       }
     ]
   },
+  "authorization_ref": "conversation:message/msg-123",
   "effect_owner_state": "none",
   "worktree_ownership": "none",
   "repo_record_ownership": "none",
@@ -456,7 +460,8 @@ disposable bookkeeping:
 ```
 
 Those fields and order are exact. `coordination_oid`, `action_instance_id`, `intent_digest`,
-and `policy_manifest` may be null; the latter three are all null or all non-null. The manifest
+`policy_manifest`, and `authorization_ref` may be null. Action/intent/manifest are all null or
+all non-null; authorization may be null under standing allow. The manifest
 and intent are the exact `workbench-policy-manifest/v1` object and
 `workbench-action-intent/v1` digest bound to the action. Effect-owner state is
 `none`, `acquired`, or `released`. Ownership is exactly
@@ -465,9 +470,11 @@ below. `worktree_set_digest` is null until create intent. Compensation target is
 `reserved`, or `released`; reason is null, `ask`, `deny`, `authorization-deny`, `handoff`,
 `creation-failure`, or `cleanup`; next step is null, `record`, `worktree`, `effect-owner`,
 `claim`, or `finish`. Stable operation and claim IDs are reused by every retry.
-`device_id` and `clone_id` identify the clone that wrote this operation copy; they may change
-only when an explicit handoff receiver reconstructs it, and `effect_owner_state: "acquired"`
-must match that exact remote owner.
+`device_id` and `clone_id` identify the clone bound to this operation. With zero effect-owner
+events ever, they may be rebound once only by the exact reconstruction exception below. From
+the first owner event onward they are immutable to automatic recovery; only the explicit
+source-led handoff protocol may transfer them. `effect_owner_state: "acquired"` must match that
+exact remote owner.
 
 Stage is exactly `prepared`, `authorization-pending`, `cancelled`, `remote-claimed`,
 `effect-owner-acquired`, `worktree-create-pending`, `worktree-ready`,
@@ -540,8 +547,8 @@ The claim algorithm is exact:
    action/manifest/intent before continuing.
 6. Before any worktree or record effect, CAS-acquire the effect owner for this operation/claim
    and persist `effect-owner-acquired`. A current different device/clone blocks. Cross-device
-   automatic reconstruction is permitted only when no effect-owner event has ever existed;
-   after acquisition, another clone needs explicit source-side handoff.
+   automatic reconstruction/rebind is permitted only under the zero-history/zero-effect
+   exception below; after acquisition, another clone needs explicit source-side handoff.
 7. Immediately before each worktree create/adopt, repeat full revalidation and persist any
    replacement binding. Capture the absent worktree-set digest, persist
    `worktree-create-pending`, then create or marker-proven adopt. Verify and persist
@@ -549,12 +556,16 @@ The claim algorithm is exact:
 8. Immediately before each repo-record create/adopt, repeat full revalidation and persist any
    replacement binding. Persist `record-create-pending`, create/adopt only the exact
    operation-owned `role: work` row, verify remote claim/worktree/record, then persist
-   `record-ready` plus ownership.
-9. After the record exists and immediately before consumption, repeat full revalidation once
-   more. Persist any replacement action/manifest/intent before obtaining newly required
-   authorization. Consume the final action idempotently when one exists, persist its binding
-   and intent in the task-content writer row, and then persist `consumed`. No-conflict
-   operations skip action consumption but still reach `consumed`.
+   `record-ready` plus ownership. Its applied provenance columns remain null until the final
+   gate; `record-ready` with a null tuple is a recoverable writer prefix, not an applied
+   concurrent-write primary.
+9. After the record exists and immediately before normal consumption, repeat full revalidation
+   once more. Persist any replacement action/manifest/intent before obtaining newly required
+   authorization. Atomically write and refetch the task-content writer row with the complete
+   applied provenance tuple, then let the common reducer mark the private action and operation
+   `consumed`. A crash after the row but before either status write recovers from that row
+   without current pre-state/policy derivation. No-conflict operations have null provenance,
+   skip action consumption, and still reach `consumed`.
 
 The remote commit OID is the serialization token. It is not a local-write fencing token, and
 no expiry or process-local lease grants authority. Before an active row is published, policy
@@ -571,7 +582,10 @@ a generic mismatch.
 
 For target `reserved`, `claim` is skipped and `finish` clears compensation fields and returns
 to `remote-claimed` with the active claim as reservation, exit `3`. For target `released`,
-`claim` CAS-appends/refetch-verifies release, then `finish` persists `released`, exit `4`.
+after record/worktree absence and effect-owner release are verified, the operation atomically
+persists stage `release-pending` with cursor `claim`. Only that stage/cursor may CAS-append the
+claim release. It refetch-verifies the release, advances the cursor to `finish`, then persists
+`released`, exit `4`. A `compensation-pending` operation never performs the claim CAS directly.
 When no effect owner or local effect exists, ask remains `remote-claimed`; deny may enter
 `release-pending` and release the claim directly. Terminal `cancelled` is used only before
 remote publication.
@@ -581,7 +595,7 @@ remote publication.
 | `allow`, same binding | Continue next effect | active | `0` after consume |
 | `ask`, no local effect | stay `remote-claimed` | active reservation | `3` |
 | `ask`, owned local effects | `compensation-pending(reserved)` prefix -> `remote-claimed` | active reservation | `3` |
-| policy or authorization `deny` | `compensation-pending(released)` -> `release-pending` -> verified `released` | released | `4` |
+| policy or authorization `deny` | `compensation-pending(released)` -> verify prior steps -> `release-pending(next=claim)` -> claim CAS -> verified `released` | released | `4` |
 | compensation/ownership ambiguity | keep exact compensation cursor and emit `writer-recovery-blocked` | active | `1` |
 
 Authority, integrity, ownership, or ambiguity failure during revalidation or compensation
@@ -589,20 +603,24 @@ keeps the active remote claim and exact cursor, returns `writer-recovery-blocked
 releases around a possible orphan. An external or unmarked worktree is never operation-owned
 and never removed.
 
-Retry and cross-device adoption are fail-closed. If the local journal is missing but exactly
-one active remote row matches current task claim, owner, and branch and no effect-owner event
-has ever existed, the kernel reconstructs
-the strict operation from that row, re-resolves current authority/policy, and continues; it
-does not abandon or release the row merely because bookkeeping was not pushed. Multiple
+Retry and cross-device adoption are fail-closed. If the new clone has no authoritative local
+journal, exactly one active remote row matches current task claim/owner/branch, no effect-owner
+event has ever existed, and exhaustive inspection proves no local worktree, repo record, or
+task-content writer effect, the kernel may reconstruct. It atomically writes/rebinds the strict
+operation with the new device/clone **before** owner acquisition, re-resolves current
+authority/policy, and continues. Any existing owner history or possible effect forbids this
+exception; it does not abandon or release the row merely because bookkeeping was not pushed.
+Multiple
 matches are `writer-recovery-ambiguous`. An exact generated worktree or exact repo record is
 adopted only by its current effect owner. A current owner on another device/clone, wrong
 path/branch/origin, ambiguous checkout, external worktree, mismatched record, or possible orphan
 returns `writer-recovery-blocked` and leaves the remote claim active.
 
 A recoverable creation failure uses `compensation-pending` target `released`; it never jumps
-directly to claim release. A crash after repo record but before consumption resumes from the
-record cursor, revalidates, and either consumes or compensates. Remote failure leaves the
-active row/cursor visible and returns `writer-lock-unavailable`.
+directly to claim release or performs claim CAS before `release-pending/claim`. A crash after
+the repo record but before consumption resumes from the record cursor, revalidates, and either
+consumes or compensates. Remote failure leaves the active row/cursor visible and returns
+`writer-lock-unavailable`.
 
 `handoff` is source-led and valid only for a reconciled `consumed` operation whose executing
 clone is current effect owner. It persists `compensation_target: "reserved"`, reason
@@ -650,6 +668,8 @@ Success returns:
   "coordination_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "action_instance_id": "act_01J00000000000000000000000",
   "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "policy_manifest_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "authorization_ref": "conversation:message/msg-123",
   "worktree_ownership": "created",
   "repo_record_ownership": "created",
   "operation_stage": "consumed",
@@ -779,8 +799,8 @@ most one. A governed call contains only its one effect plus required `--reason-c
 `--reason-ref`, and action/authorization flags; combining it with another required/state,
 revision, or external-ref mutation is invalid at exit `2`. This preserves one action and one
 authorization binding. The updated record stores action ID, reason, consumed action instance,
-intent digest, and authorization ref. Repeating the exact resulting governed record is
-idempotent.
+intent digest, policy-manifest digest, and authorization ref. Repeating the exact resulting
+governed record is idempotent.
 
 Changing a revision makes prior evidence stale. From `accepted`, `waived`, or `rejected`, a
 revision change must explicitly select `declared` or `submitted` in the same non-governed
@@ -804,7 +824,10 @@ workbench task deliverable acceptance list --format json
 
 Kernel-owned kinds are exactly `codebase-pr` and `workbench-increment`. They require a
 registered GitHub owner, a canonical HTTPS pull-request `external_ref`, and a non-null
-revision. The kernel queries the referenced PR and creates a
+revision. The command branches on this stored kind before any action/request derivation or
+policy resolution and rejects `--owner-acceptance-file`, `--action-instance-id`, and
+`--authorization-file` at exit `2`. Kernel acceptance is deterministic but ungoverned. The
+kernel queries the referenced PR and creates a
 `workbench-probe/github-pr/v1` observation only when state is merged and `headRefOid` exactly
 equals the deliverable revision. Repository/PR mismatch, an unmerged PR, or revision mismatch
 blocks acceptance. The resulting receipt has `authority_type: "kernel-probe"`; no caller
@@ -826,7 +849,7 @@ The strict probe object is:
 ```
 
 `authority_digest` in the acceptance receipt is SHA-256 over that exact minified, key-ordered
-observation JSON plus LF. The time-independent accept-intent subject is a second strict object:
+observation JSON plus LF. The time-independent probe subject is a second strict object:
 
 ```json
 {
@@ -840,13 +863,19 @@ observation JSON plus LF. The time-independent accept-intent subject is a second
 }
 ```
 
-Its listed-order minified JSON plus LF yields the stable `subject_authority_digest` used by
-`workbench-deliverable-accept-intent/v1`; `observed_at` never enters that intent. The kernel
-mints `acceptance_id` once before its first probe and persists it in the private acceptance
-attempt record; every retry reuses that ID. A changed immutable subject supersedes the attempt,
-while a fresh observation of the same subject does not. The receipt remains valid only while
+Its listed-order minified JSON plus LF yields the stable `subject_authority_digest` stored in
+the kernel receipt; it is not an action intent. The kernel mints `acceptance_id` once before
+its first probe and persists it in the private ungoverned acceptance-attempt record; every
+retry reuses that ID. A changed immutable subject replaces only that ungoverned attempt, while
+a fresh observation of the same subject does not. The receipt remains valid only while
 repository, PR number, external ref, merged state, head revision, and merge revision match the
-deliverable and stored intent.
+deliverable and stored subject.
+
+Kernel acceptance appends/refetch-verifies its receipt before updating the deliverable pointer,
+but it never enters the governed applied-effect reducer. Its receipt has
+`action_instance_id: null`, `intent_digest: null`, `policy_manifest_digest: null`, and
+`authorization_ref: null`; the stable subject/observation prove owner acceptance, not policy
+authorization. Retry repairs a missing pointer from the exact ungoverned receipt.
 
 A namespaced pack-owned kind rejects kernel probing and requires
 `--owner-acceptance-file`. That strict `workbench-owner-acceptance/v1` input repeats
@@ -912,6 +941,7 @@ A mutation returns:
     "reason_ref": null,
     "governance_action_instance_id": null,
     "governance_intent_digest": null,
+    "governance_policy_manifest_digest": null,
     "authorization_ref": null
   }
 }
@@ -940,6 +970,7 @@ A governed waiver uses the same envelope and persists the exact reason and bindi
     "reason_ref": "conversation:message/msg-456",
     "governance_action_instance_id": "act_01J00000000000000000000001",
     "governance_intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "governance_policy_manifest_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
     "authorization_ref": "conversation:message/msg-456"
   }
 }
@@ -958,7 +989,8 @@ A governed waiver uses the same envelope and persists the exact reason and bindi
 The exact deliverable field order is `deliverable_id`, `owner`, `kind`, `owner_context_ref`,
 `acceptance_authority_ref`, `required`, `external_ref`, `revision`, `state`, `acceptance_ref`,
 `governance_action`, `reason_code`, `reason_ref`, `governance_action_instance_id`,
-`governance_intent_digest`, and `authorization_ref`. The state meanings are normative.
+`governance_intent_digest`, `governance_policy_manifest_digest`, and `authorization_ref`. The
+state meanings are normative.
 Repeating `declare` with an identical record is idempotent and reports `changed: false`; the
 same ID with different data fails.
 
@@ -985,6 +1017,7 @@ Successful acceptance returns the updated deliverable plus this append-only rece
     "reason_ref": null,
     "governance_action_instance_id": null,
     "governance_intent_digest": null,
+    "governance_policy_manifest_digest": null,
     "authorization_ref": null
   },
   "acceptance": {
@@ -1000,11 +1033,40 @@ Successful acceptance returns the updated deliverable plus this append-only rece
     "authority_contract": "workbench-probe/github-pr/v1",
     "authority_ref": "https://github.com/example/web-app/pull/12",
     "authority_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "subject_authority_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
     "actor": null,
     "action_instance_id": null,
-    "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "intent_digest": null,
+    "policy_manifest_digest": null,
+    "authorization_ref": null,
     "accepted_at": "2026-07-11T03:20:00Z"
   }
+}
+```
+
+For a pack-owned kind, the receipt embedded in the same envelope instead has this provenance:
+
+```json
+{
+  "contract_version": "workbench-acceptance/v1",
+  "acceptance_id": "acc-artifact-1",
+  "deliverable_id": "release-artifact",
+  "owner": "release-pack",
+  "kind": "toolbox:artifact/release",
+  "owner_context_ref": "toolbox:product/acme-api",
+  "acceptance_authority_ref": "toolbox:policy/acme-api",
+  "revision": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "authority_type": "owner-authorization",
+  "authority_contract": "workbench-owner-acceptance/v1",
+  "authority_ref": "toolbox:policy/acme-api",
+  "authority_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+  "subject_authority_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+  "actor": "release-owner@example.com",
+  "action_instance_id": "act_01J00000000000000000000002",
+  "intent_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+  "policy_manifest_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "authorization_ref": "conversation:message/msg-accept",
+  "accepted_at": "2026-07-11T03:20:00Z"
 }
 ```
 
@@ -1012,16 +1074,20 @@ The owner-acceptance input has exact fields `contract_version`, `acceptance_id`,
 `deliverable_id`, `owner`, `kind`, `owner_context_ref`, `acceptance_authority_ref`, `revision`,
 `actor`, and `accepted_at`.
 Its receipt uses `authority_type: "owner-authorization"`,
-`authority_contract: "workbench-owner-acceptance/v1"`, SHA-256 of the strict input as
-`authority_digest`, and the consumed action instance ID. That digest serializes the input in
+`authority_contract: "workbench-owner-acceptance/v1"`, and SHA-256 of the strict input as both
+`authority_digest` and `subject_authority_digest`. That digest serializes the input in
 the listed field order as minified UTF-8 JSON plus LF. The receipt copies both immutable owner
 bindings; its `authority_ref` is derived from `acceptance_authority_ref`, never from a caller
-choice. `actor` is the authorization actor and `accepted_at` is the authorization timestamp.
+choice. `actor` is the authorization actor and `accepted_at` is the authorization timestamp;
+the receipt also stores the pending action's exact intent, policy-manifest digest, and
+authorization ref before the deliverable pointer is written.
 The exact `workbench-acceptance/v1` fields are `contract_version`, `acceptance_id`,
 `deliverable_id`, `owner`, `kind`, `owner_context_ref`, `acceptance_authority_ref`, `revision`,
-`authority_type`, `authority_contract`, `authority_ref`, `authority_digest`, `actor`,
-`action_instance_id`, `intent_digest`, and `accepted_at`; kernel probes use null owner bindings and
-`actor: null`.
+`authority_type`, `authority_contract`, `authority_ref`, `authority_digest`,
+`subject_authority_digest`, `actor`, `action_instance_id`, `intent_digest`,
+`policy_manifest_digest`, `authorization_ref`, and `accepted_at`. Pack owner receipts require
+non-null action/intent/policy/authorization provenance. Kernel probes use null owner bindings,
+`actor: null`, and null action/intent/policy/authorization provenance.
 `acceptance list` returns a `workbench-acceptances/v1` object with exact fields
 `contract_version` and `acceptances`; the latter is the receipt array and is empty when no
 receipt exists. Duplicate acceptance IDs or conflicting receipts fail.
@@ -1071,6 +1137,7 @@ Mutation output is:
     "reason_ref": null,
     "action_instance_id": null,
     "intent_digest": null,
+    "policy_manifest_digest": null,
     "authorization_ref": null
   }
 }
@@ -1078,11 +1145,11 @@ Mutation output is:
 
 List output replaces `changed` and `required_check` with `required_checks: []`. A waived
 record has `state: "waived"`, the exact reason code/reference, consumed action instance ID,
-intent digest, and authorization source reference that permitted it. The reason code is a
-required stable machine identifier; `reason_ref` is optional prose provenance.
+intent digest, policy-manifest digest, and authorization source reference that permitted it.
+The reason code is a required stable machine identifier; `reason_ref` is optional prose provenance.
 The exact required-check field order is `check_id`, `owner`, `deliverable_id`, `subject_ref`,
-`state`, `reason_code`, `reason_ref`, `action_instance_id`, `intent_digest`, and
-`authorization_ref`.
+`state`, `reason_code`, `reason_ref`, `action_instance_id`, `intent_digest`,
+`policy_manifest_digest`, and `authorization_ref`.
 When `--deliverable-id` is present, `subject_ref` is
 `workbench:deliverable/<deliverable_id>` and owner must equal the deliverable owner. Without
 it, `deliverable_id` is null and subject is `workbench:task/<claim_id>`.
@@ -1311,9 +1378,11 @@ All three commands return:
   "registration_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
   "registration_action_instance_id": "act_01J00000000000000000000000",
   "registration_intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "registration_policy_manifest_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
   "registration_authorization_ref": "conversation:message/msg-register",
   "seal_action_instance_id": "act_01J00000000000000000000001",
   "seal_intent_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+  "seal_policy_manifest_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
   "seal_authorization_ref": "conversation:message/msg-seal",
   "participants": [
     {
@@ -1364,10 +1433,10 @@ Participants are sorted by context ref and stored in task content. `registration
 `workbench:context-registration/<registration_id>` for an owner registration.
 `registration_digest` is SHA-256 over its canonical registration JSON. `show` reports
 `changed: false`; before registration/lazy seal its digest, registration refs, action IDs,
-intent digests, and authorization refs are null with empty participants and null task policy.
-Register returns `sealed: false` and persists its consumed action, intent, and authorization;
-seal returns `sealed: true` and adds the corresponding seal triple. Lazy null-context seal
-returns `sealed: true` with both triples null. Every governed mutation
+intent/policy-manifest digests, and authorization refs are null with empty participants and null
+task policy. Register returns `sealed: false` and persists its applied provenance tuple; seal
+returns `sealed: true` and adds the corresponding seal tuple. Lazy null-context seal returns
+`sealed: true` with both tuples null. Every governed mutation
 derives all context and task sources from the complete sealed set; caller
 flags cannot subtract or replace them. `task.concurrent-write` uses the union of sealed sets
 from the prospective task and every active v2 writer; legacy-v1 pseudo-claims contribute no
@@ -1467,6 +1536,8 @@ authorization gate in addition to the policy lattice. A policy `deny` still retu
 otherwise the command returns `ask` at exit `3` until the exact authenticated authorization
 is supplied, even when every policy source says `allow`. This requirement is kernel-derived
 from action/bound owner/conflict facts and cannot be relaxed by caller input.
+Resolving `task.deliverable.accept` against a kernel-owned kind is invalid at exit `2` and
+mints no instance; deterministic kernel acceptance never enters the action registry path.
 
 ### Canonical action intent and per-action binding
 
@@ -1493,7 +1564,7 @@ cleanup plan.
 |---|---|---|---|---|
 | `task.complete` | `work_ref`, else `workbench:task/<claim_id>` | current `workbench-task-revision/v1` digest | `workbench-task-complete-intent/v1` | complete sealed task context-policy set |
 | `task.abandon` | `work_ref`, else `workbench:task/<claim_id>` | current `workbench-task-abandonment-revision/v1` digest | `workbench-task-abandon-intent/v1` including exact reason | complete sealed task context-policy set |
-| `task.deliverable.accept` | `workbench:deliverable/<deliverable_id>` | deliverable-record digest with non-null revision and immutable owner bindings | `workbench-deliverable-accept-intent/v1` | complete sealed task set; pack acceptance uses the one participant bound at declaration |
+| `task.deliverable.accept` (pack only) | `workbench:deliverable/<deliverable_id>` | pack-owned deliverable-record digest with non-null revision and immutable owner bindings | `workbench-deliverable-accept-intent/v1` | complete sealed task set plus the one participant bound at declaration |
 | `task.deliverable.waive` | `workbench:deliverable/<deliverable_id>` | current deliverable-record digest | `workbench-deliverable-transition-intent/v1`, transition `waive` | complete sealed task context-policy set |
 | `task.deliverable.reject` | `workbench:deliverable/<deliverable_id>` | current deliverable-record digest | `workbench-deliverable-transition-intent/v1`, transition `reject` | complete sealed task context-policy set |
 | `task.deliverable.weaken` | `workbench:deliverable/<deliverable_id>` | current deliverable-record digest | `workbench-deliverable-transition-intent/v1`, transition `weaken` | complete sealed task context-policy set |
@@ -1531,15 +1602,13 @@ reason_ref<TAB>REASON_REF_OR_null
 workbench-deliverable-accept-intent/v1
 deliverable_id<TAB>DELIVERABLE_ID
 record_revision<TAB>DELIVERABLE_RECORD_REVISION
-mode<TAB>kernel-probe|owner-assertion
 acceptance_id<TAB>ACCEPTANCE_ID
 deliverable_revision<TAB>DELIVERABLE_REVISION
-owner_context_ref<TAB>OWNER_CONTEXT_REF_OR_null
-acceptance_authority_ref<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null
-authority_contract<TAB>AUTHORITY_CONTRACT
-subject_authority_digest<TAB>SUBJECT_AUTHORITY_DIGEST
-actor<TAB>ACTOR_OR_null
-accepted_at<TAB>RFC3339_UTC_OR_null
+owner_context_ref<TAB>OWNER_CONTEXT_REF
+acceptance_authority_ref<TAB>ACCEPTANCE_AUTHORITY_REF
+owner_assertion_digest<TAB>OWNER_ASSERTION_DIGEST
+actor<TAB>ACTOR
+accepted_at<TAB>RFC3339_UTC
 
 workbench-required-check-waive-intent/v1
 check_id<TAB>CHECK_ID
@@ -1572,12 +1641,11 @@ removal_plan_digest<TAB>REMOVAL_PLAN_DIGEST
 ```
 
 For completion, the task revision is the deterministic content-plus-selected-evidence
-snapshot already defined by `workbench-task-revision/v1`. For pack acceptance,
-`subject_authority_digest` is the strict owner-assertion digest, which binds acceptance ID, immutable
-owner bindings, deliverable revision, actor, and timestamp. Kernel PR acceptance instead uses
-the stable `workbench-probe/github-pr-subject/v1` digest and null actor/timestamp values;
-its payload `authority_contract` is that subject contract, while the receipt separately uses
-timestamped `workbench-probe/github-pr/v1`. Register and seal use their
+snapshot already defined by `workbench-task-revision/v1`. Pack acceptance's
+`owner_assertion_digest` binds acceptance ID, immutable owner bindings, deliverable revision,
+actor, and timestamp. Deterministic kernel PR acceptance is ungoverned and never creates this
+intent. Its stable subject and timestamped observation remain acceptance evidence, not policy
+payload. Register and seal use their
 already-defined strict canonical inputs directly as payloads; concurrent write binds both the
 complete conflict pre-state and the exact prospective writer row. Cleanup's removal-plan
 manifest is defined under governed cleanup.
@@ -1608,11 +1676,89 @@ closed home-set digest is always present, even with no
 legacy claim. Thus a home registry, v1 branch, or cleanup fact change supersedes a pending
 authorization without creating an action/coordination-OID hash cycle.
 
-All record, target, revision, and context derivations are recomputed immediately before
-policy consumption. Concurrent-write conflict derivation is additionally recomputed inside
-the canonical ledger CAS loop below. Governed deliverable and required-check commands use
-the same first-call, pending, retry, and consumption behavior defined below for completion
-and abandonment.
+### Applied-effect reducer
+
+Every governed command runs one common applied-effect reducer **before** deriving a current
+request, pre-state revision, context set, or policy decision. The reducer uses the supplied
+action instance when present. Without one, it joins the command's stable target identifiers
+only to non-consumed instances and provenance not already frozen as consumed; historical
+consumed provenance does not shadow a legitimate later first call. It never mints a replacement
+while a possible unreconciled applied effect exists.
+
+Every governed post-effect record carries the exact applied provenance tuple, under the
+action-specific field names shown in its schema:
+
+```text
+workbench-applied-action-provenance/v1
+action_instance_id<TAB>ACTION_INSTANCE_ID
+intent_digest<TAB>INTENT_DIGEST
+policy_manifest_digest<TAB>POLICY_MANIFEST_DIGEST
+authorization_ref<TAB>AUTHORIZATION_REF_OR_null
+```
+
+The manifest digest must equal the stored action's exact policy manifest. Authorization ref
+is the validated authorization's source ref, or null only where standing allow was sufficient.
+Actions with a mandatory explicit gate require a non-null matching authorization. The durable
+sources and secondary projections are frozen as follows:
+
+| Governed action | Primary durable applied-effect provenance | Secondary projection/postcondition |
+|---|---|---|
+| pack-only `task.deliverable.accept` | append-only owner-authorization `workbench-acceptance/v1` receipt | deliverable state `accepted` and exact `acceptance_ref` pointer |
+| `task.deliverable.waive`, `reject`, `weaken` | governed deliverable row | exact requested state/required transition and reason |
+| `task.required-check.waive` | waived required-check row | exact reason and subject retained |
+| `task.harvest.dispose` | disposed candidate record | exact decision, target-or-null, and reason |
+| `task.policy-context.register` | registered context-set record and registration digest | exact registration ref; unsealed until a valid later seal |
+| `task.policy-context.seal` | sealed context-set record | exact registered participant/task-policy set |
+| `task.concurrent-write` | task-content writer row plus matching writer operation | exact operation-owned worktree/record and `consumed` operation stage |
+| `task.complete`, `task.abandon` | terminal outcome record | matching lifecycle event; abandonment also retains reason/removal-plan digest |
+| `task.cleanup` | external `prepared` cleanup journal | exact journal-prefix retirement and final `task-cleaned` projection |
+
+Reduction is exact and ordered:
+
+1. Collect every primary and secondary record for the supplied/stored instance. A secondary
+   record without its required primary, more than one candidate primary/composite-primary set,
+   duplicate append-only receipt, incompatible or forked prefix, or another action/intent using
+   the same instance is `action-effect-unreconciled` at exit `1`.
+2. Load the stored strict action request, recompute its intent, and compare action, task,
+   target, subject revision, intent digest, policy-manifest digest, and authorization
+   provenance. Verify that the primary record's postcondition is exactly the requested payload.
+   Missing private request state is unreconciled; the current pre-state is never substituted.
+   The sole exception is cleanup after task deletion: its strict external journal contains the
+   terminal revision, complete removal plan, intent, policy manifest, and authorization needed
+   to reconstruct the request.
+3. On one exact primary, reconcile only missing derived pointers, lifecycle observations, and
+   private action status. A causally later valid successor, such as a consumed deliverable
+   reset/revision or a sealed context set retaining its registration provenance, is never
+   reverted to the earlier postcondition. Cleanup may additionally resume only the exact
+   externally committed removal-plan prefix. This recovery path does **not** derive current
+   pre-state and does not re-resolve current policy because the authorized effect is already
+   durable.
+4. Atomically mark the private action `consumed` with the digest of its verified primary
+   provenance after required projections agree. A recovery that wrote a missing
+   projection/status reports the command's normal success with `changed: true`. An instance
+   already consumed with that frozen provenance returns `changed: false` without current
+   pre-state or policy derivation; later legitimate post-consumption reset does not replay it.
+5. A mismatch, duplicate, partial incompatible effect, missing required provenance, or
+   intent/action collision never clears a record and never creates a new action or effect.
+   Only when no applied provenance exists does the normal pre-state/request/policy path begin.
+
+The canonical blocker is `{"code":"action-effect-unreconciled","ref":"<action_instance_id>"}`;
+when no unique instance can be named, `ref` is the governed target ref.
+
+Pack acceptance has a fixed multi-record crash order. After normal owner assertion and
+authorization checks, append and refetch-verify the strict acceptance receipt first; that
+receipt contains the complete applied provenance tuple and is the recovery journal. Only then
+set and refetch the deliverable state/pointer, then commit the reducer's consumed status. A
+receipt without its pointer is repaired by the reducer; a pointer without its receipt is
+unreconciled.
+Any mutation that would reset, replace, or clear a post-effect record must run this reducer
+first and cannot erase provenance while its action is not reconciled as consumed.
+
+On the normal path, all record, target, revision, and context derivations are recomputed
+immediately before policy consumption. Concurrent-write conflict derivation is additionally
+recomputed inside the canonical ledger CAS loop below. Governed deliverable and required-check
+commands use the same first-call, pending, retry, and consumption behavior defined below for
+completion and abandonment.
 
 ### Resolve
 
@@ -1754,7 +1900,8 @@ match the stored action instance, including `intent_digest` and `policy_manifest
 used authorization or an instance with a different action, task claim, target, revision,
 intent, or policy manifest is rejected at exit `1`.
 
-Immediately before consuming any governed action, the command re-derives its required
+When the reducer found no applied provenance and normal execution reaches its final gate, the
+command re-derives its required
 context set, revalidates its authority receipts, re-observes the descriptor-pinned workspace
 default ref/OID, reopens the descriptor and every present source, and recomputes every digest
 and decision. It also re-derives the exact action payload and intent digest. A payload change
@@ -1771,11 +1918,13 @@ restrictive workspace source nor a caller-edited sealed source can be bypassed b
 approval and consumption.
 
 The kernel persists the exact strict action request plus action status in tracked, disposable
-task state. The storage path is private, but the record survives session handoff when the task state is committed. A
-governed mutation marks an authorized instance `consumed` only after the mutation and its
-required lifecycle observation, if any, succeed. Cleanup is the documented exception: its
-externally durable `prepared` journal is the committed mutation and consumption point because
-task-local action storage is about to be deleted. A failed precondition leaves the instance
+task state. The storage path is private, but the record survives session handoff when the task
+state is committed. Normal execution writes the action-specific primary post-effect record
+before marking the private instance consumed. Missing secondary projections are then handled
+by the applied-effect reducer; they are not grounds to repeat policy or the primary effect.
+Cleanup is the documented exception to private status durability: its externally durable
+`prepared` journal is the committed mutation and consumption source because task-local action
+storage is about to be deleted. A failed precondition before any primary provenance leaves the instance
 reusable only for the identical binding. Action, log, status, and other disposable
 bookkeeping records are excluded structurally from the task revision digest, so persisting a
 pending instance cannot change its own binding.
@@ -1801,15 +1950,15 @@ task_contract<TAB>workbench-task/v2
 workspace_authority_descriptor<TAB>DESCRIPTOR_DIGEST
 context_ref<TAB>REF_OR_null
 work_ref<TAB>REF_OR_null
-policy_context_set<TAB>BOOLEAN<TAB>SET_DIGEST_OR_null<TAB>REGISTRATION_REF_OR_null<TAB>REGISTRATION_DIGEST_OR_null<TAB>REGISTRATION_ACTION_INSTANCE_OR_null<TAB>REGISTRATION_INTENT_DIGEST_OR_null<TAB>REGISTRATION_AUTHORIZATION_REF_OR_null<TAB>SEAL_ACTION_INSTANCE_OR_null<TAB>SEAL_INTENT_DIGEST_OR_null<TAB>SEAL_AUTHORIZATION_REF_OR_null
+policy_context_set<TAB>BOOLEAN<TAB>SET_DIGEST_OR_null<TAB>REGISTRATION_REF_OR_null<TAB>REGISTRATION_DIGEST_OR_null<TAB>REGISTRATION_ACTION_INSTANCE_OR_null<TAB>REGISTRATION_INTENT_DIGEST_OR_null<TAB>REGISTRATION_POLICY_MANIFEST_DIGEST_OR_null<TAB>REGISTRATION_AUTHORIZATION_REF_OR_null<TAB>SEAL_ACTION_INSTANCE_OR_null<TAB>SEAL_INTENT_DIGEST_OR_null<TAB>SEAL_POLICY_MANIFEST_DIGEST_OR_null<TAB>SEAL_AUTHORIZATION_REF_OR_null
 policy_context<TAB>CONTEXT_REF<TAB>POLICY_REF<TAB>POLICY_DIGEST<TAB>AUTHORITY_IDENTITY<TAB>AUTHORITY_REF<TAB>AUTHORITY_REVISION<TAB>AUTHORITY_RECEIPT_DIGEST
 task_policy<TAB>POLICY_REF<TAB>POLICY_DIGEST<TAB>AUTHORITY_IDENTITY<TAB>AUTHORITY_REF<TAB>AUTHORITY_REVISION<TAB>AUTHORITY_RECEIPT_DIGEST
-writer_claim<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>OWNER<TAB>TASK_CLAIM_ID<TAB>BRANCH<TAB>EXPECTED_PATH<TAB>CODEBASE_ORIGIN_URL<TAB>CONTEXT_POLICY_SET_DIGEST<TAB>ACTION_INSTANCE_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null
-deliverable<TAB>ID<TAB>OWNER<TAB>KIND<TAB>OWNER_CONTEXT_REF_OR_null<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null<TAB>BOOLEAN<TAB>EXTERNAL_REF_OR_null<TAB>REVISION_OR_null<TAB>STATE<TAB>ACCEPTANCE_REF_OR_null<TAB>GOVERNANCE_ACTION_OR_null<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>GOVERNANCE_ACTION_INSTANCE_OR_null<TAB>GOVERNANCE_INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
-acceptance<TAB>ID<TAB>DELIVERABLE_ID<TAB>OWNER<TAB>KIND<TAB>OWNER_CONTEXT_REF_OR_null<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null<TAB>REVISION<TAB>AUTHORITY_TYPE<TAB>AUTHORITY_CONTRACT<TAB>AUTHORITY_REF<TAB>AUTHORITY_DIGEST<TAB>ACTOR_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST<TAB>ACCEPTED_AT
-required_check<TAB>ID<TAB>OWNER<TAB>SUBJECT_REF<TAB>STATE<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
+writer_claim<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>OWNER<TAB>TASK_CLAIM_ID<TAB>BRANCH<TAB>EXPECTED_PATH<TAB>CODEBASE_ORIGIN_URL<TAB>CONTEXT_POLICY_SET_DIGEST<TAB>ACTION_INSTANCE_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
+deliverable<TAB>ID<TAB>OWNER<TAB>KIND<TAB>OWNER_CONTEXT_REF_OR_null<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null<TAB>BOOLEAN<TAB>EXTERNAL_REF_OR_null<TAB>REVISION_OR_null<TAB>STATE<TAB>ACCEPTANCE_REF_OR_null<TAB>GOVERNANCE_ACTION_OR_null<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>GOVERNANCE_ACTION_INSTANCE_OR_null<TAB>GOVERNANCE_INTENT_DIGEST_OR_null<TAB>GOVERNANCE_POLICY_MANIFEST_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
+acceptance<TAB>ID<TAB>DELIVERABLE_ID<TAB>OWNER<TAB>KIND<TAB>OWNER_CONTEXT_REF_OR_null<TAB>ACCEPTANCE_AUTHORITY_REF_OR_null<TAB>REVISION<TAB>AUTHORITY_TYPE<TAB>AUTHORITY_CONTRACT<TAB>AUTHORITY_REF<TAB>AUTHORITY_DIGEST<TAB>SUBJECT_AUTHORITY_DIGEST<TAB>ACTOR_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null<TAB>ACCEPTED_AT
+required_check<TAB>ID<TAB>OWNER<TAB>SUBJECT_REF<TAB>STATE<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
 harvest<TAB>BOOLEAN
-harvest_candidate<TAB>ID<TAB>KIND<TAB>SOURCE_REF<TAB>STATE<TAB>DECISION_OR_null<TAB>TARGET_REF_OR_null<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
+harvest_candidate<TAB>ID<TAB>KIND<TAB>SOURCE_REF<TAB>STATE<TAB>DECISION_OR_null<TAB>TARGET_REF_OR_null<TAB>REASON_CODE_OR_null<TAB>REASON_REF_OR_null<TAB>ACTION_INSTANCE_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null
 ```
 
 SHA-256 over those bytes is the `workbench-task-content/v1` revision. The outcome manifest
@@ -1826,7 +1975,7 @@ writer snapshot first:
 
 ```text
 workbench-writer-abandonment-snapshot/v1
-operation<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>STAGE<TAB>ACTION_INSTANCE_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>REMOTE_CLAIM_STATE<TAB>REMOTE_CLAIM_DIGEST_OR_null<TAB>EFFECT_OWNER_EVENT_ID_OR_null<TAB>EFFECT_OWNER_HISTORY_DIGEST_OR_null<TAB>EFFECT_OWNER_DEVICE_OR_null<TAB>EFFECT_OWNER_CLONE_OR_null<TAB>WORKTREE_OWNERSHIP<TAB>REPO_RECORD_OWNERSHIP<TAB>WORKTREE_SET_DIGEST_OR_null<TAB>COMPENSATION_TARGET_OR_null<TAB>COMPENSATION_REASON_OR_null<TAB>COMPENSATION_NEXT_STEP_OR_null
+operation<TAB>OPERATION_ID<TAB>CLAIM_ID<TAB>STAGE<TAB>ACTION_INSTANCE_OR_null<TAB>POLICY_MANIFEST_DIGEST_OR_null<TAB>INTENT_DIGEST_OR_null<TAB>AUTHORIZATION_REF_OR_null<TAB>REMOTE_CLAIM_STATE<TAB>REMOTE_CLAIM_DIGEST_OR_null<TAB>EFFECT_OWNER_EVENT_ID_OR_null<TAB>EFFECT_OWNER_HISTORY_DIGEST_OR_null<TAB>EFFECT_OWNER_DEVICE_OR_null<TAB>EFFECT_OWNER_CLONE_OR_null<TAB>WORKTREE_OWNERSHIP<TAB>REPO_RECORD_OWNERSHIP<TAB>WORKTREE_SET_DIGEST_OR_null<TAB>COMPENSATION_TARGET_OR_null<TAB>COMPENSATION_REASON_OR_null<TAB>COMPENSATION_NEXT_STEP_OR_null
 ```
 
 There is one row for every current non-cancelled operation, sorted by operation and claim ID.
@@ -1840,6 +1989,9 @@ each LF-terminated; it is null only when the event ID is null. The snapshot incl
 its authorization, ownership, and cursor facts must equal the strict local operation and
 remote ledger. Any malformed, ambiguous, or
 unjoinable fact is `writer-claim-unreconciled`, and abandonment cannot mint an action.
+For a released compensation prefix, `stage: release-pending` with next `claim` is the only
+valid pre-CAS snapshot; `compensation-pending` with next `claim` and a released remote row is
+malformed.
 
 The abandonment action revision is SHA-256 over:
 
@@ -1940,6 +2092,7 @@ All four commands return the complete ledger:
         "reason_ref": "conversation:message/msg-123",
         "action_instance_id": "act_01J00000000000000000000000",
         "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "policy_manifest_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
         "authorization_ref": "conversation:message/msg-123"
       }
     }
@@ -1951,7 +2104,8 @@ All four commands return the complete ledger:
 Candidates are sorted by ID. A pending candidate has `state: "pending"` and
 `disposition: null`. A disposition stores the exact optional reason reference and consumed
 intent digest. Its exact field order is `decision`, `target_ref`, `reason_code`, `reason_ref`,
-`action_instance_id`, `intent_digest`, and `authorization_ref`. Repeating an identical declaration or disposition is idempotent;
+`action_instance_id`, `intent_digest`, `policy_manifest_digest`, and `authorization_ref`.
+Repeating an identical declaration or disposition is idempotent;
 conflicting data fails. Completion emits `harvest-unsealed` when the inventory is open and
 `harvest-undisposed` for each pending candidate.
 
@@ -2005,13 +2159,16 @@ content row, and worktree is satisfied. One exact `released` operation with a ve
 remote row, no live worktree, and no content writer row is satisfied. Rows are matched by
 operation/claim/task/owner/branch/path/origin.
 
+One exact `handoff-ready` operation is also satisfied when its active claim and content writer
+row match, effect-owner reduction is released/null, and no local worktree exists. Delivery does
+not require rematerialization on a receiver; a receiver is needed only to resume code work.
 One exact `cancelled` operation with no remote claim, effect-owner event, worktree, repo row,
 or content writer row is also satisfied. Any `prepared`, `authorization-pending`,
 `remote-claimed`, `effect-owner-acquired`, `worktree-create-pending`, `worktree-ready`,
-`record-create-pending`, `record-ready`, `compensation-pending`, `handoff-ready`, or
+`record-create-pending`, `record-ready`, `compensation-pending`, or
 `release-pending` operation produces `writer-operation-incomplete`. An unmatched or duplicate
-active remote row, local/remote identity mismatch, consumed operation without matching
-record/worktree, or recovery blocker produces `writer-claim-unreconciled`. In either case `revision` is null,
+active remote row, local/remote identity mismatch, consumed or handoff-ready operation without
+its exact postcondition, or recovery blocker produces `writer-claim-unreconciled`. In either case `revision` is null,
 `verified` is false, and task revision hashing does not begin. Missing or
 failed current evidence, a required non-waived deliverable that is not accepted at a
 non-null revision, and unresolved required records produce `verified: false`, JSON stdout,
@@ -2025,7 +2182,8 @@ Canonical blocker codes are `missing-deliverable-revision`, `unaccepted-delivera
 `missing-evidence`, `evidence-owner-mismatch`, `evidence-subject-mismatch`,
 `failed-evidence`, `stale-evidence`, `workbench-increment-unaccepted`, `harvest-unsealed`,
 `harvest-undisposed`, `writer-operation-incomplete`, `writer-claim-unreconciled`,
-`terminal-outcome-conflict`, `terminal-content-frozen`, and `action-binding-stale`. Packs may
+`terminal-outcome-conflict`, `terminal-content-frozen`, `action-binding-stale`, and
+`action-effect-unreconciled`. Packs may
 add namespaced blocker codes; consumers ignore unknown
 codes but still treat them as blockers.
 
@@ -2044,11 +2202,14 @@ digest. On a first call the command internally resolves policy and may mint an a
 instance. `allow` continues; `ask` returns the pending policy object at exit `3`; `deny`
 returns it at exit `4`. A retry supplies the instance and authorization file.
 
-Completion repeats the exact writer join above before computing a revision and all other
-non-policy blockers. It cannot mint an action instance or activate terminal freeze while a
-writer blocker exists. If blockers exist, it returns the outcome report at exit `1` with
-`action_instance_id: null`. Otherwise it resolves policy, then repeats writer reconciliation
-and rechecks the revision digest immediately before mutation.
+Completion first runs the common applied-effect reducer. An exact terminal outcome primary
+repairs only its missing `task-completed` lifecycle projection/private status and does not run
+current writer or policy checks. With no applied provenance, completion repeats the exact
+writer join above before computing a revision and all other non-policy blockers. It cannot mint
+an action instance or activate terminal freeze while a writer blocker exists. If blockers
+exist, it returns the outcome report at exit `1` with `action_instance_id: null`. Otherwise it
+resolves policy, repeats writer reconciliation, rechecks the revision digest, atomically writes
+the terminal outcome primary, then projects lifecycle through the reducer.
 
 ### Abandon
 
@@ -2073,6 +2234,9 @@ cleanup, but it is not misrepresented as a completion
 predicate. A valid incomplete writer operation does not block authorized abandonment;
 malformed, ambiguous, or unjoinable writer facts do. Abandonment freezes new writer effects,
 and governed cleanup must compensate/release every existing operation before deletion.
+Like completion, it runs the applied-effect reducer before testing non-terminal state or
+deriving its abandonment revision. An exact existing outcome may only reconcile its matching
+`task-abandoned` projection; a lifecycle marker without the outcome primary is unreconciled.
 
 Successful outcome output is:
 
@@ -2084,6 +2248,8 @@ Successful outcome output is:
   "changed": true,
   "action_instance_id": "act_01J00000000000000000000000",
   "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "policy_manifest_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "authorization_ref": "conversation:message/msg-123",
   "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "removal_plan_digest": null,
   "reason_code": null,
@@ -2093,8 +2259,8 @@ Successful outcome output is:
 ```
 
 The exact outcome field order is `contract_version`, `task_contract`, `outcome`, `changed`,
-`action_instance_id`, `intent_digest`, `revision`, `removal_plan_digest`, `reason_code`,
-`reason_ref`, and `blockers`.
+`action_instance_id`, `intent_digest`, `policy_manifest_digest`, `authorization_ref`,
+`revision`, `removal_plan_digest`, `reason_code`, `reason_ref`, and `blockers`.
 
 Abandonment changes `outcome` to `abandoned`, sets the reason fields, and stores the exact
 non-null cleanup-plan digest already bound by its revision; completion leaves that field null
@@ -2118,7 +2284,9 @@ recorded child-task identity. Selection reads task metadata and lifecycle claim 
 does not reverse-parse a branch name. More than one live matching claim without a unique
 parent produces blocker `ambiguous-task-selection` at exit `1`.
 
-For `workbench-task/v2`, `--force` is invalid at exit `2`. The selected task must have a
+For `workbench-task/v2`, `--force` is invalid at exit `2`. After stable task selection, cleanup
+first reduces any external journal for the supplied/stored action, even when local task state
+has already disappeared. Only when no applied journal exists must the selected task have a
 `task-completed` or `task-abandoned` outcome, clean task and nested codebase worktrees, and a
 pushed task branch. Preflight blockers are `missing-terminal-outcome`,
 `dirty-task-worktree`, `dirty-codebase-worktree`, `unpushed-task-branch`,
@@ -2187,14 +2355,16 @@ timestamps are nondecreasing. The unique longest valid prefix is current. A fork
 duplicate non-idempotent prefix, or remote disagreement is `cleanup-reconciliation-failed`.
 
 The kernel writes `stage: "prepared"` only after final policy resolution; that durable
-receipt consumes the action instance. If the comment cannot be written, it returns
+receipt is the applied-effect consumption source. The reducer never reauthorizes it and marks
+private status consumed when local state still exists. If the comment cannot be written, it returns
 `cleanup-journal-unavailable` and deletes nothing. The plan lists every writer operation and
 claim ID. For each pair, cleanup uses the remote row to recover expected path/branch/origin,
 removes only the exact planned nested worktree, prunes it, and verifies that no exact or
 possible orphan remains. The prepared journal then acts as the external retirement record for
 the otherwise frozen task-content repo row; a consumed operation therefore begins cleanup at
 the `worktree` cursor and never edits that frozen row. Cleanup appends the matching remote
-`released` row through CAS and refetches it. All operation releases must be verified before
+`released` row only after persisting `release-pending` with next `claim`, then refetches it and
+advances finish. All operation releases must be verified before
 the task workspace or local task branch is deleted.
 
 Release changes coordination state, not frozen task content. Ambiguous/external worktrees or
@@ -2219,6 +2389,8 @@ Success or a computed blocker returns:
   "changed": true,
   "action_instance_id": "act_01J00000000000000000000000",
   "intent_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "policy_manifest_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "authorization_ref": "conversation:message/msg-123",
   "revision": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "removal_plan_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
   "released_writer_operations": [
@@ -2237,8 +2409,9 @@ Success or a computed blocker returns:
 ```
 
 The exact cleanup field order is `contract_version`, `task_contract`, `task_id`, `claim_id`,
-`branch`, `outcome`, `changed`, `action_instance_id`, `intent_digest`, `revision`,
-`removal_plan_digest`, `released_writer_operations`, `removed`, and `blockers`.
+`branch`, `outcome`, `changed`, `action_instance_id`, `intent_digest`,
+`policy_manifest_digest`, `authorization_ref`, `revision`, `removal_plan_digest`,
+`released_writer_operations`, `removed`, and `blockers`.
 Blocked preflight sets `outcome: null`, `changed: false`, `action_instance_id: null`, and
 lists blockers at exit `1`. Policy `ask` and `deny` return the policy object at exit `3` and
 `4`. Retry first reads the issue journal: `prepared` resumes only exact worktree retirement,
@@ -2246,7 +2419,8 @@ writer-operation release, verification, and removal steps and does not reauthori
 already consumed action; `completed` reconciles a missing `task-cleaned` lifecycle marker; a
 prior lifecycle marker is idempotent with `changed: false`. Failures use
 `cleanup-plan-mismatch`, `cleanup-journal-unavailable`, `cleanup-reconciliation-failed`,
-`writer-recovery-blocked`, `writer-lock-unavailable`, or `lifecycle-write-failed`. The external
+`action-effect-unreconciled`, `writer-recovery-blocked`, `writer-lock-unavailable`, or
+`lifecycle-write-failed`. The external
 prepared receipt and remote operation row are the recovery and consumption sources after
 task-local state disappears.
 

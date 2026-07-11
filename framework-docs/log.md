@@ -98,3 +98,5 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-07-11 10:04:43] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Added per-effect post-CAS revalidation and compensation, terminal writer reconciliation, closed legacy-home enumeration, exact start syntax, and lowercase manifest booleans
 
 ## [2026-07-11 10:42:46] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Bound authorizations to exact action intent, added effect-owner handoff and cursor recovery, separated abandonment revision, preserved submitted-v1 writers through PR ancestry, and froze cleanup removal plans
+
+## [2026-07-11 13:08:05] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Added applied-effect-first recovery, receipt-first governed pack acceptance, ungoverned kernel acceptance, zero-history writer rebind, and mandatory pre-CAS release state

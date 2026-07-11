@@ -31,11 +31,14 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   writer projection over a closed home registry (including submitted PR ancestry and origin
   replacement proofs), a crash-safe fixed-ref CAS writer/effect-owner ledger with no-effect
   cancellation, cursor-based compensation, explicit cross-device handoff, exact action-intent
-  payload digests, a dedicated abandonment revision, stable PR-acceptance subjects, exact
-  cleanup removal plans and owner-event recovery, terminal writer reconciliation, lowercase
-  manifest booleans, a frozen kernel action registry, strict JSON inputs, capability-pack rules,
-  profile language, and machine-readable compatibility shared by the engine, migration flow,
-  and optional packs (#25). This change defines the contract only; CLI and migration
+  payload digests, applied-effect-first crash reconciliation with exact durable provenance,
+  receipt-first governed pack acceptance, ungoverned/null-provenance kernel PR acceptance,
+  zero-history-only device rebind, mandatory pre-CAS `release-pending`, a dedicated abandonment
+  revision, stable PR-acceptance subjects, exact cleanup removal plans and owner-event recovery,
+  terminal writer reconciliation, lowercase manifest booleans, a frozen kernel action registry,
+  strict JSON inputs, capability-pack rules, profile language, and machine-readable compatibility
+  shared by the engine, migration flow, and optional packs (#25). This change defines the
+  contract only; CLI and migration
   implementation remain in follow-up issues.
 
 ## [0.1.1] - 2026-06-17

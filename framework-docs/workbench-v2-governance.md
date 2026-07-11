@@ -152,8 +152,7 @@ The closed home inventory comes from descriptor `workspace_home` plus same-OID
 `codebases.yaml`; adapters exhaust every home's pagination, and an in-use legacy home cannot
 be removed. Replacing a home's origin is removal of the old pair and requires proof that the
 old origin has no non-cleaned v1 claim. Missing registry, pagination, branch/PR ancestry, or
-legacy input fails closed. A legacy
-conflict always requires explicit
+legacy input fails closed. A legacy conflict always requires explicit
 `task.concurrent-write` authorization because v1 has no sealed context policy; a later v1
 `task-cleaned` fact dynamically retires its pseudo-claim.
 
@@ -162,10 +161,16 @@ Unresolved pre-publication ask has `authorization-pending` and no effects; deny/
 terminal `cancelled`. Parent-OID CAS commits then serialize remote claims and append-only
 effect-owner events. Only the current trusted device/clone owner may create, adopt, compensate,
 or remove local effects. Every stage and compensation cursor is durable before its effect.
+Cross-device journal rebind is allowed only when the new clone has no authoritative local
+journal, exactly one active claim matches, owner history is empty, and exhaustive inspection
+proves zero worktree/record/content effects. The reconstructed binding is persisted before
+acquisition. From the first owner event onward only source-led handoff may transfer the
+immutable device/clone binding.
 The full joined set, policy, and exact writer intent are revalidated after publication, before
 every local worktree/record create or adopt, and after the record before consume. Ask performs
 cursor-based reverse compensation and keeps the claim reserved; policy or authorization deny
-compensates then verifies release. External or ambiguous effects are never removed. Recovery
+verifies record/worktree/owner release, persists `release-pending(next=claim)`, then performs
+the claim CAS and verifies release. External or ambiguous effects are never removed. Recovery
 is automatic across devices only before any effect-owner event; later movement requires an
 explicit source-led handoff that releases ownership without releasing the claim. Cleanup carries
 operation/claim IDs and every effect-owner transition in its external journal and verifies
@@ -214,6 +219,7 @@ A task declares zero or more deliverables. Each deliverable has, at minimum:
 | `reason_code`, `reason_ref` | Required stable reason and optional prose reference for a governed change |
 | `governance_action_instance_id` | Consumed action for waiver, rejection, or weakening; otherwise null |
 | `governance_intent_digest` | Exact authorized transition/reason digest; otherwise null |
+| `governance_policy_manifest_digest` | Exact policy manifest applied to the governed effect; otherwise null |
 | `authorization_ref` | Matching authorization provenance, or null for standing allow |
 
 The kernel understands the mechanics of its own kinds, such as a codebase pull request or
@@ -224,7 +230,7 @@ must not create an empty workbench pull request merely to reach completion.
 
 `submitted` and `accepted` require a non-null revision; `declared`, `waived`, and `rejected`
 may remain null. One update can weaken, waive, or reject, never combine those governed
-effects, and must persist its reason and one action/intent/authorization binding. A later explicit
+effects, and must persist its reason and one action/intent/policy/authorization binding. A later explicit
 reset to `declared`/`submitted` clears current governance/acceptance fields but retains
 append-only receipts; a changed revision makes prior evidence stale. Owner context and
 acceptance authority never change on reset or revision update; a different owner binding uses
@@ -233,17 +239,18 @@ declared independently from evidence, so completion distinguishes "no check was 
 from "required evidence is missing". Exact commands and reset rules are in
 [[workbench-v2-cli-contract]].
 
-No caller can set `accepted` directly. Kernel-owned pull-request kinds require a deterministic
-merged-PR probe whose repository and head revision match; accept intent uses a timestamp-free
-probe-subject digest and one persisted acceptance ID, while the receipt retains the timestamped
-observation. Pack-owned kinds require a strict
-owner assertion plus explicit `task.deliverable.accept` authorization. Declaration first
+No caller can set `accepted` directly. Kernel-owned pull-request kinds branch before policy
+resolution and use a deterministic merged-PR probe whose repository and head revision match.
+Their timestamp-free subject and timestamped observation create an ungoverned receipt whose
+action/intent/policy/authorization fields are all null. Pack-owned kinds require a strict owner
+assertion plus explicit `task.deliverable.accept` authorization. Their append-only receipt is
+the applied-effect recovery journal and is written before the deliverable pointer. Declaration first
 binds an exact owner context and acceptance authority that resolve one sealed participant;
 the assertion repeats those stored values and cannot select another authority. Its independent
-receipt authenticates the actor. Standing `allow` alone is insufficient.
-Both paths create `workbench-acceptance/v1` receipts with `intent_digest`, included in the task
-content revision. Required-check waiver likewise requires a reason code, optional reason ref,
-and persisted intent digest.
+receipt authenticates the actor. Standing `allow` alone is insufficient. Both paths create
+`workbench-acceptance/v1` receipts in the task content revision, but only pack receipts carry
+the complete action/intent/policy/authorization provenance tuple. Required-check waiver
+likewise requires a reason code, optional reason ref, and complete applied provenance.
 
 ### Verification evidence
 
@@ -360,8 +367,9 @@ A v2 task is complete only when all applicable conditions hold:
 6. No applicable policy resolves to `deny`, and no required action remains unresolved at
    `ask`.
 7. Every task-local writer operation and remote task claim is reconciled: consumed operations
-   have exact active claim/content-row/worktree matches, and released operations have no live
-   writer effect. Pending, duplicate, unmatched, or blocked writer state prevents completion.
+   have exact active claim/content-row/worktree matches; handoff-ready operations have exact
+   active claim/content rows with released owner and no worktree; released operations have no
+   live writer effect. Pending, duplicate, unmatched, or blocked writer state prevents completion.
 
 Abandonment is a different terminal predicate. It derives
 `workbench-task-abandonment-revision/v1` from content, explicit nullable/pending deliverable
@@ -398,8 +406,10 @@ require a new task.
 
 ## Policy contract
 
-Every externally consequential or irreversible action has a stable action ID and must be
-resolved before execution. The canonical decisions are:
+Every judgment-governed externally consequential or irreversible action has a stable action ID
+and must be resolved before execution. A deterministic kernel-owned PR acceptance is the
+documented exception: it branches before policy and is authorized only by its exact owner
+probe contract. The canonical policy decisions are:
 
 | Decision | Meaning |
 |---|---|
@@ -442,6 +452,18 @@ Human approval resolves that action instance; it does not silently rewrite stand
 policy. Policy evaluation records the action ID, applicable policy sources, result, and
 authorization reference without asking shell plumbing to invent explanatory prose.
 
+Every governed command first runs the common applied-effect reducer before deriving current
+pre-state or policy. Exact durable action/intent/policy/authorization provenance is the
+consumption point. The reducer validates the stored request against the effect postcondition,
+repairs only missing pointers/lifecycle/private status (or a committed cleanup-plan prefix),
+and never re-resolves policy for an effect that already happened. Duplicate, incompatible
+partial, mismatched, or colliding provenance blocks as `action-effect-unreconciled`; only zero
+unreconciled provenance enters ordinary policy resolution. Historical consumed provenance does
+not shadow a later valid first call, and reconciliation never reverts a causally later valid
+reset or successor state. Pack acceptance writes its strict receipt before its deliverable
+pointer, terminal actions write outcome before lifecycle, concurrent write uses content row
+plus operation, and cleanup uses the external prepared journal.
+
 V2 bootstrap/migration writes the fixed protected-default `.workbench/authority.json`
 descriptor (`workbench-workspace-authority/v1`) beside profile, schema marker, and required
 policy in one accepted commit. The descriptor supplies canonical `workspace_home`; the same
@@ -458,9 +480,9 @@ pre-effect subject revision, payload contract, and exact payload digest. It then
 action instance bound to that intent digest and the full canonical policy-source manifest. An
 authorization repeats both intent and manifest digests with every other binding field. Every
 kernel action has one frozen payload schema covering its exact transition, reason, disposition,
-owner assertion or stable PR subject, context input/set, writer request, or cleanup plan. The sealed task
+pack-owner assertion, context input/set, writer request, or cleanup plan. The sealed task
 context-policy set makes participant omission impossible for a direct caller. Immediately
-before consumption, the kernel re-observes the descriptor origin/default ref with
+before normal-path consumption, the kernel re-observes the descriptor origin/default ref with
 `ls-remote --symref`, fetches its current OID, reads `.workbench/authority.json` and
 `.workbench/policy.conf` plus `codebases.yaml` from that same immutable object, validates the
 task claim's descriptor digest, closed legacy home set, every sealed participant/task receipt
@@ -569,6 +591,7 @@ The canonical v1 shape is:
     "policy_authority_receipt_contracts": ["workbench-policy-authority-receipt/v1"],
     "context_policy_contracts": ["workbench-context-policy-registration/v1", "workbench-context-policy-set/v1"],
     "authorization_contracts": ["workbench-authorization/v1"],
+    "applied_effect_contracts": ["workbench-applied-action-provenance/v1"],
     "action_intent_contracts": [
       "workbench-action-request/v1",
       "workbench-action-intent/v1",
@@ -632,6 +655,7 @@ The canonical v1 shape is:
     "knowledge.applicability/v1",
     "policy.authority/v1",
     "policy.authorization/v1",
+    "policy.applied-effect-recovery/v1",
     "policy.context-set/v1",
     "policy.intent/v1",
     "policy.resolve/v1",
@@ -684,6 +708,10 @@ turn an unreadable or unwritable coordination ref into authority.
 issue marker. `task.start/v2` means skeleton-only start/resume. Writer-claim support is
 complete only when legacy projection, writer recovery, and terminal reconciliation
 capabilities are also advertised; the ledger contract alone is insufficient.
+`policy.applied-effect-recovery/v1` means every governed command reduces durable provenance
+before current request/policy derivation and supports blocker `action-effect-unreconciled`.
+`task.acceptance/v1` covers both ungoverned deterministic kernel probes and governed pack
+owner assertions; `task.deliverable.accept` in `supported.action_ids` is pack-only.
 
 Only workspace schemas listed under `supported.workspace_schemas.write` may receive v2
 mutations without migration. A v2 engine can read an implicit v1 workspace and run legacy

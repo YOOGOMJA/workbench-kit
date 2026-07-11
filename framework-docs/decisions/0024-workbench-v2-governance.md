@@ -14,7 +14,9 @@
   policy authority, effect-owner CAS and explicit cross-device handoff, no-effect
   cancellation plus cursor-based compensation, requested-effect intent digests, a dedicated
   abandonment revision, submitted-v1 PR ancestry projection, exact cleanup removal plans,
-  and capability discovery kernel contracts. Keep product semantics in an optional pack.
+  applied-effect-first crash reconciliation, receipt-first pack acceptance, ungoverned
+  deterministic kernel acceptance, and capability discovery kernel contracts. Keep product
+  semantics in an optional pack.
 - **Context:** V1 isolates task work and accumulates knowledge, but it treats a workbench
   increment pull request as the normal delivery path and describes human gates only in
   prose. It has no durable category for current intent and no supported way for an optional
@@ -34,7 +36,9 @@
   omitted, every approval also binds its exact transition/reason/assertion/plan payload,
   remote effects have one device/clone owner and explicit handoff, abandonment never pretends
   to have a completion revision, submitted legacy work survives branch deletion through its
-  PR ancestry, and verification is tied to exact evidence subjects and immutable revisions.
+  PR ancestry, durable effect provenance prevents an AI from repeating an already-applied
+  mutation after a crash, and verification is tied to exact evidence subjects and immutable
+  revisions.
 - **Rejected alternatives:**
   1. Put product, portfolio, scenario, design, and TDD semantics in the kernel. This would
      burden every non-product workbench and collapse the generic engine/domain boundary.
@@ -151,16 +155,34 @@
   41. Treat a changed registry origin as an in-place edit. That could abandon live v1 history
       at the old origin; it is removal plus addition and requires zero non-cleaned old claims.
   42. Put timestamped GitHub probe observations directly in retryable action intent. Each
-      re-probe would supersede authorization forever; kernel acceptance uses a stable
-      timestamp-free PR subject digest and keeps the full observation only in its receipt.
+      re-probe would supersede authorization forever; deterministic kernel acceptance is
+      ungoverned, uses a stable timestamp-free PR subject, and keeps the full observation only
+      in its receipt.
+  43. Re-derive current pre-state and policy before checking whether an authorized effect was
+      already written. The effect itself changes pre-state and policy may later tighten, so a
+      retry could duplicate work or strand recovery. The common reducer inspects exact durable
+      provenance first and only repairs missing projections/status.
+  44. Update a pack deliverable pointer before appending its acceptance receipt. A crash would
+      leave an unauditable accepted state; the append-only owner receipt is now the primary
+      recovery journal and is verified before the pointer.
+  45. Rebind a writer journal to any device that sees an active claim. That can transfer live
+      effects away from their owner; automatic rebind is limited to zero owner history and
+      proven zero effects, with all later transfer requiring source-led handoff.
+  46. CAS-release a claim directly from `compensation-pending`. A crash cannot prove whether
+      prior reverse steps or release intent completed; `release-pending(next=claim)` is now the
+      only pre-CAS stage.
+  47. Run deterministic kernel PR acceptance through `task.deliverable.accept` policy. The
+      owner probe is not a judgment gate and would create false action provenance; kernel kinds
+      branch before policy with null action fields, while pack owner assertions remain governed.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing
   task contract is always v1, so active tasks can finish without forced conversion.
   Workspace, task, lifecycle, profile, policy, action intent, authority descriptor,
-  coordination/effect-owner operation, completion/abandonment revision, evidence, cleanup
-  plan, pack, and domain schemas are versioned separately from plugin SemVer. Migration is a
-  governed task and pull request, not an install-time rewrite.
+  applied-effect provenance, coordination/effect-owner operation, completion/abandonment
+  revision, acceptance evidence, cleanup plan, pack, and domain schemas are versioned
+  separately from plugin SemVer. Migration is a governed task and pull request, not an
+  install-time rewrite.
 - **Source:** workbench-kit#25 / 2026-07-11
 - **Relations:**
   - extends [[0015-task-lifecycle-events]]
