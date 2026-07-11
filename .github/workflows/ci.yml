@@ -44,9 +44,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Skill frontmatter lint
-        run: bash tests/check-skill-frontmatter.sh
-
       - name: Manifests parse as JSON
         run: |
           rc=0
@@ -55,15 +52,6 @@ jobs:
               || { echo "invalid JSON: $f"; rc=1; }
           done < <(find . -path ./.git -prune -o \( -name plugin.json -o -name marketplace.json \) -print)
           exit $rc
-
-      - name: Plugin version sync
-        run: bash scripts/check-version-sync.sh
-
-      - name: Marketplace parity
-        run: bash tests/check-marketplace-parity.sh
-
-      - name: Marketplace parity guard tests
-        run: bash tests/check-marketplace-parity-guard.sh
 
       - name: ShellCheck
         run: |
@@ -79,26 +67,8 @@ jobs:
           )
           shellcheck -S error "${files[@]}"
 
-      - name: Engine lifecycle test
-        run: bash plugins/workbench/tests/task-lifecycle.sh
-
-      - name: Engine public contract test
-        run: bash plugins/workbench/tests/contract.sh
-
-      - name: Engine v2 lifecycle test
-        run: bash plugins/workbench/tests/task-v2-lifecycle.sh
-
-      - name: Install-model test
-        run: bash tests/check-install-model.sh
-
-      - name: codebases.yaml parsing test
-        run: bash tests/check-codebases-yaml.sh
-
-      - name: CHANGELOG frozen-section guard test
-        run: bash tests/check-changelog-section-guard.sh
-
-      - name: Generated scaffold hygiene test
-        run: bash tests/check-generated-scaffold-hygiene.sh
+      - name: Repository test suite
+        run: bash tests/run.sh
 
       - name: Compose smoke test
         # generate-workbench's bundled compose.sh self-verifies; a non-zero exit fails CI.

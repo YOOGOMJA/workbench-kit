@@ -74,9 +74,11 @@ if run_checker >/dev/null 2>&1; then
   fail "a missing manifest must fail"
 fi
 
-grep -Fq 'bash tests/check-marketplace-parity.sh' "$ROOT/.github/workflows/ci.yml" \
-  || fail "CI must run the marketplace parity contract"
-grep -Fq 'bash tests/check-marketplace-parity.sh' "$ROOT/scripts/release.sh" \
-  || fail "release preparation must run the marketplace parity contract"
+grep -Fq 'tests/check-marketplace-parity.sh' "$ROOT/tests/run.sh" \
+  || fail "the root test runner must run the marketplace parity contract"
+grep -Fq 'bash tests/run.sh' "$ROOT/.github/workflows/ci.yml" \
+  || fail "CI must use the root test runner"
+grep -Fq 'bash tests/run.sh' "$ROOT/scripts/release.sh" \
+  || fail "release preparation must use the root test runner"
 
 echo "PASS marketplace parity guard tests"
