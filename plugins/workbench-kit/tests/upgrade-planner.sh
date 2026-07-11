@@ -22,7 +22,11 @@ from workbench_kit_contracts import (
     validate_migration_receipt,
     validate_plan,
 )
-from workbench_kit_planner import PlanningError, build_migration_plan
+from workbench_kit_planner import (
+    PlanningError,
+    build_current_plan,
+    build_migration_plan,
+)
 
 OID = "1" * 40
 SHA = "sha256:" + "a" * 64
@@ -470,6 +474,100 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
         for operation in approved_removal["operations"]
     )
     assert validate_plan(approved_removal) == approved_removal
+
+    current_public = {
+        **public,
+        "doctor_projection": {
+            **public["doctor_projection"],
+            "ready": True,
+        },
+        "legacy_inventory_projection": {
+            **public["legacy_inventory_projection"],
+            "command": "show",
+        },
+    }
+    current_diagnosis = {
+        **embedded_diagnosis,
+        "classification": "already-current",
+        "provenance": {
+            "kind": None,
+            "state": "absent",
+            "receipt_digest": None,
+            "ref": None,
+        },
+        "language": "en",
+        "blockers": [],
+    }
+    current_task = {**migration_task, "task_contract": "workbench-task/v2"}
+    current_noop = build_current_plan(
+        root,
+        diagnosis=current_diagnosis,
+        public_snapshot=current_public,
+        migration_task=current_task,
+        planner=planner_v2,
+        engine_manifest_projection=manifest_projection,
+        plugin_equivalence_input=equivalence_input,
+        remove_embedded=False,
+        removal_approval_input=None,
+    )
+    assert current_noop["classification_before"] == "already-current"
+    assert current_noop["target_classification"] == "already-current"
+    assert current_noop["changed"] is False
+    assert current_noop["actionable"] is False
+    assert current_noop["operations"] == []
+    assert current_noop["artifacts"] == []
+    assert current_noop["inputs"]["bootstrap_authority_approval"] is None
+    assert current_noop["inputs"]["reviewed_overlay"] is None
+    assert validate_plan(current_noop) == current_noop
+
+    current_candidate = build_current_plan(
+        root,
+        diagnosis=current_diagnosis,
+        public_snapshot=current_public,
+        migration_task=current_task,
+        planner=planner_v2,
+        engine_manifest_projection=manifest_projection,
+        plugin_equivalence_input=equivalence_input,
+        remove_embedded=True,
+        removal_approval_input=None,
+    )
+    assert current_candidate["blockers"] == [{
+        "code": "removal-approval-required",
+        "ref": current_candidate["removal_plan_basis_digest"],
+    }]
+    current_approval = {
+        **approval,
+        "approved_plan_basis_digest": current_candidate[
+            "removal_plan_basis_digest"
+        ],
+    }
+    current_approval_input = {
+        "receipt": current_approval,
+        "object_digest": canonical_digest(current_approval),
+        "source_digest": canonical_digest(
+            canonical_bytes(current_approval), raw=True
+        ),
+    }
+    current_removal = build_current_plan(
+        root,
+        diagnosis=current_diagnosis,
+        public_snapshot=current_public,
+        migration_task=current_task,
+        planner=planner_v2,
+        engine_manifest_projection=manifest_projection,
+        plugin_equivalence_input=equivalence_input,
+        remove_embedded=True,
+        removal_approval_input=current_approval_input,
+    )
+    assert current_removal["actionable"] is True
+    assert [operation["path"] for operation in current_removal["operations"]] == [
+        engine_node["path"]
+    ]
+    assert not any(
+        path in {"AGENTS.md", "CLAUDE.md", ".claude/settings.json"}
+        for path in (operation["path"] for operation in current_removal["operations"])
+    )
+    assert validate_plan(current_removal) == current_removal
 
 print("PASS: deterministic migration planner and preservation manifest")
 PY

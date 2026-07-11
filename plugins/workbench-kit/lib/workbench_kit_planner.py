@@ -572,3 +572,194 @@ def build_migration_plan(
         raise PlanningError(error.code, error.ref) from error
     except ContractError as error:
         raise PlanningError(error.code, error.ref) from error
+
+
+def build_current_plan(
+    workspace: pathlib.Path,
+    *,
+    diagnosis: dict[str, Any],
+    public_snapshot: dict[str, Any],
+    migration_task: dict[str, Any],
+    planner: dict[str, Any],
+    engine_manifest_projection: dict[str, Any] | None = None,
+    plugin_equivalence_input: dict[str, Any] | None = None,
+    remove_embedded: bool = False,
+    removal_approval_input: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    root = workspace.resolve(strict=True)
+    try:
+        migration_task = exact_object(
+            migration_task, MIGRATION_TASK_FIELDS, "migration_task"
+        )
+        if migration_task["task_contract"] != "workbench-task/v2":
+            raise PlanningError("migration-task-contract-invalid", "task/index.md")
+        planner = exact_object(planner, PLANNER_FIELDS, "planner")
+        if engine_manifest_projection is not None:
+            engine_manifest_projection = validate_engine_manifest(
+                engine_manifest_projection
+            )
+        if plugin_equivalence_input is not None:
+            plugin_equivalence_input = validate_receipt_input(
+                plugin_equivalence_input,
+                "plugin_equivalence_input",
+                validate_equivalence_receipt,
+            )
+        if removal_approval_input is not None:
+            removal_approval_input = validate_receipt_input(
+                removal_approval_input,
+                "removal_approval_input",
+                validate_removal_approval,
+            )
+        if not isinstance(remove_embedded, bool):
+            raise PlanningError("remove-embedded-invalid", "remove_embedded")
+        if (
+            diagnosis["classification"] != "already-current"
+            or diagnosis["blockers"]
+        ):
+            raise PlanningError(
+                "classification-not-actionable", diagnosis["classification"]
+            )
+
+        doctor = public_snapshot["doctor_projection"]
+        legacy = public_snapshot["legacy_inventory_projection"]
+        if doctor["ready"] is not True or legacy["command"] != "show":
+            raise PlanningError("public-snapshot-stale", "doctor/inventory")
+        source_revision, source_tree_digest = _source_identity(
+            root, migration_task
+        )
+        language = {
+            "contract_version": "workbench-kit-language-decision/v1",
+            "tag": diagnosis["language"],
+            "source": "workspace-profile",
+            "source_ref": ".workbench/profile.conf",
+            "digest": None,
+        }
+        language["digest"] = canonical_digest(language, null_field="digest")
+        language = validate_language(language)
+
+        embedded_state = diagnosis["embedded_engine"]["state"]
+        if embedded_state == "absent":
+            if any(
+                item is not None
+                for item in (
+                    engine_manifest_projection,
+                    plugin_equivalence_input,
+                    removal_approval_input,
+                )
+            ) or remove_embedded:
+                raise PlanningError("embedded-engine-absent", "embedded-engine")
+            embedded_after = "absent"
+        elif embedded_state == "present-verified":
+            if engine_manifest_projection is None or plugin_equivalence_input is None:
+                raise PlanningError(
+                    "plugin-equivalence-unavailable", "embedded-engine"
+                )
+            if (
+                diagnosis["embedded_engine"]["equivalence_receipt_digest"]
+                != plugin_equivalence_input["object_digest"]
+            ):
+                raise PlanningError("plugin-equivalence-stale", "embedded-engine")
+            embedded_after = "absent" if remove_embedded else "present-verified"
+            if not remove_embedded and removal_approval_input is not None:
+                raise PlanningError(
+                    "removal-operation-required", "removal_approval"
+                )
+        else:
+            raise PlanningError(
+                "plugin-equivalence-unavailable", "embedded-engine"
+            )
+        embedded = {
+            "before": embedded_state,
+            "after": embedded_after,
+            "equivalence_receipt_digest": diagnosis["embedded_engine"][
+                "equivalence_receipt_digest"
+            ],
+        }
+
+        active_tasks = {
+            "contract_version": "workbench-kit-active-v1-tasks/v1",
+            "source_inventory_object_digest": legacy["object_digest"],
+            "tasks": public_snapshot["active_v1_tasks"],
+            "digest": None,
+        }
+        active_tasks["digest"] = canonical_digest(
+            active_tasks, null_field="digest"
+        )
+        active_tasks = validate_active_tasks(active_tasks)
+
+        operations = []
+        if remove_embedded:
+            equivalence = plugin_equivalence_input["receipt"]
+            operations = [
+                _remove_operation(root, node, equivalence["receipt_id"])
+                for node in equivalence["removable_nodes"]
+            ]
+        operations.sort(key=lambda item: (item["path"], item["op"]))
+        operation_paths = {operation["path"] for operation in operations}
+        parents = _parent_directories(root, sorted(operation_paths))
+        preserved = _preserved_nodes(root, operation_paths)
+
+        removal_plan_basis_digest = None
+        blockers = []
+        if operations:
+            removal_basis = {
+                "contract_version": "workbench-kit-removal-plan-basis/v1",
+                "workspace_source_revision": source_revision,
+                "workspace_source_tree_digest": source_tree_digest,
+                "migration_task_claim_id": migration_task["claim_id"],
+                "planner_revision": planner["planner_revision"],
+                "legacy_inventory_digest": legacy["object_digest"],
+                "equivalence_receipt_digest": plugin_equivalence_input[
+                    "object_digest"
+                ],
+                "remove_operations": operations,
+            }
+            removal_plan_basis_digest = canonical_digest(removal_basis)
+            if removal_approval_input is None:
+                blockers = [{
+                    "code": "removal-approval-required",
+                    "ref": removal_plan_basis_digest,
+                }]
+
+        plan = {
+            "contract_version": "workbench-kit-upgrade-plan/v1",
+            "plan_digest": None,
+            "classification_before": "already-current",
+            "target_classification": "already-current",
+            "embedded_engine": embedded,
+            "provenance_before": diagnosis["provenance"],
+            "provenance_after": diagnosis["provenance"],
+            "workspace": {
+                "root": str(root),
+                "source_revision": source_revision,
+                "default_revision": legacy["authority_revision"],
+                "source_tree_digest": source_tree_digest,
+                "migration_task": migration_task,
+            },
+            "planner": planner,
+            "doctor": doctor,
+            "legacy_inventory": legacy,
+            "inputs": {
+                "language": language,
+                "bootstrap_authority_approval": None,
+                "reviewed_overlay": None,
+            },
+            "engine_manifest": engine_manifest_projection,
+            "plugin_equivalence": plugin_equivalence_input,
+            "removal_plan_basis_digest": removal_plan_basis_digest,
+            "removal_approval": removal_approval_input,
+            "active_v1_tasks": active_tasks,
+            "preserved": preserved,
+            "parent_directories": parents,
+            "artifacts": [],
+            "operations": operations,
+            "blockers": blockers,
+            "changed": bool(operations),
+            "actionable": bool(operations) and not blockers,
+        }
+        plan["plan_digest"] = canonical_digest(plan, null_field="plan_digest")
+        return validate_plan(plan)
+    except StaticInspectionError as error:
+        raise PlanningError(error.code, error.ref) from error
+    except ContractError as error:
+        raise PlanningError(error.code, error.ref) from error
