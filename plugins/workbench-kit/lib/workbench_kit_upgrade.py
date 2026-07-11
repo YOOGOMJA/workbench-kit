@@ -116,7 +116,13 @@ def read_migration_task(
     if node["node_type"] != "file" or node["mode"] != "100644":
         raise CliError("migration-task-invalid", "task/index.md")
     values = _frontmatter(node["content"])
-    if any(not values.get(field) for field in ("id", "branch", "claim_id")):
+    if (
+        any(
+            field not in values
+            for field in ("id", "issue", "home", "parent", "branch", "claim_id")
+        )
+        or any(not values[field] for field in ("id", "issue", "branch", "claim_id"))
+    ):
         raise CliError("migration-task-invalid", "task/index.md")
     task_contract = values.get("task_contract") or "workbench-task/v1"
     expected = (
@@ -166,13 +172,27 @@ def read_migration_task(
     else:
         claim = public_snapshot.get("migration_task_claim")
         coordination = public_snapshot.get("doctor", {}).get("writer_coordination", {})
+        local_home = values.get("home") or None
+        local_parent = values.get("parent") or None
+        local_issue = values.get("issue")
+        descriptor_digest = values.get("workspace_authority_descriptor_digest")
         identity_matches = (
             isinstance(claim, dict)
+            and claim.get("task_id") == values["id"]
+            and str(claim.get("issue")) == local_issue
+            and claim.get("home") == local_home
+            and (
+                claim.get("parent") is None
+                if local_parent is None
+                else str(claim.get("parent")) == local_parent
+            )
             and claim.get("claim_id") == values["claim_id"]
             and claim.get("task_contract") == expected
             and claim.get("branch") == current_branch
             and claim.get("workspace_authority_descriptor_digest")
             == coordination.get("descriptor_digest")
+            and descriptor_digest
+            == claim.get("workspace_authority_descriptor_digest")
             and isinstance(claim.get("workspace_authority_descriptor_digest"), str)
         )
     if not identity_matches:

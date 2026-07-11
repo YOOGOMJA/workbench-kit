@@ -27,8 +27,11 @@ interpreting exit status, or preparing external evidence and journal paths.
 
 1. **Diagnose with a read-only dry-run.** Create an external `0600` plan file,
    then run the route-specific dry-run from the CLI reference. If classification is
-   blocked, malformed, unrecognized, or indeterminate, report its exact blocker and
-   stop. Do not repair workspace evidence by hand.
+   blocked, unrecognized, or indeterminate, report its exact blocker and stop. For
+   `malformed`, continue only when every blocker is exactly
+   `generator-composition-invalid` at `AGENTS.md` and a human-supplied reviewed-overlay
+   receipt is available; run the documented reviewed-overlay recovery dry-run without
+   editing workspace evidence. All other `malformed` classifications stop.
 
 2. **Review before writing.** Summarize `classification_before`, target,
    `actionable`, blockers, embedded-engine before/after, operations, preserved paths,

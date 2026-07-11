@@ -90,7 +90,11 @@
     },
     "path": {
       "type": "string",
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+      "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$",
+      "allOf": [
+        { "not": { "pattern": "^(?:\\.[gG][iI][tT]|\\.[wW][oO][rR][kK][tT][rR][eE][eE][sS]|\\.[cC][oO][dD][eE][bB][aA][sS][eE][sS])(?:/|$)" } },
+        { "not": { "pattern": "^[tT][aA][sS][kK]/[cC][oO][dD][eE][bB][aA][sS][eE][sS](?:/|$)" } }
+      ]
     },
     "classification": {
       "enum": [
@@ -168,7 +172,7 @@
         "contract_version": { "const": "workbench-kit-planner/v1" },
         "plugin_version": {
           "type": "string",
-          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
         },
         "planner_revision": { "$ref": "#/$defs/oid" }
       }
@@ -354,7 +358,17 @@
         "mode": { "enum": ["100644", "100755", "120000"] },
         "digest": { "$ref": "#/$defs/digest" },
         "link_target": { "type": ["string", "null"] }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "enum": ["100644", "100755"] }, "link_target": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "const": "120000" }, "link_target": { "type": "string", "minLength": 1 } } }
+        }
+      ]
     },
     "parentDirectory": {
       "type": "object",
@@ -366,7 +380,17 @@
         "before_mode": { "type": ["string", "null"], "pattern": "^04[0-7]{4}$" },
         "after_type": { "const": "directory" },
         "after_mode": { "type": "string", "pattern": "^04[0-7]{4}$" }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "before_type": { "type": "null" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "type": "null" }, "after_mode": { "const": "040755" } } }
+        },
+        {
+          "if": { "properties": { "before_type": { "const": "directory" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "type": "string", "pattern": "^04[0-7]{4}$" } } }
+        }
+      ]
     },
     "artifact": {
       "type": "object",
@@ -388,7 +412,17 @@
         "link_target": { "type": ["string", "null"] },
         "source_ref": { "type": "string", "minLength": 1 },
         "source_digest": { "$ref": "#/$defs/digest" }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "enum": ["100644", "100755"] }, "content_base64": { "type": "string" }, "link_target": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "const": "120000" }, "content_base64": { "type": "null" }, "link_target": { "type": "string", "minLength": 1 } } }
+        }
+      ]
     },
     "operation": {
       "type": "object",
@@ -416,7 +450,33 @@
         "after_digest": { "$ref": "#/$defs/nullableDigest" },
         "artifact_source_digest": { "$ref": "#/$defs/nullableDigest" },
         "equivalence_receipt_ref": { "type": ["string", "null"] }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "before_type": { "const": "file" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "enum": ["100644", "100755"] } } }
+        },
+        {
+          "if": { "properties": { "before_type": { "const": "symlink" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "const": "120000" } } }
+        },
+        {
+          "if": { "properties": { "before_type": { "type": "null" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "after_type": { "const": "file" } }, "required": ["after_type"] },
+          "then": { "properties": { "after_mode": { "enum": ["100644", "100755"] } } }
+        },
+        {
+          "if": { "properties": { "after_type": { "const": "symlink" } }, "required": ["after_type"] },
+          "then": { "properties": { "after_mode": { "const": "120000" } } }
+        },
+        {
+          "if": { "properties": { "after_type": { "type": "null" } }, "required": ["after_type"] },
+          "then": { "properties": { "after_mode": { "type": "null" } } }
+        }
+      ]
     },
     "blocker": {
       "type": "object",

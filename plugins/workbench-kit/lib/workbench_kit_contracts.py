@@ -21,7 +21,11 @@ from workbench_kit_json import (
 
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+SEMVER = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
 HOME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEFAULT_REF = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
 RFC3339_UTC = re.compile(
@@ -443,15 +447,11 @@ def validate_authority_approval(value: Any) -> dict[str, Any]:
         fail("protection.revision")
     if protection["direct_task_actor_writes"] != "blocked":
         fail("protection.direct_task_actor_writes")
-    if not isinstance(protection["verified_at"], str) or RFC3339_UTC.fullmatch(
-        protection["verified_at"]
-    ) is None:
+    if not rfc3339_utc_valid(protection["verified_at"]):
         fail("protection.verified_at")
     text(protection["evidence_ref"], "protection.evidence_ref", ascii_only=True)
     text(approval["actor"], "actor", ascii_only=True)
-    if not isinstance(approval["approved_at"], str) or RFC3339_UTC.fullmatch(
-        approval["approved_at"]
-    ) is None:
+    if not rfc3339_utc_valid(approval["approved_at"]):
         fail("approved_at")
     text(approval["source_ref"], "source_ref", ascii_only=True)
     approval["proposed_descriptor"] = descriptor
@@ -490,9 +490,7 @@ def validate_reviewed_overlay(value: Any) -> dict[str, Any]:
     ):
         fail("reviewed-overlay.content_digest")
     text(receipt["actor"], "reviewed-overlay.actor", ascii_only=True)
-    if not isinstance(receipt["reviewed_at"], str) or RFC3339_UTC.fullmatch(
-        receipt["reviewed_at"]
-    ) is None:
+    if not rfc3339_utc_valid(receipt["reviewed_at"]):
         fail("reviewed-overlay.reviewed_at")
     text(receipt["source_ref"], "reviewed-overlay.source_ref", ascii_only=True)
     return receipt
@@ -767,9 +765,7 @@ def validate_removal_approval(value: Any) -> dict[str, Any]:
         text(approval[field], f"removal-approval.{field}", ascii_only=True)
     digest(approval["equivalence_receipt_digest"], "removal-approval.equivalence_digest")
     digest(approval["approved_plan_basis_digest"], "removal-approval.plan_basis_digest")
-    if not isinstance(approval["approved_at"], str) or RFC3339_UTC.fullmatch(
-        approval["approved_at"]
-    ) is None:
+    if not rfc3339_utc_valid(approval["approved_at"]):
         fail("removal-approval.approved_at")
     return approval
 

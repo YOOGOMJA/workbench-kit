@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import unicodedata
 from collections.abc import Sequence
 from typing import Any
 
@@ -32,7 +33,11 @@ BOOTSTRAP_APPROVAL_CONTRACT = "workbench-bootstrap-authority-approval/v1"
 ENGINE_MANIFEST_CONTRACT = "workbench-plugin-manifest/v1"
 GIT_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
-SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+SEMVER = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
 HOME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEFAULT_REF = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
 GITHUB_ORIGIN = re.compile(
@@ -87,6 +92,8 @@ ENGINE_EXCLUSIONS = [
     {"path": ".git/", "match": "prefix"},
     {"path": "lib/__pycache__/", "match": "prefix"},
 ]
+RESERVED_MANIFEST_PREFIXES = {"." + name for name in ("git", "worktrees", "codebases")}
+RESERVED_MANIFEST_PAIR = ("task", "codebases")
 
 
 class AdapterError(Exception):
@@ -520,6 +527,10 @@ def _task_claim(document: dict[str, Any], branch: str) -> dict[str, Any]:
     if blockers:
         raise AdapterError("public-task-status-invalid", f"{ref}.writer_integrity_blockers")
     required = (
+        "task_id",
+        "issue",
+        "home",
+        "parent",
         "claim_id",
         "task_contract",
         "branch",
@@ -528,46 +539,63 @@ def _task_claim(document: dict[str, Any], branch: str) -> dict[str, Any]:
         "work_ref",
         "work_owners",
     )
-    normalized = []
-    for offset, value in enumerate(tasks):
-        task = require_object(value, f"{ref}.tasks[{offset}]")
-        if any(field not in task for field in required):
-            raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}]")
-        for field in ("claim_id", "branch"):
-            if (
-                not isinstance(task[field], str)
-                or not task[field]
-                or any(ord(char) < 32 or ord(char) == 127 for char in task[field])
-            ):
-                raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].{field}")
-        if task["task_contract"] != "workbench-task/v2":
-            raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].task_contract")
-        if (
-            not isinstance(task["workspace_authority_descriptor_digest"], str)
-            or SHA256.fullmatch(task["workspace_authority_descriptor_digest"]) is None
-        ):
-            raise AdapterError(
-                "public-task-status-invalid",
-                f"{ref}.tasks[{offset}].workspace_authority_descriptor_digest",
-            )
-        for field in ("context_ref", "work_ref"):
-            if task[field] is not None and (
-                not isinstance(task[field], str)
-                or not task[field]
-                or any(ord(char) < 32 or ord(char) == 127 for char in task[field])
-            ):
-                raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].{field}")
-        owners = require_array(task["work_owners"], f"{ref}.tasks[{offset}].work_owners")
-        if (
-            any(not isinstance(owner, str) or not owner for owner in owners)
-            or owners != sorted(set(owners))
-        ):
-            raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].work_owners")
-        normalized.append({field: task[field] for field in required})
-    matches = [task for task in normalized if task["branch"] == branch]
+    task_rows = [
+        (offset, require_object(value, f"{ref}.tasks[{offset}]"))
+        for offset, value in enumerate(tasks)
+    ]
+    matches = [item for item in task_rows if item[1].get("branch") == branch]
     if len(matches) != 1:
         raise AdapterError("public-task-status-invalid", branch)
-    return matches[0]
+    offset, task = matches[0]
+    if any(field not in task for field in required):
+        raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}]")
+    for field in ("task_id", "claim_id", "branch"):
+        if (
+            not isinstance(task[field], str)
+            or not task[field]
+            or any(ord(char) < 32 or ord(char) == 127 for char in task[field])
+        ):
+            raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].{field}")
+    issue = task["issue"]
+    home = task["home"]
+    parent = task["parent"]
+    if not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0:
+        raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].issue")
+    if home is not None and (
+        not isinstance(home, str) or HOME.fullmatch(home) is None or home.isdigit()
+    ):
+        raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].home")
+    if parent is not None and (
+        not isinstance(parent, int) or isinstance(parent, bool) or parent <= 0
+    ):
+        raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].parent")
+    expected_task_id = str(issue) if home is None else f"{home}#{issue}"
+    if task["task_id"] != expected_task_id:
+        raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].task_id")
+    if task["task_contract"] != "workbench-task/v2":
+        raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].task_contract")
+    if (
+        not isinstance(task["workspace_authority_descriptor_digest"], str)
+        or SHA256.fullmatch(task["workspace_authority_descriptor_digest"]) is None
+    ):
+        raise AdapterError(
+            "public-task-status-invalid",
+            f"{ref}.tasks[{offset}].workspace_authority_descriptor_digest",
+        )
+    for field in ("context_ref", "work_ref"):
+        if task[field] is not None and (
+            not isinstance(task[field], str)
+            or not task[field]
+            or any(ord(char) < 32 or ord(char) == 127 for char in task[field])
+        ):
+            raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].{field}")
+    owners = require_array(task["work_owners"], f"{ref}.tasks[{offset}].work_owners")
+    if (
+        any(not isinstance(owner, str) or not owner for owner in owners)
+        or owners != sorted(set(owners))
+    ):
+        raise AdapterError("public-task-status-invalid", f"{ref}.tasks[{offset}].work_owners")
+    return {field: task[field] for field in required}
 
 
 def validate_contract(
@@ -997,11 +1025,23 @@ def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> N
         if not exact_fields(node, MANIFEST_NODE_FIELDS):
             raise AdapterError("public-contract-invalid", f"{ref}.node")
         path = node.get("path")
-        if not isinstance(path, str) or not path or "\x00" in path:
+        if (
+            not isinstance(path, str)
+            or not path
+            or "\x00" in path
+            or "\\" in path
+            or unicodedata.normalize("NFC", path) != path
+        ):
             raise AdapterError("public-contract-invalid", f"{ref}.node.path")
         if path != ".":
             pure = pathlib.PurePosixPath(path)
             if pure.is_absolute() or pure.as_posix() != path or ".." in pure.parts:
+                raise AdapterError("public-contract-invalid", f"{ref}.node.path")
+            folded = tuple(part.casefold() for part in pure.parts)
+            if (
+                folded[0] in RESERVED_MANIFEST_PREFIXES
+                or folded[:2] == RESERVED_MANIFEST_PAIR
+            ):
                 raise AdapterError("public-contract-invalid", f"{ref}.node.path")
         node_paths.append(path)
         node_type = node.get("node_type")
@@ -1023,7 +1063,13 @@ def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> N
             raise AdapterError("public-contract-invalid", f"{ref}.node")
         if not isinstance(node.get("digest"), str) or SHA256.fullmatch(node["digest"]) is None:
             raise AdapterError("public-contract-invalid", f"{ref}.node.digest")
-    if node_paths != sorted(node_paths) or len(node_paths) != len(set(node_paths)) or not nodes:
+    folded_paths = [path.casefold() for path in node_paths]
+    if (
+        node_paths != sorted(node_paths)
+        or len(node_paths) != len(set(node_paths))
+        or len(folded_paths) != len(set(folded_paths))
+        or not nodes
+    ):
         raise AdapterError("public-contract-invalid", f"{ref}.nodes")
     if not isinstance(document["digest"], str) or SHA256.fullmatch(document["digest"]) is None:
         raise AdapterError("public-contract-invalid", f"{ref}.digest")

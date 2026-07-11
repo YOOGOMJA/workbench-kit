@@ -90,6 +90,9 @@ for required_text in (
 ):
     assert required_text in surface, required_text
 assert "--authority-file" not in surface
+assert "generator-composition-invalid" in skill
+assert "human-supplied reviewed-overlay" in skill
+assert "All other `malformed`" in skill
 
 changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
 unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]

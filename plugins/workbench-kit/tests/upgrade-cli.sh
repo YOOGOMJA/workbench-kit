@@ -269,24 +269,38 @@ with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
         rejected_task = error.code == "migration-task-contract-invalid"
     assert rejected_task
 
+    descriptor_digest = "sha256:" + "b" * 64
     v2_index = index.replace(
+        b"id: workbench#27\n",
+        b"id: 27\n",
+    ).replace(
         b"claim_id: claim-27\n",
-        b"claim_id: claim-27\ntask_contract: workbench-task/v2\n",
+        (
+            b"claim_id: claim-27\n"
+            b"task_contract: workbench-task/v2\n"
+            b"workspace_authority_descriptor_digest: "
+            + descriptor_digest.encode()
+            + b"\n"
+        ),
     )
     (workspace / "task/index.md").write_bytes(v2_index)
     public_v2 = {
         "migration_task_claim": {
+            "task_id": "27",
+            "issue": 27,
+            "home": None,
+            "parent": None,
             "claim_id": "claim-27",
             "task_contract": "workbench-task/v2",
             "branch": "task/27-upgrade",
-            "workspace_authority_descriptor_digest": "sha256:" + "b" * 64,
+            "workspace_authority_descriptor_digest": descriptor_digest,
             "context_ref": None,
             "work_ref": None,
             "work_owners": [],
         },
         "doctor": {
             "writer_coordination": {
-                "descriptor_digest": "sha256:" + "b" * 64,
+                "descriptor_digest": descriptor_digest,
             }
         },
     }
@@ -301,6 +315,24 @@ with tempfile.TemporaryDirectory(prefix="workbench-cli-contract-") as temporary:
         assert error.code == "migration-task-identity-invalid", error.code
     else:
         raise AssertionError("forged local v2 task identity was accepted")
+    forged = v2_index.replace(b"id: 27", b"id: 999")
+    (workspace / "task/index.md").write_bytes(forged)
+    try:
+        read_migration_task(workspace, "current-v2", public_v2)
+    except CliError as error:
+        assert error.code == "migration-task-identity-invalid", error.code
+    else:
+        raise AssertionError("forged local v2 task id was accepted")
+    forged = v2_index.replace(
+        descriptor_digest.encode(), ("sha256:" + "c" * 64).encode()
+    )
+    (workspace / "task/index.md").write_bytes(forged)
+    try:
+        read_migration_task(workspace, "current-v2", public_v2)
+    except CliError as error:
+        assert error.code == "migration-task-identity-invalid", error.code
+    else:
+        raise AssertionError("forged local v2 descriptor was accepted")
     (workspace / "task/index.md").write_bytes(v2_index)
 
     authority = {

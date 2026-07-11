@@ -54,7 +54,11 @@
     "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
     "path": {
       "type": "string",
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+      "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$",
+      "allOf": [
+        { "not": { "pattern": "^(?:\\.[gG][iI][tT]|\\.[wW][oO][rR][kK][tT][rR][eE][eE][sS]|\\.[cC][oO][dD][eE][bB][aA][sS][eE][sS])(?:/|$)" } },
+        { "not": { "pattern": "^[tT][aA][sS][kK]/[cC][oO][dD][eE][bB][aA][sS][eE][sS](?:/|$)" } }
+      ]
     },
     "artifactNode": {
       "type": "object",
@@ -65,7 +69,17 @@
         "node_type": { "enum": ["file", "symlink"] },
         "mode": { "enum": ["100644", "100755", "120000"] },
         "digest": { "$ref": "#/$defs/digest" }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "enum": ["100644", "100755"] } } }
+        },
+        {
+          "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "const": "120000" } } }
+        }
+      ]
     }
   }
 }

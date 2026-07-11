@@ -114,11 +114,15 @@
     "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
     "path": {
       "type": "string",
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+      "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$",
+      "allOf": [
+        { "not": { "pattern": "^(?:\\.[gG][iI][tT]|\\.[wW][oO][rR][kK][tT][rR][eE][eE][sS]|\\.[cC][oO][dD][eE][bB][aA][sS][eE][sS])(?:/|$)" } },
+        { "not": { "pattern": "^[tT][aA][sS][kK]/[cC][oO][dD][eE][bB][aA][sS][eE][sS](?:/|$)" } }
+      ]
     },
     "semver": {
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
     },
     "node": {
       "type": "object",
@@ -130,7 +134,17 @@
         "mode": { "enum": ["100644", "100755", "120000"] },
         "digest": { "$ref": "#/$defs/digest" },
         "link_target": { "type": ["string", "null"] }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "enum": ["100644", "100755"] }, "link_target": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "const": "120000" }, "link_target": { "type": "string", "minLength": 1 } } }
+        }
+      ]
     }
   }
 }

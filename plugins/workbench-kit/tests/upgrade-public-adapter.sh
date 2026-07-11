@@ -164,6 +164,9 @@ expected+="$legacy_workspace"$'\t'"legacy-inventory bootstrap-show --authority-a
 probe extra-field "$legacy_workspace" "$approval" >/dev/null \
   || { echo "unknown public field was rejected" >&2; exit 1; }
 
+probe task-status-with-v1 "$current_workspace" >/dev/null \
+  || { echo "unrelated local-only v1 status row was rejected" >&2; exit 1; }
+
 current_git_before="$(git_state_digest "$current_workspace")"
 v2="$(probe v2-ok "$current_workspace")" || { echo "$v2" >&2; exit 1; }
 [ "$current_git_before" = "$(git_state_digest "$current_workspace")" ] \
@@ -175,6 +178,10 @@ snapshot = json.loads(sys.argv[1])
 assert snapshot["contract"]["workspace"]["schema"] == "workbench/v2"
 assert snapshot["legacy_inventory_command"] == "show"
 assert snapshot["migration_task_claim"]["claim_id"] == "claim-27"
+assert snapshot["migration_task_claim"]["task_id"] == "27"
+assert snapshot["migration_task_claim"]["issue"] == 27
+assert snapshot["migration_task_claim"]["home"] is None
+assert snapshot["migration_task_claim"]["parent"] is None
 assert snapshot["migration_task_claim"]["task_contract"] == "workbench-task/v2"
 assert snapshot["migration_task_claim"]["branch"]
 assert snapshot["migration_task_claim"]["workspace_authority_descriptor_digest"].startswith(
@@ -267,6 +274,11 @@ rejected(bad)
 
 bad = copy.deepcopy(snapshot["engine_manifest"])
 bad["nodes"][2]["path"] = "other/workbench"
+resign(bad)
+rejected(bad)
+
+bad = copy.deepcopy(snapshot["engine_manifest"])
+bad["nodes"][2]["path"] = "task/codebases/embedded"
 resign(bad)
 rejected(bad)
 

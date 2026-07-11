@@ -97,11 +97,15 @@ case "$*" in
   "task status --format json")
     [ "$workspace_schema" = workbench/v2 ] || exit 92
     branch="$(git symbolic-ref --quiet --short HEAD)"
-    row='{"claim_id":"claim-27","task_contract":"workbench-task/v2","branch":"'"$branch"'","workspace_authority_descriptor_digest":"'"$descriptor_digest"'","context_ref":null,"work_ref":null,"work_owners":[],"future_task_field":true}'
+    row='{"task_id":"27","issue":27,"home":null,"parent":null,"claim_id":"claim-27","task_contract":"workbench-task/v2","branch":"'"$branch"'","workspace_authority_descriptor_digest":"'"$descriptor_digest"'","context_ref":null,"work_ref":null,"work_owners":[],"future_task_field":true}'
     tasks="[$row]"
     blockers='[]'
     status=0
     [ "$mode" != task-status-duplicate ] || tasks="[$row,$row]"
+    if [ "$mode" = task-status-with-v1 ]; then
+      legacy='{"task_id":"workbench#55","issue":55,"home":"workbench","parent":null,"claim_id":"legacy-55","task_contract":"workbench-task/v1","branch":"task/55-legacy","workspace_authority_descriptor_digest":null,"context_ref":null,"work_ref":null,"work_owners":[]}'
+      tasks="[$legacy,$row]"
+    fi
     if [ "$mode" = task-status-blocker ]; then
       blockers='[{"code":"task-status-identity-unreconciled","ref":"task/index.md"}]'
       status=1

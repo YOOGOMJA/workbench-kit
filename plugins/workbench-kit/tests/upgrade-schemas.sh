@@ -21,6 +21,7 @@ from workbench_kit_contracts import (
     validate_generation_receipt,
     validate_generator_receipt,
     validate_migration_receipt,
+    validate_operation,
     validate_plan,
     validate_path_set,
     validate_relative_path,
@@ -95,6 +96,15 @@ duplicate = authority_sources[0].replace(
     1,
 )
 rejected(lambda: parse_authority_approval(duplicate))
+for field in ("approved_at",):
+    impossible = copy.deepcopy(authority)
+    impossible[field] = "2026-99-99T99:99:99Z"
+    rejected(lambda impossible=impossible: parse_authority_approval(
+        canonical_bytes(impossible)
+    ))
+impossible = copy.deepcopy(authority)
+impossible["protection"]["verified_at"] = "2026-02-29T00:00:00Z"
+rejected(lambda: parse_authority_approval(canonical_bytes(impossible)))
 nullable = copy.deepcopy(authority)
 nullable["proposed_descriptor"]["hosting_adapter"] = None
 nullable["proposed_descriptor"]["hosting_ref"] = None
@@ -118,6 +128,9 @@ assert reviewed["content"] == overlay_bytes
 bad = dict(overlay)
 bad["content_base64"] = base64.b64encode(b"no-final-lf").decode()
 bad["content_digest"] = canonical_digest(b"no-final-lf", raw=True)
+rejected(lambda: parse_reviewed_overlay(canonical_bytes(bad)))
+bad = dict(overlay)
+bad["reviewed_at"] = "2026-99-99T99:99:99Z"
 rejected(lambda: parse_reviewed_overlay(canonical_bytes(bad)))
 
 for path in ("docs/index.md", ".workbench/schema", "AGENTS.md"):
@@ -604,6 +617,10 @@ generator = {
 generator["receipt_digest"] = canonical_digest(generator, null_field="receipt_digest")
 assert validate_generator_receipt(dict(reversed(list(generator.items())))) == generator
 bad = copy.deepcopy(generator)
+bad["generator_version"] = "1.2.3-.."
+bad["receipt_digest"] = canonical_digest(bad, null_field="receipt_digest")
+rejected(lambda: validate_generator_receipt(bad))
+bad = copy.deepcopy(generator)
 bad["core_digest"] = SHA
 bad["receipt_digest"] = canonical_digest(bad, null_field="receipt_digest")
 rejected(lambda: validate_generator_receipt(bad))
@@ -701,6 +718,9 @@ assert validate_removal_approval(removal) == removal
 bad = dict(removal)
 bad["approved_at"] = "yesterday"
 rejected(lambda: validate_removal_approval(bad))
+bad = dict(removal)
+bad["approved_at"] = "2026-99-99T99:99:99Z"
+rejected(lambda: validate_removal_approval(bad))
 
 preserved_node = {
     "path": "docs/index.md",
@@ -721,6 +741,9 @@ remove_operation = {
     "artifact_source_digest": None,
     "equivalence_receipt_ref": equivalence["receipt_id"],
 }
+bad_operation = copy.deepcopy(remove_operation)
+bad_operation["before_mode"] = "120000"
+rejected(lambda: validate_operation(bad_operation))
 removal_plan = copy.deepcopy(plan)
 removal_plan["plan_digest"] = None
 removal_plan["planner"]["plugin_version"] = equivalence["replacement_plugin"][
