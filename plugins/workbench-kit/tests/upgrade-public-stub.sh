@@ -26,6 +26,24 @@ if [ "$mode" = mutate-state ] && [ "$*" = "contract show --format json" ]; then
   printf 'mutated fetch state\n' > "$(git rev-parse --absolute-git-dir)/FETCH_HEAD"
 fi
 
+if [ "$mode" = mutate-git-admin ] && [ "$*" = "contract show --format json" ]; then
+  git_dir="$(git rev-parse --absolute-git-dir)"
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+  printf '[upgrade]\n\tadmin = mutated\n' > "$common_dir/config"
+  mkdir -p "$common_dir/hooks" "$common_dir/logs" "$common_dir/objects/ff"
+  rm -f "$common_dir/hooks/pre-commit"
+  ln -s ../config "$common_dir/hooks/pre-commit"
+  printf 'mutated log\n' >> "$common_dir/logs/HEAD"
+  printf '# pack-refs with: peeled fully-peeled sorted\n' > "$common_dir/packed-refs"
+  printf 'fetched object cache bytes\n' > \
+    "$common_dir/objects/ff/00000000000000000000000000000000000000"
+  printf 'mutated linked admin\n' > "$git_dir/FETCH_HEAD"
+fi
+
+if [ "$mode" = mutate-git-pointer ] && [ "$*" = "contract show --format json" ]; then
+  printf 'gitdir: /nonexistent/workbench-kit-mutated\n' > .git
+fi
+
 case "$*" in
   "contract show --format json")
     root="$PWD"

@@ -341,65 +341,297 @@ def _worktree_manifest(root: pathlib.Path) -> dict[str, tuple[str, int, bytes | 
     return manifest
 
 
-def _git_file(path: pathlib.Path) -> tuple[bool, int | None, bytes | None]:
+ABSENT_STATE = ("absent", None, None)
+
+
+def _state_node(path: pathlib.Path) -> tuple[str, int | None, bytes | str | None]:
     try:
         node = os.lstat(path)
     except FileNotFoundError:
-        return False, None, None
+        return ABSENT_STATE
     except OSError as error:
         raise AdapterError("public-state-unavailable", str(path)) from error
-    if not stat.S_ISREG(node.st_mode) or stat.S_ISLNK(node.st_mode):
+    mode = stat.S_IMODE(node.st_mode)
+    if stat.S_ISDIR(node.st_mode) and not stat.S_ISLNK(node.st_mode):
+        return "directory", mode, None
+    if stat.S_ISLNK(node.st_mode):
+        try:
+            target = os.readlink(path)
+            verified = os.lstat(path)
+        except OSError as error:
+            raise AdapterError("public-state-unavailable", str(path)) from error
+        if (
+            not stat.S_ISLNK(verified.st_mode)
+            or (node.st_dev, node.st_ino, node.st_mtime_ns)
+            != (verified.st_dev, verified.st_ino, verified.st_mtime_ns)
+        ):
+            raise AdapterError("public-state-unavailable", str(path))
+        return "symlink", mode, target
+    if stat.S_ISREG(node.st_mode):
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise AdapterError("public-state-unavailable", str(path)) from error
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (node.st_dev, node.st_ino) != (opened.st_dev, opened.st_ino)
+                or stat.S_IMODE(opened.st_mode) != mode
+                or opened.st_size != node.st_size
+            ):
+                raise AdapterError("public-state-unavailable", str(path))
+            chunks = []
+            remaining = opened.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    raise AdapterError("public-state-unavailable", str(path))
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise AdapterError("public-state-unavailable", str(path))
+            verified = os.fstat(descriptor)
+            if (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ) != (
+                verified.st_dev,
+                verified.st_ino,
+                verified.st_mode,
+                verified.st_size,
+                verified.st_mtime_ns,
+                verified.st_ctime_ns,
+            ):
+                raise AdapterError("public-state-unavailable", str(path))
+            return "file", mode, b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    raise AdapterError("public-state-unavailable", str(path))
+
+
+def _require_nofollow_directory(path: pathlib.Path) -> os.stat_result:
+    if not path.is_absolute():
         raise AdapterError("public-state-unavailable", str(path))
-    try:
-        content = path.read_bytes()
-    except OSError as error:
-        raise AdapterError("public-state-unavailable", str(path)) from error
-    return True, stat.S_IMODE(node.st_mode), content
+    current = pathlib.Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            node = os.lstat(current)
+        except OSError as error:
+            raise AdapterError("public-state-unavailable", str(path)) from error
+        if not stat.S_ISDIR(node.st_mode) or stat.S_ISLNK(node.st_mode):
+            raise AdapterError("public-state-unavailable", str(path))
+    return node
 
 
-def _parse_refs(raw: bytes) -> dict[str, tuple[str, str | None]]:
-    refs: dict[str, tuple[str, str | None]] = {}
+def _require_nofollow_ancestors(path: pathlib.Path) -> None:
+    if not path.is_absolute():
+        raise AdapterError("public-state-unavailable", str(path))
+    current = pathlib.Path(path.anchor)
+    for part in path.parts[1:-1]:
+        current /= part
+        try:
+            node = os.lstat(current)
+        except OSError as error:
+            raise AdapterError("public-state-unavailable", str(path)) from error
+        if not stat.S_ISDIR(node.st_mode) or stat.S_ISLNK(node.st_mode):
+            raise AdapterError("public-state-unavailable", str(path))
+
+
+def _binding_path(base: pathlib.Path, raw: str) -> pathlib.Path:
+    candidate = pathlib.Path(raw)
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    return pathlib.Path(os.path.abspath(candidate))
+
+
+def _decode_pointer(image: tuple[str, int | None, bytes | str | None], ref: str) -> str:
+    if image[0] != "file" or not isinstance(image[2], bytes):
+        raise AdapterError("public-state-unavailable", ref)
     try:
-        text = raw.decode("utf-8", errors="strict")
+        value = image[2].decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
-        raise AdapterError("public-state-unavailable", "git refs") from error
-    for line in text.splitlines():
-        parts = line.split("\0")
-        if len(parts) != 3 or not parts[0] or not parts[1] or parts[0] in refs:
-            raise AdapterError("public-state-unavailable", "git refs")
-        refs[parts[0]] = (parts[1], parts[2] or None)
-    return refs
+        raise AdapterError("public-state-unavailable", ref) from error
+    if not value.endswith("\n") or value.count("\n") != 1:
+        raise AdapterError("public-state-unavailable", ref)
+    return value[:-1]
 
 
-def _capture_caller_state(workspace: pathlib.Path) -> dict[str, Any]:
-    git_dir_raw, _ = _git_read(workspace, ("rev-parse", "--absolute-git-dir"))
+def _raw_git_binding(
+    workspace: pathlib.Path, *, strict: bool
+) -> dict[str, Any]:
+    pointer_path = workspace / ".git"
+    pointer = _state_node(pointer_path)
     try:
-        git_dir = pathlib.Path(git_dir_raw.decode("utf-8", errors="strict").strip()).resolve()
-    except UnicodeDecodeError as error:
-        raise AdapterError("public-state-unavailable", "git directory") from error
-    symbolic, symbolic_status = _git_read(
-        workspace, ("symbolic-ref", "--quiet", "HEAD"), {0, 1}
+        if pointer[0] == "directory":
+            git_dir = pointer_path
+        else:
+            line = _decode_pointer(pointer, str(pointer_path))
+            if not line.startswith("gitdir: ") or not line[8:]:
+                raise AdapterError("public-state-unavailable", str(pointer_path))
+            git_dir = _binding_path(workspace, line[8:])
+        git_node = _require_nofollow_directory(git_dir)
+        commondir_image = _state_node(git_dir / "commondir")
+        if commondir_image[0] == "absent":
+            common_dir = git_dir
+        else:
+            raw_common = _decode_pointer(
+                commondir_image, str(git_dir / "commondir")
+            )
+            if not raw_common:
+                raise AdapterError(
+                    "public-state-unavailable", str(git_dir / "commondir")
+                )
+            common_dir = _binding_path(git_dir, raw_common)
+        common_node = _require_nofollow_directory(common_dir)
+        object_dir = common_dir / "objects"
+        object_node = _require_nofollow_directory(object_dir)
+        return {
+            "status": "valid",
+            "git_dir": str(git_dir),
+            "git_binding": (git_node.st_dev, git_node.st_ino),
+            "common_dir": str(common_dir),
+            "common_binding": (common_node.st_dev, common_node.st_ino),
+            "object_dir": str(object_dir),
+            "object_binding": (object_node.st_dev, object_node.st_ino),
+        }
+    except AdapterError as error:
+        if strict:
+            raise
+        return {"status": "invalid", "ref": error.ref}
+
+
+def _discovered_git_binding(workspace: pathlib.Path) -> dict[str, Any]:
+    binding = _raw_git_binding(workspace, strict=True)
+    commands = (
+        (("rev-parse", "--absolute-git-dir"), "git_dir"),
+        (("rev-parse", "--path-format=absolute", "--git-common-dir"), "common_dir"),
+        (("rev-parse", "--path-format=absolute", "--git-path", "objects"), "object_dir"),
     )
-    head, head_status = _git_read(
-        workspace, ("rev-parse", "--verify", "HEAD"), {0, 128}
+    for argv, field in commands:
+        raw, _ = _git_read(workspace, argv)
+        try:
+            reported = raw.decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError as error:
+            raise AdapterError("public-state-unavailable", field) from error
+        if pathlib.Path(os.path.abspath(reported)) != pathlib.Path(binding[field]):
+            raise AdapterError("public-state-unavailable", field)
+    return binding
+
+
+def _admin_specs(binding: dict[str, Any]) -> list[dict[str, Any]]:
+    roots = sorted(
+        {
+            pathlib.Path(binding["git_dir"]),
+            pathlib.Path(binding["common_dir"]),
+        },
+        key=lambda path: (len(path.parts), str(path)),
     )
-    refs_raw, _ = _git_read(
-        workspace,
-        ("for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"),
+    minimal = [
+        root
+        for root in roots
+        if not any(parent == root or parent in root.parents for parent in roots if parent != root)
+    ]
+    object_dir = pathlib.Path(binding["object_dir"])
+    if not any(root == object_dir or root in object_dir.parents for root in minimal):
+        minimal.append(object_dir)
+    specs = []
+    for root in sorted(minimal, key=str):
+        node = _require_nofollow_directory(root)
+        object_relative = None
+        if root == object_dir:
+            object_relative = "."
+        elif root in object_dir.parents:
+            object_relative = object_dir.relative_to(root).as_posix()
+        specs.append({
+            "path": str(root),
+            "binding": (node.st_dev, node.st_ino),
+            "object_relative": object_relative,
+        })
+    return specs
+
+
+def _admin_manifest(
+    root: pathlib.Path, object_relative: str | None
+) -> dict[str, tuple[str, int | None, bytes | str | None]]:
+    manifest = {".": _state_node(root)}
+    if manifest["."][0] != "directory" or object_relative == ".":
+        return manifest
+
+    def visit(directory: pathlib.Path, prefix: pathlib.PurePosixPath) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError as error:
+            raise AdapterError("public-state-unavailable", str(directory)) from error
+        for entry in entries:
+            relative_path = prefix / entry.name
+            relative = relative_path.as_posix()
+            path = pathlib.Path(entry.path)
+            image = _state_node(path)
+            manifest[relative] = image
+            if image[0] == "directory" and relative != object_relative:
+                visit(path, relative_path)
+
+    visit(root, pathlib.PurePosixPath())
+    return manifest
+
+
+def _capture_caller_state(
+    workspace: pathlib.Path,
+    git_specs: list[dict[str, Any]] | None = None,
+    expected_git_binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    binding = (
+        _discovered_git_binding(workspace)
+        if git_specs is None
+        else _raw_git_binding(workspace, strict=False)
     )
-    porcelain, _ = _git_read(
-        workspace, ("status", "--porcelain=v2", "--untracked-files=all")
-    )
+    specs = _admin_specs(binding) if git_specs is None else git_specs
+    known_binding = expected_git_binding or binding
+    git_nodes = {}
+    if known_binding.get("status") == "valid":
+        for field in ("git_dir", "common_dir", "object_dir"):
+            path = pathlib.Path(known_binding[field])
+            _require_nofollow_ancestors(path)
+            image = _state_node(path)
+            node_binding = None
+            if image[0] == "directory":
+                node = os.lstat(path)
+                node_binding = (node.st_dev, node.st_ino)
+            git_nodes[field] = {
+                "path": str(path),
+                "binding": node_binding,
+                "image": image,
+            }
+    admin = []
+    for spec in specs:
+        root = pathlib.Path(spec["path"])
+        _require_nofollow_ancestors(root)
+        image = _state_node(root)
+        root_binding = None
+        if image[0] == "directory":
+            node = os.lstat(root)
+            root_binding = (node.st_dev, node.st_ino)
+        admin.append({
+            "path": spec["path"],
+            "binding": root_binding,
+            "object_relative": spec["object_relative"],
+            "manifest": _admin_manifest(root, spec["object_relative"]),
+        })
     return {
         "root_mode": stat.S_IMODE(os.lstat(workspace).st_mode),
         "worktree": _worktree_manifest(workspace),
-        "git_dir": str(git_dir),
-        "head_symbolic": symbolic if symbolic_status == 0 else None,
-        "head_oid": head if head_status == 0 else None,
-        "refs": _parse_refs(refs_raw),
-        "porcelain": porcelain,
-        "index": _git_file(git_dir / "index"),
-        "fetch_head": _git_file(git_dir / "FETCH_HEAD"),
+        "git_pointer": _state_node(workspace / ".git"),
+        "git_binding": binding,
+        "git_nodes": git_nodes,
+        "git_specs": specs,
+        "git_admin": admin,
     }
 
 
@@ -461,52 +693,193 @@ def _restore_worktree(workspace: pathlib.Path, state: dict[str, Any]) -> None:
     os.chmod(workspace, state["root_mode"])
 
 
-def _git_write(workspace: pathlib.Path, argv: Sequence[str]) -> None:
-    _git_read(workspace, argv)
+def _path_for_manifest(root: pathlib.Path, relative: str) -> pathlib.Path:
+    if relative == ".":
+        return root
+    return root.joinpath(*pathlib.PurePosixPath(relative).parts)
 
 
-def _restore_git_state(workspace: pathlib.Path, state: dict[str, Any]) -> None:
-    refs = state["refs"]
-    for ref, (oid, symref) in sorted(refs.items()):
-        if symref is None:
-            _git_write(workspace, ("update-ref", ref, oid))
-        else:
-            _git_write(workspace, ("symbolic-ref", ref, symref))
-    symbolic = state["head_symbolic"]
-    if symbolic is not None:
-        target = symbolic.decode("utf-8", errors="strict").strip()
-        _git_write(workspace, ("symbolic-ref", "HEAD", target))
-    elif state["head_oid"] is not None:
-        oid_value = state["head_oid"].decode("ascii").strip()
-        _git_write(workspace, ("update-ref", "--no-deref", "HEAD", oid_value))
-    current_raw, _ = _git_read(
-        workspace,
-        ("for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"),
-    )
-    for ref in sorted(set(_parse_refs(current_raw)) - set(refs)):
-        _git_write(workspace, ("update-ref", "-d", ref))
-    git_dir = pathlib.Path(state["git_dir"])
-    for name, snapshot in (
-        ("index", state["index"]),
-        ("FETCH_HEAD", state["fetch_head"]),
+def _require_admin_cas(
+    root: pathlib.Path,
+    object_relative: str | None,
+    expected: dict[str, tuple[str, int | None, bytes | str | None]],
+) -> None:
+    if _admin_manifest(root, object_relative) != expected:
+        raise AdapterError("public-adapter-restore-failed", str(root))
+
+
+def _write_state_node(
+    path: pathlib.Path,
+    image: tuple[str, int | None, bytes | str | None],
+) -> None:
+    kind, mode, payload = image
+    if kind == "directory":
+        path.mkdir(mode=mode)
+    elif kind == "file":
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags, mode)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short state restore write")
+                view = view[written:]
+            os.fchmod(descriptor, mode)
+        finally:
+            os.close(descriptor)
+    elif kind == "symlink":
+        os.symlink(payload, path)
+    else:
+        raise AdapterError("public-adapter-restore-failed", str(path))
+
+
+def _restore_admin_manifest(
+    root: pathlib.Path,
+    object_relative: str | None,
+    before: dict[str, tuple[str, int | None, bytes | str | None]],
+    after: dict[str, tuple[str, int | None, bytes | str | None]],
+) -> None:
+    expected = dict(after)
+    if before.get(".", ABSENT_STATE)[0] != after.get(".", ABSENT_STATE)[0]:
+        raise AdapterError("public-adapter-restore-failed", str(root))
+
+    removals = [
+        relative
+        for relative, image in after.items()
+        if relative != "."
+        and (
+            relative not in before
+            or before[relative][0] != image[0]
+        )
+    ]
+    for relative in sorted(
+        removals, key=lambda value: (value.count("/"), value), reverse=True
     ):
-        path = git_dir / name
-        exists, mode, content = snapshot
-        if exists:
-            path.write_bytes(content)
-            os.chmod(path, mode)
-        else:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        _require_admin_cas(root, object_relative, expected)
+        path = _path_for_manifest(root, relative)
+        if _state_node(path) != expected[relative]:
+            raise AdapterError("public-adapter-restore-failed", str(path))
+        _remove_node(path)
+        expected.pop(relative, None)
+
+    directories = [
+        relative
+        for relative, image in before.items()
+        if relative != "."
+        and image[0] == "directory"
+        and expected.get(relative, ABSENT_STATE)[0] != "directory"
+    ]
+    for relative in sorted(
+        directories, key=lambda value: (value.count("/"), value)
+    ):
+        _require_admin_cas(root, object_relative, expected)
+        path = _path_for_manifest(root, relative)
+        _write_state_node(path, before[relative])
+        expected[relative] = before[relative]
+
+    leaves = [
+        relative
+        for relative, image in before.items()
+        if relative != "."
+        and image[0] in ("file", "symlink")
+        and expected.get(relative, ABSENT_STATE) != image
+    ]
+    for relative in sorted(leaves):
+        _require_admin_cas(root, object_relative, expected)
+        path = _path_for_manifest(root, relative)
+        current = expected.get(relative, ABSENT_STATE)
+        if _state_node(path) != current:
+            raise AdapterError("public-adapter-restore-failed", str(path))
+        if current[0] != "absent":
+            _remove_node(path)
+        _write_state_node(path, before[relative])
+        expected[relative] = before[relative]
+
+    directory_modes = [
+        relative
+        for relative, image in before.items()
+        if image[0] == "directory" and expected.get(relative) != image
+    ]
+    for relative in sorted(
+        directory_modes,
+        key=lambda value: (value.count("/"), value),
+        reverse=True,
+    ):
+        _require_admin_cas(root, object_relative, expected)
+        path = _path_for_manifest(root, relative)
+        if _state_node(path) != expected[relative]:
+            raise AdapterError("public-adapter-restore-failed", str(path))
+        os.chmod(path, before[relative][1])
+        expected[relative] = before[relative]
+
+    _require_admin_cas(root, object_relative, before)
 
 
-def _restore_caller_state(workspace: pathlib.Path, state: dict[str, Any]) -> None:
+def _restore_git_pointer(
+    workspace: pathlib.Path,
+    before: tuple[str, int | None, bytes | str | None],
+    after: tuple[str, int | None, bytes | str | None],
+) -> None:
+    path = workspace / ".git"
+    if before == after or before[0] == "directory":
+        return
+    if _state_node(path) != after:
+        raise AdapterError("public-adapter-restore-failed", str(path))
+    if after[0] != "absent":
+        _remove_node(path)
+    if before[0] != "absent":
+        _write_state_node(path, before)
+
+
+def _restore_caller_state(
+    workspace: pathlib.Path,
+    state: dict[str, Any],
+    after: dict[str, Any],
+) -> None:
     try:
+        current = _capture_caller_state(
+            workspace, state["git_specs"], state["git_binding"]
+        )
+        if current != after:
+            raise AdapterError(
+                "public-adapter-restore-failed", str(workspace)
+            )
         _restore_worktree(workspace, state)
-        _restore_git_state(workspace, state)
-        if _capture_caller_state(workspace) != state:
+        _restore_git_pointer(
+            workspace, state["git_pointer"], after["git_pointer"]
+        )
+        if state["git_nodes"] != after["git_nodes"]:
+            raise AdapterError(
+                "public-adapter-restore-failed", str(workspace)
+            )
+        before_admin = {item["path"]: item for item in state["git_admin"]}
+        after_admin = {item["path"]: item for item in after["git_admin"]}
+        for path in sorted(before_admin):
+            expected_binding = before_admin[path]["binding"]
+            observed_binding = after_admin[path]["binding"]
+            if expected_binding != observed_binding:
+                raise AdapterError(
+                    "public-adapter-restore-failed", path
+                )
+            root = pathlib.Path(path)
+            _require_nofollow_directory(root)
+            _restore_admin_manifest(
+                root,
+                before_admin[path]["object_relative"],
+                before_admin[path]["manifest"],
+                after_admin[path]["manifest"],
+            )
+        if _capture_caller_state(
+            workspace, state["git_specs"], state["git_binding"]
+        ) != state:
+            raise AdapterError("public-adapter-restore-failed", str(workspace))
+        if _raw_git_binding(workspace, strict=True) != state["git_binding"]:
             raise AdapterError("public-adapter-restore-failed", str(workspace))
     except AdapterError:
         raise
@@ -1286,11 +1659,17 @@ def inspect_public_kernel(
     except BaseException as error:
         failure = error
     try:
-        after = _capture_caller_state(workspace)
+        after = _capture_caller_state(
+            workspace, before["git_specs"], before["git_binding"]
+        )
     except BaseException:
         after = None
     if after != before:
-        _restore_caller_state(workspace, before)
+        if after is None:
+            raise AdapterError(
+                "public-adapter-restore-failed", str(workspace)
+            ) from failure
+        _restore_caller_state(workspace, before, after)
         raise AdapterError("public-adapter-mutated", str(workspace)) from failure
     if failure is not None:
         raise failure

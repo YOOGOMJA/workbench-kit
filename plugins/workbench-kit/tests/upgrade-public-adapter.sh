@@ -6,7 +6,9 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/workbench-upgrade-adapter.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 legacy_workspace="$tmp/legacy-workspace"
 current_workspace="$tmp/current-workspace"
-mkdir -p "$legacy_workspace" "$current_workspace/.workbench"
+linked_source="$tmp/linked-source"
+linked_workspace="$tmp/linked-workspace"
+mkdir -p "$legacy_workspace" "$current_workspace/.workbench" "$linked_source"
 printf 'workbench/v2\n' > "$current_workspace/.workbench/schema"
 git -C "$legacy_workspace" init -q
 git -C "$current_workspace" init -q
@@ -16,8 +18,14 @@ for repo in "$legacy_workspace" "$current_workspace"; do
   git -C "$repo" add -A
   git -C "$repo" commit --allow-empty -qm "fixture: public adapter"
 done
+git -C "$linked_source" init -q
+git -C "$linked_source" config user.name Fixture
+git -C "$linked_source" config user.email fixture@example.invalid
+git -C "$linked_source" commit --allow-empty -qm "fixture: linked public adapter"
+git -C "$linked_source" worktree add -qb task/27-linked "$linked_workspace"
 legacy_workspace="$(cd "$legacy_workspace" && pwd -P)"
 current_workspace="$(cd "$current_workspace" && pwd -P)"
+linked_workspace="$(cd "$linked_workspace" && pwd -P)"
 approval="$tmp/bootstrap-authority-approval.json"
 printf '%s\n' '{"contract_version":"workbench-bootstrap-authority-approval/v1","approval_id":"approval-fixture-1","proposed_descriptor":{"contract_version":"workbench-workspace-authority/v1","authority_identity":"github:example/workbench","origin_url":"https://github.com/example/workbench.git","default_ref":"refs/heads/main","workspace_home":"workbench","hosting_adapter":"github","hosting_ref":"github:repository/example/workbench"},"default_revision":"1111111111111111111111111111111111111111","protection":{"ref":"refs/heads/main","revision":"1111111111111111111111111111111111111111","direct_task_actor_writes":"blocked","verified_at":"2026-07-11T00:00:00Z","evidence_ref":"github:ruleset/example"},"actor":"github:user/example","approved_at":"2026-07-11T00:00:00Z","source_ref":"github:repository/example/workbench"}' > "$approval"
 approval="$(cd "$(dirname "$approval")" && pwd -P)/$(basename "$approval")"
@@ -34,19 +42,47 @@ root = pathlib.Path(sys.argv[1])
 git_dir = pathlib.Path(subprocess.check_output(
     ["git", "-C", str(root), "rev-parse", "--absolute-git-dir"]
 ).decode().strip())
+common_dir = pathlib.Path(subprocess.check_output([
+    "git", "-C", str(root), "rev-parse", "--path-format=absolute",
+    "--git-common-dir",
+]).decode().strip())
 parts = []
-for command in (
-    ("symbolic-ref", "-q", "HEAD"),
-    ("rev-parse", "HEAD"),
-    ("for-each-ref", "--format=%(refname)%00%(objectname)"),
-    ("status", "--porcelain=v2", "--untracked-files=all"),
-):
-    parts.append(subprocess.run(
-        ["git", "-C", str(root), *command], capture_output=True, check=False
-    ).stdout)
-for name in ("index", "FETCH_HEAD"):
-    path = git_dir / name
-    parts.append(name.encode() + b"\0" + (path.read_bytes() if path.exists() else b"<absent>"))
+
+pointer = root / ".git"
+pointer_node = os.lstat(pointer)
+if pointer.is_dir():
+    parts.append(b"P\0directory\0" + oct(pointer_node.st_mode & 0o7777).encode())
+elif pointer.is_file():
+    parts.append(
+        b"P\0file\0" + oct(pointer_node.st_mode & 0o7777).encode()
+        + b"\0" + pointer.read_bytes()
+    )
+else:
+    parts.append(b"P\0link\0" + os.readlink(pointer).encode())
+
+for admin_root in sorted({git_dir, common_dir}, key=str):
+    label = str(admin_root).encode()
+    for current, directories, files in os.walk(
+        admin_root, topdown=True, followlinks=False
+    ):
+        current_path = pathlib.Path(current)
+        relative_root = current_path.relative_to(admin_root)
+        if admin_root == common_dir and relative_root == pathlib.Path("objects"):
+            directories[:] = []
+            files[:] = []
+        directories[:] = sorted(directories)
+        for name in sorted(directories + files):
+            path = current_path / name
+            relative = (relative_root / name).as_posix().encode()
+            node = os.lstat(path)
+            mode = oct(node.st_mode & 0o7777).encode()
+            if path.is_symlink():
+                payload = b"L\0" + os.readlink(path).encode()
+            elif path.is_dir():
+                payload = b"D"
+            else:
+                payload = b"F\0" + path.read_bytes()
+            parts.append(b"G\0" + label + b"\0" + relative + b"\0" + mode + b"\0" + payload)
 for current, directories, files in os.walk(root, topdown=True, followlinks=False):
     directories[:] = sorted(item for item in directories if item != ".git")
     for name in sorted(files):
@@ -67,7 +103,7 @@ probe() {
   UPGRADE_STUB_LOG="$tmp/$mode.log" \
   UPGRADE_STUB_APPROVAL_FILE="$approval" \
   WORKBENCH_KIT_WORKBENCH_BIN="$ROOT/tests/upgrade-public-stub.sh" \
-  python3 - "$ROOT/lib" "$workspace" "$authority_file" "$inventory_mode" \
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" "$workspace" "$authority_file" "$inventory_mode" \
     "$include_manifest" <<'PY'
 import json
 import pathlib
@@ -218,7 +254,7 @@ expected_staged+="$current_workspace"$'\t'"legacy-inventory bootstrap-show --aut
 
 removal="$(probe removal "$current_workspace" - show true)" \
   || { echo "$removal" >&2; exit 1; }
-python3 - "$ROOT/lib" "$removal" <<'PY'
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" "$removal" <<'PY'
 import copy
 import hashlib
 import json
@@ -325,7 +361,7 @@ inventory="$({
   UPGRADE_STUB_MODE=v2-ok UPGRADE_STUB_APPROVAL_FILE="$approval" \
     "$ROOT/tests/upgrade-public-stub.sh" legacy-inventory show --format json
 })"
-python3 - "$ROOT/lib" "$inventory" <<'PY'
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" "$inventory" <<'PY'
 import copy
 import json
 import sys
@@ -412,6 +448,62 @@ expect_failure mutate-state public-adapter-mutated "$current_workspace" - show
   exit 1
 }
 
+admin_before="$(git_state_digest "$current_workspace")"
+expect_failure mutate-git-admin public-adapter-mutated "$current_workspace" - show
+[ "$admin_before" = "$(git_state_digest "$current_workspace")" ] || {
+  echo "Git control state was not restored exactly" >&2
+  exit 1
+}
+common_dir="$(git -C "$current_workspace" rev-parse --path-format=absolute --git-common-dir)"
+[ -f "$common_dir/objects/ff/00000000000000000000000000000000000000" ] || {
+  echo "newly fetched object cache data was removed" >&2
+  exit 1
+}
+
+pointer_before="$(git_state_digest "$linked_workspace")"
+expect_failure mutate-git-pointer public-adapter-mutated "$linked_workspace" "$approval"
+[ "$pointer_before" = "$(git_state_digest "$linked_workspace")" ] || {
+  echo "linked-worktree .git pointer was not restored exactly" >&2
+  exit 1
+}
+git -C "$linked_workspace" status --porcelain=v2 >/dev/null
+
+UPGRADE_STUB_MODE=mutate-state \
+UPGRADE_STUB_APPROVAL_FILE="$approval" \
+WORKBENCH_KIT_WORKBENCH_BIN="$ROOT/tests/upgrade-public-stub.sh" \
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" "$current_workspace" <<'PY'
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import workbench_kit_adapter as adapter
+
+workspace = pathlib.Path(sys.argv[2])
+common = pathlib.Path(subprocess.check_output([
+    "git", "-C", str(workspace), "rev-parse", "--path-format=absolute",
+    "--git-common-dir",
+]).decode().strip())
+original = adapter._restore_caller_state
+third_party = b"[upgrade]\n\tconcurrent = preserved\n"
+
+def race_restore(root, before, *remaining):
+    (common / "config").write_bytes(third_party)
+    return original(root, before, *remaining)
+
+adapter._restore_caller_state = race_restore
+try:
+    try:
+        adapter.inspect_public_kernel(workspace, inventory_mode="show")
+    except adapter.AdapterError as error:
+        assert error.code == "public-adapter-restore-failed", error.code
+    else:
+        raise AssertionError("concurrent Git admin mutation was overwritten")
+finally:
+    adapter._restore_caller_state = original
+assert (common / "config").read_bytes() == third_party
+PY
+
 if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' \
   "$ROOT/lib/workbench_kit_adapter.py" 2>/dev/null; then
   echo "workbench-kit adapter references private/runtime workbench state" >&2
@@ -419,3 +511,8 @@ if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' \
 fi
 
 echo "PASS: strict public workbench adapter boundary"
+
+if find "$ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi
