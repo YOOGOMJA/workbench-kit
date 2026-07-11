@@ -84,7 +84,7 @@ assert json.loads(sys.argv[1]) == {
 PY
 
 quality="$(toolbox product quality check set alpha --id unit \
-  --kind test --required true --command-part npm --command-part test)" \
+  --owner web --kind test --required true --command-part npm --command-part test)" \
   || fail "quality check set failed"
 python3 - "$quality" <<'PY'
 import json
@@ -96,10 +96,20 @@ assert json.loads(sys.argv[1]) == {
         "command": ["npm", "test"],
         "id": "unit",
         "kind": "test",
+        "owner": "web",
         "required": True,
     },
 }
 PY
+
+expect_failure "references unknown repository owner 'missing'" \
+  toolbox product quality check set alpha --id missing-owner --owner missing \
+    --kind test --required true --command-part make --command-part test
+toolbox product repository set alpha --id docs --path codebases/docs \
+  --role reference >/dev/null
+expect_failure "references non-writable repository owner 'docs'" \
+  toolbox product quality check set alpha --id reference-owner --owner docs \
+    --kind lint --required true --command-part make --command-part lint
 
 cat >"$tmp/scenario.json" <<'EOF'
 {
@@ -150,6 +160,19 @@ expect_failure "belongs to product 'other'" toolbox scenario apply \
   --product alpha --file "$tmp/scenario.json"
 after="$(shasum "$wb/products/alpha/scenarios/SCN-ALPHA-1.json" | awk '{print $1}')"
 [ "$before" = "$after" ] || fail "invalid scenario partially replaced valid state"
+
+cp "$wb/products/alpha/quality.json" "$tmp/quality-valid.json"
+python3 - "$wb/products/alpha/quality.json" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+document = json.loads(path.read_text())
+del document["checks"][0]["owner"]
+path.write_text(json.dumps(document))
+PY
+expect_failure "is missing required field 'owner'" toolbox product check alpha
+cp "$tmp/quality-valid.json" "$wb/products/alpha/quality.json"
 
 toolbox product check alpha >/dev/null || fail "mutations left invalid product state"
 echo "PASS: atomic product workflow mutations"

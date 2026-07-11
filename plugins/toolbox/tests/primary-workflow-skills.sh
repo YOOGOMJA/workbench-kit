@@ -27,7 +27,10 @@ contracts = {
         "workbench task policy-context register",
         "workbench task policy-context seal",
         "workbench task deliverable declare",
+        "--id <deliverable-id> --owner <owner> --kind codebase-pr",
         "workbench task required-check declare",
+        "check.owner",
+        "Do not guess",
         "profile.language",
         "unresolved `ask`",
         "unaccepted deliverable",
@@ -40,6 +43,9 @@ contracts = {
         "profile.language",
         "exactly one",
         "Re-evaluate",
+        "task-start",
+        "ticket-incubate",
+        "Never invent an issue ID",
     ],
 }
 

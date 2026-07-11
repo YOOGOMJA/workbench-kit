@@ -65,6 +65,9 @@ quality = json.loads((root / "templates/quality.json").read_text())
 assert quality["development"]["tdd"] == "required"
 assert quality["development"]["designSystem"] == "required"
 assert quality["checks"] == []
+quality_check = json.loads((root / "schemas/quality.schema.json").read_text())["properties"]["checks"]["items"]
+assert quality_check["required"] == ["id", "owner", "kind", "command", "required"]
+assert set(quality_check["properties"]) == {"id", "owner", "kind", "command", "required"}
 PY
 
 echo "PASS: versioned state schemas and templates"

@@ -32,10 +32,17 @@ for product in alpha beta gamma delta epsilon; do
   toolbox product repository set "$product" --id "$product-web" \
     --path "codebases/$product-web" --role owner >/dev/null
   toolbox product quality check set "$product" --id unit --kind test \
-    --required true --command-part npm --command-part test >/dev/null
+    --owner "$product-web" --required true \
+    --command-part npm --command-part test >/dev/null
   toolbox product quality check set "$product" --id optional-lint --kind lint \
-    --required false --command-part npm --command-part lint >/dev/null
+    --owner "$product-web" --required false \
+    --command-part npm --command-part lint >/dev/null
 done
+toolbox product repository set alpha --id alpha-api \
+  --path codebases/alpha-api --role work >/dev/null
+toolbox product quality check set alpha --id api-contract --owner alpha-api \
+  --kind integration --required true \
+  --command-part npm --command-part run --command-part test:contract >/dev/null
 
 scenario() {
   local product="$1" id="$2" status="$3" priority="$4" dependencies="$5"
@@ -107,13 +114,22 @@ import sys
 assert json.loads(sys.argv[1]) == {
     "contract_version": "toolbox-run-plan/v1",
     "product_ref": "toolbox:product/alpha",
-    "repository_owners": ["alpha-web"],
+    "repository_owners": ["alpha-api", "alpha-web"],
     "remaining_candidates": [],
-    "required_quality_checks": [{
-        "command": ["npm", "test"],
-        "id": "unit",
-        "kind": "test",
-    }],
+    "required_quality_checks": [
+        {
+            "command": ["npm", "run", "test:contract"],
+            "id": "api-contract",
+            "kind": "integration",
+            "owner": "alpha-api",
+        },
+        {
+            "command": ["npm", "test"],
+            "id": "unit",
+            "kind": "test",
+            "owner": "alpha-web",
+        },
+    ],
     "scenario_ref": "toolbox:scenario/SCN-ALPHA-READY",
     "selection_scope": "product",
     "skipped_products": [],

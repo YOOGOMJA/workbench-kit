@@ -39,6 +39,7 @@ contracts = {
         "toolbox workbench check",
         "toolbox product init",
         "toolbox product repository set",
+        "--owner <repository-id>",
         "compatibility",
         "Do not rewrite existing code",
         "profile.language",
