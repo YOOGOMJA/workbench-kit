@@ -20,10 +20,13 @@ from workbench_kit_contracts import (
     node_digest,
     validate_active_tasks,
     validate_authority_approval,
+    validate_engine_manifest,
+    validate_equivalence_receipt,
     validate_generator_receipt,
     validate_language,
     validate_plan,
     validate_receipt_input,
+    validate_removal_approval,
     validate_reviewed_overlay,
 )
 from workbench_kit_render import (
@@ -159,6 +162,29 @@ def _operation_for(
     }
 
 
+def _remove_operation(
+    root: pathlib.Path, expected: dict[str, Any], receipt_id: str
+) -> dict[str, Any]:
+    before = _inspect_node(root, expected["path"])
+    if any(
+        before[field] != expected[field]
+        for field in ("node_type", "mode", "digest", "link_target")
+    ):
+        raise PlanningError("plugin-equivalence-stale", expected["path"])
+    return {
+        "op": "remove",
+        "path": expected["path"],
+        "before_type": expected["node_type"],
+        "before_mode": expected["mode"],
+        "before_digest": expected["digest"],
+        "after_type": None,
+        "after_mode": None,
+        "after_digest": None,
+        "artifact_source_digest": None,
+        "equivalence_receipt_ref": receipt_id,
+    }
+
+
 def _parent_directories(
     root: pathlib.Path, operation_paths: list[str]
 ) -> list[dict[str, Any]]:
@@ -256,6 +282,10 @@ def build_migration_plan(
     planner: dict[str, Any],
     generator_receipt: dict[str, Any],
     reviewed_overlay_input: dict[str, Any] | None,
+    engine_manifest_projection: dict[str, Any] | None = None,
+    plugin_equivalence_input: dict[str, Any] | None = None,
+    remove_embedded: bool = False,
+    removal_approval_input: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = workspace.resolve(strict=True)
     try:
@@ -277,6 +307,24 @@ def build_migration_plan(
                 "reviewed_overlay_input",
                 validate_reviewed_overlay,
             )
+        if plugin_equivalence_input is not None:
+            plugin_equivalence_input = validate_receipt_input(
+                plugin_equivalence_input,
+                "plugin_equivalence_input",
+                validate_equivalence_receipt,
+            )
+        if engine_manifest_projection is not None:
+            engine_manifest_projection = validate_engine_manifest(
+                engine_manifest_projection
+            )
+        if removal_approval_input is not None:
+            removal_approval_input = validate_receipt_input(
+                removal_approval_input,
+                "removal_approval_input",
+                validate_removal_approval,
+            )
+        if not isinstance(remove_embedded, bool):
+            raise PlanningError("remove-embedded-invalid", "remove_embedded")
         review_recovery = (
             reviewed_overlay_input is not None
             and diagnosis["classification"] == "malformed"
@@ -297,7 +345,30 @@ def build_migration_plan(
         )
         if not ordinary_migration and not review_recovery:
             raise PlanningError("classification-not-actionable", diagnosis["classification"])
-        if diagnosis["embedded_engine"]["state"] != "absent":
+        embedded_state = diagnosis["embedded_engine"]["state"]
+        if embedded_state == "absent":
+            if any(
+                item is not None
+                for item in (
+                    engine_manifest_projection,
+                    plugin_equivalence_input,
+                    removal_approval_input,
+                )
+            ) or remove_embedded:
+                raise PlanningError("embedded-engine-absent", "embedded-engine")
+            embedded_after = "absent"
+        elif embedded_state == "present-verified":
+            if engine_manifest_projection is None or plugin_equivalence_input is None:
+                raise PlanningError("plugin-equivalence-unavailable", "embedded-engine")
+            if (
+                diagnosis["embedded_engine"]["equivalence_receipt_digest"]
+                != plugin_equivalence_input["object_digest"]
+            ):
+                raise PlanningError("plugin-equivalence-stale", "embedded-engine")
+            embedded_after = "absent" if remove_embedded else "present-verified"
+            if not remove_embedded and removal_approval_input is not None:
+                raise PlanningError("removal-operation-required", "removal_approval")
+        else:
             raise PlanningError("plugin-equivalence-unavailable", "embedded-engine")
 
         source_revision, source_tree_digest = _source_identity(root, migration_task)
@@ -368,8 +439,8 @@ def build_migration_plan(
             )
 
         embedded = {
-            "before": diagnosis["embedded_engine"]["state"],
-            "after": diagnosis["embedded_engine"]["state"],
+            "before": embedded_state,
+            "after": embedded_after,
             "equivalence_receipt_digest": diagnosis["embedded_engine"][
                 "equivalence_receipt_digest"
             ],
@@ -418,9 +489,41 @@ def build_migration_plan(
             if operation is not None:
                 artifacts.append(artifact)
                 operations.append(operation)
+        if remove_embedded:
+            equivalence = plugin_equivalence_input["receipt"]
+            operations.extend(
+                _remove_operation(root, node, equivalence["receipt_id"])
+                for node in equivalence["removable_nodes"]
+            )
+        artifacts.sort(key=lambda item: item["path"])
+        operations.sort(key=lambda item: (item["path"], item["op"]))
         operation_paths = {item["path"] for item in operations}
         parents = _parent_directories(root, sorted(operation_paths))
         preserved = _preserved_nodes(root, operation_paths)
+        remove_operations = [
+            operation for operation in operations if operation["op"] == "remove"
+        ]
+        removal_plan_basis_digest = None
+        blockers = []
+        if remove_operations:
+            removal_basis = {
+                "contract_version": "workbench-kit-removal-plan-basis/v1",
+                "workspace_source_revision": source_revision,
+                "workspace_source_tree_digest": source_tree_digest,
+                "migration_task_claim_id": migration_task["claim_id"],
+                "planner_revision": planner["planner_revision"],
+                "legacy_inventory_digest": legacy["object_digest"],
+                "equivalence_receipt_digest": plugin_equivalence_input[
+                    "object_digest"
+                ],
+                "remove_operations": remove_operations,
+            }
+            removal_plan_basis_digest = canonical_digest(removal_basis)
+            if removal_approval_input is None:
+                blockers.append({
+                    "code": "removal-approval-required",
+                    "ref": removal_plan_basis_digest,
+                })
         provenance_after = {
             "kind": "migration",
             "state": "valid",
@@ -450,18 +553,18 @@ def build_migration_plan(
                 "bootstrap_authority_approval": authority_input,
                 "reviewed_overlay": reviewed_overlay_input,
             },
-            "engine_manifest": None,
-            "plugin_equivalence": None,
-            "removal_plan_basis_digest": None,
-            "removal_approval": None,
+            "engine_manifest": engine_manifest_projection,
+            "plugin_equivalence": plugin_equivalence_input,
+            "removal_plan_basis_digest": removal_plan_basis_digest,
+            "removal_approval": removal_approval_input,
             "active_v1_tasks": active_tasks,
             "preserved": preserved,
             "parent_directories": parents,
             "artifacts": artifacts,
             "operations": operations,
-            "blockers": [],
+            "blockers": blockers,
             "changed": bool(operations),
-            "actionable": bool(operations),
+            "actionable": bool(operations) and not blockers,
         }
         plan["plan_digest"] = canonical_digest(plan, null_field="plan_digest")
         return validate_plan(plan)

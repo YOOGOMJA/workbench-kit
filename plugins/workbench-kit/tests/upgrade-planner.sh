@@ -15,6 +15,7 @@ sys.path.insert(0, sys.argv[1])
 from workbench_kit_contracts import (
     canonical_bytes,
     canonical_digest,
+    node_digest,
     parse_authority_approval,
     parse_reviewed_overlay,
     strict_load,
@@ -318,6 +319,157 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
     reviewed_paths = {item["path"] for item in reviewed_plan["operations"]}
     assert {"AGENTS.overlay.md", "AGENTS.md", "CLAUDE.md"} <= reviewed_paths
     assert validate_plan(reviewed_plan) == reviewed_plan
+
+    engine_bytes = b"#!/bin/sh\nexit 0\n"
+    write(root, "legacy-engine/task", engine_bytes, 0o755)
+    subprocess.run(["git", "-C", str(root), "add", "legacy-engine/task"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture: embedded engine"], check=True)
+    engine_node = {
+        "path": "legacy-engine/task",
+        "node_type": "file",
+        "mode": "100755",
+        "digest": node_digest("file", "100755", content=engine_bytes),
+        "link_target": None,
+    }
+    legacy_manifest = {
+        "contract_version": "workbench-legacy-engine-manifest/v1",
+        "source_ref": "github:YOOGOMJA/workbench-kit#legacy-engine",
+        "source_revision": "4" * 40,
+        "allowed_roots": ["legacy-engine"],
+        "removable_nodes": [engine_node],
+        "discovery_links": [],
+    }
+    equivalence = {
+        "contract_version": "workbench-plugin-equivalence/v1",
+        "receipt_id": "equivalence-fixture-27",
+        "replacement_plugin": {
+            "plugin_name": "workbench",
+            "plugin_version": "0.2.0",
+            "source_revision": "5" * 40,
+            "plugin_manifest_digest": SHA,
+            "source_ref": "github:YOOGOMJA/workbench-kit#plugins/workbench",
+        },
+        "public_contract": {
+            "contract_version": "workbench-contract/v1",
+            "engine_name": "workbench",
+            "engine_version": "0.2.0",
+            "supported_object_digest": "sha256:" + "6" * 64,
+            "capabilities": ["engine.manifest/v1", "workspace.schema/v1"],
+        },
+        "required_capabilities": ["engine.manifest/v1", "workspace.schema/v1"],
+        "legacy_source": {
+            "source_ref": legacy_manifest["source_ref"],
+            "source_revision": legacy_manifest["source_revision"],
+        },
+        "legacy_manifest_digest": canonical_digest(legacy_manifest),
+        "allowed_roots": legacy_manifest["allowed_roots"],
+        "removable_nodes": legacy_manifest["removable_nodes"],
+        "discovery_links": legacy_manifest["discovery_links"],
+        "verification_evidence": [
+            {"evidence_id": "contract", "kind": "contract-test", "source_ref": "ci:contract", "source_revision": "7" * 40, "digest": SHA},
+            {"evidence_id": "integration", "kind": "integration-test", "source_ref": "ci:integration", "source_revision": "7" * 40, "digest": SHA},
+            {"evidence_id": "audit", "kind": "manifest-audit", "source_ref": "ci:audit", "source_revision": "7" * 40, "digest": SHA},
+        ],
+    }
+    equivalence_input = {
+        "receipt": equivalence,
+        "object_digest": canonical_digest(equivalence),
+        "source_digest": canonical_digest(canonical_bytes(equivalence), raw=True),
+    }
+    manifest_projection = {
+        "contract_version": "workbench-plugin-manifest/v1",
+        "command": "engine-manifest show",
+        "object_digest": "sha256:" + "8" * 64,
+        "source_digest": "sha256:" + "9" * 64,
+        "content_revision": "sha256:" + "a" * 64,
+        "manifest_digest": SHA,
+    }
+    embedded_diagnosis = {
+        **malformed,
+        "embedded_engine": {
+            "state": "present-verified",
+            "equivalence_receipt_digest": canonical_digest(equivalence),
+        },
+    }
+    planner_v2 = {**planner, "plugin_version": "0.2.0"}
+    preserved_engine_plan = build_migration_plan(
+        root,
+        diagnosis=embedded_diagnosis,
+        public_snapshot=public,
+        authority_input=authority_input,
+        language=language,
+        migration_task=migration_task,
+        planner=planner_v2,
+        generator_receipt=generator,
+        reviewed_overlay_input=reviewed_input,
+        engine_manifest_projection=manifest_projection,
+        plugin_equivalence_input=equivalence_input,
+        remove_embedded=False,
+        removal_approval_input=None,
+    )
+    assert preserved_engine_plan["embedded_engine"]["after"] == "present-verified"
+    assert not any(
+        operation["op"] == "remove"
+        for operation in preserved_engine_plan["operations"]
+    )
+    assert preserved_engine_plan["actionable"] is True
+
+    removal_candidate = build_migration_plan(
+        root,
+        diagnosis=embedded_diagnosis,
+        public_snapshot=public,
+        authority_input=authority_input,
+        language=language,
+        migration_task=migration_task,
+        planner=planner_v2,
+        generator_receipt=generator,
+        reviewed_overlay_input=reviewed_input,
+        engine_manifest_projection=manifest_projection,
+        plugin_equivalence_input=equivalence_input,
+        remove_embedded=True,
+        removal_approval_input=None,
+    )
+    assert removal_candidate["actionable"] is False
+    assert removal_candidate["blockers"] == [{
+        "code": "removal-approval-required",
+        "ref": removal_candidate["removal_plan_basis_digest"],
+    }]
+    approval = {
+        "contract_version": "workbench-kit-removal-approval/v1",
+        "approval_id": "removal-27",
+        "equivalence_receipt_id": equivalence["receipt_id"],
+        "equivalence_receipt_digest": canonical_digest(equivalence),
+        "approved_plan_basis_digest": removal_candidate["removal_plan_basis_digest"],
+        "actor": "github:user/example",
+        "approved_at": "2026-07-11T00:00:00Z",
+        "source_ref": "github:issue/example/27",
+    }
+    approval_input = {
+        "receipt": approval,
+        "object_digest": canonical_digest(approval),
+        "source_digest": canonical_digest(canonical_bytes(approval), raw=True),
+    }
+    approved_removal = build_migration_plan(
+        root,
+        diagnosis=embedded_diagnosis,
+        public_snapshot=public,
+        authority_input=authority_input,
+        language=language,
+        migration_task=migration_task,
+        planner=planner_v2,
+        generator_receipt=generator,
+        reviewed_overlay_input=reviewed_input,
+        engine_manifest_projection=manifest_projection,
+        plugin_equivalence_input=equivalence_input,
+        remove_embedded=True,
+        removal_approval_input=approval_input,
+    )
+    assert approved_removal["actionable"] is True
+    assert any(
+        operation["op"] == "remove" and operation["path"] == engine_node["path"]
+        for operation in approved_removal["operations"]
+    )
+    assert validate_plan(approved_removal) == approved_removal
 
 print("PASS: deterministic migration planner and preservation manifest")
 PY
