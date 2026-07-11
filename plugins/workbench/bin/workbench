@@ -2,6 +2,7 @@
 # workbench — 플러그인이 PATH에 올리는 단일 진입점. utils/* 로 디스패치한다.
 # 플러그인 설치 시 CLAUDE_PLUGIN_ROOT가 set됨; 로컬 실행 시 스크립트 위치로 폴백.
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 sub="${1:-}"; [ $# -gt 0 ] && shift || true
 case "$sub" in

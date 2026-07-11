@@ -10,6 +10,8 @@ import re
 import sys
 from typing import Any, Dict, Mapping, Optional, Sequence
 
+sys.dont_write_bytecode = True
+
 from workbench_intent import load_request
 
 

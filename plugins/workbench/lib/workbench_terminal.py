@@ -11,6 +11,8 @@ import re
 import sys
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+sys.dont_write_bytecode = True
+
 from workbench_writer import (
     CLAIM_FIELDS,
     EFFECT_FIELDS,
