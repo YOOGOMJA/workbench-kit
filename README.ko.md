@@ -67,10 +67,10 @@ workbench-kit은 세 플러그인의 **마켓플레이스**입니다. 엔진과 
 
 ```
 codex plugin marketplace add https://github.com/YOOGOMJA/workbench-kit
-codex plugin add workbench
-codex plugin add workbench-kit
+codex plugin add workbench@workbench-kit
+codex plugin add workbench-kit@workbench-kit
 # 제품 개발 워크플로가 필요할 때만:
-codex plugin add toolbox
+codex plugin add toolbox@workbench-kit
 ```
 
 요구사항: Claude Code **또는** Codex, `git`(워크트리 지원), 이슈·PR 배관용 `gh` CLI.

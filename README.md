@@ -68,10 +68,10 @@ Codex. "Bring your own rules" — the mechanism is fixed, your conventions are n
 
 ```
 codex plugin marketplace add https://github.com/YOOGOMJA/workbench-kit
-codex plugin add workbench
-codex plugin add workbench-kit
+codex plugin add workbench@workbench-kit
+codex plugin add workbench-kit@workbench-kit
 # Optional product-delivery workflows:
-codex plugin add toolbox
+codex plugin add toolbox@workbench-kit
 ```
 
 Requirements: Claude Code **or** Codex, `git` (with worktree support), and the
