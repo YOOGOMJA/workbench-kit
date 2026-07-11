@@ -15,6 +15,7 @@ import tempfile
 
 sys.path.insert(0, sys.argv[1])
 
+import workbench_kit_journal as journal_module
 from workbench_kit_contracts import (
     canonical_bytes,
     canonical_digest,
@@ -49,6 +50,8 @@ def rejected(callable_, code):
 
 
 def fixture_plan(root):
+    if not (root / ".git").exists():
+        (root / ".git").mkdir()
     before = b"legacy marker\n"
     after = b"workbench/v2\n"
     (root / ".workbench").mkdir()
@@ -214,6 +217,21 @@ def passed_validation(plan):
         "digest": None,
     }
     validation["digest"] = canonical_digest(validation, null_field="digest")
+    return validation
+
+
+def passed_removal_validation(plan):
+    validation = {
+        "status": "passed",
+        "classification_after": plan["target_classification"],
+        "basis_kind": "removal-plan",
+        "basis_digest": plan["removal_plan_basis_digest"],
+        "blockers": [],
+        "digest": None,
+    }
+    validation["digest"] = canonical_digest(
+        validation, null_field="digest"
+    )
     return validation
 
 
@@ -451,6 +469,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert location["directory"].parent == journal_root
     assert location["directory"].name == first["workspace_id"]
     assert location["journal"].name == plan["plan_digest"][7:] + ".json"
+    assert location["owner"].parent.parent.parent.parent == root / ".git"
     installed = install_prepared_journal(first, location)
     assert installed == location["journal"]
     installed_stat = os.lstat(installed)
@@ -976,12 +995,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         removal_location,
         plan_source_digest=removal_source,
         updated_at="2026-07-11T00:16:00Z",
-        validate_after=lambda current: {
-            **passed_validation(current),
-            "basis_kind": "removal-plan",
-            "basis_digest": current["removal_plan_basis_digest"],
-            "digest": None,
-        },
+        validate_after=passed_removal_validation,
         fault_hook=fail_after_removal,
     )
     assert removal_rollback["transaction"]["stage"] == "rolled-back"
@@ -1107,7 +1121,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         environment={},
     )
     install_prepared_journal(replace_journal, replace_location)
-    replace_location["replace_temp"].write_bytes(b"partial replace journal")
+    replace_location["replace_temp"].write_bytes(b"foreign replace journal")
     replace_location["replace_temp"].chmod(0o600)
     replace_recovered = execute_upgrade(
         replace_plan,
@@ -1117,7 +1131,10 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         validate_after=passed_validation,
     )
     assert replace_recovered["transaction"]["stage"] == "completed"
-    assert not replace_location["replace_temp"].exists()
+    assert (
+        replace_location["replace_temp"].read_bytes()
+        == b"foreign replace journal"
+    )
     assert (replace_root / ".workbench/schema").read_bytes() == replace_after
 
     umask_root = pathlib.Path(temporary) / "umask-workbench"
@@ -1293,11 +1310,39 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
         journal_dir=journal_root,
         environment={},
     )
-    initial_location["initial_temp"].write_bytes(b"partial initial journal")
+    initial_location["initial_temp"].write_bytes(
+        canonical_bytes(initial_journal)[:23]
+    )
     initial_location["initial_temp"].chmod(0o600)
     install_prepared_journal(initial_journal, initial_location)
     assert initial_location["journal"].is_file()
     assert not initial_location["initial_temp"].exists()
+
+    foreign_initial_root = pathlib.Path(temporary) / "foreign-initial-workbench"
+    foreign_initial_root.mkdir()
+    foreign_initial_root = foreign_initial_root.resolve()
+    foreign_initial_plan, _, _ = fixture_plan(foreign_initial_root)
+    foreign_initial_source = canonical_digest(
+        canonical_bytes(foreign_initial_plan), raw=True
+    )
+    foreign_initial_journal = build_prepared_journal(
+        foreign_initial_plan, foreign_initial_source, CREATED_AT
+    )
+    foreign_initial_location = resolve_journal_location(
+        foreign_initial_root,
+        foreign_initial_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    foreign_initial_location["initial_temp"].write_bytes(b"foreign journal\n")
+    foreign_initial_location["initial_temp"].chmod(0o600)
+    rejected(
+        lambda: install_prepared_journal(
+            foreign_initial_journal, foreign_initial_location
+        ),
+        "journal-unsafe",
+    )
+    assert foreign_initial_location["initial_temp"].read_bytes() == b"foreign journal\n"
 
     foreign_root = pathlib.Path(temporary) / "foreign-temp-workbench"
     foreign_root.mkdir()
@@ -1316,7 +1361,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     install_prepared_journal(foreign_journal, foreign_location)
     foreign_temp = foreign_root / foreign_journal["effects"][0]["temp_path"]
     foreign_temp.write_bytes(b"foreign complete-looking temp\n")
-    foreign_temp.chmod(0o644)
+    foreign_temp.chmod(0o600)
     rejected(
         lambda: execute_upgrade(
             foreign_plan,
@@ -1352,22 +1397,21 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     owner_store_b = pathlib.Path(temporary).resolve() / "owner-store-b"
     owner_store_a.mkdir(mode=0o700)
     owner_store_b.mkdir(mode=0o700)
-    owner_coordination = pathlib.Path(temporary).resolve() / "owner-coordination"
-    owner_coordination.mkdir(mode=0o700)
     owner_location_a = resolve_journal_location(
         owner_root,
         owner_plan_a["plan_digest"],
         journal_dir=owner_store_a,
         environment={},
-        coordination_root=owner_coordination,
     )
+    owner_xdg = pathlib.Path(temporary).resolve() / "owner-xdg"
+    owner_xdg.mkdir(mode=0o700)
     owner_location_b = resolve_journal_location(
         owner_root,
         owner_plan_b["plan_digest"],
         journal_dir=owner_store_b,
-        environment={},
-        coordination_root=owner_coordination,
+        environment={"XDG_STATE_HOME": str(owner_xdg)},
     )
+    assert owner_location_a["owner"] == owner_location_b["owner"]
     install_prepared_journal(owner_journal_a, owner_location_a)
 
     def crash_before_owner_effect(point, _effect, direction):
@@ -1390,6 +1434,507 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     rejected(
         lambda: install_prepared_journal(owner_journal_b, owner_location_b),
         "transaction-in-progress",
+    )
+
+    owner_prefix_root = pathlib.Path(temporary) / "owner-prefix-workbench"
+    owner_prefix_root.mkdir()
+    owner_prefix_root = owner_prefix_root.resolve()
+    owner_prefix_plan, _, owner_prefix_after = fixture_plan(owner_prefix_root)
+    owner_prefix_source = canonical_digest(
+        canonical_bytes(owner_prefix_plan), raw=True
+    )
+    owner_prefix_journal = build_prepared_journal(
+        owner_prefix_plan, owner_prefix_source, CREATED_AT
+    )
+    owner_prefix_location = resolve_journal_location(
+        owner_prefix_root,
+        owner_prefix_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(owner_prefix_journal, owner_prefix_location)
+    os.link(
+        owner_prefix_location["owner"],
+        owner_prefix_location["owner_temp"],
+    )
+    owner_prefix_result = execute_upgrade(
+        owner_prefix_plan,
+        owner_prefix_location,
+        plan_source_digest=owner_prefix_source,
+        updated_at="2026-07-11T00:27:00Z",
+        validate_after=passed_validation,
+    )
+    assert owner_prefix_result["transaction"]["stage"] == "completed"
+    assert not owner_prefix_location["owner_temp"].exists()
+    assert (owner_prefix_root / ".workbench/schema").read_bytes() == owner_prefix_after
+
+    owner_binding_root = pathlib.Path(temporary) / "owner-binding-workbench"
+    owner_binding_root.mkdir()
+    owner_binding_root = owner_binding_root.resolve()
+    owner_binding_plan, _, _ = fixture_plan(owner_binding_root)
+    owner_binding_source = canonical_digest(
+        canonical_bytes(owner_binding_plan), raw=True
+    )
+    owner_binding_journal = build_prepared_journal(
+        owner_binding_plan, owner_binding_source, CREATED_AT
+    )
+    owner_binding_location = resolve_journal_location(
+        owner_binding_root,
+        owner_binding_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(owner_binding_journal, owner_binding_location)
+    owner_record = journal_module.strict_load(
+        owner_binding_location["owner"].read_bytes(), "owner"
+    )
+    owner_record["owner_id"] = "upgrade-" + "f" * 64
+    owner_binding_location["owner"].write_bytes(canonical_bytes(owner_record))
+    rejected(
+        lambda: execute_upgrade(
+            owner_binding_plan,
+            owner_binding_location,
+            plan_source_digest=owner_binding_source,
+            updated_at="2026-07-11T00:27:30Z",
+            validate_after=passed_validation,
+        ),
+        "owner-mismatch",
+    )
+
+    for crash_point in ("after-target-install", "after-temp-unlink"):
+        prefix_root = pathlib.Path(temporary) / f"{crash_point}-workbench"
+        prefix_root.mkdir()
+        prefix_root = prefix_root.resolve()
+        prefix_plan, _, prefix_after = fixture_plan(prefix_root)
+        prefix_source = canonical_digest(canonical_bytes(prefix_plan), raw=True)
+        prefix_journal = build_prepared_journal(
+            prefix_plan, prefix_source, CREATED_AT
+        )
+        prefix_location = resolve_journal_location(
+            prefix_root,
+            prefix_plan["plan_digest"],
+            journal_dir=journal_root,
+            environment={},
+        )
+        install_prepared_journal(prefix_journal, prefix_location)
+
+        def crash_update_prefix(point, _effect, direction, expected=crash_point):
+            if point == expected and direction == "forward":
+                raise Crash()
+
+        try:
+            execute_upgrade(
+                prefix_plan,
+                prefix_location,
+                plan_source_digest=prefix_source,
+                updated_at="2026-07-11T00:28:00Z",
+                validate_after=passed_validation,
+                fault_hook=crash_update_prefix,
+            )
+        except Crash:
+            pass
+        else:
+            raise AssertionError(f"{crash_point} did not interrupt update")
+        prefix_result = execute_upgrade(
+            prefix_plan,
+            prefix_location,
+            plan_source_digest=prefix_source,
+            updated_at="2026-07-11T00:29:00Z",
+            validate_after=passed_validation,
+        )
+        assert prefix_result["transaction"]["stage"] == "completed"
+        assert (prefix_root / ".workbench/schema").read_bytes() == prefix_after
+        assert not list(
+            (prefix_root / ".workbench").glob(".workbench-kit.*.backup")
+        )
+
+    root_swap_root = pathlib.Path(temporary) / "root-swap-workbench"
+    root_swap_root.mkdir()
+    root_swap_root = root_swap_root.resolve()
+    root_swap_plan, root_swap_before, _ = fixture_plan(root_swap_root)
+    root_swap_source = canonical_digest(
+        canonical_bytes(root_swap_plan), raw=True
+    )
+    root_swap_journal = build_prepared_journal(
+        root_swap_plan, root_swap_source, CREATED_AT
+    )
+    root_swap_location = resolve_journal_location(
+        root_swap_root,
+        root_swap_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(root_swap_journal, root_swap_location)
+    detached_root = root_swap_root.with_name(root_swap_root.name + "-detached")
+
+    def replace_workspace_root(point, _effect, direction):
+        if point != "after-temp-fsync" or direction != "forward":
+            return
+        os.rename(root_swap_root, detached_root)
+        root_swap_root.mkdir()
+        (root_swap_root / ".git").mkdir()
+        (root_swap_root / ".workbench").mkdir()
+        (root_swap_root / ".workbench/schema").write_bytes(b"replacement\n")
+
+    rejected(
+        lambda: execute_upgrade(
+            root_swap_plan,
+            root_swap_location,
+            plan_source_digest=root_swap_source,
+            updated_at="2026-07-11T00:30:00Z",
+            validate_after=passed_validation,
+            fault_hook=replace_workspace_root,
+        ),
+        "workspace-binding-stale",
+    )
+    assert (detached_root / ".workbench/schema").read_bytes() == root_swap_before
+    assert (root_swap_root / ".workbench/schema").read_bytes() == b"replacement\n"
+
+    installed_swap_root = pathlib.Path(temporary) / "installed-swap-workbench"
+    installed_swap_root.mkdir()
+    installed_swap_root = installed_swap_root.resolve()
+    installed_swap_plan, installed_swap_before, installed_swap_after = fixture_plan(
+        installed_swap_root
+    )
+    installed_swap_source = canonical_digest(
+        canonical_bytes(installed_swap_plan), raw=True
+    )
+    installed_swap_journal = build_prepared_journal(
+        installed_swap_plan, installed_swap_source, CREATED_AT
+    )
+    installed_swap_location = resolve_journal_location(
+        installed_swap_root,
+        installed_swap_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(
+        installed_swap_journal, installed_swap_location
+    )
+    installed_detached = installed_swap_root.with_name(
+        installed_swap_root.name + "-detached"
+    )
+
+    def replace_root_after_install(point, _effect, direction):
+        if point != "after-target-install" or direction != "forward":
+            return
+        os.rename(installed_swap_root, installed_detached)
+        installed_swap_root.mkdir()
+        (installed_swap_root / ".git").mkdir()
+        (installed_swap_root / ".workbench").mkdir()
+        (installed_swap_root / ".workbench/schema").write_bytes(
+            b"replacement after install\n"
+        )
+
+    rejected(
+        lambda: execute_upgrade(
+            installed_swap_plan,
+            installed_swap_location,
+            plan_source_digest=installed_swap_source,
+            updated_at="2026-07-11T00:30:15Z",
+            validate_after=passed_validation,
+            fault_hook=replace_root_after_install,
+        ),
+        "workspace-binding-stale",
+    )
+    installed_temp = (
+        installed_detached / installed_swap_journal["effects"][0]["temp_path"]
+    )
+    assert installed_temp.read_bytes() == installed_swap_before
+    assert (
+        installed_detached / ".workbench/schema"
+    ).read_bytes() == installed_swap_after
+    assert (
+        installed_swap_root / ".workbench/schema"
+    ).read_bytes() == b"replacement after install\n"
+
+    missing_parent_root = pathlib.Path(temporary) / "missing-parent-workbench"
+    missing_parent_root.mkdir()
+    missing_parent_root = missing_parent_root.resolve()
+    missing_parent_plan, _ = fixture_create_plan(missing_parent_root)
+    missing_parent_source = canonical_digest(
+        canonical_bytes(missing_parent_plan), raw=True
+    )
+    missing_parent_journal = build_prepared_journal(
+        missing_parent_plan, missing_parent_source, CREATED_AT
+    )
+    missing_parent_location = resolve_journal_location(
+        missing_parent_root,
+        missing_parent_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(
+        missing_parent_journal, missing_parent_location
+    )
+
+    def remove_created_parent(point, effect, direction):
+        if (
+            point == "before-effect"
+            and direction == "forward"
+            and effect["kind"] == "create"
+        ):
+            (missing_parent_root / ".workbench").rmdir()
+
+    rejected(
+        lambda: execute_upgrade(
+            missing_parent_plan,
+            missing_parent_location,
+            plan_source_digest=missing_parent_source,
+            updated_at="2026-07-11T00:30:30Z",
+            validate_after=passed_validation,
+            fault_hook=remove_created_parent,
+        ),
+        "transaction-state-mismatch",
+    )
+
+    removal_cas_root = pathlib.Path(temporary) / "removal-cas-workbench"
+    removal_cas_root.mkdir()
+    removal_cas_root = removal_cas_root.resolve()
+    removal_cas_plan, _ = fixture_removal_plan(removal_cas_root)
+    removal_cas_source = canonical_digest(
+        canonical_bytes(removal_cas_plan), raw=True
+    )
+    removal_cas_journal = build_prepared_journal(
+        removal_cas_plan, removal_cas_source, CREATED_AT
+    )
+    removal_cas_location = resolve_journal_location(
+        removal_cas_root,
+        removal_cas_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(removal_cas_journal, removal_cas_location)
+
+    def edit_remove_target(point, effect, direction):
+        if point == "after-source-check" and direction == "forward":
+            (removal_cas_root / effect["path"]).write_bytes(b"concurrent edit\n")
+
+    rejected(
+        lambda: execute_upgrade(
+            removal_cas_plan,
+            removal_cas_location,
+            plan_source_digest=removal_cas_source,
+            updated_at="2026-07-11T00:31:00Z",
+            validate_after=passed_removal_validation,
+            fault_hook=edit_remove_target,
+        ),
+        "transaction-state-mismatch",
+    )
+    assert (removal_cas_root / "legacy-engine/task").read_bytes() == b"concurrent edit\n"
+
+    removal_parent_root = pathlib.Path(temporary) / "removal-parent-workbench"
+    removal_parent_root.mkdir()
+    removal_parent_root = removal_parent_root.resolve()
+    removal_parent_plan, removal_parent_bytes = fixture_removal_plan(
+        removal_parent_root
+    )
+    removal_parent_source = canonical_digest(
+        canonical_bytes(removal_parent_plan), raw=True
+    )
+    removal_parent_journal = build_prepared_journal(
+        removal_parent_plan, removal_parent_source, CREATED_AT
+    )
+    removal_parent_location = resolve_journal_location(
+        removal_parent_root,
+        removal_parent_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(removal_parent_journal, removal_parent_location)
+    removal_detached = removal_parent_root / "legacy-engine-detached"
+    removal_external = pathlib.Path(temporary).resolve() / "removal-external"
+    removal_external.mkdir()
+    (removal_external / "task").write_bytes(b"external sentinel\n")
+
+    def swap_remove_parent(point, _effect, direction):
+        if point != "after-source-check" or direction != "forward":
+            return
+        os.rename(removal_parent_root / "legacy-engine", removal_detached)
+        (removal_parent_root / "legacy-engine").symlink_to(
+            removal_external, target_is_directory=True
+        )
+
+    rejected(
+        lambda: execute_upgrade(
+            removal_parent_plan,
+            removal_parent_location,
+            plan_source_digest=removal_parent_source,
+            updated_at="2026-07-11T00:32:00Z",
+            validate_after=passed_removal_validation,
+            fault_hook=swap_remove_parent,
+        ),
+        "node-parent-unsafe",
+    )
+    assert (removal_detached / "task").read_bytes() == removal_parent_bytes
+    assert (removal_external / "task").read_bytes() == b"external sentinel\n"
+
+    for crash_point in ("after-target-install", "after-temp-unlink"):
+        removal_prefix_root = (
+            pathlib.Path(temporary) / f"remove-{crash_point}-workbench"
+        )
+        removal_prefix_root.mkdir()
+        removal_prefix_root = removal_prefix_root.resolve()
+        removal_prefix_plan, _ = fixture_removal_plan(removal_prefix_root)
+        removal_prefix_source = canonical_digest(
+            canonical_bytes(removal_prefix_plan), raw=True
+        )
+        removal_prefix_journal = build_prepared_journal(
+            removal_prefix_plan, removal_prefix_source, CREATED_AT
+        )
+        removal_prefix_location = resolve_journal_location(
+            removal_prefix_root,
+            removal_prefix_plan["plan_digest"],
+            journal_dir=journal_root,
+            environment={},
+        )
+        install_prepared_journal(
+            removal_prefix_journal, removal_prefix_location
+        )
+
+        def crash_remove_prefix(
+            point, effect, direction, expected=crash_point
+        ):
+            if (
+                point == expected
+                and direction == "forward"
+                and effect["kind"] == "remove"
+            ):
+                raise Crash()
+
+        try:
+            execute_upgrade(
+                removal_prefix_plan,
+                removal_prefix_location,
+                plan_source_digest=removal_prefix_source,
+                updated_at="2026-07-11T00:33:00Z",
+                validate_after=passed_removal_validation,
+                fault_hook=crash_remove_prefix,
+            )
+        except Crash:
+            pass
+        else:
+            raise AssertionError(
+                f"remove {crash_point} did not interrupt execution"
+            )
+        removal_prefix_temp = (
+            removal_prefix_root
+            / removal_prefix_journal["effects"][0]["temp_path"]
+        )
+        if crash_point == "after-target-install":
+            assert removal_prefix_temp.is_file()
+        else:
+            assert not removal_prefix_temp.exists()
+        removal_prefix_result = execute_upgrade(
+            removal_prefix_plan,
+            removal_prefix_location,
+            plan_source_digest=removal_prefix_source,
+            updated_at="2026-07-11T00:34:00Z",
+            validate_after=passed_removal_validation,
+        )
+        assert removal_prefix_result["transaction"]["stage"] == "completed"
+        assert not removal_prefix_temp.exists()
+        assert not (removal_prefix_root / "legacy-engine/task").exists()
+
+    removal_reverse_root = pathlib.Path(temporary) / "remove-reverse-workbench"
+    removal_reverse_root.mkdir()
+    removal_reverse_root = removal_reverse_root.resolve()
+    removal_reverse_plan, removal_reverse_bytes = fixture_removal_plan(
+        removal_reverse_root
+    )
+    removal_reverse_source = canonical_digest(
+        canonical_bytes(removal_reverse_plan), raw=True
+    )
+    removal_reverse_journal = build_prepared_journal(
+        removal_reverse_plan, removal_reverse_source, CREATED_AT
+    )
+    removal_reverse_location = resolve_journal_location(
+        removal_reverse_root,
+        removal_reverse_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    install_prepared_journal(
+        removal_reverse_journal, removal_reverse_location
+    )
+    removal_reverse_failed = False
+
+    def crash_remove_reverse(point, effect, direction):
+        global removal_reverse_failed
+        if (
+            point == "after-effect"
+            and direction == "forward"
+            and effect["kind"] == "remove"
+            and not removal_reverse_failed
+        ):
+            removal_reverse_failed = True
+            raise RuntimeError("start remove rollback")
+        if (
+            point == "after-target-install"
+            and direction == "reverse"
+            and effect["kind"] == "remove"
+        ):
+            raise Crash()
+
+    try:
+        execute_upgrade(
+            removal_reverse_plan,
+            removal_reverse_location,
+            plan_source_digest=removal_reverse_source,
+            updated_at="2026-07-11T00:35:00Z",
+            validate_after=passed_removal_validation,
+            fault_hook=crash_remove_reverse,
+        )
+    except Crash:
+        pass
+    else:
+        raise AssertionError("remove reverse did not interrupt execution")
+    removal_reverse_result = execute_upgrade(
+        removal_reverse_plan,
+        removal_reverse_location,
+        plan_source_digest=removal_reverse_source,
+        updated_at="2026-07-11T00:36:00Z",
+        validate_after=passed_removal_validation,
+    )
+    assert removal_reverse_result["transaction"]["stage"] == "rolled-back"
+    assert (
+        removal_reverse_root / "legacy-engine/task"
+    ).read_bytes() == removal_reverse_bytes
+
+    linked_root = pathlib.Path(temporary) / "linked-workbench"
+    linked_root.mkdir()
+    linked_root = linked_root.resolve()
+    fixture_plan(linked_root)
+    (linked_root / ".git").rmdir()
+    common_git = pathlib.Path(temporary).resolve() / "linked-common.git"
+    worktree_git = common_git / "worktrees/linked-workbench"
+    worktree_git.mkdir(parents=True)
+    (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
+    (worktree_git / "gitdir").write_text(
+        str(linked_root / ".git") + "\n", encoding="utf-8"
+    )
+    (linked_root / ".git").write_text(
+        "gitdir: " + str(worktree_git) + "\n", encoding="utf-8"
+    )
+    linked_location = resolve_journal_location(
+        linked_root,
+        "sha256:" + "e" * 64,
+        journal_dir=journal_root,
+        environment={},
+    )
+    assert worktree_git in linked_location["owner"].parents
+    (worktree_git / "gitdir").write_text(
+        str(pathlib.Path(temporary) / "other/.git") + "\n",
+        encoding="utf-8",
+    )
+    rejected(
+        lambda: resolve_journal_location(
+            linked_root,
+            "sha256:" + "e" * 64,
+            journal_dir=journal_root,
+            environment={},
+        ),
+        "git-directory-unsafe",
     )
 
 print("PASS: deterministic full-preimage upgrade journal preparation")

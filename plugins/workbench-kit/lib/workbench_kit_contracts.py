@@ -1784,10 +1784,13 @@ def validate_effect(value: Any, journal_id: str) -> dict[str, Any]:
         if source_digest != expected_source:
             fail("effect.artifact_source_digest")
     else:
+        parent = pathlib.PurePosixPath(path).parent.as_posix()
+        name = f".workbench-kit.{journal_id}.{effect['effect_id']}.tmp"
+        expected_temp = name if parent == "." else f"{parent}/{name}"
         if (
             before["node_type"] not in ("file", "symlink")
             or after["node_type"] != "absent"
-            or effect["temp_path"] is not None
+            or effect["temp_path"] != expected_temp
             or source_digest is not None
         ):
             fail("effect.remove")

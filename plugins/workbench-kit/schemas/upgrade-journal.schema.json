@@ -103,7 +103,31 @@
         "after": { "$ref": "#/$defs/nodeImage" },
         "artifact_source_digest": { "$ref": "#/$defs/nullableDigest" },
         "equivalence_receipt_ref": { "type": ["string", "null"] }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "const": "ensure-directory" } },
+            "required": ["kind"]
+          },
+          "then": { "properties": { "temp_path": { "type": "null" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "enum": ["create", "update", "remove"] }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "temp_path": {
+                "$ref": "upgrade-plan.schema.json#/$defs/path"
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

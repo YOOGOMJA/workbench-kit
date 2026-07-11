@@ -54,5 +54,14 @@ assert generation["properties"]["embedded_engine"]["properties"]["state"] == {
     "const": "absent"
 }
 
+journal = json.loads((schema_dir / "upgrade-journal.schema.json").read_bytes())
+effect = journal["$defs"]["effect"]
+assert effect["allOf"][0]["then"]["properties"]["temp_path"] == {
+    "type": "null"
+}
+assert effect["allOf"][1]["then"]["properties"]["temp_path"] == {
+    "$ref": "upgrade-plan.schema.json#/$defs/path"
+}
+
 print("PASS: published upgrade JSON schemas are closed and discoverable")
 PY
