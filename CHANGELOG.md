@@ -21,6 +21,12 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   workbench/profile compatibility adapter, profile-bound product language,
   caller-contained strict JSON state, and deterministic product, scenario, and portfolio
   validation (#28). Marketplace registration remains follow-up work.
+- **Policy-aware v2 task lifecycle** — the `workbench` plugin now discovers explicit
+  workspace/profile contracts and manages opaque task refs, multiple deliverables,
+  required checks, revision-bound evidence, policy authorization, harvest disposition,
+  terminal completion or abandonment, coordinated multi-repo writer claims, legacy-writer
+  projection, governed cleanup, readiness diagnosis, and a canonical installed-engine
+  manifest while retaining v1 task flows (#26).
 - **Frozen released-section guard** — a CI `changelog-frozen` job
   (`scripts/check-changelog-section.sh`) fails any PR that adds a CHANGELOG entry under an
   already-released `## [X.Y.Z]` section instead of `## [Unreleased]`, so an in-flight PR

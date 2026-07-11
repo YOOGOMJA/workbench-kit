@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Public, read-only workbench kernel capability discovery.
+set -euo pipefail
+
+state_error() { echo "error: $*" >&2; exit 1; }
+usage_error() { echo "error: $*" >&2; exit 2; }
+
+require_contract_python() {
+  command -v python3 >/dev/null 2>&1 \
+    && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1 \
+    || state_error "Python 3.9 or newer is required for workbench contract commands"
+}
+
+workspace_root() {
+  git rev-parse --show-toplevel 2>/dev/null || state_error "workbench git repository not found"
+}
+
+workspace_contract() {
+  local root="$1" marker helper
+  marker="$root/.workbench/schema"
+  if [ ! -e "$marker" ]; then
+    WORKSPACE_SCHEMA="workbench/v1"
+    WORKSPACE_SOURCE="implicit"
+    return 0
+  fi
+  [ -f "$marker" ] || usage_error "invalid workspace schema marker: $marker"
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  WORKSPACE_SCHEMA="$(python3 "$helper" schema "$marker")" \
+    || usage_error "invalid workspace schema marker: $marker"
+  WORKSPACE_SOURCE="marker"
+}
+
+cmd_show() {
+  local format="" root profile_util profile_json helper plugin_root manifest_helper engine_version
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ "$format" = json ] || usage_error "unsupported format: ${format:-none} (expected json)"
+  require_contract_python
+  root="$(workspace_root)"
+  workspace_contract "$root"
+  profile_util="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/profile"
+  [ -x "$profile_util" ] || state_error "profile reader not installed: $profile_util"
+  profile_json="$("$profile_util" show --format json)"
+  plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  helper="$plugin_root/lib/workbench_contract.py"
+  manifest_helper="$plugin_root/lib/workbench_manifest.py"
+  engine_version="$(python3 "$manifest_helper" version --plugin-root "$plugin_root")" \
+    || state_error "installed plugin metadata is invalid"
+  python3 "$helper" contract --root "$root" --schema "$WORKSPACE_SCHEMA" \
+    --source "$WORKSPACE_SOURCE" --profile-json "$profile_json" --engine-version "$engine_version"
+}
+
+case "${1:-}" in
+  show) shift; cmd_show "$@" ;;
+  *) usage_error "usage: workbench contract show --format json" ;;
+esac

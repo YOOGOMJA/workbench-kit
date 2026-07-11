@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Public, read-only manifest for the installed workbench engine bundle.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+state_error() { echo "error: $*" >&2; exit 1; }
+usage_error() { echo "error: $*" >&2; exit 2; }
+
+require_python() {
+  command -v python3 >/dev/null 2>&1 \
+    && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1 \
+    || state_error "Python 3.9 or newer is required for workbench engine-manifest"
+}
+
+cmd_show() {
+  local format=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ "$format" = json ] || usage_error "unsupported format: ${format:-none} (expected json)"
+  require_python
+  python3 "$ROOT/lib/workbench_manifest.py" show --plugin-root "$ROOT"
+}
+
+case "${1:-}" in
+  show) shift; cmd_show "$@" ;;
+  *) usage_error "usage: workbench engine-manifest show --format json" ;;
+esac

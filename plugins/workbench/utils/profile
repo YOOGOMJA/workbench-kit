@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Read the tracked machine profile. Narrative files are intentionally ignored.
+set -euo pipefail
+
+state_error() { echo "error: $*" >&2; exit 1; }
+usage_error() { echo "error: $*" >&2; exit 2; }
+
+require_contract_python() {
+  command -v python3 >/dev/null 2>&1 \
+    && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1 \
+    || state_error "Python 3.9 or newer is required for workbench contract commands"
+}
+
+workspace_root() {
+  git rev-parse --show-toplevel 2>/dev/null || state_error "workbench git repository not found"
+}
+
+workspace_schema() {
+  local root="$1" marker helper
+  marker="$root/.workbench/schema"
+  if [ ! -e "$marker" ]; then printf '%s\n' workbench/v1; return; fi
+  [ -f "$marker" ] || usage_error "invalid workspace schema marker: $marker"
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  python3 "$helper" schema "$marker" || usage_error "invalid workspace schema marker"
+}
+
+read_profile() {
+  local file="$1" line key value schema="" language="" seen_schema="" seen_language="" lineno=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in
+      *=*) key="${line%%=*}"; value="${line#*=}" ;;
+      *) state_error "invalid profile line $lineno" ;;
+    esac
+    case "$key" in
+      schema)
+        [ -z "$seen_schema" ] || state_error "duplicate profile key: schema"
+        seen_schema=1; schema="$value"
+        ;;
+      language)
+        [ -z "$seen_language" ] || state_error "duplicate profile key: language"
+        seen_language=1; language="$value"
+        ;;
+      *) state_error "unknown profile key: $key" ;;
+    esac
+  done < "$file"
+  [ "$schema" = workbench-profile/v1 ] || state_error "profile schema must be workbench-profile/v1"
+  [ -n "$language" ] || state_error "profile language is required"
+  local helper
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  python3 "$helper" validate-language "$language" \
+    || state_error "profile language must be a well-formed ASCII BCP 47 tag"
+  PROFILE_LANGUAGE="$language"
+}
+
+cmd_show() {
+  local format="" root schema file helper
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ "$format" = json ] || usage_error "unsupported format: ${format:-none} (expected json)"
+  require_contract_python
+  root="$(workspace_root)"; schema="$(workspace_schema "$root")"
+  file="$root/.workbench/profile.conf"
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  if [ ! -e "$file" ]; then
+    [ "$schema" = workbench/v1 ] \
+      || state_error "v2 workspace requires tracked .workbench/profile.conf"
+    python3 "$helper" profile --source unavailable
+    return 0
+  fi
+  [ "$schema" = workbench/v2 ] || state_error "workspace profile requires workbench/v2"
+  [ -f "$file" ] || state_error "invalid profile path: $file"
+  read_profile "$file"
+  python3 "$helper" profile --source workspace --language "$PROFILE_LANGUAGE"
+}
+
+case "${1:-}" in
+  show) shift; cmd_show "$@" ;;
+  *) usage_error "usage: workbench profile show --format json" ;;
+esac
