@@ -22,7 +22,7 @@
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
       "not": { "pattern": "^[0-9]+$" }
     },
-    "language": { "$ref": "upgrade-plan.schema.json#/$defs/language" },
+    "language": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/language" },
     "authority_descriptor_digest": { "$ref": "#/$defs/digest" },
     "embedded_engine": {
       "type": "object",

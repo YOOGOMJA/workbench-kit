@@ -33,7 +33,7 @@
         "contract_version": { "const": "workbench-workspace-authority/v1" },
         "authority_identity": { "type": "string", "minLength": 1 },
         "origin_url": { "type": "string", "minLength": 1 },
-        "default_ref": { "type": "string", "pattern": "^refs/heads/[A-Za-z0-9._/-]+$" },
+        "default_ref": { "type": "string", "pattern": "^(?!.*//)(?!.*(?:^|/)\\.\\.(?:/|$))refs/heads/[A-Za-z0-9._/-]+$" },
         "workspace_home": {
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",

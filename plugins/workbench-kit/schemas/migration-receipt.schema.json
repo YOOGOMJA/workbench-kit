@@ -29,9 +29,9 @@
       "type": "string",
       "pattern": "^git-tree:(?:[0-9a-f]{40}|[0-9a-f]{64})$"
     },
-    "planner": { "$ref": "upgrade-plan.schema.json#/$defs/planner" },
-    "migration_task": { "$ref": "upgrade-plan.schema.json#/$defs/migrationTask" },
-    "language": { "$ref": "upgrade-plan.schema.json#/$defs/language" },
+    "planner": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/planner" },
+    "migration_task": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/migrationTask" },
+    "language": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/language" },
     "authority_approval_object_digest": { "$ref": "#/$defs/digest" },
     "authority_approval_source_digest": { "$ref": "#/$defs/digest" },
     "reviewed_overlay_object_digest": { "$ref": "#/$defs/nullableDigest" },
@@ -39,7 +39,7 @@
     "legacy_inventory_object_digest": { "$ref": "#/$defs/digest" },
     "legacy_inventory_source_digest": { "$ref": "#/$defs/digest" },
     "active_v1_tasks_digest": { "$ref": "#/$defs/digest" },
-    "embedded_engine": { "$ref": "upgrade-plan.schema.json#/$defs/embedded" },
+    "embedded_engine": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/embedded" },
     "artifacts": {
       "type": "array",
       "items": { "$ref": "#/$defs/artifactNode" }

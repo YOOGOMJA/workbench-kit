@@ -2,12 +2,22 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" <<'PY'
+command -v uv >/dev/null || {
+  echo "uv is required for Draft 2020-12 schema validation" >&2
+  exit 1
+}
+PYTHONDONTWRITEBYTECODE=1 uv run --quiet \
+  --with-requirements "$ROOT/tests/requirements-schema.txt" \
+  python3 - "$ROOT/lib" "$ROOT/schemas" <<'PY'
 import base64
 import copy
 import hashlib
 import json
+import pathlib
 import sys
+
+from jsonschema import Draft202012Validator, FormatChecker
+from referencing import Registry, Resource
 
 sys.path.insert(0, sys.argv[1])
 from workbench_kit_contracts import (
@@ -32,6 +42,34 @@ from workbench_kit_contracts import (
 
 SHA = "sha256:" + "a" * 64
 OID = "1" * 40
+schema_dir = pathlib.Path(sys.argv[2])
+schema_documents = {
+    path.name: json.loads(path.read_bytes())
+    for path in schema_dir.glob("*.schema.json")
+}
+schema_registry = Registry().with_resources(
+    (document["$id"], Resource.from_contents(document))
+    for document in schema_documents.values()
+)
+
+
+def schema_accepts(filename, value):
+    validator = Draft202012Validator(
+        schema_documents[filename],
+        registry=schema_registry,
+        format_checker=FormatChecker(),
+    )
+    errors = list(validator.iter_errors(value))
+    assert not errors, (filename, errors[0].json_path, errors[0].message)
+
+
+def schema_rejects(filename, value):
+    validator = Draft202012Validator(
+        schema_documents[filename],
+        registry=schema_registry,
+        format_checker=FormatChecker(),
+    )
+    assert list(validator.iter_errors(value)), filename
 
 unordered = {"z": 1, "a": {"y": 2, "b": 3}}
 reordered = {"a": {"b": 3, "y": 2}, "z": 1}
@@ -1024,5 +1062,36 @@ bad["completion_result"]["result_digest"] = canonical_digest(
 )
 rejected(lambda: validate_journal(bad))
 
+for filename, document in (
+    ("bootstrap-authority-approval.schema.json", authority),
+    ("generation-receipt.schema.json", generation_receipt),
+    ("generator-receipt.schema.json", generator),
+    ("migration-receipt.schema.json", migration_receipt),
+    ("plugin-equivalence.schema.json", equivalence),
+    ("removal-approval.schema.json", removal),
+    ("upgrade-plan.schema.json", changed),
+    ("upgrade-result.schema.json", result),
+    ("upgrade-journal.schema.json", journal),
+):
+    schema_accepts(filename, document)
+
+bad_schema_plan = copy.deepcopy(changed)
+bad_schema_plan["changed"] = False
+schema_rejects("upgrade-plan.schema.json", bad_schema_plan)
+bad_schema_plan = copy.deepcopy(changed)
+bad_schema_plan["actionable"] = False
+schema_rejects("upgrade-plan.schema.json", bad_schema_plan)
+bad_schema_journal = copy.deepcopy(journal)
+bad_schema_journal["direction"] = "none"
+schema_rejects("upgrade-journal.schema.json", bad_schema_journal)
+bad_schema_result = copy.deepcopy(result)
+bad_schema_result["changed"] = False
+schema_rejects("upgrade-result.schema.json", bad_schema_result)
+
 print("PASS: strict migration schemas and canonical digests")
 PY
+
+if find "$ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi

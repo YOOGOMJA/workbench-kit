@@ -170,3 +170,8 @@ rejected(lambda: compose_agents(receipt, b"missing-final-lf"))
 
 print("PASS: deterministic structured merges and v2 rendering")
 PY
+
+if find "$ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi

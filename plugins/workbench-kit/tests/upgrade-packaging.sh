@@ -104,3 +104,8 @@ bash "$REPO_ROOT/tests/check-skill-frontmatter.sh"
 "$PLUGIN_ROOT/bin/workbench-kit" --help | grep -q 'upgrade-workbench'
 
 echo "PASS: packaged upgrade CLI, skill, contracts, and fail-closed runtime inventory"
+
+if find "$PLUGIN_ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi

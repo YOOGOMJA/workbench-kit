@@ -243,3 +243,8 @@ for metadata_path in sorted(FIXTURE_ROOT.glob("*/fixture.json")):
 
 print("PASS: filesystem upgrade classification and migration route fixtures")
 PY
+
+if find "$KIT_ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi

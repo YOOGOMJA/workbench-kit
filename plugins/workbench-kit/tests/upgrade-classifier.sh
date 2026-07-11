@@ -503,3 +503,8 @@ with tempfile.TemporaryDirectory(prefix="workbench-classifier-") as temporary:
 
 print("PASS: closed workspace classifier and provenance lifecycle")
 PY
+
+if find "$ROOT" -type d -name __pycache__ -print -quit | grep -q .; then
+  echo "Python bytecode cache escaped upgrade tests" >&2
+  exit 1
+fi
