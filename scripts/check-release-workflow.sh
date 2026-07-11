@@ -36,11 +36,21 @@ if ci.index("- name: Set up uv") > ci.index("bash tests/run.sh"):
 preflight = 'bash scripts/release-preflight.sh "${{ steps.rel.outputs.version }}"'
 publish = 'gh release create "v${{ steps.rel.outputs.version }}"'
 tag_check = 'git rev-parse "refs/tags/v$V^{commit}"'
-release_check = "gh release view \"v$V\" --json tagName,targetCommitish,isDraft,isPrerelease"
-for item in (preflight, publish, tag_check, release_check):
+release_check = (
+    'gh release view "v$V" --json '
+    'tagName,targetCommitish,isDraft,isPrerelease,body'
+)
+notes_check = 'pathlib.Path("notes.md").read_text'
+for item in (preflight, publish, tag_check, release_check, notes_check):
     if item not in release:
         raise SystemExit(f"release workflow is missing gate item: {item}")
-if not release.index(preflight) < release.index(publish) < release.index(tag_check):
+if not (
+    release.index(preflight)
+    < release.index(publish)
+    < release.rindex(tag_check)
+    < release.rindex(release_check)
+    < release.rindex(notes_check)
+):
     raise SystemExit("release workflow gate order is invalid")
 PY
 

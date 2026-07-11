@@ -43,21 +43,31 @@ jobs:
           )"
           echo "version=$V"
           if git rev-parse "refs/tags/v$V" >/dev/null 2>&1; then
-            RELEASE="$(gh release view "v$V" --json tagName,isDraft,isPrerelease)" || {
+            bash scripts/check-release-contract.sh "$V" notes.md
+            TAG_COMMIT="$(git rev-parse "refs/tags/v$V^{commit}")"
+            RELEASE="$(gh release view "v$V" --json tagName,targetCommitish,isDraft,isPrerelease,body)" || {
               echo "v$V exists without a readable GitHub Release" >&2
               exit 1
             }
-            python3 - "$V" "$RELEASE" <<'PY'
+            python3 - "$V" "$TAG_COMMIT" "$RELEASE" <<'PY'
           import json
+          import pathlib
           import sys
 
-          version, raw = sys.argv[1:]
+          version, revision, raw = sys.argv[1:]
           value = json.loads(raw)
-          assert value == {
+          release_body = value.pop("body", None)
+          expected = {
               "tagName": "v" + version,
+              "targetCommitish": revision,
               "isDraft": False,
               "isPrerelease": False,
-          }, value
+          }
+          if value != expected:
+              raise SystemExit(f"published release metadata mismatch: {value!r}")
+          notes = pathlib.Path("notes.md").read_text(encoding="utf-8").rstrip("\r\n")
+          if not isinstance(release_body, str) or release_body.rstrip("\r\n") != notes:
+              raise SystemExit("published release notes do not match CHANGELOG")
           PY
             echo "v$V is already published"
             echo "go=false" >> "$GITHUB_OUTPUT"
@@ -98,17 +108,24 @@ jobs:
             echo "v$V points to $TAG_COMMIT, expected $GITHUB_SHA" >&2
             exit 1
           }
-          RELEASE="$(gh release view "v$V" --json tagName,targetCommitish,isDraft,isPrerelease)"
+          RELEASE="$(gh release view "v$V" --json tagName,targetCommitish,isDraft,isPrerelease,body)"
           python3 - "$V" "$GITHUB_SHA" "$RELEASE" <<'PY'
           import json
+          import pathlib
           import sys
 
           version, revision, raw = sys.argv[1:]
           value = json.loads(raw)
-          assert value == {
+          release_body = value.pop("body", None)
+          expected = {
               "tagName": "v" + version,
               "targetCommitish": revision,
               "isDraft": False,
               "isPrerelease": False,
-          }, value
+          }
+          if value != expected:
+              raise SystemExit(f"published release metadata mismatch: {value!r}")
+          notes = pathlib.Path("notes.md").read_text(encoding="utf-8").rstrip("\r\n")
+          if not isinstance(release_body, str) or release_body.rstrip("\r\n") != notes:
+              raise SystemExit("published release notes do not match CHANGELOG")
           PY

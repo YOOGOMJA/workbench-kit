@@ -67,11 +67,28 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
-text = text.replace("git rev-parse \"refs/tags/v$V^{commit}\"", "printf removed-tag-check", 1)
+text = text.replace("git rev-parse \"refs/tags/v$V^{commit}\"", "printf removed-tag-check")
 path.write_text(text)
 PY
 if bash "$CHECKER" "$TMP/ci.yml" "$TMP/release.yml" >/dev/null 2>&1; then
   fail "release checker accepted publication without post-tag verification"
+fi
+
+cp "$ROOT/.github/workflows/release.yml" "$TMP/release.yml"
+python3 - "$TMP/release.yml" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+text = text.replace(
+    "tagName,targetCommitish,isDraft,isPrerelease,body",
+    "tagName,targetCommitish,isDraft,isPrerelease",
+)
+path.write_text(text)
+PY
+if bash "$CHECKER" "$TMP/ci.yml" "$TMP/release.yml" >/dev/null 2>&1; then
+  fail "release checker accepted publication without release-note verification"
 fi
 
 echo "PASS release gate contract"
