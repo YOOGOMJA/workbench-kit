@@ -412,6 +412,12 @@ def load_operation(file: str) -> Dict[str, Any]:
         or worktree_digest is None
     ):
         raise ValueError("consumed writer operation requires every owned effect")
+    if value["stage"] == "handoff-ready" and (
+        value["effect_owner_state"] != "released"
+        or value["worktree_ownership"] != "none"
+        or value["repo_record_ownership"] != "none"
+    ):
+        raise ValueError("handoff-ready writer operation cannot retain local effects")
     return value
 
 
@@ -919,6 +925,14 @@ def local_writer_effects_match(operation_path: str, operation: Mapping[str, Any]
     codebase_branch = "task/{}{}-{}".format(parent + "/" if parent else "", issue, slug)
     expected_repo_row = "- {} | {} | work".format(operation["owner"], codebase_branch)
     index_lines = index.read_text(encoding="utf-8").splitlines()
+    row_path = task_root / "task/.workbench/writer-rows/{}.record".format(operation["owner"])
+    worktree = task_root / operation["expected_path"]
+    if operation["stage"] == "handoff-ready":
+        return (
+            index_lines.count(expected_repo_row) == 0
+            and not row_path.exists()
+            and not worktree.exists()
+        )
     if index_lines.count(expected_repo_row) != 1:
         return False
     row_fields = (
@@ -938,7 +952,7 @@ def local_writer_effects_match(operation_path: str, operation: Mapping[str, Any]
         "authorization_ref",
     )
     row = ordered_record(
-        task_root / "task/.workbench/writer-rows/{}.record".format(operation["owner"]),
+        row_path,
         row_fields,
     )
     policy = operation["policy_manifest"]
@@ -960,12 +974,9 @@ def local_writer_effects_match(operation_path: str, operation: Mapping[str, Any]
     }
     if row != expected_row:
         return False
-    if operation["stage"] == "handoff-ready":
-        return not (task_root / operation["expected_path"]).exists()
     if operation["stage"] != "consumed":
         return True
 
-    worktree = task_root / operation["expected_path"]
     cache = workspace / ".codebases" / operation["owner"]
     if not worktree.is_dir() or not cache.is_dir():
         return False
@@ -992,6 +1003,167 @@ def local_writer_effects_match(operation_path: str, operation: Mapping[str, Any]
         "codebase_origin_url": operation["codebase_origin_url"],
     }
     return tuple(marker) == tuple(expected_marker) and marker == expected_marker
+
+
+def operation_local_facts(operation_path: str, operation: Mapping[str, Any]) -> Dict[str, Any]:
+    path = Path(operation_path).resolve()
+    if (
+        path.parent.name != "writer-operations"
+        or path.parent.parent.name != ".workbench"
+        or path.parent.parent.parent.name != "task"
+    ):
+        raise ValueError("writer operation is outside a task state directory")
+    task_root = path.parents[3]
+    if task_root.parent.name != ".worktrees":
+        raise ValueError("writer operation task workspace is not canonical")
+    workspace = task_root.parent.parent
+    index = task_root / "task/index.md"
+    frontmatter = task_frontmatter(index)
+    if (
+        frontmatter.get("claim_id") != operation["task_claim_id"]
+        or frontmatter.get("branch") != operation["branch"]
+    ):
+        raise ValueError("writer operation does not bind the current task")
+    issue = frontmatter.get("issue", "")
+    slug = frontmatter.get("slug", "")
+    parent = frontmatter.get("parent", "")
+    if not issue.isdigit() or not slug:
+        raise ValueError("writer operation task identity is malformed")
+    codebase_branch = "task/{}{}-{}".format(parent + "/" if parent else "", issue, slug)
+    expected_row = "- {} | {} | work".format(operation["owner"], codebase_branch)
+    row_count = index.read_text(encoding="utf-8").splitlines().count(expected_row)
+    row_path = task_root / "task/.workbench/writer-rows/{}.record".format(operation["owner"])
+    worktree = task_root / operation["expected_path"]
+    cache = workspace / ".codebases" / operation["owner"]
+    attached = False
+    if cache.is_dir():
+        raw = subprocess.check_output(
+            ["git", "-C", str(cache), "worktree", "list", "--porcelain", "-z"],
+            stderr=subprocess.DEVNULL,
+        )
+        for block in raw.split(b"\0\0"):
+            fields: Dict[bytes, bytes] = {}
+            for item in block.strip(b"\0").split(b"\0"):
+                if not item:
+                    continue
+                key, _, value = item.partition(b" ")
+                if key in fields:
+                    raise ValueError("duplicate worktree porcelain field")
+                fields[key] = value
+            candidate = fields.get(b"worktree")
+            branch = fields.get(b"branch")
+            if (
+                candidate is not None
+                and os.path.realpath(os.fsdecode(candidate)) == os.path.realpath(worktree)
+            ) or branch == ("refs/heads/" + codebase_branch).encode("utf-8"):
+                attached = True
+    return {
+        "worktree_present": worktree.exists() or worktree.is_symlink(),
+        "worktree_attached": attached,
+        "repo_record_present": row_path.exists() or row_path.is_symlink(),
+        "repo_index_rows": row_count,
+    }
+
+
+def operation_remote_state(
+    rows: Sequence[Mapping[str, str]], operation: Mapping[str, Any]
+) -> Tuple[str, Optional[Dict[str, str]]]:
+    claims = [
+        row
+        for row in rows
+        if row["kind"] == "claim"
+        and row["operation_id"] == operation["operation_id"]
+        and row["claim_id"] == operation["claim_id"]
+    ]
+    expected = operation_claim_binding(operation)
+    if any(any(row[key] != item for key, item in expected.items()) for row in claims):
+        raise ValueError("writer claim does not join the exact local operation")
+    effects = [
+        row
+        for row in rows
+        if row["kind"] == "effect-owner"
+        and row["operation_id"] == operation["operation_id"]
+        and row["claim_id"] == operation["claim_id"]
+    ]
+    return current_claim_state(claims), latest_effect(effects)
+
+
+def cmd_operation_status(args: argparse.Namespace) -> None:
+    operation = load_operation(args.operation_file)
+    rows, _ = read_ledger(args.ledger_file)
+    claim_state, effect = operation_remote_state(rows, operation)
+    local = operation_local_facts(args.operation_file, operation)
+    no_local_effect = (
+        not local["worktree_present"]
+        and not local["worktree_attached"]
+        and not local["repo_record_present"]
+        and local["repo_index_rows"] == 0
+    )
+    cancellable = (
+        operation["stage"] in ("prepared", "authorization-pending", "cancelled")
+        and claim_state == "absent"
+        and effect is None
+        and no_local_effect
+    )
+    blockers: List[Dict[str, str]] = []
+    if not cancellable and operation["stage"] != "cancelled":
+        blockers.append(
+            {"code": "writer-cancel-has-effects", "ref": operation["operation_id"]}
+        )
+    write_json(
+        {
+            "contract_version": "workbench-writer-operation-status/v1",
+            "operation": operation,
+            "remote_claim_state": claim_state,
+            "effect_owner": effect,
+            "local_effects": local,
+            "cancellable": cancellable,
+            "blockers": blockers,
+        }
+    )
+
+
+def cmd_operation_handoff(args: argparse.Namespace) -> None:
+    operation = load_operation(args.operation_file)
+    rows, _ = read_ledger(args.ledger_file)
+    claim_state, effect = operation_remote_state(rows, operation)
+    if (
+        operation["stage"] != "compensation-pending"
+        or operation["compensation_target"] != "reserved"
+        or operation["compensation_reason"] != "handoff"
+        or operation["compensation_next_step"] != "finish"
+        or operation["effect_owner_state"] != "released"
+        or operation["worktree_ownership"] != "none"
+        or operation["repo_record_ownership"] != "none"
+        or claim_state != "active"
+        or effect is None
+        or effect["state"] != "released"
+        or effect["device_id"] != operation["device_id"]
+        or effect["clone_id"] != operation["clone_id"]
+    ):
+        raise ValueError("writer handoff preconditions do not reconcile")
+    local = operation_local_facts(args.operation_file, operation)
+    if (
+        local["worktree_present"]
+        or local["worktree_attached"]
+        or local["repo_record_present"]
+        or local["repo_index_rows"] != 0
+    ):
+        raise ValueError("writer handoff still has local effects")
+    require_text(args.to_device_id, "to_device_id")
+    if UUID.fullmatch(args.to_clone_id) is None:
+        raise ValueError("to_clone_id must be a lowercase UUID")
+    operation["device_id"] = args.to_device_id
+    operation["clone_id"] = args.to_clone_id
+    operation["stage"] = "handoff-ready"
+    operation["compensation_target"] = None
+    operation["compensation_reason"] = None
+    operation["compensation_next_step"] = None
+    ordered = {field: operation[field] for field in OPERATION_FIELDS}
+    with open(args.output, "w", encoding="utf-8") as handle:
+        json.dump(ordered, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    load_operation(args.output)
 
 
 def cmd_status_projection(args: argparse.Namespace) -> None:
@@ -1224,10 +1396,20 @@ def cmd_worktree_set(args: argparse.Namespace) -> None:
     ):
         if not value or any(char in value for char in ("\t", "\r", "\n")):
             raise ValueError("{} cannot be represented canonically".format(field))
-    if expected_path in {item["path"] for item in records}:
-        raise ValueError("expected worktree path is not absent")
-    if args.expected_branch in {item["branch"] for item in records}:
-        raise ValueError("expected worktree branch is not absent")
+    matching = [
+        item
+        for item in records
+        if item["path"] == expected_path or item["branch"] == args.expected_branch
+    ]
+    if args.recover_present:
+        if len(matching) != 1 or matching[0] != {
+            "path": expected_path,
+            "branch": args.expected_branch,
+        }:
+            raise ValueError("expected recovery worktree is not an exact single attachment")
+        records = [item for item in records if item is not matching[0]]
+    elif matching:
+        raise ValueError("expected worktree path or branch is not absent")
     rows = ["workbench-worktree-set/v1\n"]
     for item in sorted(records, key=lambda value: (value["path"], value["branch"] or "")):
         path = item["path"]
@@ -1267,12 +1449,24 @@ def parser() -> argparse.ArgumentParser:
     operation.add_argument("file")
     operation.add_argument("--format", choices=("json", "shell"), required=True)
     operation.set_defaults(func=cmd_operation)
+    operation_status = commands.add_parser("operation-status")
+    operation_status.add_argument("--operation-file", required=True)
+    operation_status.add_argument("--ledger-file", required=True)
+    operation_status.set_defaults(func=cmd_operation_status)
+    operation_handoff = commands.add_parser("operation-handoff")
+    operation_handoff.add_argument("--operation-file", required=True)
+    operation_handoff.add_argument("--ledger-file", required=True)
+    operation_handoff.add_argument("--to-device-id", required=True)
+    operation_handoff.add_argument("--to-clone-id", required=True)
+    operation_handoff.add_argument("--output", required=True)
+    operation_handoff.set_defaults(func=cmd_operation_handoff)
     worktree_set = commands.add_parser("worktree-set")
     worktree_set.add_argument("--porcelain-file", required=True)
     worktree_set.add_argument("--common-git-dir", required=True)
     worktree_set.add_argument("--origin-url", required=True)
     worktree_set.add_argument("--expected-path", required=True)
     worktree_set.add_argument("--expected-branch", required=True)
+    worktree_set.add_argument("--recover-present", action="store_true")
     worktree_set.add_argument("--format", choices=("digest", "manifest"), required=True)
     worktree_set.set_defaults(func=cmd_worktree_set)
 

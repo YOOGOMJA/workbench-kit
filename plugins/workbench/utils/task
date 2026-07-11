@@ -5,6 +5,7 @@
 #
 #   workbench task start <ID> [slug] [--parent N]    task 시작 (워크트리 + 스캐폴드)
 #   workbench task add-repo <name> [--ref <base>] [--role work|reference]
+#   workbench task writer-operation show|cancel|handoff --operation-id ID --format json
 #   workbench task resume <ID> [--parent N]          다른 기기에서 task 재구성
 #   workbench task submit --title <t> --body-file <f>   task/ cleanup 커밋 + push + PR
 #   workbench task done <ID> [--parent N] [--force]  워크트리·브랜치 정리 (티켓은 건드리지 않음)
@@ -1099,17 +1100,23 @@ else:
 mint_writer_operation_id() { printf 'wop_%s_%s_%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "${RANDOM:-0}"; }
 
 writer_runtime_identity() {
-  local root="$1" common dir seed
+  local root="$1" common dir seed tmp
   common="$(git -C "$root" rev-parse --git-common-dir)"
   common="$(cd "$root" && cd "$common" && pwd)"; dir="$common/workbench-v2"
   mkdir -p "$dir"
   if [ ! -f "$dir/device-id" ]; then
     seed="$(hostname 2>/dev/null || printf local)@$common"
+    tmp="$dir/device-id.tmp.$$.$RANDOM"
     printf 'device:local/%s\n' "$(printf '%s' "$seed" | shasum -a 256 | awk '{print substr($1,1,24)}')" \
-      > "$dir/device-id"
+      > "$tmp"
+    ln "$tmp" "$dir/device-id" 2>/dev/null || true
+    rm -f "$tmp"
   fi
   if [ ! -f "$dir/clone-id" ]; then
-    python3 -c 'import uuid; print(uuid.uuid4())' > "$dir/clone-id"
+    tmp="$dir/clone-id.tmp.$$.$RANDOM"
+    python3 -c 'import uuid; print(uuid.uuid4())' > "$tmp"
+    ln "$tmp" "$dir/clone-id" 2>/dev/null || true
+    rm -f "$tmp"
   fi
   WRITER_DEVICE_ID="$(cat "$dir/device-id")"; WRITER_CLONE_ID="$(cat "$dir/clone-id")"
   require_single_line device_id "$WRITER_DEVICE_ID"; require_single_line clone_id "$WRITER_CLONE_ID"
@@ -1126,9 +1133,12 @@ writer_load_operation_final() {
   local file="$1" output line key value
   output="$(python3 "$(writer_helper)" operation "$file" --format shell)" || return 1
   WRITER_OPERATION_ID=""; WRITER_CLAIM_ID=""; WRITER_OPERATION_STAGE=""
+  WRITER_OPERATION_TASK_CLAIM_ID=""; WRITER_OPERATION_EXPECTED_PATH=""
   WRITER_OPERATION_ACTION=""; WRITER_OPERATION_INTENT=""; WRITER_OPERATION_MANIFEST=""
   WRITER_OPERATION_AUTHORIZATION=""; WRITER_OPERATION_COORDINATION_OID=""
+  WRITER_OPERATION_EFFECT_OWNER_STATE=""
   WRITER_OPERATION_WORKTREE_OWNERSHIP=""; WRITER_OPERATION_RECORD_OWNERSHIP=""
+  WRITER_OPERATION_WORKTREE_SET_DIGEST=""
   WRITER_OPERATION_REGISTRY_REVISION=""; WRITER_OPERATION_REGISTRY_DIGEST=""
   WRITER_OWNER=""; WRITER_CODEBASE_BRANCH=""; WRITER_CODEBASE_ORIGIN=""
   WRITER_CONTEXT_DIGEST=""; WRITER_DEVICE_ID=""; WRITER_CLONE_ID=""
@@ -1136,7 +1146,9 @@ writer_load_operation_final() {
     key="${line%%=*}"; value="${line#*=}"
     case "$key" in
       operation_id) WRITER_OPERATION_ID="$value" ;; claim_id) WRITER_CLAIM_ID="$value" ;;
+      task_claim_id) WRITER_OPERATION_TASK_CLAIM_ID="$value" ;;
       owner) WRITER_OWNER="$value" ;; branch) WRITER_CODEBASE_BRANCH="$value" ;;
+      expected_path) WRITER_OPERATION_EXPECTED_PATH="$value" ;;
       codebase_origin_url) WRITER_CODEBASE_ORIGIN="$value" ;;
       registry_revision) WRITER_OPERATION_REGISTRY_REVISION="$value" ;;
       registry_digest) WRITER_OPERATION_REGISTRY_DIGEST="$value" ;;
@@ -1145,9 +1157,11 @@ writer_load_operation_final() {
       stage) WRITER_OPERATION_STAGE="$value" ;; action_instance_id) WRITER_OPERATION_ACTION="$value" ;;
       intent_digest) WRITER_OPERATION_INTENT="$value" ;; policy_manifest) WRITER_OPERATION_POLICY_JSON="$value" ;;
       authorization_ref) WRITER_OPERATION_AUTHORIZATION="$value" ;;
+      effect_owner_state) WRITER_OPERATION_EFFECT_OWNER_STATE="$value" ;;
       coordination_oid) WRITER_OPERATION_COORDINATION_OID="$value" ;;
       worktree_ownership) WRITER_OPERATION_WORKTREE_OWNERSHIP="$value" ;;
       repo_record_ownership) WRITER_OPERATION_RECORD_OWNERSHIP="$value" ;;
+      worktree_set_digest) WRITER_OPERATION_WORKTREE_SET_DIGEST="$value" ;;
     esac
   done <<< "$output"
   if [ -n "${WRITER_OPERATION_POLICY_JSON:-}" ]; then
@@ -1202,7 +1216,8 @@ writer_append_active_final() {
       || { rm -f "$ledger" "$next"; return 1; }
     observed="$WRITER_OBSERVED_OID"
     state="$(python3 "$(writer_helper)" ledger-state "$ledger" --operation-id "$WRITER_OPERATION_ID" \
-      --claim-id "$WRITER_CLAIM_ID" --format shell | sed -n 's/^claim_state=//p')" \
+      --claim-id "$WRITER_CLAIM_ID" --operation-file "$operation" --format shell | \
+      sed -n 's/^claim_state=//p')" \
       || { rm -f "$ledger" "$next"; return 1; }
     if [ "$state" = active ]; then
       WRITER_COORDINATION_REVISION="$observed"; rm -f "$ledger" "$next"; return 0
@@ -1216,7 +1231,8 @@ writer_append_active_final() {
       ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
       if writer_load_remote_ledger "$root" "$origin" "$ledger"; then
         state="$(python3 "$(writer_helper)" ledger-state "$ledger" --operation-id "$WRITER_OPERATION_ID" \
-          --claim-id "$WRITER_CLAIM_ID" --format shell | sed -n 's/^claim_state=//p')"
+          --claim-id "$WRITER_CLAIM_ID" --operation-file "$operation" --format shell | \
+          sed -n 's/^claim_state=//p')"
         WRITER_COORDINATION_REVISION="$WRITER_OBSERVED_OID"; rm -f "$ledger"
         [ "$state" = active ] && return 0
       else rm -f "$ledger"; fi
@@ -1233,16 +1249,24 @@ mint_writer_event_id() {
 
 writer_effect_owner_cas() {
   local root="$1" origin="$2" desired="$3" requested_event="${4:-}"
-  local attempt ledger next observed state device clone event
+  local operation="${5:-${WRITER_OPERATION_FILE:-}}"
+  local attempt ledger next observed state device clone event reduced
   for ((attempt=1; attempt<=8; attempt++)); do
     ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
     next="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-next.XXXXXX")"
     writer_load_remote_ledger "$root" "$origin" "$ledger" \
       || { rm -f "$ledger" "$next"; return 1; }
     observed="$WRITER_OBSERVED_OID"
-    local reduced="$(python3 "$(writer_helper)" ledger-state "$ledger" \
-      --operation-id "$WRITER_OPERATION_ID" --claim-id "$WRITER_CLAIM_ID" --format shell)" \
-      || { rm -f "$ledger" "$next"; return 1; }
+    if [ -n "$operation" ]; then
+      reduced="$(python3 "$(writer_helper)" ledger-state "$ledger" \
+        --operation-id "$WRITER_OPERATION_ID" --claim-id "$WRITER_CLAIM_ID" \
+        --operation-file "$operation" --format shell)" \
+        || { rm -f "$ledger" "$next"; return 1; }
+    else
+      reduced="$(python3 "$(writer_helper)" ledger-state "$ledger" \
+        --operation-id "$WRITER_OPERATION_ID" --claim-id "$WRITER_CLAIM_ID" --format shell)" \
+        || { rm -f "$ledger" "$next"; return 1; }
+    fi
     state="$(printf '%s\n' "$reduced" | sed -n 's/^effect_owner_state=//p')"
     device="$(printf '%s\n' "$reduced" | sed -n 's/^effect_owner_device_id=//p')"
     clone="$(printf '%s\n' "$reduced" | sed -n 's/^effect_owner_clone_id=//p')"
@@ -1274,14 +1298,21 @@ writer_effect_owner_cas() {
 }
 
 writer_append_release_final() {
-  local root="$1" origin="$2" attempt ledger next observed state
+  local root="$1" origin="$2" operation="${3:-${WRITER_OPERATION_FILE:-}}"
+  local attempt ledger next observed state
   for ((attempt=1; attempt<=8; attempt++)); do
     ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
     next="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-next.XXXXXX")"
     writer_load_remote_ledger "$root" "$origin" "$ledger" || { rm -f "$ledger" "$next"; return 1; }
     observed="$WRITER_OBSERVED_OID"
-    state="$(python3 "$(writer_helper)" ledger-state "$ledger" --operation-id "$WRITER_OPERATION_ID" \
-      --claim-id "$WRITER_CLAIM_ID" --format shell | sed -n 's/^claim_state=//p')"
+    if [ -n "$operation" ]; then
+      state="$(python3 "$(writer_helper)" ledger-state "$ledger" --operation-id "$WRITER_OPERATION_ID" \
+        --claim-id "$WRITER_CLAIM_ID" --operation-file "$operation" --format shell | \
+        sed -n 's/^claim_state=//p')"
+    else
+      state="$(python3 "$(writer_helper)" ledger-state "$ledger" --operation-id "$WRITER_OPERATION_ID" \
+        --claim-id "$WRITER_CLAIM_ID" --format shell | sed -n 's/^claim_state=//p')"
+    fi
     [ "$state" != released ] || { WRITER_COORDINATION_REVISION="$observed"; rm -f "$ledger" "$next"; return 0; }
     [ "$state" = active ] || { rm -f "$ledger" "$next"; return 1; }
     python3 "$(writer_helper)" ledger-append-claim "$ledger" --output "$next" --state released \
@@ -1312,6 +1343,32 @@ writer_worktree_snapshot_digest() {
     rm -f "$porcelain"; return 1
   }
   rm -f "$porcelain"; printf '%s\n' "$digest"
+}
+
+writer_worktree_recovery_digest() {
+  local clone="$1" origin="$2" expected_path="$3" expected_branch="$4"
+  local porcelain common digest
+  porcelain="$(mktemp "${TMPDIR:-/tmp}/workbench-worktree-set.XXXXXX")"
+  git -C "$clone" worktree list --porcelain -z > "$porcelain" || {
+    rm -f "$porcelain"; return 1
+  }
+  common="$(git -C "$clone" rev-parse --git-common-dir)" || {
+    rm -f "$porcelain"; return 1
+  }
+  case "$common" in /*) ;; *) common="$clone/$common" ;; esac
+  digest="$(python3 "$(writer_helper)" worktree-set --porcelain-file "$porcelain" \
+    --common-git-dir "$common" --origin-url "$origin" --expected-path "$expected_path" \
+    --expected-branch "refs/heads/$expected_branch" --recover-present --format digest)" || {
+    rm -f "$porcelain"; return 1
+  }
+  rm -f "$porcelain"; printf '%s\n' "$digest"
+}
+
+writer_marker_file() {
+  local wt="$1" gitdir
+  gitdir="$(git -C "$wt" rev-parse --git-dir 2>/dev/null)" || return 1
+  case "$gitdir" in /*) ;; *) gitdir="$wt/$gitdir" ;; esac
+  printf '%s/workbench-writer-owner.json\n' "$gitdir"
 }
 
 writer_write_marker() {
@@ -1348,6 +1405,21 @@ expected = {
 }
 raise SystemExit(0 if value == expected and list(value) == list(expected) else 1)
 PY
+}
+
+writer_worktree_structure_matches_final() {
+  local clone_common worktree_common actual_branch actual_origin
+  [ -d "$WRITER_WORKTREE" ] || return 1
+  actual_branch="$(git -C "$WRITER_WORKTREE" symbolic-ref --short HEAD 2>/dev/null)" \
+    || return 1
+  [ "$actual_branch" = "$WRITER_CODEBASE_BRANCH" ] || return 1
+  actual_origin="$(git -C "$WRITER_WORKTREE" remote get-url origin 2>/dev/null)" || return 1
+  [ "$actual_origin" = "$WRITER_CODEBASE_ORIGIN" ] || return 1
+  clone_common="$(git -C "$WRITER_CLONE" rev-parse --git-common-dir)" || return 1
+  worktree_common="$(git -C "$WRITER_WORKTREE" rev-parse --git-common-dir)" || return 1
+  clone_common="$(cd "$WRITER_CLONE" && cd "$clone_common" && pwd -P)" || return 1
+  worktree_common="$(cd "$WRITER_WORKTREE" && cd "$worktree_common" && pwd -P)" || return 1
+  [ "$clone_common" = "$worktree_common" ]
 }
 
 writer_row_dir() { printf '%s/writer-rows\n' "$(task_state_dir)"; }
@@ -1443,8 +1515,15 @@ print_writer_claim_json_final() {
   printf ']}\n'
 }
 
+writer_test_interrupt() {
+  local stage="$1" operation="$2"
+  [ "${WORKBENCH_TEST_FAIL_WRITER_STAGE:-}" = "$stage" ] || return 1
+  writer_load_operation_final "$operation"
+  print_writer_claim_json_final false writer-test-interruption
+}
+
 writer_recover_zero_history() {
-  local ledger="$1" operation="$2" matching count effects row operation_id claim_id action
+  local ledger="$1" operation="$2" matching count effects row operation_id claim_id state
   [ ! -e "$WRITER_WORKTREE" ] || return 10
   ! repos_block | grep -q "^- $WRITER_OWNER |" || return 10
   [ ! -e "$(writer_row_dir)/$WRITER_OWNER.record" ] || return 10
@@ -1457,6 +1536,17 @@ writer_recover_zero_history() {
   [ "$count" = 1 ] || { [ "$count" = 0 ] && return 10 || return 11; }
   [ "$effects" = 0 ] || return 12
   row="$(writer_json_query "$matching" matches.0)"
+  [ "$(writer_json_query "$row" task_claim_id)" = "$CURRENT_CLAIM_ID" ] \
+    && [ "$(writer_json_query "$row" owner)" = "$WRITER_OWNER" ] \
+    && [ "$(writer_json_query "$row" branch)" = "$CURRENT_BRANCH" ] \
+    && [ "$(writer_json_query "$row" expected_path)" = "task/codebases/$WRITER_OWNER" ] \
+    && [ "$(writer_json_query "$row" codebase_origin_url)" = "$WRITER_CODEBASE_ORIGIN" ] \
+    && [ "$(writer_json_query "$row" context_policy_set_digest)" = "$WRITER_CONTEXT_DIGEST" ] \
+    && [ "$(writer_json_query "$row" action_instance_id)" = null ] \
+    && [ "$(writer_json_query "$row" policy_manifest_digest)" = null ] \
+    && [ "$(writer_json_query "$row" intent_digest)" = null ] \
+    && [ "$(writer_json_query "$row" authorization_ref)" = null ] \
+    || return 12
   operation_id="$(writer_json_query "$row" operation_id)"; claim_id="$(writer_json_query "$row" claim_id)"
   python3 "$(writer_helper)" operation-create --operation-id "$operation_id" --claim-id "$claim_id" \
     --task-claim-id "$CURRENT_CLAIM_ID" --owner "$WRITER_OWNER" --branch "$CURRENT_BRANCH" \
@@ -1465,6 +1555,10 @@ writer_recover_zero_history() {
     --context-policy-set-digest "$WRITER_CONTEXT_DIGEST" --device-id "$WRITER_DEVICE_ID" \
     --clone-id "$WRITER_CLONE_ID" --coordination-oid "$WRITER_OBSERVED_OID" \
     --stage remote-claimed --output "$operation" || return 12
+  state="$(python3 "$(writer_helper)" ledger-state "$ledger" --operation-id "$operation_id" \
+    --claim-id "$claim_id" --operation-file "$operation" --format shell | \
+    sed -n 's/^claim_state=//p')" || return 12
+  [ "$state" = active ] || return 12
   return 0
 }
 
@@ -1505,10 +1599,12 @@ writer_resolve_final() {
 cmd_add_repo_v2_work_final() {
   local name="$1" ref="$2" instance_id="$3" authorization_file="$4"
   local root context_state operation_dir operation ledger origin observed existing recovery_rc
-  local issue parent slug snapshot row_file primary_digest action_manifest changed=true
+  local issue parent slug snapshot row_file primary_digest changed=true
+  local marker_file recovery_digest record_recovered=false record_count owner_rows
   root="$(wb_root)"; WRITER_OWNER="$name"; WRITER_CLONE="$root/.codebases/$name"
   [ -d "$WRITER_CLONE/.git" ] || die ".codebases/$name 없음 — codebases.yaml에 추가 후 workbench setup 실행"
   current_task_identity; writer_runtime_identity "$root"
+  WRITER_RUNTIME_DEVICE_ID="$WRITER_DEVICE_ID"; WRITER_RUNTIME_CLONE_ID="$WRITER_CLONE_ID"
   protected_registry_entry "$root" "$name" "$(index_get workspace_authority_descriptor_digest)" \
     || die "protected-codebase-registry-unavailable: $name"
   WRITER_CODEBASE_ORIGIN="$PROTECTED_REGISTRY_ORIGIN"
@@ -1563,6 +1659,7 @@ cmd_add_repo_v2_work_final() {
     fi
   fi
   writer_load_operation_final "$operation" || { rm -f "$ledger"; return 1; }
+  WRITER_OPERATION_FILE="$operation"
   [ "$WRITER_OPERATION_REGISTRY_REVISION" = "$PROTECTED_REGISTRY_REVISION" ] \
     && [ "$WRITER_OPERATION_REGISTRY_DIGEST" = "$PROTECTED_REGISTRY_DIGEST" ] \
     && [ "$WRITER_CODEBASE_ORIGIN" = "$PROTECTED_REGISTRY_ORIGIN" ] \
@@ -1575,46 +1672,110 @@ cmd_add_repo_v2_work_final() {
     WRITER_COORDINATION_REVISION="$observed"; rm -f "$ledger"
     print_writer_claim_json_final false; return 0
   fi
-  local publish_attempt publish_rc published=false
-  for ((publish_attempt=1; publish_attempt<=8; publish_attempt++)); do
-    if ! writer_resolve_final "$operation" "$ledger" "$instance_id" "$authorization_file"; then
-      recovery_rc=$?; rm -f "$ledger"; return "$recovery_rc"
+  local publish_attempt publish_rc published=false operation_already_claimed=false
+  case "$WRITER_OPERATION_STAGE" in
+    remote-claimed|effect-owner-acquired|worktree-create-pending|worktree-ready|record-create-pending|record-ready|handoff-ready)
+      operation_already_claimed=true ;;
+    prepared|authorization-pending) : ;;
+    *) rm -f "$ledger"; print_writer_claim_json_final false writer-recovery-blocked; return 1 ;;
+  esac
+  if [ "$operation_already_claimed" = true ]; then
+    [ "$WRITER_DEVICE_ID" = "$WRITER_RUNTIME_DEVICE_ID" ] \
+      && [ "$WRITER_CLONE_ID" = "$WRITER_RUNTIME_CLONE_ID" ] \
+      || { rm -f "$ledger"; print_writer_claim_json_final false writer-recovery-blocked; return 1; }
+    writer_conflict_final "$ledger" "$operation" || {
+      rm -f "$ledger"; print_writer_claim_json_final false writer-recovery-blocked; return 1
+    }
+    rm -f "$ledger"
+    if writer_append_active_final "$root" "$origin" "$operation"; then
+      published=true
+    else
+      print_writer_claim_json_final false writer-recovery-blocked; return 1
     fi
-    writer_load_operation_final "$operation"; rm -f "$ledger"
-    if writer_append_active_final "$root" "$origin" "$operation"; then published=true; break
-    else publish_rc=$?; fi
-    [ "$publish_rc" = 3 ] || { print_writer_claim_json_final false writer-lock-unavailable; return 1; }
-    ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
-    writer_load_remote_ledger "$root" "$origin" "$ledger" \
-      || { rm -f "$ledger"; print_writer_claim_json_final false writer-lock-unavailable; return 1; }
-    instance_id=""
-  done
+  else
+    for ((publish_attempt=1; publish_attempt<=8; publish_attempt++)); do
+      if writer_resolve_final "$operation" "$ledger" "$instance_id" "$authorization_file"; then
+        :
+      else
+        recovery_rc=$?; rm -f "$ledger"; return "$recovery_rc"
+      fi
+      writer_load_operation_final "$operation"; rm -f "$ledger"
+      if writer_append_active_final "$root" "$origin" "$operation"; then published=true; break
+      else publish_rc=$?; fi
+      [ "$publish_rc" = 3 ] || { print_writer_claim_json_final false writer-lock-unavailable; return 1; }
+      ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
+      writer_load_remote_ledger "$root" "$origin" "$ledger" \
+        || { rm -f "$ledger"; print_writer_claim_json_final false writer-lock-unavailable; return 1; }
+      instance_id=""
+    done
+  fi
   [ "$published" = true ] || { print_writer_claim_json_final false writer-lock-unavailable; return 1; }
-  writer_operation_update "$operation" --stage remote-claimed --coordination-oid "$WRITER_COORDINATION_REVISION"
-  writer_load_operation_final "$operation"
+  if [ "$operation_already_claimed" = false ]; then
+    writer_operation_update "$operation" --stage remote-claimed --coordination-oid "$WRITER_COORDINATION_REVISION"
+    writer_load_operation_final "$operation"
+  fi
   if [ "${WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM:-0}" = 1 ]; then
     print_writer_claim_json_final false writer-lock-unavailable
     return 1
   fi
-  if ! writer_effect_owner_cas "$root" "$origin" acquired; then
+  if writer_effect_owner_cas "$root" "$origin" acquired; then
+    :
+  else
     recovery_rc=$?; [ "$recovery_rc" = 2 ] && print_writer_claim_json_final false writer-recovery-blocked \
       || print_writer_claim_json_final false writer-lock-unavailable; return 1
   fi
-  writer_operation_update "$operation" --stage effect-owner-acquired --effect-owner-state acquired \
-    --coordination-oid "$WRITER_COORDINATION_REVISION"
-  snapshot="$(writer_worktree_snapshot_digest "$WRITER_CLONE" "$WRITER_CODEBASE_ORIGIN" \
-    "$WRITER_WORKTREE" "$WRITER_CODEBASE_BRANCH")" || {
-    print_writer_claim_json_final false writer-recovery-blocked; return 1
-  }
-  writer_operation_update "$operation" --stage worktree-create-pending --worktree-set-digest "$snapshot"
-  local worktree_failed=false
+  if [ "$WRITER_OPERATION_EFFECT_OWNER_STATE" != acquired ]; then
+    writer_operation_update "$operation" --stage effect-owner-acquired --effect-owner-state acquired \
+      --coordination-oid "$WRITER_COORDINATION_REVISION"
+    writer_load_operation_final "$operation"
+  fi
+  if writer_test_interrupt effect-owner-acquired "$operation"; then return 1; fi
+
+  if [ -z "$WRITER_OPERATION_WORKTREE_SET_DIGEST" ]; then
+    snapshot="$(writer_worktree_snapshot_digest "$WRITER_CLONE" "$WRITER_CODEBASE_ORIGIN" \
+      "$WRITER_WORKTREE" "$WRITER_CODEBASE_BRANCH")" || {
+      print_writer_claim_json_final false writer-recovery-blocked; return 1
+    }
+    writer_operation_update "$operation" --stage worktree-create-pending --worktree-set-digest "$snapshot"
+    writer_load_operation_final "$operation"
+  fi
+
+  local worktree_failed=false worktree_recovered=false
   if [ -d "$WRITER_WORKTREE" ]; then
-    if writer_marker_matches "$WRITER_WORKTREE" "$WRITER_CODEBASE_ORIGIN"; then changed=false
-    else worktree_failed=true; fi
+    if recovery_digest="$(writer_worktree_recovery_digest "$WRITER_CLONE" "$WRITER_CODEBASE_ORIGIN" \
+      "$WRITER_WORKTREE" "$WRITER_CODEBASE_BRANCH")"; then
+      [ "$recovery_digest" = "$WRITER_OPERATION_WORKTREE_SET_DIGEST" ] \
+        && writer_worktree_structure_matches_final || {
+        print_writer_claim_json_final false writer-recovery-blocked; return 1
+      }
+      marker_file="$(writer_marker_file "$WRITER_WORKTREE")" || {
+        print_writer_claim_json_final false writer-recovery-blocked; return 1
+      }
+      if writer_marker_matches "$WRITER_WORKTREE" "$WRITER_CODEBASE_ORIGIN"; then
+        [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" = none ] && worktree_recovered=true
+      elif [ -e "$marker_file" ] || [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" != none ]; then
+        print_writer_claim_json_final false writer-recovery-blocked; return 1
+      else
+        writer_write_marker "$WRITER_WORKTREE" "$WRITER_CODEBASE_ORIGIN" || {
+          print_writer_claim_json_final false writer-recovery-blocked; return 1
+        }
+        if writer_test_interrupt marker-written "$operation"; then return 1; fi
+        worktree_recovered=true
+      fi
+    elif [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" = none ]; then
+      worktree_failed=true
+    else
+      print_writer_claim_json_final false writer-recovery-blocked; return 1
+    fi
+  elif [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" != none ]; then
+    print_writer_claim_json_final false writer-recovery-blocked; return 1
   elif ! writer_local_attach "$WRITER_CLONE" "$WRITER_WORKTREE" "$WRITER_CODEBASE_BRANCH" "$ref" >/dev/null 2>&1; then
     worktree_failed=true
   else
+    if writer_test_interrupt worktree-attached "$operation"; then return 1; fi
     writer_write_marker "$WRITER_WORKTREE" "$WRITER_CODEBASE_ORIGIN" || worktree_failed=true
+    if [ "$worktree_failed" = false ] \
+      && writer_test_interrupt marker-written "$operation"; then return 1; fi
   fi
   if [ "$worktree_failed" = true ]; then
       writer_operation_update "$operation" --stage compensation-pending --compensation-target released \
@@ -1629,16 +1790,44 @@ cmd_add_repo_v2_work_final() {
       fi
       writer_load_operation_final "$operation"; print_writer_claim_json_final false writer-lock-unavailable; return 1
   fi
-  writer_operation_update "$operation" --stage worktree-ready --worktree-ownership created
+  if [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" = none ]; then
+    if [ "$worktree_recovered" = true ]; then
+      writer_operation_update "$operation" --stage worktree-ready --worktree-ownership adopted
+    else
+      writer_operation_update "$operation" --stage worktree-ready --worktree-ownership created
+    fi
+    writer_load_operation_final "$operation"
+  fi
   writer_operation_update "$operation" --stage record-create-pending
-  if ! repos_block | grep -q "^- $name |"; then repos_append "- $name | $WRITER_CODEBASE_BRANCH | work"; fi
-  row_file="$(writer_row_dir)/$name.record"
-  write_writer_row_final "$row_file" "" "" "" ""
-  writer_operation_update "$operation" --stage record-ready --repo-record-ownership created
   writer_load_operation_final "$operation"
-  if [ -n "$WRITER_OPERATION_ACTION" ]; then
+  record_count="$(repos_block | grep -Fxc -- "- $name | $WRITER_CODEBASE_BRANCH | work" || true)"
+  owner_rows="$(repos_block | grep -c "^- $name |" || true)"
+  if [ "$record_count" = 0 ] && [ "$owner_rows" = 0 ]; then
+    repos_append "- $name | $WRITER_CODEBASE_BRANCH | work"
+    if writer_test_interrupt repo-index-written "$operation"; then return 1; fi
+  elif [ "$record_count" = 1 ] && [ "$owner_rows" = 1 ]; then
+    record_recovered=true
+  else
+    print_writer_claim_json_final false writer-recovery-blocked; return 1
+  fi
+  row_file="$(writer_row_dir)/$name.record"
+  if [ -e "$row_file" ]; then
+    writer_row_matches_final "$row_file" || {
+      print_writer_claim_json_final false writer-recovery-blocked; return 1
+    }
+    record_recovered=true
+  else
     write_writer_row_final "$row_file" "$WRITER_OPERATION_ACTION" "$WRITER_OPERATION_INTENT" \
       "$WRITER_OPERATION_MANIFEST" "$WRITER_OPERATION_AUTHORIZATION"
+    if writer_test_interrupt writer-row-written "$operation"; then return 1; fi
+  fi
+  if [ "$record_recovered" = true ]; then
+    writer_operation_update "$operation" --stage record-ready --repo-record-ownership adopted
+  else
+    writer_operation_update "$operation" --stage record-ready --repo-record-ownership created
+  fi
+  writer_load_operation_final "$operation"
+  if [ -n "$WRITER_OPERATION_ACTION" ]; then
     primary_digest="$(digest_manifest "$row_file")"
     consume_governed_action task.concurrent-write "workbench:codebase/$name" "$WRITER_CONFLICT_REVISION" \
       "$WRITER_OPERATION_ACTION" "$WRITER_OPERATION_INTENT" "$primary_digest" || {
@@ -1686,6 +1875,247 @@ cmd_add_repo() {
     WRITER_OWNER="$name"; WRITER_CLAIM_ID=""; WRITER_TASK_CLAIM_ID="$(index_get claim_id)"; WRITER_ROLE=reference
     WRITER_CONFLICT_COUNT=0; print_writer_claim_json true "" ""
   fi
+}
+
+writer_operation_file() {
+  local operation_id="$1"
+  validate_record_id operation_id "$operation_id"
+  printf '%s/%s.json\n' "$(writer_operation_dir)" "$operation_id"
+}
+
+writer_operation_context() {
+  local operation_id="$1" root origin operation
+  require_task_worktree; require_v2_task; current_task_identity
+  operation="$(writer_operation_file "$operation_id")"
+  [ -f "$operation" ] || die "writer operation not found: $operation_id"
+  root="$(wb_root)"; writer_runtime_identity "$root"
+  WRITER_RUNTIME_DEVICE_ID="$WRITER_DEVICE_ID"
+  WRITER_RUNTIME_CLONE_ID="$WRITER_CLONE_ID"
+  writer_load_operation_final "$operation" || die "invalid writer operation: $operation_id"
+  [ "$WRITER_OPERATION_ID" = "$operation_id" ] \
+    && [ "$WRITER_OPERATION_TASK_CLAIM_ID" = "$CURRENT_CLAIM_ID" ] \
+    && [ "$WRITER_CODEBASE_BRANCH" = "$CURRENT_BRANCH" ] \
+    || die "writer operation does not bind the current task: $operation_id"
+  WRITER_CLONE="$root/.codebases/$WRITER_OWNER"
+  WRITER_WORKTREE="$TASK_DIR/$WRITER_OPERATION_EXPECTED_PATH"
+  [ -d "$WRITER_CLONE/.git" ] || die "writer codebase cache unavailable: $WRITER_OWNER"
+  origin="$(canonical_workspace_origin_url "$root")" || return 1
+  WRITER_OPERATION_FILE="$operation"
+  WRITER_WORKSPACE_ROOT="$root"
+  WRITER_WORKSPACE_ORIGIN="$origin"
+  WRITER_OPERATION_LEDGER="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
+  writer_load_remote_ledger "$root" "$origin" "$WRITER_OPERATION_LEDGER" || {
+    rm -f "$WRITER_OPERATION_LEDGER"; die "writer coordination unavailable"
+  }
+  WRITER_COORDINATION_REVISION="$WRITER_OBSERVED_OID"
+}
+
+writer_operation_transition_json() {
+  local transition="$1" changed="$2" blocker="${3:-}" target_device="${4:-}" target_clone="${5:-}"
+  printf '{"contract_version":"workbench-writer-operation-transition/v1","transition":"%s","operation_id":"%s","claim_id":"%s","changed":%s,"operation_stage":"%s","coordination_ref":"%s","coordination_revision":' \
+    "$transition" "$(json_escape "$WRITER_OPERATION_ID")" "$(json_escape "$WRITER_CLAIM_ID")" \
+    "$changed" "$(json_escape "$WRITER_OPERATION_STAGE")" "$WRITER_COORDINATION_REF"
+  json_nullable "${WRITER_COORDINATION_REVISION:-}"
+  printf ',"target_device_id":'; json_nullable "$target_device"
+  printf ',"target_clone_id":'; json_nullable "$target_clone"
+  printf ',"blockers":['
+  [ -z "$blocker" ] || printf '{"code":"%s","ref":"%s"}' \
+    "$blocker" "$(json_escape "$WRITER_OPERATION_ID")"
+  printf ']}\n'
+}
+
+writer_persist_operation_transition() {
+  git -C "$TASK_DIR" add -A task/index.md task/.workbench/writer-operations \
+    task/.workbench/writer-rows 2>/dev/null || return 1
+  if ! git -C "$TASK_DIR" diff --cached --quiet; then
+    git -C "$TASK_DIR" commit -q -m "task: writer-operation $1 $WRITER_OPERATION_ID" || return 1
+  fi
+  git -C "$TASK_DIR" push -q origin "$CURRENT_BRANCH"
+}
+
+writer_worktree_matches_final() {
+  writer_worktree_structure_matches_final \
+    && writer_marker_matches "$WRITER_WORKTREE" "$WRITER_CODEBASE_ORIGIN"
+}
+
+writer_remove_repo_index_row() {
+  local row="- $WRITER_OWNER | $WRITER_CODEBASE_BRANCH | work" file tmp count
+  file="$TASK_DIR/task/index.md"; tmp="$file.tmp.$$"
+  count="$(grep -Fxc -- "$row" "$file" || true)"
+  [ "$count" = 1 ] || return 1
+  awk -v row="$row" '$0 != row { print }' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+cmd_writer_operation_show() {
+  local operation_id="$1" format="$2"
+  [ "$format" = json ] || die "writer-operation show requires --format json"
+  writer_operation_context "$operation_id"
+  if ! python3 "$(writer_helper)" operation-status --operation-file "$WRITER_OPERATION_FILE" \
+    --ledger-file "$WRITER_OPERATION_LEDGER"; then
+    rm -f "$WRITER_OPERATION_LEDGER"; return 1
+  fi
+  rm -f "$WRITER_OPERATION_LEDGER"
+}
+
+cmd_writer_operation_cancel() {
+  local operation_id="$1" format="$2" status cancellable
+  [ "$format" = json ] || die "writer-operation cancel requires --format json"
+  writer_operation_context "$operation_id"
+  status="$(python3 "$(writer_helper)" operation-status \
+    --operation-file "$WRITER_OPERATION_FILE" --ledger-file "$WRITER_OPERATION_LEDGER")" || {
+    rm -f "$WRITER_OPERATION_LEDGER"; writer_operation_transition_json cancel false writer-recovery-blocked; return 1
+  }
+  cancellable="$(writer_json_query "$status" cancellable)"
+  if [ "$WRITER_OPERATION_STAGE" = cancelled ] && [ "$cancellable" = true ]; then
+    rm -f "$WRITER_OPERATION_LEDGER"
+    writer_operation_transition_json cancel false; return 0
+  fi
+  if [ "$cancellable" != true ]; then
+    rm -f "$WRITER_OPERATION_LEDGER"
+    writer_operation_transition_json cancel false writer-cancel-has-effects; return 1
+  fi
+  writer_operation_update "$WRITER_OPERATION_FILE" --stage cancelled
+  writer_load_operation_final "$WRITER_OPERATION_FILE"
+  rm -f "$WRITER_OPERATION_LEDGER"
+  if ! writer_persist_operation_transition cancel; then
+    writer_operation_transition_json cancel true writer-transition-not-durable; return 1
+  fi
+  writer_operation_transition_json cancel true
+}
+
+cmd_writer_operation_handoff() {
+  local operation_id="$1" format="$2" target_device="$3" target_clone="$4"
+  local row_file next ledger_rc
+  [ "$format" = json ] || die "writer-operation handoff requires --format json"
+  require_single_line to_device_id "$target_device"
+  printf '%s\n' "$target_clone" | grep -Eq \
+    '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' \
+    || die "invalid handoff clone id: $target_clone"
+  writer_operation_context "$operation_id"
+  if [ "$WRITER_OPERATION_STAGE" = handoff-ready ]; then
+    if [ "$WRITER_DEVICE_ID" = "$target_device" ] && [ "$WRITER_CLONE_ID" = "$target_clone" ] \
+      && python3 "$(writer_helper)" operation-status --operation-file "$WRITER_OPERATION_FILE" \
+        --ledger-file "$WRITER_OPERATION_LEDGER" >/dev/null; then
+      rm -f "$WRITER_OPERATION_LEDGER"
+      writer_operation_transition_json handoff false "" "$target_device" "$target_clone"; return 0
+    fi
+    rm -f "$WRITER_OPERATION_LEDGER"
+    writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+  fi
+  if [ "$WRITER_OPERATION_STAGE" = consumed ]; then
+    if [ "$WRITER_RUNTIME_DEVICE_ID" != "$WRITER_DEVICE_ID" ] \
+      || [ "$WRITER_RUNTIME_CLONE_ID" != "$WRITER_CLONE_ID" ] \
+      || ! writer_consumed_matches_final "$WRITER_OPERATION_LEDGER" "$WRITER_OPERATION_FILE"; then
+      rm -f "$WRITER_OPERATION_LEDGER"
+      writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+    fi
+    [ "$target_device" != "$WRITER_DEVICE_ID" ] || [ "$target_clone" != "$WRITER_CLONE_ID" ] || {
+      rm -f "$WRITER_OPERATION_LEDGER"
+      writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+    }
+    writer_operation_update "$WRITER_OPERATION_FILE" --stage compensation-pending \
+      --compensation-target reserved --compensation-reason handoff --compensation-next-step record
+    writer_load_operation_final "$WRITER_OPERATION_FILE"
+  elif [ "$WRITER_OPERATION_STAGE" != compensation-pending ] \
+    || [ "$(json_get "$(cat "$WRITER_OPERATION_FILE")" compensation_reason)" != handoff ]; then
+    rm -f "$WRITER_OPERATION_LEDGER"
+    writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+  fi
+
+  row_file="$(writer_row_dir)/$WRITER_OWNER.record"
+  if [ "$WRITER_OPERATION_RECORD_OWNERSHIP" != none ]; then
+    writer_row_matches_final "$row_file" && writer_remove_repo_index_row || {
+      rm -f "$WRITER_OPERATION_LEDGER"
+      writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+    }
+    rm -f "$row_file"
+    writer_operation_update "$WRITER_OPERATION_FILE" --repo-record-ownership none \
+      --compensation-next-step worktree
+    writer_load_operation_final "$WRITER_OPERATION_FILE"
+  elif [ -e "$row_file" ] || repos_block | grep -Fqx -- "- $WRITER_OWNER | $WRITER_CODEBASE_BRANCH | work"; then
+    rm -f "$WRITER_OPERATION_LEDGER"
+    writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+  fi
+
+  if [ "$WRITER_OPERATION_WORKTREE_OWNERSHIP" != none ]; then
+    if ! writer_worktree_matches_final \
+      || ! git -C "$WRITER_CLONE" worktree remove "$WRITER_WORKTREE" >/dev/null 2>&1; then
+      rm -f "$WRITER_OPERATION_LEDGER"
+      writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+    fi
+    writer_operation_update "$WRITER_OPERATION_FILE" --worktree-ownership none \
+      --compensation-next-step effect-owner
+    writer_load_operation_final "$WRITER_OPERATION_FILE"
+  elif [ -e "$WRITER_WORKTREE" ]; then
+    rm -f "$WRITER_OPERATION_LEDGER"
+    writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+  fi
+
+  if [ "$WRITER_OPERATION_EFFECT_OWNER_STATE" != released ]; then
+    if writer_effect_owner_cas "$WRITER_WORKSPACE_ROOT" "$WRITER_WORKSPACE_ORIGIN" released; then
+      :
+    else
+      ledger_rc=$?; rm -f "$WRITER_OPERATION_LEDGER"
+      [ "$ledger_rc" = 2 ] && writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone" \
+        || writer_operation_transition_json handoff false writer-lock-unavailable "$target_device" "$target_clone"
+      return 1
+    fi
+    writer_operation_update "$WRITER_OPERATION_FILE" --effect-owner-state released \
+      --coordination-oid "$WRITER_COORDINATION_REVISION" --compensation-next-step finish
+    writer_load_operation_final "$WRITER_OPERATION_FILE"
+  fi
+
+  rm -f "$WRITER_OPERATION_LEDGER"
+  WRITER_OPERATION_LEDGER="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
+  writer_load_remote_ledger "$WRITER_WORKSPACE_ROOT" "$WRITER_WORKSPACE_ORIGIN" \
+    "$WRITER_OPERATION_LEDGER" || {
+    rm -f "$WRITER_OPERATION_LEDGER"
+    writer_operation_transition_json handoff false writer-lock-unavailable "$target_device" "$target_clone"; return 1
+  }
+  next="$WRITER_OPERATION_FILE.handoff.$$"
+  if ! python3 "$(writer_helper)" operation-handoff --operation-file "$WRITER_OPERATION_FILE" \
+    --ledger-file "$WRITER_OPERATION_LEDGER" --to-device-id "$target_device" \
+    --to-clone-id "$target_clone" --output "$next"; then
+    rm -f "$WRITER_OPERATION_LEDGER" "$next"
+    writer_operation_transition_json handoff false writer-handoff-blocked "$target_device" "$target_clone"; return 1
+  fi
+  mv "$next" "$WRITER_OPERATION_FILE"
+  writer_load_operation_final "$WRITER_OPERATION_FILE"
+  WRITER_COORDINATION_REVISION="$WRITER_OBSERVED_OID"
+  rm -f "$WRITER_OPERATION_LEDGER"
+  if ! writer_persist_operation_transition handoff; then
+    writer_operation_transition_json handoff true writer-transition-not-durable "$target_device" "$target_clone"; return 1
+  fi
+  writer_operation_transition_json handoff true "" "$target_device" "$target_clone"
+}
+
+cmd_writer_operation() {
+  local subcommand="${1:-}" operation_id="" format="" target_device="" target_clone=""
+  [ -n "$subcommand" ] || die "usage: workbench task writer-operation show|cancel|handoff ..."
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --operation-id) operation_id="$2"; shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      --to-device-id) target_device="$2"; shift 2 ;;
+      --to-clone-id) target_clone="$2"; shift 2 ;;
+      *) die "unknown writer-operation option: $1" ;;
+    esac
+  done
+  [ -n "$operation_id" ] || die "writer-operation requires --operation-id"
+  require_task_worktree; require_v2_task
+  case "$subcommand" in
+    show) [ -z "$target_device$target_clone" ] || die "show does not accept a handoff target"
+      cmd_writer_operation_show "$operation_id" "$format" ;;
+    cancel) [ -z "$target_device$target_clone" ] || die "cancel does not accept a handoff target"
+      require_mutable_task task.writer-operation.cancel || return 1
+      cmd_writer_operation_cancel "$operation_id" "$format" ;;
+    handoff) [ -n "$target_device" ] && [ -n "$target_clone" ] \
+        || die "handoff requires --to-device-id and --to-clone-id"
+      require_mutable_task task.writer-operation.handoff || return 1
+      cmd_writer_operation_handoff "$operation_id" "$format" "$target_device" "$target_clone" ;;
+    *) die "unknown writer-operation command: $subcommand" ;;
+  esac
 }
 
 # ── v2 task state ──────────────────────────────────────────────────────
@@ -4731,7 +5161,7 @@ cleanup_reconcile_writer_operations() {
           if [ "$CLEANUP_REMOTE_EFFECT" = acquired ]; then
             [ "$CLEANUP_REMOTE_DEVICE" = "$WRITER_DEVICE_ID" ] \
               && [ "$CLEANUP_REMOTE_CLONE" = "$WRITER_CLONE_ID" ] || return 1
-            writer_effect_owner_cas "$root" "$origin" released "$CLEANUP_OWNER_LAST_EVENT" \
+            writer_effect_owner_cas "$root" "$origin" released "$CLEANUP_OWNER_LAST_EVENT" "$operation_file" \
               || return 1
             cleanup_load_remote_writer "$root" "$origin" "$operation_file" || return 1
           fi
@@ -4775,7 +5205,7 @@ cleanup_reconcile_writer_operations() {
       cleanup_emit_owner_event "$journal_file" "$root" "$WRITER_OPERATION_ID" \
         "$WRITER_CLAIM_ID" "$WRITER_DEVICE_ID" "$WRITER_CLONE_ID" released intended \
         "$event" || return 1
-      writer_effect_owner_cas "$root" "$origin" released "$event" || return 1
+      writer_effect_owner_cas "$root" "$origin" released "$event" "$operation_file" || return 1
       cleanup_load_remote_writer "$root" "$origin" "$operation_file" || return 1
       [ "$CLEANUP_REMOTE_EFFECT" = released ] && [ "$CLEANUP_REMOTE_EVENT" = "$event" ] \
         || return 1
@@ -4788,7 +5218,7 @@ cleanup_reconcile_writer_operations() {
     cleanup_load_remote_writer "$root" "$origin" "$operation_file" || return 1
     if [ "$CLEANUP_REMOTE_CLAIM" = active ]; then
       [ "$CLEANUP_REMOTE_EFFECT" != acquired ] || return 1
-      writer_append_release_final "$root" "$origin" || return 1
+      writer_append_release_final "$root" "$origin" "$operation_file" || return 1
       cleanup_load_remote_writer "$root" "$origin" "$operation_file" || return 1
     fi
     if [ "$CLEANUP_REMOTE_CLAIM" = absent ]; then
@@ -5316,6 +5746,7 @@ cmd_tickets() {
 case "${1:-}" in
   start)    shift; cmd_start "$@" ;;
   add-repo) shift; cmd_add_repo "$@" ;;
+  writer-operation) shift; cmd_writer_operation "$@" ;;
   resume)   shift; cmd_resume "$@" ;;
   submit)   shift; cmd_submit "$@" ;;
   done)     shift; cmd_done "$@" ;;
