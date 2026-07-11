@@ -26,7 +26,8 @@ toolbox() {
   TOOLBOX_WORKBENCH_BIN="$tmp/workbench" "$TOOLBOX" --workspace "$wb" "$@"
 }
 
-for product in alpha beta gamma delta epsilon paused terminal multi; do
+for product in \
+  alpha beta gamma delta epsilon paused terminal multi mixed active-mixed; do
   toolbox product init --id "$product" --name "$product" --language en \
     --objective "Plan $product" >/dev/null
   toolbox product repository set "$product" --id "$product-web" \
@@ -66,6 +67,11 @@ scenario terminal SCN-TERMINAL-READY ready 1 '[]'
 scenario multi SCN-MULTI-A active 1 '[]'
 scenario multi SCN-MULTI-B active 2 '[]'
 scenario multi SCN-MULTI-READY ready 3 '[]'
+scenario mixed SCN-MIXED-BLOCKED blocked 1 '[]'
+scenario mixed SCN-MIXED-READY ready 0 '[]'
+scenario active-mixed SCN-ACTIVE-MIXED-ACTIVE active 1 '[]'
+scenario active-mixed SCN-ACTIVE-MIXED-BLOCKED blocked 2 '[]'
+scenario active-mixed SCN-ACTIVE-MIXED-WAIT ready 3 '["SCN-ACTIVE-MIXED-BLOCKED"]'
 
 python3 - "$wb/products/paused/product.json" "$wb/products/terminal/product.json" <<'PY'
 import json
@@ -114,7 +120,12 @@ gamma_status="$(toolbox product status gamma)" || fail "blocked product status f
 paused_status="$(toolbox product status paused)" || fail "paused product status failed"
 terminal_status="$(toolbox product status terminal)" || fail "terminal product status failed"
 multi_status="$(toolbox product status multi)" || fail "multiple-active product status failed"
-python3 - "$beta_status" "$gamma_status" "$paused_status" "$terminal_status" "$multi_status" <<'PY'
+mixed_status="$(toolbox product status mixed)" || fail "ready-plus-blocked status failed"
+active_mixed_status="$(toolbox product status active-mixed)" \
+  || fail "active-plus-blocked status failed"
+python3 - \
+  "$beta_status" "$gamma_status" "$paused_status" "$terminal_status" \
+  "$multi_status" "$mixed_status" "$active_mixed_status" <<'PY'
 import json
 import sys
 beta = json.loads(sys.argv[1])
@@ -122,6 +133,8 @@ gamma = json.loads(sys.argv[2])
 paused = json.loads(sys.argv[3])
 terminal = json.loads(sys.argv[4])
 multi = json.loads(sys.argv[5])
+mixed = json.loads(sys.argv[6])
+active_mixed = json.loads(sys.argv[7])
 assert beta["active_scenario_ref"] == "toolbox:scenario/SCN-BETA-ACTIVE"
 assert beta["next_action"] == "continue-active-scenario"
 assert gamma["blockers"] == [{
@@ -148,6 +161,30 @@ assert multi["blockers"] == [{
     "ref": "toolbox:product/multi",
 }]
 assert multi["next_action"] == "resolve-blocker"
+assert mixed["ready_candidates"] == [{
+    "priority": 0,
+    "scenario_ref": "toolbox:scenario/SCN-MIXED-READY",
+    "title": "SCN-MIXED-READY",
+}]
+assert mixed["blockers"] == [{
+    "code": "scenario-blocked",
+    "ref": "toolbox:scenario/SCN-MIXED-BLOCKED",
+}]
+assert mixed["next_action"] == "start-ready-scenario"
+assert active_mixed["active_scenario_ref"] == (
+    "toolbox:scenario/SCN-ACTIVE-MIXED-ACTIVE"
+)
+assert active_mixed["blockers"] == [
+    {
+        "code": "scenario-blocked",
+        "ref": "toolbox:scenario/SCN-ACTIVE-MIXED-BLOCKED",
+    },
+    {
+        "code": "scenario-dependency-incomplete",
+        "ref": "toolbox:scenario/SCN-ACTIVE-MIXED-WAIT",
+    },
+]
+assert active_mixed["next_action"] == "continue-active-scenario"
 PY
 
 plan="$(toolbox product run-plan alpha)" || fail "product run-plan failed"
@@ -182,6 +219,16 @@ PY
 explicit="$(toolbox product run-plan alpha --scenario SCN-ALPHA-READY)"
 [ "$plan" = "$explicit" ] || fail "explicit ready scenario changed the plan"
 
+mixed_plan="$(toolbox product run-plan mixed)" \
+  || fail "ready scenario should outrank unrelated blocked backlog"
+python3 - "$mixed_plan" <<'PY'
+import json
+import sys
+actual = json.loads(sys.argv[1])
+assert actual["product_ref"] == "toolbox:product/mixed"
+assert actual["scenario_ref"] == "toolbox:scenario/SCN-MIXED-READY"
+PY
+
 expect_plan_failure() {
   local expected="$1"
   shift
@@ -202,6 +249,7 @@ expect_plan_failure "active-scenario-exists" product run-plan beta
 expect_plan_failure "product-paused" product run-plan paused
 expect_plan_failure "product-terminal" product run-plan terminal
 expect_plan_failure "multiple-active-scenarios" product run-plan multi
+expect_plan_failure "active-scenario-exists" product run-plan active-mixed
 
 portfolio="$(toolbox portfolio run-plan)" || fail "portfolio run-plan failed"
 portfolio_again="$(toolbox portfolio run-plan)" || fail "second portfolio run-plan failed"
@@ -212,14 +260,15 @@ import sys
 actual = json.loads(sys.argv[1])
 assert actual["contract_version"] == "toolbox-run-plan/v1"
 assert actual["selection_scope"] == "portfolio"
-assert actual["product_ref"] == "toolbox:product/alpha"
-assert actual["scenario_ref"] == "toolbox:scenario/SCN-ALPHA-READY"
-assert actual["repository_owners"] == ["alpha-api", "alpha-web"]
+assert actual["product_ref"] == "toolbox:product/mixed"
+assert actual["scenario_ref"] == "toolbox:scenario/SCN-MIXED-READY"
+assert actual["repository_owners"] == ["mixed-web"]
 assert [(item["id"], item["owner"]) for item in actual["required_quality_checks"]] == [
-    ("api-contract", "alpha-api"),
-    ("unit", "alpha-web"),
+    ("unit", "mixed-web"),
 ]
 assert [item["product_ref"] for item in actual["skipped_products"]] == [
+    "toolbox:product/active-mixed",
+    "toolbox:product/alpha",
     "toolbox:product/beta",
     "toolbox:product/delta",
     "toolbox:product/epsilon",
@@ -230,37 +279,52 @@ assert [item["product_ref"] for item in actual["skipped_products"]] == [
 ]
 assert actual["skipped_products"][0]["reasons"] == [{
     "code": "active-scenario-exists",
-    "ref": "toolbox:scenario/SCN-BETA-ACTIVE",
+    "ref": "toolbox:scenario/SCN-ACTIVE-MIXED-ACTIVE",
 }]
 assert actual["skipped_products"][1]["reasons"] == [{
+    "code": "lower-priority-candidate",
+    "ref": "toolbox:scenario/SCN-ALPHA-READY",
+}]
+assert actual["skipped_products"][2]["reasons"] == [{
+    "code": "active-scenario-exists",
+    "ref": "toolbox:scenario/SCN-BETA-ACTIVE",
+}]
+assert actual["skipped_products"][3]["reasons"] == [{
     "code": "scenario-dependency-incomplete",
     "ref": "toolbox:scenario/SCN-DELTA-WAIT",
 }]
-assert actual["skipped_products"][2]["reasons"] == [{
+assert actual["skipped_products"][4]["reasons"] == [{
     "code": "lower-priority-candidate",
     "ref": "toolbox:scenario/SCN-EPSILON-READY",
 }]
-assert actual["skipped_products"][3]["reasons"] == [{
+assert actual["skipped_products"][5]["reasons"] == [{
     "code": "scenario-blocked",
     "ref": "toolbox:scenario/SCN-GAMMA-BLOCKED",
 }]
-assert actual["skipped_products"][4]["reasons"] == [{
+assert actual["skipped_products"][6]["reasons"] == [{
     "code": "multiple-active-scenarios",
     "ref": "toolbox:product/multi",
 }]
-assert actual["skipped_products"][5]["reasons"] == [{
+assert actual["skipped_products"][7]["reasons"] == [{
     "code": "product-paused",
     "ref": "toolbox:product/paused",
 }]
-assert actual["skipped_products"][6]["reasons"] == [{
+assert actual["skipped_products"][8]["reasons"] == [{
     "code": "product-terminal",
     "ref": "toolbox:product/terminal",
 }]
-assert actual["remaining_candidates"] == [{
-    "priority": 30,
-    "product_ref": "toolbox:product/epsilon",
-    "scenario_ref": "toolbox:scenario/SCN-EPSILON-READY",
-}]
+assert actual["remaining_candidates"] == [
+    {
+        "priority": 20,
+        "product_ref": "toolbox:product/alpha",
+        "scenario_ref": "toolbox:scenario/SCN-ALPHA-READY",
+    },
+    {
+        "priority": 30,
+        "product_ref": "toolbox:product/epsilon",
+        "scenario_ref": "toolbox:scenario/SCN-EPSILON-READY",
+    },
+]
 PY
 
 after="$(find "$wb/products" -type f -print0 | sort -z | xargs -0 shasum | shasum)"

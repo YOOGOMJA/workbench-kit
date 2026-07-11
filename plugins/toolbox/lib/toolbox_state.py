@@ -924,9 +924,7 @@ def get_product_bundle(portfolio: dict[str, Any], product_id: str) -> dict[str, 
     raise StateError(f"product '{product_id}' does not exist")
 
 
-def scenario_blockers(
-    bundle: dict[str, Any], index: dict[str, tuple[str, dict[str, Any]]]
-) -> list[dict[str, str]]:
+def product_blockers(bundle: dict[str, Any]) -> list[dict[str, str]]:
     product = bundle["product"]
     product_ref = f"toolbox:product/{product['id']}"
     if product["status"] == "paused":
@@ -940,7 +938,12 @@ def scenario_blockers(
     )
     if len(active) > 1:
         return [{"code": "multiple-active-scenarios", "ref": product_ref}]
+    return []
 
+
+def local_scenario_blockers(
+    bundle: dict[str, Any], index: dict[str, tuple[str, dict[str, Any]]]
+) -> list[dict[str, str]]:
     blockers: list[dict[str, str]] = []
     for scenario in sorted(bundle["scenarios"], key=lambda item: item["id"]):
         scenario_ref = f"toolbox:scenario/{scenario['id']}"
@@ -976,15 +979,18 @@ def product_status(workspace: pathlib.Path, product_id: str) -> dict[str, Any]:
         }
         for item in candidate_scenarios(workspace, product_id)
     ]
-    blockers = scenario_blockers(bundle, index)
+    wide_blockers = product_blockers(bundle)
+    blockers = wide_blockers or local_scenario_blockers(bundle, index)
     if bundle["product"]["status"] in ("completed", "archived"):
         next_action = "none"
-    elif blockers:
+    elif wide_blockers:
         next_action = "resolve-blocker"
     elif len(active) == 1:
         next_action = "continue-active-scenario"
     elif candidates:
         next_action = "start-ready-scenario"
+    elif blockers:
+        next_action = "resolve-blocker"
     else:
         next_action = "none"
     return {
@@ -1045,9 +1051,9 @@ def product_run_plan(
     portfolio, index = check_portfolio(workspace)
     bundle = get_product_bundle(portfolio, product_id)
     product_ref = f"toolbox:product/{product_id}"
-    blockers = scenario_blockers(bundle, index)
-    if blockers:
-        blocker = blockers[0]
+    wide_blockers = product_blockers(bundle)
+    if wide_blockers:
+        blocker = wide_blockers[0]
         raise StateError(f"{blocker['code']}: {blocker['ref']}")
     active = sorted(
         (item for item in bundle["scenarios"] if item["status"] == "active"),
@@ -1082,6 +1088,10 @@ def product_run_plan(
     else:
         candidates = candidate_scenarios(workspace, product_id)
         if not candidates:
+            blockers = local_scenario_blockers(bundle, index)
+            if blockers:
+                blocker = blockers[0]
+                raise StateError(f"{blocker['code']}: {blocker['ref']}")
             raise StateError(f"no-ready-scenario: {product_ref}")
         candidate = index[candidates[0]["scenario_id"]][1]
     return build_run_plan(bundle, candidate, "product", [], [])
@@ -1099,13 +1109,14 @@ def portfolio_run_plan(workspace: pathlib.Path) -> dict[str, Any]:
     for bundle in portfolio["products"]:
         product_id = bundle["product"]["id"]
         product_ref = f"toolbox:product/{product_id}"
-        blockers = scenario_blockers(bundle, index)
+        wide_blockers = product_blockers(bundle)
+        local_blockers = local_scenario_blockers(bundle, index)
         active = sorted(
             (item for item in bundle["scenarios"] if item["status"] == "active"),
             key=lambda item: item["id"],
         )
-        if blockers:
-            reasons = blockers
+        if wide_blockers:
+            reasons = wide_blockers
         elif active:
             reasons = [{
                 "code": "active-scenario-exists",
@@ -1114,6 +1125,8 @@ def portfolio_run_plan(workspace: pathlib.Path) -> dict[str, Any]:
         elif candidates_by_product.get(product_id):
             eligible.extend(candidates_by_product[product_id])
             continue
+        elif local_blockers:
+            reasons = local_blockers
         else:
             reasons = [{"code": "no-ready-scenario", "ref": product_ref}]
         skipped.append({"product_ref": product_ref, "reasons": reasons[:1]})
