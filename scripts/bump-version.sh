@@ -20,4 +20,5 @@ while IFS= read -r -d '' f; do
 done < <(find "$ROOT/plugins" \( -path '*/.claude-plugin/plugin.json' -o -path '*/.codex-plugin/plugin.json' \) -print0)
 
 echo "bumped $n manifest(s) to $V"
-echo "next: update CHANGELOG.md, commit, then tag (see RELEASING.md)"
+echo "next: update CHANGELOG.md, commit on the release branch, and open a PR"
+echo "      the release workflow auto-tags after merge (see RELEASING.md)"

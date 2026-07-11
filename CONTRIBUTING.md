@@ -45,6 +45,6 @@ release gates.
 
 ## Releases
 
-See [RELEASING.md](RELEASING.md). In short: land on `main`, bump the version
-(`scripts/bump-version.sh X.Y.Z`), move `## [Unreleased]` to `## [X.Y.Z] - <date>`,
-and the release workflow cuts the tag + GitHub Release.
+See [RELEASING.md](RELEASING.md). In short: run `scripts/release.sh X.Y.Z` on a
+branch, promote `## [Unreleased]` to `## [X.Y.Z] - <date>`, open and merge a PR,
+and let the release workflow cut the tag + GitHub Release.

@@ -4,14 +4,17 @@ All notable changes to workbench-kit are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims for
 [Semantic Versioning](https://semver.org/).
 
-This is one changelog for the whole marketplace (both the `workbench` and
-`workbench-kit` plugins). When an entry touches only one plugin, it says which.
+This is one changelog for the whole marketplace: three plugins (`workbench`,
+`workbench-kit`, and the optional `toolbox`). When an entry touches only one plugin, it says which.
 See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ## [Unreleased]
 
 ### Added
 
+- **Three-plugin marketplace integration** — registers the optional `toolbox` in both Claude
+  Code and Codex marketplaces, validates strict three-plugin/six-manifest parity, and gives
+  CI and release preparation one inventory-checked repository test suite (#30).
 - **Governed existing-workbench upgrades** — the `workbench-kit` plugin now
   classifies generated, embedded, staged, current, malformed, and unrecognized
   workspaces; emits deterministic dry-run plans; applies them through an external,
@@ -27,7 +30,7 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 - **Optional `toolbox` foundation** — adds cross-tool plugin manifests, a public
   workbench/profile compatibility adapter, profile-bound product language,
   caller-contained strict JSON state, and deterministic product, scenario, and portfolio
-  validation (#28). Marketplace registration remains follow-up work.
+  validation (#28). Marketplace registration ships through #30.
 - **Policy-aware v2 task lifecycle** — the `workbench` plugin now discovers explicit
   workspace/profile contracts and manages opaque task refs, multiple deliverables,
   required checks, revision-bound evidence, policy authorization, harvest disposition,

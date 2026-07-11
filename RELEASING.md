@@ -2,7 +2,8 @@
 
 workbench-kit is a **marketplace repo** hosting three plugins (`workbench`,
 `workbench-kit`, and the optional `toolbox`). Users install from this repo's
-default branch, so a release is: land on `main` → bump version → tag → write notes.
+default branch, so a release is: prepare the version and notes on a branch → merge
+to `main` → let the release workflow tag and publish it.
 
 ## Versioning
 

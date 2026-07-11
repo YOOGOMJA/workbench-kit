@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # release.sh <X.Y.Z> — one-shot release prep: bump version across all manifests and run
-# the checks. It does NOT commit, tag, or push — it prints those steps for you to do on
-# main. Keeps releasing self-contained in the repo. Full procedure: RELEASING.md.
+# the checks. It does NOT commit, tag, or push; run it on a release branch, then follow
+# the printed PR steps. Full procedure: RELEASING.md.
 set -euo pipefail
 V="${1:-}"
 [ -n "$V" ] || { echo "usage: release.sh <X.Y.Z>" >&2; exit 2; }

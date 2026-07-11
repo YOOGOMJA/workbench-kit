@@ -85,6 +85,9 @@ codex plugin add toolbox@workbench-kit
 /workbench-kit:generate-workbench            # 레포를 생성하고 초안은 버림
 ```
 
+Codex에서는 같은 설치 스킬을 `$interview-for-personalizing`,
+`$generate-workbench`로 호출합니다.
+
 <p align="center">
   <img src="demo/workbench-kit-bootstrap.gif" width="820" alt="실제 에이전트가 인터뷰 후 generate-workbench로 최소 워크벤치 레포를 합성" />
 </p>
@@ -118,6 +121,9 @@ my-workbench/
 /workbench:task-submit            # task/ 정리, squash PR 생성
 /workbench:task-done <issue>      # 머지 후 작업 공간 정리
 ```
+
+Codex에서는 `$task-start`, `$task-submit`, `$task-done`을 사용합니다. 나머지 엔진
+진입점도 같은 `$skill-name` 규칙을 따릅니다.
 
 그 밖의 진입점: `/workbench:ticket-incubate`(아이디어 → 이슈),
 `/workbench:task-status` · `/workbench:task-tickets`(읽기 전용 현황),

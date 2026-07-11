@@ -87,6 +87,9 @@ then scaffolds a minimal repo personalized to your conventions:
 /workbench-kit:generate-workbench            # scaffolds the repo, then discards the draft
 ```
 
+In Codex, invoke the same installed skills as `$interview-for-personalizing` and
+`$generate-workbench`.
+
 <p align="center">
   <img src="demo/workbench-kit-bootstrap.gif" width="820" alt="A real agent runs the interview then generate-workbench, composing a fresh minimal workbench repo" />
 </p>
@@ -122,6 +125,9 @@ increment survives to `main`:
 /workbench:task-submit            # clean up task/, open a squash PR
 /workbench:task-done <issue>      # sweep the workspace after merge
 ```
+
+In Codex, use `$task-start`, `$task-submit`, and `$task-done`. The remaining
+engine entry points follow the same `$skill-name` convention.
 
 Other entry points: `/workbench:ticket-incubate` (idea → issue),
 `/workbench:task-status` · `/workbench:task-tickets` (read-only overviews),
