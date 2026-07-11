@@ -23,6 +23,9 @@ REQUIRED_CAPABILITIES = {
     "workspace.doctor/v1",
     "workspace.legacy-inventory/v1",
 }
+BOOTSTRAP_CAPABILITY = "workspace.legacy-inventory-bootstrap/v1"
+LEGACY_INVENTORY_CONTRACT = "workbench-legacy-inventory/v1"
+BOOTSTRAP_APPROVAL_CONTRACT = "workbench-bootstrap-authority-approval/v1"
 GIT_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
@@ -97,7 +100,7 @@ def run_public_json(
     return require_object(value, ref), completed.returncode
 
 
-def validate_contract(document: dict[str, Any], workspace: pathlib.Path) -> None:
+def validate_contract(document: dict[str, Any], workspace: pathlib.Path) -> str:
     ref = "workbench contract show"
     if document.get("contract_version") != "workbench-contract/v1":
         raise AdapterError("public-contract-invalid", ref)
@@ -110,14 +113,34 @@ def validate_contract(document: dict[str, Any], workspace: pathlib.Path) -> None
     root = workspace_contract.get("root")
     if not isinstance(root, str) or pathlib.Path(root).resolve() != workspace:
         raise AdapterError("caller-root-mismatch", str(root))
-    if workspace_contract.get("schema") not in ("workbench/v1", "workbench/v2"):
+    schema = workspace_contract.get("schema")
+    if schema not in ("workbench/v1", "workbench/v2"):
         raise AdapterError("public-contract-invalid", f"{ref}.workspace.schema")
+    supported = require_object(document.get("supported"), f"{ref}.supported")
+    inventory_contracts = require_array(
+        supported.get("legacy_inventory_contracts"),
+        f"{ref}.supported.legacy_inventory_contracts",
+    )
+    if LEGACY_INVENTORY_CONTRACT not in inventory_contracts:
+        raise AdapterError("public-contract-missing", LEGACY_INVENTORY_CONTRACT)
     capabilities = require_array(document.get("capabilities"), f"{ref}.capabilities")
     if not all(isinstance(item, str) for item in capabilities):
         raise AdapterError("public-contract-invalid", f"{ref}.capabilities")
     missing = sorted(REQUIRED_CAPABILITIES - set(capabilities))
     if missing:
         raise AdapterError("public-capability-missing", missing[0])
+    if schema == "workbench/v1":
+        if "bootstrap_authority_approval_contracts" not in supported:
+            raise AdapterError("public-contract-missing", BOOTSTRAP_APPROVAL_CONTRACT)
+        approval_contracts = require_array(
+            supported.get("bootstrap_authority_approval_contracts"),
+            f"{ref}.supported.bootstrap_authority_approval_contracts",
+        )
+        if BOOTSTRAP_APPROVAL_CONTRACT not in approval_contracts:
+            raise AdapterError("public-contract-missing", BOOTSTRAP_APPROVAL_CONTRACT)
+        if BOOTSTRAP_CAPABILITY not in capabilities:
+            raise AdapterError("public-capability-missing", BOOTSTRAP_CAPABILITY)
+    return schema
 
 
 def validate_doctor(document: dict[str, Any], status: int) -> None:
@@ -210,27 +233,47 @@ def validate_inventory(
     return active
 
 
-def inspect_public_kernel(workspace: pathlib.Path) -> dict[str, Any]:
+def inspect_public_kernel(
+    workspace: pathlib.Path,
+    authority_approval_file: pathlib.Path | None = None,
+) -> dict[str, Any]:
     workspace = workspace.resolve()
     binary = resolve_workbench_binary()
     contract, _ = run_public_json(
         binary, ("contract", "show", "--format", "json"), workspace, {0}
     )
-    validate_contract(contract, workspace)
+    schema = validate_contract(contract, workspace)
     doctor, doctor_status = run_public_json(
         binary, ("doctor", "--format", "json"), workspace, {0, 1}
     )
     validate_doctor(doctor, doctor_status)
+    if schema == "workbench/v1":
+        if authority_approval_file is None:
+            raise AdapterError(
+                "bootstrap-authority-approval-required",
+                "--authority-approval-file",
+            )
+        approval = authority_approval_file.expanduser().resolve()
+        inventory_argv = (
+            "legacy-inventory",
+            "bootstrap-show",
+            "--authority-approval-file",
+            str(approval),
+            "--format",
+            "json",
+        )
+        inventory_command = "bootstrap-show"
+    else:
+        inventory_argv = ("legacy-inventory", "show", "--format", "json")
+        inventory_command = "show"
     inventory, inventory_status = run_public_json(
-        binary,
-        ("legacy-inventory", "show", "--format", "json"),
-        workspace,
-        {0, 1},
+        binary, inventory_argv, workspace, {0, 1}
     )
     active = validate_inventory(inventory, inventory_status)
     return {
         "contract": contract,
         "doctor": doctor,
         "legacy_inventory": inventory,
+        "legacy_inventory_command": inventory_command,
         "active_v1_tasks": active,
     }

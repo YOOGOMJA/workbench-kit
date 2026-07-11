@@ -27,8 +27,13 @@ case "$*" in
     fi
     extra=""
     [ "$mode" != extra-field ] || extra=',"future_field":{"accepted":true}'
-    printf '{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"%s","source":"%s"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]}},"capabilities":["workspace.schema/v1","workspace.doctor/v1","workspace.legacy-inventory/v1"]%s}\n' \
-      "$root" "$workspace_schema" "$workspace_source" "$extra"
+    bootstrap_supported=',"bootstrap_authority_approval_contracts":["workbench-bootstrap-authority-approval/v1"]'
+    [ "$mode" != missing-bootstrap-contract ] || bootstrap_supported=''
+    bootstrap_capability=',"workspace.legacy-inventory-bootstrap/v1"'
+    [ "$mode" != missing-bootstrap-capability ] || bootstrap_capability=''
+    printf '{"contract_version":"workbench-contract/v1","engine":{"name":"workbench","version":"0.2.0"},"workspace":{"root":"%s","schema":"%s","source":"%s"},"supported":{"workspace_schemas":{"read":["workbench/v1","workbench/v2"],"write":["workbench/v2"]},"legacy_inventory_contracts":["workbench-legacy-inventory/v1"]%s},"capabilities":["workspace.schema/v1","workspace.doctor/v1","workspace.legacy-inventory/v1"%s]%s}\n' \
+      "$root" "$workspace_schema" "$workspace_source" "$bootstrap_supported" \
+      "$bootstrap_capability" "$extra"
     ;;
   "doctor --format json")
     if [ "$mode" = doctor-bad-exit ]; then
@@ -52,7 +57,14 @@ case "$*" in
       "$ready" "$ready" "$ready" "$permission" "$push_ready" "$blocker"
     exit "$status"
     ;;
-  "legacy-inventory show --format json")
+  "legacy-inventory show --format json"|legacy-inventory\ bootstrap-show\ --authority-approval-file\ *\ --format\ json)
+    if [ "${2:-}" = bootstrap-show ]; then
+      [ "$workspace_schema" = workbench/v1 ] || exit 92
+      [ "${4:-}" = "${UPGRADE_STUB_APPROVAL_FILE:-}" ] || exit 92
+      [ -f "${4:-}" ] || exit 92
+    else
+      [ "$workspace_schema" = workbench/v2 ] || exit 92
+    fi
     complete=true
     blockers='[]'
     pagination_complete=true
