@@ -1867,6 +1867,7 @@ PY
 
 test_cleanup_retires_consumed_writer_before_local_deletion() {
   local task_dir actual operation_id claim_id ledger ref comments operation gitdir marker backup out
+  local observation revision
   setup_writer_workbench writer_cleanup
   printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
   git -C "$WRITER_REPO" add .workbench/policy.conf
@@ -1935,6 +1936,18 @@ PY
     fail "consumed writer retry must reject a missing ownership marker"
   fi
   assert_file_contains "$out" '"code":"writer-recovery-blocked"'
+  observation="$TMPDIR/writer_cleanup/legacy-observation.json"
+  revision="$(git -C "$WRITER_REPO" rev-parse origin/main)"
+  write_empty_legacy_observation "$observation" "$revision" \
+    "$(git -C "$WRITER_REPO" remote get-url origin)" shared-api \
+    "$TMPDIR/writer_cleanup/shared-api.git"
+  out="$TMPDIR/writer_cleanup/status-unreconciled.out"
+  if WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+    run_task writer_cleanup "$WRITER_REPO" status --format json >"$out" 2>&1; then
+    fail "status must fail closed for a consumed writer with no ownership marker"
+  fi
+  assert_file_contains "$out" '"code":"writer-claim-unreconciled"'
+  assert_file_contains "$out" "\"ref\":\"${operation_id}\""
   mv "$backup" "$marker"
 
   actual="$(run_task_in_dir writer_cleanup "$task_dir" abandon \

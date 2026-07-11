@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
@@ -18,6 +20,7 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
+OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 CLAIM_FIELDS = (
     "kind",
@@ -306,6 +309,8 @@ def load_operation(file: str) -> Dict[str, Any]:
         if not isinstance(value[key], str):
             raise ValueError("{} must be a string".format(key))
         require_text(value[key], key)
+    if OWNER.fullmatch(value["owner"]) is None or value["owner"].isdigit():
+        raise ValueError("writer operation owner must be a canonical home")
     if value["expected_path"] != "task/codebases/" + value["owner"]:
         raise ValueError("writer operation expected_path does not bind the owner")
     if UUID.fullmatch(value["clone_id"] if isinstance(value["clone_id"], str) else "") is None:
@@ -780,6 +785,155 @@ def validate_status_claim(value: Any) -> Mapping[str, Any]:
     return value
 
 
+def ordered_record(path: Path, fields: Sequence[str]) -> Dict[str, str]:
+    value: Dict[str, str] = {}
+    order: List[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for lineno, raw in enumerate(handle, 1):
+            if not raw.endswith("\n") or "=" not in raw:
+                raise ValueError("malformed local writer record line {}".format(lineno))
+            key, item = raw[:-1].split("=", 1)
+            if not key or key in value or "\t" in key or "\r" in item:
+                raise ValueError("invalid local writer record")
+            value[key] = item
+            order.append(key)
+    if tuple(order) != tuple(fields):
+        raise ValueError("local writer record fields or order do not match")
+    return value
+
+
+def git_value(cwd: Path, *args: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(cwd), *args],
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ).strip()
+
+
+def resolve_git_path(cwd: Path, value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = cwd / path
+    return Path(os.path.realpath(path))
+
+
+def task_frontmatter(index: Path) -> Dict[str, str]:
+    lines = index.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0] != "---":
+        raise ValueError("task index has no frontmatter")
+    try:
+        end = lines.index("---", 1)
+    except ValueError as exc:
+        raise ValueError("task index frontmatter is unterminated") from exc
+    value: Dict[str, str] = {}
+    for line in lines[1:end]:
+        if ": " not in line:
+            continue
+        key, item = line.split(": ", 1)
+        if key in value:
+            raise ValueError("duplicate task index frontmatter field")
+        value[key] = item
+    return value
+
+
+def local_writer_effects_match(operation_path: str, operation: Mapping[str, Any]) -> bool:
+    path = Path(operation_path).resolve()
+    if (
+        path.parent.name != "writer-operations"
+        or path.parent.parent.name != ".workbench"
+        or path.parent.parent.parent.name != "task"
+    ):
+        return False
+    task_root = path.parents[3]
+    if task_root.parent.name != ".worktrees":
+        return False
+    workspace = task_root.parent.parent
+    index = task_root / "task/index.md"
+    frontmatter = task_frontmatter(index)
+    if (
+        frontmatter.get("claim_id") != operation["task_claim_id"]
+        or frontmatter.get("branch") != operation["branch"]
+    ):
+        return False
+    issue = frontmatter.get("issue", "")
+    slug = frontmatter.get("slug", "")
+    parent = frontmatter.get("parent", "")
+    if not issue.isdigit() or not slug:
+        return False
+    codebase_branch = "task/{}{}-{}".format(parent + "/" if parent else "", issue, slug)
+    expected_repo_row = "- {} | {} | work".format(operation["owner"], codebase_branch)
+    index_lines = index.read_text(encoding="utf-8").splitlines()
+    if index_lines.count(expected_repo_row) != 1:
+        return False
+    row_fields = (
+        "operation_id",
+        "claim_id",
+        "owner",
+        "task_claim_id",
+        "branch",
+        "expected_path",
+        "codebase_origin_url",
+        "context_policy_set_digest",
+        "action_instance_id",
+        "intent_digest",
+        "policy_manifest_digest",
+        "authorization_ref",
+    )
+    row = ordered_record(
+        task_root / "task/.workbench/writer-rows/{}.record".format(operation["owner"]),
+        row_fields,
+    )
+    policy = operation["policy_manifest"]
+    expected_row = {
+        "operation_id": operation["operation_id"],
+        "claim_id": operation["claim_id"],
+        "owner": operation["owner"],
+        "task_claim_id": operation["task_claim_id"],
+        "branch": codebase_branch,
+        "expected_path": operation["expected_path"],
+        "codebase_origin_url": operation["codebase_origin_url"],
+        "context_policy_set_digest": operation["context_policy_set_digest"],
+        "action_instance_id": operation["action_instance_id"] or "",
+        "intent_digest": operation["intent_digest"] or "",
+        "policy_manifest_digest": "" if policy is None else policy["digest"],
+        "authorization_ref": operation["authorization_ref"] or "",
+    }
+    if row != expected_row:
+        return False
+    if operation["stage"] == "handoff-ready":
+        return not (task_root / operation["expected_path"]).exists()
+    if operation["stage"] != "consumed":
+        return True
+
+    worktree = task_root / operation["expected_path"]
+    cache = workspace / ".codebases" / operation["owner"]
+    if not worktree.is_dir() or not cache.is_dir():
+        return False
+    if git_value(worktree, "symbolic-ref", "--short", "HEAD") != codebase_branch:
+        return False
+    if git_value(worktree, "remote", "get-url", "origin") != operation["codebase_origin_url"]:
+        return False
+    if git_value(cache, "remote", "get-url", "origin") != operation["codebase_origin_url"]:
+        return False
+    worktree_common = resolve_git_path(worktree, git_value(worktree, "rev-parse", "--git-common-dir"))
+    cache_common = resolve_git_path(cache, git_value(cache, "rev-parse", "--git-common-dir"))
+    if worktree_common != cache_common:
+        return False
+    gitdir = resolve_git_path(worktree, git_value(worktree, "rev-parse", "--git-dir"))
+    with (gitdir / "workbench-writer-owner.json").open("r", encoding="utf-8") as handle:
+        marker = json.load(handle, object_pairs_hook=unique_object)
+    expected_marker = {
+        "contract_version": "workbench-writer-worktree-owner/v1",
+        "operation_id": operation["operation_id"],
+        "claim_id": operation["claim_id"],
+        "task_claim_id": operation["task_claim_id"],
+        "expected_path": operation["expected_path"],
+        "branch": codebase_branch,
+        "codebase_origin_url": operation["codebase_origin_url"],
+    }
+    return tuple(marker) == tuple(expected_marker) and marker == expected_marker
+
+
 def cmd_status_projection(args: argparse.Namespace) -> None:
     rows, _ = read_ledger(args.ledger_file)
     legacy = load_json(args.legacy_inventory_file)
@@ -861,6 +1015,11 @@ def cmd_status_projection(args: argparse.Namespace) -> None:
                 {"code": "writer-operation-incomplete", "ref": operation["operation_id"]}
             )
             continue
+        if valid and stage in ("consumed", "handoff-ready"):
+            try:
+                valid = local_writer_effects_match(path, operation)
+            except (OSError, UnicodeError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+                valid = False
         if not valid:
             blockers.append(
                 {"code": "writer-claim-unreconciled", "ref": operation["operation_id"]}
