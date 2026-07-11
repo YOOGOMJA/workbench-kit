@@ -92,3 +92,5 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-07-11 08:18:03] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Bound actions to complete canonical policy manifests, sealed owner context, authority-backed acceptance, terminal content freeze, revision-safe evidence, durable cleanup recovery, and enforced writer claims
 
 ## [2026-07-11 09:11:15] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Pinned remote workspace policy authority, per-participant receipts, single-effect deliverable transitions, CAS writer claims, and the frozen v1 action registry
+
+## [2026-07-11 09:44:02] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md, index.md, decisions/index.md | Defined skeleton-only v2 start, protected-default authority descriptors, legacy-aware crash-safe writer recovery, declaration-bound pack ownership, and read-only doctor permission checks

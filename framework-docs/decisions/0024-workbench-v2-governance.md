@@ -7,9 +7,11 @@
   completion, revision-bound evidence, `allow | ask | deny` policy resolution, generic
   namespaced references, replay-safe action instances, task-level contract selection, exact
   public CLI/JSON records, authority-backed acceptance, terminal content freeze, a sealed
-  harvest ledger, externally journaled cleanup, CAS-serialized writer claims,
-  origin-pinned workspace policy, per-participant sealed policy authority, and capability
-  discovery kernel contracts. Keep product semantics in an optional pack.
+  harvest ledger, externally journaled cleanup, skeleton-only v2 start/resume,
+  legacy-aware CAS writer claims with crash-safe operation journals, protected-default
+  authority descriptors, declaration-bound pack ownership, per-participant sealed policy
+  authority, and capability discovery kernel contracts. Keep product semantics in an optional
+  pack.
 - **Context:** V1 isolates task work and accumulates knowledge, but it treats a workbench
   increment pull request as the normal delivery path and describes human gates only in
   prose. It has no durable category for current intent and no supported way for an optional
@@ -25,7 +27,8 @@
   compatibility, deliverables, and evidence, while human reviewers receive rationale and
   Mermaid diagrams. Missing known rules default to `ask`, unknown action IDs are
   non-executable, unsupported capabilities block mutation, authorization is bound to
-  action/task/target/revision/full authority manifest, and verification is tied to exact
+  action/task/target/revision/full authority manifest, legacy writers cannot be silently
+  omitted, remote claims are cross-device recoverable, and verification is tied to exact
   evidence subjects and immutable revisions.
 - **Rejected alternatives:**
   1. Put product, portfolio, scenario, design, and TDD semantics in the kernel. This would
@@ -92,13 +95,31 @@
   24. Combine deliverable weakening, waiver, or rejection in one authorized update or omit
       its reason. Each governed call now has one effect, one action binding, and persisted
       reason fields with explicit later reset semantics.
+  25. Let v2 start/resume auto-attach a work repo or seal null context. Product refs could not
+      be set before irreversible writer state; v2 now creates only a skeleton and requires
+      explicit refs, seal, and add-repo steps while preserving v1 behavior.
+  26. Treat the v2 coordination ledger as the complete writer set. Active v1 tasks would be
+      invisible; every v2 claim now joins deterministic pseudo-claims from authoritative v1
+      lifecycle facts and canonical task-branch role records.
+  27. Persist only a remote writer row and reconstruct local effects heuristically. A crash
+      could duplicate or prematurely release a worktree; strict operation stages, expanded
+      remote identity, exact adoption, and external cleanup recovery now govern retries.
+  28. Let a pack assertion select acceptance authority at accept time. The caller could switch
+      owners after declaration; pack deliverables now bind one context and authority
+      immutably at declaration and repeat them in every record and receipt.
+  29. Locate workspace authority through a bootstrap issue comment. Issue discovery is
+      ambiguous and separate from policy revision; the protected-default authority descriptor
+      and policy are fetched from one immutable OID, with comments only optional audit data.
+  30. Treat a no-op dry-run push as proof of writer-ref readiness. It may not prove permission
+      or rules; doctor now requires read-only hosting-adapter inspection, reports unsupported
+      inspection as unknown/not-ready, and leaves actual CAS as final proof.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing
   task contract is always v1, so active tasks can finish without forced conversion.
-  Workspace, task, lifecycle, profile, policy, authority, coordination, evidence, pack, and
-  domain schemas are versioned separately from plugin SemVer. Migration is a governed task
-  and pull request, not an install-time rewrite.
+  Workspace, task, lifecycle, profile, policy, authority descriptor, coordination operation,
+  evidence, pack, and domain schemas are versioned separately from plugin SemVer. Migration
+  is a governed task and pull request, not an install-time rewrite.
 - **Source:** workbench-kit#25 / 2026-07-11
 - **Relations:**
   - extends [[0015-task-lifecycle-events]]
