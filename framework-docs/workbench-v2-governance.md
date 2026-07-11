@@ -129,9 +129,16 @@ The kernel reports simultaneous `role: work` writers for the same codebase as
 not a lock. Enforcement occurs at `task add-repo --role work`, before writer state or a
 nested worktree is created. A conflict resolves `task.concurrent-write` over the union of
 every writer's sealed context set and consumes authorization only after the writer claim
-succeeds; missing policy resolves to `ask`. The final re-query and durable claim run under
-an owner-scoped, fenced coordination lease shared across processes and devices, so two
-callers cannot both pass an empty observation and write concurrently.
+succeeds. Serialization uses the append-only `workbench-writer-claims/v1` ledger on fixed
+canonical-origin ref `refs/heads/workbench-coordination/writer-claims`: each mutation creates
+a commit whose parent is the observed remote OID and pushes by fast-forward or exact
+force-with-lease CAS. A failed CAS refetches, recomputes conflicts/policy, and supersedes
+stale authorization. The pushed commit OID is the serialization token, not a local lease.
+Local-failure/crash retries reconcile the same persisted claim before creating another, and
+a persisted claim that fresh policy no longer permits is released before the policy result
+returns. Cleanup appends release rows without changing frozen task content. `workbench doctor`
+checks canonical origin identity, ledger read/parse, and non-destructive push readiness; any
+failure is `writer-lock-unavailable`.
 
 A cross-product initiative normally uses an umbrella work item with independent child tasks.
 Each child can verify, complete, abandon, and clean without pretending that every repository
@@ -143,12 +150,16 @@ and the pack must define rollback because the kernel does not provide cross-repo
 transactions.
 
 The namespace owner registers the complete context-policy participant set through a strict
-owner input. Core stores portable workspace-relative policy refs, evaluates the proposed set
-when sealing, and makes it immutable. Registration requires explicit authorization from the
-authenticated context owner, who attests completeness; standing `allow` is insufficient. A
-non-null task context cannot seal an empty set. Every later governed mutation automatically
-uses the entire sealed set; a direct caller cannot replace or omit sources with command-line
-paths.
+owner input. Every participant carries its own policy ref/digest and authenticated authority
+receipt, so atomic work may preserve different owners instead of collapsing them into one
+authority. An optional task policy is pinned and owner-authorized in the same set and may
+only tighten. Registration requires explicit context-owner authorization; standing `allow`
+is insufficient. A non-null context cannot seal an empty participant set. A null context
+remains settable after task start; if still null at the first governed mutation or explicit
+seal, it is lazily auto-registered/sealed with an empty set and no prompt. Context becomes
+immutable only after seal. Every later governed mutation uses the whole set. Changed
+participant/task bytes block as `policy-source-tampered`; callers cannot replace, omit, or
+re-authorize them per action.
 
 ### Deliverables
 
@@ -161,9 +172,11 @@ A task declares zero or more deliverables. Each deliverable has, at minimum:
 | `kind` | Kernel-defined kind or a namespaced pack kind |
 | `required` | Boolean; defaults to `true` |
 | `external_ref` | Optional pull request, artifact, or other delivery reference |
-| `revision` | Exact revision identifier; optional only while state is `declared` |
+| `revision` | Exact revision identifier; required for `submitted`/`accepted`, optional otherwise |
 | `state` | `declared`, `submitted`, `accepted`, `waived`, or `rejected` |
 | `acceptance_ref` | Append-only authority receipt required for `accepted` |
+| `governance_action` | Waive, reject, or weaken action ID; otherwise null |
+| `reason_code`, `reason_ref` | Required stable reason and optional prose reference for a governed change |
 | `governance_action_instance_id` | Consumed action for waiver, rejection, or weakening; otherwise null |
 | `authorization_ref` | Matching authorization provenance, or null for standing allow |
 
@@ -173,16 +186,20 @@ deliverable can be `waived` only through a governed action with a recorded reaso
 or unmerged pull request is `submitted`, not `accepted`. A task with no workbench increment
 must not create an empty workbench pull request merely to reach completion.
 
-`submitted` and `accepted` require a non-null revision. A changed revision returns the
-deliverable to a non-accepted state and makes its prior evidence stale. Required checks are
-declared independently from evidence, so completion can distinguish "no check was required"
-from "required evidence is missing". Exact commands and records are defined in
+`submitted` and `accepted` require a non-null revision; `declared`, `waived`, and `rejected`
+may remain null. One update can weaken, waive, or reject, never combine those governed
+effects, and must persist its reason and one action/authorization binding. A later explicit
+reset to `declared`/`submitted` clears current governance/acceptance fields but retains
+append-only receipts; a changed revision makes prior evidence stale. Required checks are
+declared independently from evidence, so completion distinguishes "no check was required"
+from "required evidence is missing". Exact commands and reset rules are in
 [[workbench-v2-cli-contract]].
 
 No caller can set `accepted` directly. Kernel-owned pull-request kinds require a deterministic
 merged-PR probe whose repository and head revision match. Pack-owned kinds require a strict
-owner assertion plus explicit, authenticated `task.deliverable.accept` authorization from
-the authority named by the sealed owner context; standing `allow` alone is insufficient.
+owner assertion plus explicit `task.deliverable.accept` authorization. The kind namespace
+and assertion authority ref must resolve exactly one sealed participant; its independent
+receipt authenticates the actor. Standing `allow` alone is insufficient.
 Both paths create `workbench-acceptance/v1` receipts included in the task content revision.
 
 ### Verification evidence
@@ -308,13 +325,16 @@ compatibility path until migration policy removes it in a future major contract.
 is the governed `task.cleanup` action and has its own revision-bound receipt, blockers, and
 retry semantics in [[workbench-v2-cli-contract]]. Before deleting task-local recovery state,
 it persists a `prepared` cleanup journal in the task home's issue comments; retries reconcile
-that external receipt through `completed` and `task-cleaned`.
+that external receipt through writer-claim release, `completed`, and `task-cleaned`. Release
+appends a CAS ledger event on the canonical coordination ref and does not mutate frozen task
+content.
 
 Completion and abandonment both freeze every revision-affecting fact. Refs, context set,
 deliverables and acceptance, required checks, evidence, harvest, and writer claims reject
 mutation with `terminal-content-frozen`. Only read-only queries, same-outcome reconciliation,
 durable cleanup-journal reconciliation, and bookkeeping excluded from the content revision
-remain available. Result changes require a new task.
+remain available. Coordination-ledger release is cleanup bookkeeping, not a task-content
+change. Result changes require a new task.
 
 ## Policy contract
 
@@ -332,19 +352,23 @@ evaluated in this order of authority:
 
 1. platform and harness safety policy;
 2. workspace policy;
-3. referenced-context or capability-pack policy;
-4. task-local constraints.
+3. every sealed referenced-context policy;
+4. an optional sealed task policy.
 
-A lower-authority layer may tighten but never relax a higher-authority result. A missing
-rule and an unknown action ID both resolve to `ask`. An agent must not infer authorization
-from previous similar actions, prose, silence, or a successful dry run.
+A lower-authority layer may tighten but never relax a higher-authority result. Workspace
+policy is required. Absent optional platform/task policy is neutral and contributes no row;
+a valid present source missing a known action contributes `ask`. The v1 executable registry
+is exactly the frozen kernel action table in [[workbench-v2-cli-contract]]. Unknown or
+namespaced action IDs are `unsupported-action`, not executable `ask`; pack action
+registration is reserved for a future contract. An agent must not infer authorization from
+previous similar actions, prose, silence, or a successful dry run.
 
 ```mermaid
 flowchart TD
     A[Governed action] --> P[Collect applicable policies]
     P --> D{Any deny?}
     D -->|yes| X[Deny and record]
-    D -->|no| Q{Any ask or missing rule?}
+    D -->|no| Q{Any ask or missing known rule?}
     Q -->|yes| H[Ask for this action instance]
     Q -->|no| L[Allow and execute]
     H --> R{Human decision}
@@ -356,14 +380,26 @@ Human approval resolves that action instance; it does not silently rewrite stand
 policy. Policy evaluation records the action ID, applicable policy sources, result, and
 authorization reference without asking shell plumbing to invent explanatory prose.
 
+V2 bootstrap/task claim pins canonical workspace origin URL, authority identity, and default
+ref in an authenticated `workbench-workspace-authority/v1` issue fact outside the task
+branch. Bootstrap uses `task_claim_id: null`; each task claim copies the same identity with
+its claim ID, and the two must match. Remote unavailability is
+`policy-authority-unavailable`; changed identity/ref is
+`policy-authority-mismatch`; a valid current authority revision missing required workspace
+policy is `policy-source-missing`.
+
 The kernel mints a unique action instance bound to `action_id`, `task_claim_id`,
 `target_ref`, revision digest, and the full canonical policy-source manifest. An
 authorization repeats the manifest digest with every other binding field. The sealed task
 context-policy set makes participant omission impossible for a direct caller. Immediately
-before consumption, the kernel reopens every canonical source and re-resolves strictest
-policy; a changed manifest supersedes the old instance and authorization. These rules
-prevent approval for one task, target, revision, or policy set from authorizing another.
-The higher-authority platform remains responsible for authenticating the approving actor.
+before consumption, the kernel re-observes the pinned workspace origin/default ref with
+`ls-remote --symref`, fetches its current OID, reads only that immutable object's
+`.workbench/policy.conf`, validates every sealed participant/task receipt and digest, and
+re-resolves strictest policy. The task-branch workspace copy is ignored. A changed protected
+workspace revision supersedes old authorization; changed sealed context/task bytes fail as
+`policy-source-tampered` without a replacement. These rules prevent approval for one task,
+target, revision, policy set, or authority revision from authorizing another. The trusted
+platform remains responsible for authenticating approving actors and authority receipts.
 
 The public `workbench-policy/v1` resolution object is:
 
@@ -381,24 +417,14 @@ The public `workbench-policy/v1` resolution object is:
       "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
       "sources": [
         {
-          "layer": "platform",
-          "context_ref": null,
-          "policy_ref": "platform:harness/default",
-          "policy_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-          "decision": "allow"
-        },
-        {
           "layer": "workspace",
           "context_ref": null,
           "policy_ref": ".workbench/policy.conf",
           "policy_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-          "decision": "ask"
-        },
-        {
-          "layer": "task",
-          "context_ref": null,
-          "policy_ref": null,
-          "policy_digest": null,
+          "authority_identity": "github:example/workbench",
+          "authority_ref": "refs/heads/main",
+          "authority_revision": "1111111111111111111111111111111111111111",
+          "authority_receipt_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
           "decision": "ask"
         }
       ]
@@ -411,10 +437,11 @@ The public `workbench-policy/v1` resolution object is:
 ```
 
 `policy_manifest.sources[].layer` is one of `platform`, `workspace`, `context`, or `task`.
-Caller-owned refs are portable workspace-relative paths with content digests; context
-sources also keep their context ref. `authorization_ref` is null until an explicit,
-matching authorization is recorded. Exact registration, manifest, action binding,
-authorization, and re-resolution rules are in [[workbench-v2-cli-contract]].
+Each present row binds policy ref/digest plus authority identity/ref/revision/receipt digest;
+there are no null placeholders for absent optional sources. Context rows also keep their
+context ref. `authorization_ref` is null until an explicit matching authorization is
+recorded. Exact authority facts, registration, manifest serialization, blockers, binding,
+and re-resolution rules are in [[workbench-v2-cli-contract]].
 
 ## Public capability discovery
 
@@ -463,8 +490,10 @@ The canonical v1 shape is:
       "write": ["workbench-task-lifecycle:v2"]
     },
     "profile_contracts": ["workbench-profile/v1"],
+    "workspace_authority_contracts": ["workbench-workspace-authority/v1"],
     "policy_contracts": ["workbench-policy/v1"],
     "policy_manifest_contracts": ["workbench-policy-manifest/v1"],
+    "policy_authority_receipt_contracts": ["workbench-policy-authority-receipt/v1"],
     "context_policy_contracts": ["workbench-context-policy-registration/v1", "workbench-context-policy-set/v1"],
     "authorization_contracts": ["workbench-authorization/v1"],
     "acceptance_contracts": [
@@ -475,12 +504,28 @@ The canonical v1 shape is:
     ],
     "external_probe_contracts": ["workbench-probe/github-pr/v1"],
     "cleanup_journal_contracts": ["workbench-task-cleanup-journal/v1"],
+    "doctor_contracts": ["workbench-doctor/v1"],
     "evidence_contracts": ["workbench-evidence/v1"],
-    "writer_claim_contracts": ["workbench-writer-claim/v1"],
-    "capability_pack_contracts": ["workbench-capability-pack/v1"]
+    "writer_claim_contracts": ["workbench-writer-claim/v1", "workbench-writer-claims/v1"],
+    "capability_pack_contracts": ["workbench-capability-pack/v1"],
+    "action_ids": [
+      "task.abandon",
+      "task.cleanup",
+      "task.complete",
+      "task.concurrent-write",
+      "task.deliverable.accept",
+      "task.deliverable.reject",
+      "task.deliverable.waive",
+      "task.deliverable.weaken",
+      "task.harvest.dispose",
+      "task.policy-context.register",
+      "task.policy-context.seal",
+      "task.required-check.waive"
+    ]
   },
   "capabilities": [
     "knowledge.applicability/v1",
+    "policy.authority/v1",
     "policy.authorization/v1",
     "policy.context-set/v1",
     "policy.resolve/v1",
@@ -497,6 +542,8 @@ The canonical v1 shape is:
     "task.required-checks/v1",
     "task.writer-claims/v1",
     "task.writer-conflicts/v1",
+    "workspace.authority/v1",
+    "workspace.doctor/v1",
     "workspace.schema/v1"
   ]
 }
@@ -515,6 +562,11 @@ ignore unknown object fields and capability IDs. They must require every capabil
 use and reject an unavailable contract before mutation. A producer may add optional fields
 or capability IDs within `workbench-contract/v1`; changing or removing defined field
 semantics requires a new discovery contract version.
+
+`supported.action_ids` is different: it is the complete executable v1 registry, not an open
+extension point. An action absent from that array cannot be resolved or executed. Runtime
+writer-ref readiness is reported by `workbench doctor`; advertising the capability does not
+turn an unreadable or unwritable coordination ref into authority.
 
 Only workspace schemas listed under `supported.workspace_schemas.write` may receive v2
 mutations without migration. A v2 engine can read an implicit v1 workspace and run legacy
@@ -550,7 +602,11 @@ The public pack contract ID is `workbench-capability-pack/v1`. A conforming pack
 
 A pack may ship its own deterministic CLI and schemas. Those schemas are independently
 versioned and declare their required workbench capabilities; plugin SemVer alone is not a
-state-schema version.
+state-schema version. In v1 a pack cannot register or execute a new governed action ID; it
+composes the frozen kernel registry. Toolbox product semantics therefore use generic refs,
+deliverables, required checks, evidence, harvest, completion/abandonment, concurrency, and
+cleanup rather than a parallel policy action namespace. Public pack-action registration is
+reserved for a future contract version.
 
 ## Compound knowledge contract
 
@@ -621,6 +677,8 @@ Workbench v2 follows these rules:
 - New v2 events are written only where the workspace schema and engine capabilities allow
   them and the task declares `workbench-task/v2`. V1-only readers may ignore unknown v2
   observations.
+- V2 governed mutations require an authenticated workspace-authority claim fact and current
+  required policy on its pinned default ref. There is no fallback to a task worktree copy.
 - Adding an optional discovery field or a new capability is backward compatible. Removing
   a field, changing defined semantics, or making optional state mandatory requires a new
   contract or workspace schema version.
@@ -647,10 +705,12 @@ flowchart TD
   state, and refuses unsafe writes.
 - **workbench-kit bootstrap/migration** diagnoses generated-minimal and embedded-legacy
   workbenches, preserves user overlays and accumulated knowledge, and writes the schema
-  marker and valid `.workbench/profile.conf` in the same accepted migration pull request.
-  The profile must be valid before the v2 marker is exposed, so no committed v2 state is
-  undiscoverable. Migration does not add `task_contract` to active legacy tasks; only newly
-  created v2 tasks receive it.
+  marker, valid `.workbench/profile.conf`, and required `.workbench/policy.conf` in the same
+  accepted migration pull request. It pins canonical origin/default-ref identity through the
+  trusted bootstrap/claim adapter and requires doctor to prove authority readability and
+  non-destructive coordination-ref write readiness. Profile and policy must be valid on the
+  protected default branch before the v2 marker is exposed. Migration does not add
+  `task_contract` to active legacy tasks; only newly created v2 tasks receive it.
 - A **capability pack** adopts or migrates only its own domain state after the generic
   workbench contract is compatible. Installing a pack never implies adoption.
 - The **user or resolved policy** controls merge, destructive cleanup, production effects,
@@ -666,7 +726,9 @@ The contract is optimized for reliable agent operation without making human revi
 
 - machine consumers receive versioned structured facts; people receive rationale and
   diagrams;
-- unknown values fail closed, so a model cannot turn uncertainty into authorization;
+- unknown values fail closed and unknown action IDs are non-executable, so a model cannot
+  turn uncertainty into authorization;
+- workspace policy comes from a pinned remote authority object, never a task-editable copy;
 - evidence is revision-bound, so stale success language cannot satisfy completion;
 - stable English identifiers avoid translation drift across Claude Code, Codex, and future
   adapters;

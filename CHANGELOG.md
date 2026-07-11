@@ -25,10 +25,12 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   replay-safe policy authorization, task-level legacy detection, living-state and
   compound-knowledge boundaries, governed cleanup, a sealed harvest ledger, repeatable
   context-policy provenance, authority-backed acceptance receipts, terminal content freeze,
-  revision-safe task evidence, durable cleanup recovery, enforced writer claims, strict JSON
-  inputs, capability-pack rules, profile language, and machine-readable compatibility shared
-  by the engine, migration flow, and optional packs (#25). This change defines the contract
-  only; CLI and migration implementation remain in follow-up issues.
+  revision-safe task evidence, origin-pinned workspace policy, per-participant authority
+  receipts, single-effect governed deliverable updates, durable cleanup recovery, a fixed-ref
+  CAS writer ledger, a frozen kernel action registry, strict JSON inputs, capability-pack
+  rules, profile language, and machine-readable compatibility shared by the engine,
+  migration flow, and optional packs (#25). This change defines the contract only; CLI and
+  migration implementation remain in follow-up issues.
 
 ## [0.1.1] - 2026-06-17
 

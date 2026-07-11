@@ -22,7 +22,7 @@
 | 기계 docs 검증의 거처 | `docs-lint`는 판단 스킬, 링크 무결성은 `utils/docs check` | 채택 | [0014](0014-docs-check-boundary.md) |
 | task lifecycle event 경계 | issue comment marker는 배관 fact, 티켓 처분·분류는 스킬/사람 게이트 | 채택 | [0015](0015-task-lifecycle-events.md) |
 | 기계적 불변식의 강제 방식 | 인지적 가드는 에이전트 판단, 기계적 불변식은 utils/task commit/check | 채택 | [0016](0016-mechanical-invariant-enforcement.md) |
-| Workbench v2 governance contracts | Generic lifecycle, replay-safe policy, exact CLI records, state, and pack contracts | Accepted | [0024](0024-workbench-v2-governance.md) |
+| Workbench v2 governance contracts | Generic lifecycle, origin-pinned replay-safe policy, CAS writer ledger, exact CLI/state/pack contracts | Accepted | [0024](0024-workbench-v2-governance.md) |
 
 Identifiers 0017 and 0019-0023 are preserved for the historical workbench decisions that
 led to workbench-kit. Decision 0024 links to those sources instead of silently reusing

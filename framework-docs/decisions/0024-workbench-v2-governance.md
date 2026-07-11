@@ -7,9 +7,9 @@
   completion, revision-bound evidence, `allow | ask | deny` policy resolution, generic
   namespaced references, replay-safe action instances, task-level contract selection, exact
   public CLI/JSON records, authority-backed acceptance, terminal content freeze, a sealed
-  harvest ledger, externally journaled cleanup, fenced writer claims, sealed context-policy
-  provenance, and capability discovery kernel contracts. Keep product semantics in an
-  optional pack.
+  harvest ledger, externally journaled cleanup, CAS-serialized writer claims,
+  origin-pinned workspace policy, per-participant sealed policy authority, and capability
+  discovery kernel contracts. Keep product semantics in an optional pack.
 - **Context:** V1 isolates task work and accumulates knowledge, but it treats a workbench
   increment pull request as the normal delivery path and describes human gates only in
   prose. It has no durable category for current intent and no supported way for an optional
@@ -23,9 +23,10 @@
 - **AI considerations:** Framework keys and identifiers remain English across Claude Code,
   Codex, and future adapters. A model receives structured facts for authorization,
   compatibility, deliverables, and evidence, while human reviewers receive rationale and
-  Mermaid diagrams. Unknown actions default to `ask`, unsupported capabilities block
-  mutation, authorization is bound to action/task/target/revision/full policy manifest, and
-  verification is tied to exact evidence subjects and immutable revisions.
+  Mermaid diagrams. Missing known rules default to `ask`, unknown action IDs are
+  non-executable, unsupported capabilities block mutation, authorization is bound to
+  action/task/target/revision/full authority manifest, and verification is tied to exact
+  evidence subjects and immutable revisions.
 - **Rejected alternatives:**
   1. Put product, portfolio, scenario, design, and TDD semantics in the kernel. This would
      burden every non-product workbench and collapse the generic engine/domain boundary.
@@ -50,7 +51,8 @@
       restrictive participant without leaving provenance.
   11. Let callers provide workspace, task, or context policy paths per action. A caller
       could omit a restrictive source, and absolute paths would make persisted receipts
-      non-portable; canonical workspace paths and a sealed owner-registered set avoid both.
+      non-portable; canonical remote workspace authority and a sealed owner-registered set
+      avoid both.
   12. Cache only a policy decision or source-list digest. Approval could survive changed
       source bytes or a newly applicable source; each instance instead stores the complete
       canonical manifest and re-resolves it immediately before consumption.
@@ -68,18 +70,35 @@
       issue before deletion.
   17. Report concurrent codebase writers without enforcing the mutation point. A race could
       still create a second writer; `task add-repo --role work` now resolves policy before
-      creating the claim or worktree and serializes the final recheck/write under a fenced,
-      owner-scoped coordination lease.
+      creating the worktree and serializes claims on one fixed remote ref through parent-OID
+      compare-and-swap commits.
   18. Let a v2 workspace fall back to an unavailable or prose-derived profile. Packs would
       receive ambiguous language state after migration; v2 discovery instead fails closed
       until its tracked machine profile is valid.
+  19. Read workspace policy from the current task branch. A task could authorize itself;
+      resolution now pins canonical origin/default-ref identity and reads only the freshly
+      observed immutable default-branch object.
+  20. Materialize absent optional platform/task sources as `ask` rows. This defeats standing
+      workspace authorization; absent optional sources are neutral, while a missing action in
+      a present valid source remains `ask` and missing required workspace policy is an error.
+  21. Collapse atomic participants into one context authority. Different owners would lose
+      provenance; every participant now has an independent authority receipt and digest.
+  22. Specify an abstract expiring/fenced writer lease. Without one concrete shared backend,
+      local processes could disagree; the canonical-origin append-only ledger and Git ref CAS
+      are the v1 serialization mechanism.
+  23. Claim that packs can register governed action bindings without a public registration
+      API. V1 freezes executable IDs to kernel actions; toolbox composes those contracts and
+      pack-action registration remains future work.
+  24. Combine deliverable weakening, waiver, or rejection in one authorized update or omit
+      its reason. Each governed call now has one effect, one action binding, and persisted
+      reason fields with explicit later reset semantics.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing
   task contract is always v1, so active tasks can finish without forced conversion.
-  Workspace, task, lifecycle, profile, policy, evidence, pack, and domain schemas are
-  versioned separately from plugin SemVer. Migration is a governed task and pull request,
-  not an install-time rewrite.
+  Workspace, task, lifecycle, profile, policy, authority, coordination, evidence, pack, and
+  domain schemas are versioned separately from plugin SemVer. Migration is a governed task
+  and pull request, not an install-time rewrite.
 - **Source:** workbench-kit#25 / 2026-07-11
 - **Relations:**
   - extends [[0015-task-lifecycle-events]]
