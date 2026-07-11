@@ -46,8 +46,8 @@ def load_json(file: str) -> Any:
 
 
 def require_object(value: Any, fields: Tuple[str, ...], name: str) -> Dict[str, Any]:
-    if not isinstance(value, dict) or tuple(value) != fields:
-        raise ValueError("{} fields or order do not match the contract".format(name))
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError("{} fields do not match the contract".format(name))
     return value
 
 

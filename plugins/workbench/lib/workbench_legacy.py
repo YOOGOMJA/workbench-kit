@@ -139,8 +139,8 @@ def require_home(value: Any, field: str) -> str:
 
 
 def require_fields(value: Any, fields: Tuple[str, ...], name: str) -> Dict[str, Any]:
-    if not isinstance(value, dict) or tuple(value) != fields:
-        raise ValueError("{} fields or order do not match the contract".format(name))
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError("{} fields do not match the contract".format(name))
     return value
 
 
@@ -189,9 +189,9 @@ def load_authority(file: str) -> Dict[str, Any]:
 
 
 def canonical_json(value: Any) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
-        "utf-8"
-    )
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
 
 
 def load_bootstrap_approval(file: str) -> Tuple[Dict[str, Any], bytes]:
@@ -225,9 +225,7 @@ def load_bootstrap_approval(file: str) -> Tuple[Dict[str, Any], bytes]:
         require_printable_ascii(value[key], key)
     if not isinstance(value["approved_at"], str) or RFC3339_UTC.fullmatch(value["approved_at"]) is None:
         raise ValueError("approved_at must be RFC 3339 UTC")
-    if canonical_json(value) != raw:
-        raise ValueError("bootstrap approval must use the exact canonical JSON serialization")
-    return value, raw
+    return value, canonical_json(value)
 
 
 def atomic_write(path: str, raw: bytes) -> None:
@@ -321,8 +319,7 @@ def registry_snapshot(
 ) -> Dict[str, Any]:
     authority = load_authority(authority_file)
     require_oid(source_revision, "source_revision")
-    with open(authority_file, "rb") as handle:
-        descriptor_digest = "sha256:" + hashlib.sha256(handle.read()).hexdigest()
+    descriptor_digest = "sha256:" + hashlib.sha256(canonical_json(authority)).hexdigest()
     with open(registry_file, "rb") as handle:
         registry_raw = handle.read()
     codebases = [
@@ -505,8 +502,7 @@ def build_inventory(
     authority = load_authority(authority_file)
     require_oid(default_revision, "default_revision")
     require_oid(bootstrap_revision, "bootstrap_revision")
-    with open(authority_file, "rb") as handle:
-        descriptor_digest = "sha256:" + hashlib.sha256(handle.read()).hexdigest()
+    descriptor_digest = "sha256:" + hashlib.sha256(canonical_json(authority)).hexdigest()
     current_home_set = home_set(authority_file, registry_file)
     observation = load_json(observation_file)
     require_fields(observation, OBSERVATION_FIELDS, "legacy adapter observation")

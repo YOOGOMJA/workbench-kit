@@ -160,11 +160,26 @@ observe_workspace_authority() {
 source_add() {
   local layer="$1" context_ref="$2" policy_ref="$3" file="$4"
   local authority_identity="$5" authority_ref="$6" authority_revision="$7" receipt_digest="$8"
-  local decision digest
+  local decision digest i
   [ -f "$file" ] || integrity_error "required policy source is unreadable: ${policy_ref:-$file}"
   decision="$(policy_file_decision "$file" "$ACTION_ID")" \
     || integrity_error "policy-source-invalid"
   digest="$(sha256_file "$file")"
+  if [ "$layer" = context ]; then
+    for ((i=0; i<SOURCE_COUNT; i++)); do
+      [ "${SOURCE_LAYERS[$i]}" = context ] \
+        && [ "${SOURCE_CONTEXT_REFS[$i]}" = "$context_ref" ] || continue
+      [ "${SOURCE_POLICY_REFS[$i]}" = "$policy_ref" ] \
+        && [ "${SOURCE_POLICY_DIGESTS[$i]}" = "$digest" ] \
+        && [ "${SOURCE_AUTHORITY_IDENTITIES[$i]}" = "$authority_identity" ] \
+        && [ "${SOURCE_AUTHORITY_REFS[$i]}" = "$authority_ref" ] \
+        && [ "${SOURCE_AUTHORITY_REVISIONS[$i]}" = "$authority_revision" ] \
+        && [ "${SOURCE_RECEIPT_DIGESTS[$i]}" = "$receipt_digest" ] \
+        && [ "${SOURCE_DECISIONS[$i]}" = "$decision" ] \
+        || integrity_error "policy-context-union-conflict"
+      return 0
+    done
+  fi
   SOURCE_LAYERS[$SOURCE_COUNT]="$layer"
   SOURCE_CONTEXT_REFS[$SOURCE_COUNT]="$context_ref"
   SOURCE_POLICY_REFS[$SOURCE_COUNT]="$policy_ref"
@@ -238,6 +253,40 @@ load_context_policy_sources() {
   done <<< "$rows"
 }
 
+load_concurrent_context_sources() {
+  local manifest="${WORKBENCH_CONCURRENT_CONTEXTS_FILE:-}" header kind claim expected_digest
+  local workspace registration extra state output rows layer context_ref policy_ref expected_policy_digest
+  local authority_identity authority_ref authority_revision receipt_digest file actual_digest
+  [ "$ACTION_ID" = task.concurrent-write ] || return 0
+  [ -n "$manifest" ] && [ -f "$manifest" ] || integrity_error "policy-context-unavailable"
+  IFS= read -r header < "$manifest"
+  [ "$header" = workbench-concurrent-context-union/v1 ] \
+    || integrity_error "policy-context-unavailable"
+  while IFS=$'\t' read -r kind claim expected_digest workspace registration extra; do
+    [ -n "$kind" ] || continue
+    [ "$kind" = context ] && [ -z "$extra" ] && [ -d "$workspace" ] \
+      && [ -f "$registration" ] || integrity_error "policy-context-unavailable"
+    state="$workspace/task/.workbench/policy-context/state.record"
+    [ -f "$state" ] || integrity_error "policy-context-unavailable"
+    python3 "$(contract_helper)" context-snapshot --registration-file "$registration" \
+      --state-file "$state" --workspace-root "$workspace" --task-claim-id "$claim" \
+      --context-digest "$expected_digest" >/dev/null 2>&1 \
+      || integrity_error "policy-context-unavailable"
+    rows="$(python3 "$(contract_helper)" registration-sources "$registration" \
+      --workspace-root "$workspace" 2>/dev/null)" || integrity_error "policy-context-unavailable"
+    while IFS=$'\t' read -r layer context_ref policy_ref expected_policy_digest authority_identity \
+      authority_ref authority_revision receipt_digest; do
+      [ "$layer" = context ] || continue
+      file="$workspace/$policy_ref"
+      actual_digest="$(sha256_file "$file")" || integrity_error "policy-context-unavailable"
+      [ "$actual_digest" = "$expected_policy_digest" ] \
+        || integrity_error "policy-context-unavailable"
+      source_add context "$context_ref" "$policy_ref" "$file" "$authority_identity" \
+        "$authority_ref" "$authority_revision" "$receipt_digest"
+    done <<< "$rows"
+  done < <(tail -n +2 "$manifest")
+}
+
 build_policy_manifest() {
   local manifest i descriptor_digest platform_digest platform_ref
   SOURCE_LAYERS=(); SOURCE_CONTEXT_REFS=(); SOURCE_POLICY_REFS=(); SOURCE_POLICY_DIGESTS=()
@@ -267,6 +316,7 @@ build_policy_manifest() {
     task.policy-context.seal) load_context_policy_sources registered ;;
     *) load_context_policy_sources sealed ;;
   esac
+  [ "$ACTION_ID" != task.concurrent-write ] || load_concurrent_context_sources
 
   manifest="$(mktemp "${TMPDIR:-/tmp}/workbench-policy-manifest.XXXXXX")"
   printf 'workbench-policy-manifest/v1\n' > "$manifest"

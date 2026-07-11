@@ -138,8 +138,8 @@ def load_json(file: str) -> Any:
 
 def strict_object(file: str, fields: Sequence[str]) -> Dict[str, Any]:
     value = load_json(file)
-    if not isinstance(value, dict) or tuple(value) != tuple(fields):
-        raise ValueError("JSON object fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError("JSON object fields do not match the contract")
     return value
 
 
@@ -187,10 +187,11 @@ def parse_json_payload(contract: str, payload: str) -> Mapping[str, Any]:
     value = json.loads(payload, object_pairs_hook=unique_object)
     if not isinstance(value, dict) or value.get("contract_version") != contract:
         raise ValueError("JSON intent payload contract mismatch")
-    canonical = json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
-    if canonical != payload:
-        raise ValueError("JSON intent payload is not canonical")
     return value
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
 def require_nullable(value: str, field: str) -> None:
@@ -303,9 +304,10 @@ def load_request(file: str) -> Dict[str, Any]:
     if expected_payload in PAYLOAD_FIELDS:
         fields = parse_line_payload(expected_payload, payload)
         validate_line_binding(value, fields)
+        digest_payload = payload
     else:
-        parse_json_payload(expected_payload, payload)
-    payload_digest = sha256(payload.encode("utf-8"))
+        digest_payload = canonical_json(parse_json_payload(expected_payload, payload))
+    payload_digest = sha256(digest_payload.encode("utf-8"))
     value["payload_digest"] = payload_digest
     value["intent_digest"] = sha256(intent_manifest(value, payload_digest))
     return value

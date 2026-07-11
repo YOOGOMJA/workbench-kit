@@ -171,7 +171,9 @@ def require_contract_string(value: Dict[str, Any], key: str) -> str:
 
 
 def digest_json(value: Any) -> str:
-    raw = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    raw = (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
@@ -198,8 +200,8 @@ def load_authority_descriptor(file: str) -> Dict[str, Any]:
     )
     with open(file, "r", encoding="utf-8") as handle:
         value = json.load(handle, object_pairs_hook=unique_object)
-    if not isinstance(value, dict) or tuple(value) != fields:
-        raise ValueError("workspace authority fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError("workspace authority fields do not match the contract")
     if value["contract_version"] != "workbench-workspace-authority/v1":
         raise ValueError("unsupported workspace authority contract")
     for key in ("authority_identity", "origin_url", "default_ref", "workspace_home"):
@@ -256,8 +258,8 @@ def cmd_hosting_authority(args: argparse.Namespace) -> None:
     )
     with open(args.verification_file, "r", encoding="utf-8") as handle:
         value = json.load(handle, object_pairs_hook=unique_object)
-    if not isinstance(value, dict) or tuple(value) != fields:
-        raise ValueError("hosting authority fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError("hosting authority fields do not match the contract")
     if value["contract_version"] != "workbench-hosting-authority-verification/v1":
         raise ValueError("unsupported hosting authority verification contract")
     for key in (
@@ -391,8 +393,8 @@ def validate_policy_ref(workspace: Path, policy_ref: Any, field: str) -> Path:
 
 
 def validate_authority_receipt(value: Any) -> Dict[str, Any]:
-    if not isinstance(value, dict) or tuple(value) != RECEIPT_FIELDS:
-        raise ValueError("authority receipt fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(RECEIPT_FIELDS):
+        raise ValueError("authority receipt fields do not match the contract")
     if value["contract_version"] != "workbench-policy-authority-receipt/v1":
         raise ValueError("unsupported policy authority receipt contract")
     for key in ("authority_identity", "authority_ref", "policy_ref", "actor", "source_ref"):
@@ -413,8 +415,8 @@ def validate_authority_receipt(value: Any) -> Dict[str, Any]:
 def validate_policy_binding(
     value: Any, fields: Any, workspace: Path, expected_context: Any = None
 ) -> Dict[str, Any]:
-    if not isinstance(value, dict) or tuple(value) != fields:
-        raise ValueError("policy binding fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError("policy binding fields do not match the contract")
     if expected_context is not None:
         context_ref = value["context_ref"]
         if not isinstance(context_ref, str) or not is_namespaced_ref(context_ref):
@@ -433,8 +435,8 @@ def validate_policy_binding(
 def load_registration(file: str, workspace_root: str) -> Dict[str, Any]:
     with open(file, "r", encoding="utf-8") as handle:
         value = json.load(handle, object_pairs_hook=unique_object)
-    if not isinstance(value, dict) or tuple(value) != REGISTRATION_FIELDS:
-        raise ValueError("context registration fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(REGISTRATION_FIELDS):
+        raise ValueError("context registration fields do not match the contract")
     if value["contract_version"] != "workbench-context-policy-registration/v1":
         raise ValueError("unsupported context policy registration contract")
     for key in ("registration_id", "task_claim_id", "actor"):
@@ -528,6 +530,83 @@ def context_set_digest(value: Dict[str, Any], registration_ref: str) -> str:
     return sha256_bytes(("\n".join(lines) + "\n").encode("utf-8"))
 
 
+CONTEXT_STATE_FIELDS = (
+    "registration_ref",
+    "registration_digest",
+    "task_context_ref",
+    "sealed",
+    "digest",
+    "registration_action_instance_id",
+    "registration_intent_digest",
+    "registration_policy_manifest_digest",
+    "registration_authorization_ref",
+    "seal_action_instance_id",
+    "seal_intent_digest",
+    "seal_policy_manifest_digest",
+    "seal_authorization_ref",
+    "registered_at",
+    "sealed_at",
+)
+
+
+def read_context_state(file: str) -> Dict[str, str]:
+    raw = Path(file).read_bytes()
+    if not raw.endswith(b"\n") or b"\r" in raw:
+        raise ValueError("context state must be LF-terminated")
+    rows: Dict[str, str] = {}
+    for line in raw.decode("utf-8").splitlines():
+        if "=" not in line:
+            raise ValueError("malformed context state line")
+        key, value = line.split("=", 1)
+        if not key or key in rows:
+            raise ValueError("invalid or duplicate context state field")
+        rows[key] = value
+    if tuple(rows) != CONTEXT_STATE_FIELDS:
+        raise ValueError("context state fields or order do not match the contract")
+    return rows
+
+
+def validate_context_action_tuple(state: Dict[str, str], prefix: str) -> None:
+    action = state[prefix + "_action_instance_id"]
+    intent = state[prefix + "_intent_digest"]
+    manifest = state[prefix + "_policy_manifest_digest"]
+    authorization = state[prefix + "_authorization_ref"]
+    if not any((action, intent, manifest, authorization)):
+        return
+    require_printable_ascii(action, prefix + "_action_instance_id")
+    require_sha256(intent, prefix + "_intent_digest")
+    require_sha256(manifest, prefix + "_policy_manifest_digest")
+    if authorization:
+        require_printable_ascii(authorization, prefix + "_authorization_ref")
+
+
+def cmd_context_snapshot(args: argparse.Namespace) -> None:
+    value = load_registration(args.registration_file, args.workspace_root)
+    state = read_context_state(args.state_file)
+    if value["task_claim_id"] != args.task_claim_id:
+        raise ValueError("context snapshot task claim mismatch")
+    if value["task_context_ref"] is None:
+        registration_ref = "workbench:context-registration/auto-null/" + args.task_claim_id
+    else:
+        registration_ref = "workbench:context-registration/" + value["registration_id"]
+    expected_digest = context_set_digest(value, registration_ref)
+    expected_context = value["task_context_ref"] or ""
+    if (
+        state["registration_ref"] != registration_ref
+        or state["registration_digest"] != digest_json(value)
+        or state["task_context_ref"] != expected_context
+        or state["sealed"] != "true"
+        or state["digest"] != expected_digest
+        or expected_digest != args.context_digest
+        or state["registered_at"] != value["registered_at"]
+        or RFC3339_UTC.fullmatch(state["sealed_at"]) is None
+    ):
+        raise ValueError("context snapshot does not match its sealed registration")
+    validate_context_action_tuple(state, "registration")
+    validate_context_action_tuple(state, "seal")
+    sys.stdout.write("digest={}\ntask_claim_id={}\n".format(expected_digest, args.task_claim_id))
+
+
 def cmd_registration(args: argparse.Namespace) -> None:
     value = load_registration(args.file, args.workspace_root)
     if value["task_context_ref"] is None:
@@ -581,8 +660,8 @@ OWNER_ACCEPTANCE_FIELDS = (
 def cmd_owner_acceptance(args: argparse.Namespace) -> None:
     with open(args.file, "r", encoding="utf-8") as handle:
         value = json.load(handle, object_pairs_hook=unique_object)
-    if not isinstance(value, dict) or tuple(value) != OWNER_ACCEPTANCE_FIELDS:
-        raise ValueError("owner acceptance fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(OWNER_ACCEPTANCE_FIELDS):
+        raise ValueError("owner acceptance fields do not match the contract")
     if value["contract_version"] != "workbench-owner-acceptance/v1":
         raise ValueError("unsupported owner acceptance contract")
     for key in ("acceptance_id", "deliverable_id", "owner", "kind", "revision", "actor"):
@@ -1273,6 +1352,14 @@ def parser() -> argparse.ArgumentParser:
     context_set.add_argument("--seal-authorization-ref")
     context_set.add_argument("--format", choices=("json", "shell"), required=True)
     context_set.set_defaults(func=cmd_context_set)
+
+    context_snapshot = commands.add_parser("context-snapshot")
+    context_snapshot.add_argument("--registration-file", required=True)
+    context_snapshot.add_argument("--state-file", required=True)
+    context_snapshot.add_argument("--workspace-root", required=True)
+    context_snapshot.add_argument("--task-claim-id", required=True)
+    context_snapshot.add_argument("--context-digest", required=True)
+    context_snapshot.set_defaults(func=cmd_context_snapshot)
 
     profile = commands.add_parser("profile")
     profile.add_argument("--source", choices=("workspace", "unavailable"), required=True)

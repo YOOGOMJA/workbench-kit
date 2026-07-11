@@ -221,7 +221,9 @@ def manifest(root: Path) -> Dict[str, Any]:
         "nodes": nodes,
         "digest": None,
     }
-    raw = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    raw = (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
     value["digest"] = sha256(raw)
     return value
 

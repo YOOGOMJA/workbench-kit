@@ -14,6 +14,7 @@ WRITER_HELPER="$PLUGIN_ROOT/lib/workbench_writer.py"
 TERMINAL_HELPER="$PLUGIN_ROOT/lib/workbench_terminal.py"
 CLEANUP_HELPER="$PLUGIN_ROOT/lib/workbench_cleanup.py"
 LEGACY_HELPER="$PLUGIN_ROOT/lib/workbench_legacy.py"
+LIFECYCLE_HELPER="$PLUGIN_ROOT/lib/workbench_lifecycle.py"
 LEGACY_UTIL="$PLUGIN_ROOT/utils/legacy-inventory"
 SCAFFOLD_TEMPLATES="$(cd "$PLUGIN_ROOT/../workbench-kit/scaffold/templates" && pwd)"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/workbench-task-v2.XXXXXX")"
@@ -135,17 +136,62 @@ case "${1:-} ${2:-}" in
       && grep -Fq '"stage":"completed"' "$body_file"; then
       exit 42
     fi
-    if [ "${GH_FAIL_LIFECYCLE_EVENT:-}" = task-cleaned ] \
-      && grep -Fq '"event":"task-cleaned"' "$body_file"; then
+    if [ -n "${GH_FAIL_LIFECYCLE_EVENT:-}" ] \
+      && grep -Fq "\"event\":\"$GH_FAIL_LIFECYCLE_EVENT\"" "$body_file"; then
       exit 43
     fi
     cat "$body_file" >> "$GH_COMMENTS_DIR/$issue.comments"
     printf '\n' >> "$GH_COMMENTS_DIR/$issue.comments"
     ;;
   "pr view")
-    printf '%s\t%s\t%s\n' "${GH_PR_STATE:-MERGED}" "${GH_PR_HEAD:-abc123}" "${GH_PR_MERGE:-merge789}"
+    if [[ "$*" == *"--json state,headRefOid,mergeCommit"* ]]; then
+      printf '%s\t%s\t%s\n' "${GH_PR_STATE:-MERGED}" "${GH_PR_HEAD:-abc123}" "${GH_PR_MERGE:-merge789}"
+    else
+      [ -f "$GH_COMMENTS_DIR/pr-17.json" ] || exit 1
+      cat "$GH_COMMENTS_DIR/pr-17.json"
+    fi
     ;;
-  "pr list") printf '\n' ;;
+  "pr create")
+    head=""; base=""; shift 2
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --head) head="$2"; shift 2 ;;
+        --base) base="$2"; shift 2 ;;
+        --title|--body-file) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -n "$head" ] && [ "$base" = main ] || exit 9
+    head_oid="$(git rev-parse HEAD)"
+    mkdir -p "$GH_COMMENTS_DIR"
+    python3 - "$GH_COMMENTS_DIR/pr-17.json" "$head" "$head_oid" <<'PY'
+import json
+import sys
+
+value = {
+    "number": 17,
+    "url": "https://github.com/example/workbench/pull/17",
+    "headRefName": sys.argv[2],
+    "headRefOid": sys.argv[3],
+    "baseRefName": "main",
+    "state": "OPEN",
+    "merged": False,
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+    printf '%s\n' 'https://github.com/example/workbench/pull/17'
+    ;;
+  "pr list")
+    if [ -f "$GH_COMMENTS_DIR/pr-17.json" ]; then
+      python3 - "$GH_COMMENTS_DIR/pr-17.json" <<'PY'
+import json
+import sys
+print(json.dumps([json.load(open(sys.argv[1], encoding="utf-8"))], separators=(",", ":")))
+PY
+    else printf '[]\n'; fi
+    ;;
   *) echo "unexpected gh call: $*" >&2; exit 9 ;;
 esac
 EOF
@@ -157,17 +203,84 @@ write_fake_hosting_authority() {
   cat > "$file" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[ "${1:-}" = authority ] || exit 2
+[ -n "${1:-}" ] || exit 2
+command="$1"
 shift
-authority="" revision=""
+authority="" revision="" issue="" repository="" head_branch="" head_revision=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --authority-file) authority="$2"; shift 2 ;;
     --default-revision) revision="$2"; shift 2 ;;
+    --issue) issue="$2"; shift 2 ;;
+    --repository) repository="$2"; shift 2 ;;
+    --head-branch) head_branch="$2"; shift 2 ;;
+    --head-revision) head_revision="$2"; shift 2 ;;
     --format) [ "$2" = json ]; shift 2 ;;
     *) exit 2 ;;
   esac
 done
+if [ "$command" = lifecycle ]; then
+  python3 - "$repository" "$issue" "${GH_COMMENTS_DIR:-}/$issue.comments" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+repository = pathlib.Path(sys.argv[1])
+origin = subprocess.check_output(
+    ["git", "-C", str(repository), "remote", "get-url", "origin"], text=True
+).strip()
+comments = pathlib.Path(sys.argv[3])
+body = comments.read_text(encoding="utf-8") if comments.exists() else ""
+value = {
+    "contract_version": "workbench-hosting-lifecycle-observation/v1",
+    "repository_origin_url": origin,
+    "issue": int(sys.argv[2]),
+    "pagination": {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None},
+    "comments": [] if not body else [{"author_identity": "test@example.invalid", "body": body}],
+}
+print(json.dumps(value, separators=(",", ":")))
+PY
+  exit
+fi
+if [ "$command" = submission ]; then
+  python3 - "$repository" "$head_branch" "$head_revision" "${GH_COMMENTS_DIR:-}/pr-17.json" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+repository = pathlib.Path(sys.argv[1])
+origin = subprocess.check_output(
+    ["git", "-C", str(repository), "remote", "get-url", "origin"], text=True
+).strip()
+stored = pathlib.Path(sys.argv[4])
+pull_requests = []
+if stored.exists():
+    item = json.load(open(stored, encoding="utf-8"))
+    pull_requests.append({
+        "number": item["number"],
+        "url": item["url"],
+        "head_branch": item["headRefName"],
+        "head_revision": item["headRefOid"],
+        "head_repository_origin_url": origin,
+        "head_is_fork": False,
+        "base_ref": item["baseRefName"],
+        "state": "merged" if item["merged"] else "open",
+    })
+value = {
+    "contract_version": "workbench-hosting-submission-observation/v1",
+    "repository_origin_url": origin,
+    "head_branch": sys.argv[2],
+    "base_ref": "main",
+    "pagination": {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None},
+    "pull_requests": pull_requests,
+}
+print(json.dumps(value, separators=(",", ":")))
+PY
+  exit
+fi
+[ "$command" = authority ] || exit 2
 python3 - "$authority" "$revision" <<'PY'
 import json
 import sys
@@ -285,6 +398,7 @@ setup_workbench() {
   cp "$TERMINAL_HELPER" "$repo/lib/workbench_terminal.py"
   cp "$CLEANUP_HELPER" "$repo/lib/workbench_cleanup.py"
   cp "$LEGACY_HELPER" "$repo/lib/workbench_legacy.py"
+  cp "$LIFECYCLE_HELPER" "$repo/lib/workbench_lifecycle.py"
   cp "$LEGACY_UTIL" "$repo/utils/legacy-inventory"
   chmod +x "$repo/utils/legacy-inventory"
   cp "$SCAFFOLD_TEMPLATES/task-AGENTS.md" "$repo/templates/task-AGENTS.md"
@@ -339,9 +453,13 @@ run_task_in_dir() {
     WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/$case_name/bin/hosting-authority" \
     WORKBENCH_TRUSTED_LEGACY_ADAPTER="${WORKBENCH_TRUSTED_LEGACY_ADAPTER:-$TMPDIR/$case_name/bin/legacy-adapter}" \
     WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY:-0}" \
+    WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_ATTEMPT="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_ATTEMPT:-0}" \
+    WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PROBE="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PROBE:-0}" \
     WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY:-}" \
     WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM="${WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM:-0}" \
     WORKBENCH_TEST_FAIL_WRITER_STAGE="${WORKBENCH_TEST_FAIL_WRITER_STAGE:-}" \
+    GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
+    GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
     GH_PR_STATE="${GH_PR_STATE:-}" GH_PR_HEAD="${GH_PR_HEAD:-}" GH_PR_MERGE="${GH_PR_MERGE:-}" \
     WRITER_BARRIER_ID="${WRITER_BARRIER_ID:-}" \
     bash -c 'dir="$1"; shift; cd "$dir"; "$dir/utils/task" "$@"' bash "$dir" "$@"
@@ -575,6 +693,93 @@ prepare_writer_task() {
   git -C "$WRITER_TASK_DIR" push -q
 }
 
+replace_writer_context() {
+  local task_dir="$1" label="$2" decision="$3" claim policy digest registration output
+  local set_digest registration_ref registration_digest state
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  python3 - "$task_dir/task/index.md" "$label" <<'PY'
+import sys
+
+path, label = sys.argv[1:]
+rows = open(path, encoding="utf-8").read().splitlines()
+for index, row in enumerate(rows):
+    if row.startswith("context_ref:"):
+        rows[index] = "context_ref: toolbox:product/" + label
+        break
+else:
+    closing = rows.index("---", 1)
+    rows.insert(closing, "context_ref: toolbox:product/" + label)
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(rows) + "\n")
+PY
+  mkdir -p "$task_dir/contexts" "$task_dir/task/.workbench/policy-context"
+  policy="$task_dir/contexts/$label.policy"
+  printf '%s\n' 'schema=workbench-policy/v1' "action.task.concurrent-write=$decision" > "$policy"
+  digest="sha256:$(python3 - "$policy" <<'PY'
+import hashlib
+import sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+PY
+)"
+  registration="$task_dir/task/.workbench/policy-context/registration.json"
+  python3 - "$registration" "$claim" "$label" "$digest" <<'PY'
+import json
+import sys
+
+receipt = {
+    "contract_version": "workbench-policy-authority-receipt/v1",
+    "authority_identity": "toolbox:authority/" + sys.argv[3],
+    "authority_ref": "toolbox:policy/" + sys.argv[3],
+    "authority_revision": "sha256:" + "a" * 64,
+    "policy_ref": "contexts/" + sys.argv[3] + ".policy",
+    "policy_digest": sys.argv[4],
+    "actor": "owner@example.com",
+    "issued_at": "2026-07-11T05:00:00Z",
+    "source_ref": "toolbox:approval/" + sys.argv[3],
+}
+value = {
+    "contract_version": "workbench-context-policy-registration/v1",
+    "registration_id": "ctxreg-" + sys.argv[3],
+    "task_claim_id": sys.argv[2],
+    "task_context_ref": "toolbox:product/" + sys.argv[3],
+    "participants": [{
+        "context_ref": "toolbox:product/" + sys.argv[3],
+        "policy_ref": "contexts/" + sys.argv[3] + ".policy",
+        "policy_digest": sys.argv[4],
+        "authority_ref": "toolbox:policy/" + sys.argv[3],
+        "authority_receipt": receipt,
+    }],
+    "task_policy": None,
+    "actor": "owner@example.com",
+    "registered_at": "2026-07-11T05:01:00Z",
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  output="$(python3 "$CONTRACT_HELPER" context-set --registration-file "$registration" \
+    --workspace-root "$task_dir" --sealed true --changed true --format shell)"
+  set_digest="$(printf '%s\n' "$output" | sed -n 's/^digest=//p')"
+  registration_ref="$(printf '%s\n' "$output" | sed -n 's/^registration_ref=//p')"
+  registration_digest="$(printf '%s\n' "$output" | sed -n 's/^registration_digest=//p')"
+  state="$task_dir/task/.workbench/policy-context/state.record"
+  {
+    printf 'registration_ref=%s\n' "$registration_ref"
+    printf 'registration_digest=%s\n' "$registration_digest"
+    printf 'task_context_ref=toolbox:product/%s\n' "$label"
+    printf 'sealed=true\n'
+    printf 'digest=%s\n' "$set_digest"
+    printf 'registration_action_instance_id=\nregistration_intent_digest=\n'
+    printf 'registration_policy_manifest_digest=\nregistration_authorization_ref=\n'
+    printf 'seal_action_instance_id=\nseal_intent_digest=\nseal_policy_manifest_digest=\n'
+    printf 'seal_authorization_ref=\nregistered_at=2026-07-11T05:01:00Z\n'
+    printf 'sealed_at=2026-07-11T05:02:00Z\n'
+  } > "$state"
+  git -C "$task_dir" add task/index.md task/.workbench contexts
+  git -C "$task_dir" commit -q -m "test: bind $label writer context"
+  git -C "$task_dir" push -q
+}
+
 write_empty_legacy_observation() {
   local output="$1" revision="$2" workspace_origin="$3" home="$4" home_origin="$5"
   python3 - "$output" "$revision" "$workspace_origin" "$home" "$home_origin" <<'PY'
@@ -737,10 +942,12 @@ test_v2_start_and_resume_are_authority_bound_skeletons() {
   task_dir="$repo/.worktrees/task__shared-api__29-skeleton"
   digest="$(python3 - "$repo/.workbench/authority.json" <<'PY'
 import hashlib
+import json
 import sys
 
-with open(sys.argv[1], "rb") as handle:
-    print("sha256:" + hashlib.sha256(handle.read()).hexdigest())
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+print("sha256:" + hashlib.sha256(raw).hexdigest())
 PY
 )"
 
@@ -1879,6 +2086,60 @@ test_terminal_outcome_freezes_mutations_and_verification_is_read_only() {
   verified_after="$(grep -c '"event":"task-verified"' "$TMPDIR/terminal_freeze/comments/29.comments" || true)"
   [ "$verified_before" = "$verified_after" ] \
     || fail "post-terminal verification must not emit task-verified"
+}
+
+test_terminal_lifecycle_rejects_post_terminal_reactivation() {
+  local repo task_dir claim branch descriptor comments out rc
+  repo="$(setup_workbench terminal_absorbing)"
+  printf '%s\n' 'action.task.abandon=allow' >> "$repo/.workbench/policy.conf"
+  git -C "$repo" add .workbench/policy.conf
+  git -C "$repo" commit -q -m "test: allow absorbing terminal fixture"
+  git -C "$repo" push -q
+  task_dir="$(start_task terminal_absorbing "$repo")"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  branch="$(git -C "$task_dir" branch --show-current)"
+  descriptor="$(sed -n 's/^workspace_authority_descriptor_digest: *//p' "$task_dir/task/index.md")"
+  run_task_in_dir terminal_absorbing "$task_dir" abandon \
+    --reason-code superseded --format json >/dev/null
+  comments="$TMPDIR/terminal_absorbing/comments/29.comments"
+  python3 - "$comments" "$claim" "$branch" "$descriptor" <<'PY'
+import json
+import sys
+value = {
+    "task_contract": "workbench-task/v2",
+    "event": "task-active",
+    "claim_id": sys.argv[2],
+    "issue": 29,
+    "home": None,
+    "branch": sys.argv[3],
+    "workspace_authority_descriptor_digest": sys.argv[4],
+    "pr": None,
+    "revision": None,
+    "action_instance_id": None,
+    "intent_digest": None,
+    "actor": "test@example.invalid",
+    "tool": "workbench",
+    "at": "2026-07-11T05:30:00Z",
+}
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write("<!-- workbench-task-lifecycle:v2\n")
+    handle.write(json.dumps(value, separators=(",", ":")) + "\n")
+    handle.write("-->\nworkbench task lifecycle: task-active\n\n")
+PY
+  out="$TMPDIR/terminal_absorbing/retry.out"
+  if run_task_in_dir terminal_absorbing "$task_dir" abandon \
+    --reason-code ignored --format json >"$out" 2>&1; then
+    fail "terminal outcome accepted a post-terminal task-active event"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "post-terminal transition returned $rc"
+  assert_file_contains "$out" '"code":"action-effect-unreconciled"'
+
+  out="$TMPDIR/terminal_absorbing/mutation.out"
+  if run_task_in_dir terminal_absorbing "$task_dir" refs set \
+    --work-ref toolbox:scenario/SCN-099 --format json >"$out" 2>&1; then
+    fail "post-terminal lifecycle corruption reopened mutable task content"
+  fi
+  assert_file_contains "$out" '"code":"action-effect-unreconciled"'
 }
 
 test_forged_local_terminal_has_no_freeze_or_outcome_authority() {
@@ -3353,6 +3614,345 @@ assert [item["branch"] for item in claims] == [
 PY
 }
 
+test_v2_submit_reconciles_durable_submission_without_v1_fallback() {
+  local repo task_dir body out rc actual comments marker branch head pr_creates
+  repo="$(setup_workbench v2_submit)"
+  printf '%s\n' 'kit: https://github.com/example/workbench.git' > "$repo/codebases.yaml"
+  git -C "$repo" add codebases.yaml
+  git -C "$repo" commit -q -m "test: register increment owner"
+  git -C "$repo" push -q
+  task_dir="$(start_task v2_submit "$repo")"
+  run_task_in_dir v2_submit "$task_dir" policy-context seal --format json >/dev/null
+  run_task_in_dir v2_submit "$task_dir" deliverable declare --id workbench-pr --owner kit \
+    --kind workbench-increment --format json >/dev/null
+  mkdir -p "$task_dir/docs"
+  printf '%s\n' '# Durable increment' > "$task_dir/docs/increment.md"
+  printf '\n## [2026-07-11 12:00:00] code · create docs/increment.md | v2 submit fixture\n' \
+    >> "$task_dir/task/log.md"
+  printf '%s\n' '# Status' '' '상태: submit fixture ready' > "$task_dir/task/status.md"
+  git -C "$task_dir" add docs/increment.md task
+  git -C "$task_dir" commit -q -m "feat: add submitted increment"
+  git -C "$task_dir" push -q
+  body="$TMPDIR/v2_submit/pr-body.md"; printf '%s\n' 'fixture PR' > "$body"
+
+  out="$TMPDIR/v2_submit/first-submit.out"
+  if GH_FAIL_LIFECYCLE_EVENT=task-submitted run_task_in_dir v2_submit "$task_dir" submit \
+    --title "feat: durable v2 submit" --body-file "$body" >"$out" 2>&1; then
+    fail "v2 submit succeeded after its durable submission fact failed"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "failed v2 lifecycle projection returned $rc"
+  [ ! -e "$task_dir/task/index.md" ] || fail "v2 submit fixture did not exercise post-cleanup recovery"
+  [ -f "$TMPDIR/v2_submit/comments/pr-17.json" ] || fail "v2 submit did not create its PR primary"
+
+  actual="$(run_task_in_dir v2_submit "$task_dir" submit \
+    --title "feat: durable v2 submit" --body-file "$body")"
+  assert_contains "$actual" 'https://github.com/example/workbench/pull/17'
+  pr_creates="$(grep -c 'pr create' "$TMPDIR/v2_submit/gh.log" || true)"
+  [ "$pr_creates" = 1 ] || fail "submission retry created a second PR"
+  comments="$TMPDIR/v2_submit/comments/29.comments"
+  python3 - "$comments" "$TMPDIR/v2_submit/comments/pr-17.json" <<'PY'
+import json
+import re
+import sys
+
+comments = open(sys.argv[1], encoding="utf-8").read()
+markers = [json.loads(raw) for raw in re.findall(
+    r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->", comments
+)]
+submitted = [item for item in markers if item["event"] == "task-submitted"]
+assert len(submitted) == 1
+marker = submitted[0]
+pr = json.load(open(sys.argv[2], encoding="utf-8"))
+assert marker["task_contract"] == "workbench-task/v2"
+assert marker["pr"] == pr["number"] == 17
+assert marker["revision"] == pr["headRefOid"]
+assert marker["action_instance_id"] is None and marker["intent_digest"] is None
+assert marker["workspace_authority_descriptor_digest"].startswith("sha256:")
+PY
+
+  branch="$(git -C "$task_dir" branch --show-current)"; head="$(git -C "$task_dir" rev-parse HEAD)"
+  marker="$(python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+value = next(json.loads(raw) for raw in re.findall(
+    r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->",
+    open(sys.argv[1], encoding="utf-8").read(),
+) if json.loads(raw)["event"] == "task-submitted")
+keys = list(value)
+value = {key: value[key] for key in reversed(keys)}
+print(json.dumps(value, separators=(",", ":")))
+PY
+)"
+  python3 - "$comments" "$marker" <<'PY'
+import re
+import sys
+path, marker = sys.argv[1:]
+raw = open(path, encoding="utf-8").read()
+raw = re.sub(
+    r'(<!-- workbench-task-lifecycle:v2\n)[^\r\n]+(\n-->\nworkbench task lifecycle: task-submitted)',
+    lambda match: match.group(1) + marker + match.group(2),
+    raw,
+)
+open(path, "w", encoding="utf-8").write(raw)
+PY
+  out="$TMPDIR/v2_submit/done.out"
+  if run_task v2_submit "$repo" done 29 --format json >"$out" 2>&1; then
+    fail "submitted v2 task entered the v1 done path"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "v2 merge-wait cleanup returned $rc"
+  assert_file_contains "$out" '"contract_version":"workbench-task-cleanup/v1"'
+  assert_file_contains "$out" '"outcome":null'
+  assert_file_contains "$out" '"code":"missing-terminal-outcome"'
+  git -C "$task_dir" rev-parse "$head^:task/index.md" >/dev/null \
+    || fail "submission ancestry lost the pre-cleanup task identity"
+  [ "$(git -C "$task_dir" branch --show-current)" = "$branch" ] || fail "submit changed task branch"
+}
+
+test_lifecycle_parser_is_strict_trusted_and_key_order_independent() {
+  local observation valid_snapshot valid out rc
+  observation="$TMPDIR/lifecycle-observation.json"
+  python3 - "$observation" <<'PY'
+import json
+import sys
+
+value = {
+    "task_contract": "workbench-task/v2",
+    "event": "task-submitted",
+    "claim_id": "task__29-fixture",
+    "issue": 29,
+    "home": None,
+    "branch": "task/29-fixture",
+    "workspace_authority_descriptor_digest": "sha256:" + "a" * 64,
+    "pr": 17,
+    "revision": "a" * 40,
+    "action_instance_id": None,
+    "intent_digest": None,
+    "actor": "test@example.invalid",
+    "tool": "workbench",
+    "at": "2026-07-11T05:02:00Z",
+}
+value = {key: value[key] for key in reversed(list(value))}
+body = "<!-- workbench-task-lifecycle:v2\n" + json.dumps(value, separators=(",", ":")) + "\n-->\n"
+observation = {
+    "contract_version": "workbench-hosting-lifecycle-observation/v1",
+    "repository_origin_url": "https://github.com/example/workbench.git",
+    "issue": 29,
+    "pagination": {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None},
+    "comments": [{"author_identity": "test@example.invalid", "body": body}],
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(observation, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  valid_snapshot="$TMPDIR/lifecycle-valid-observation.json"; cp "$observation" "$valid_snapshot"
+  out="$(python3 "$LIFECYCLE_HELPER" markers --observation-file "$observation" \
+    --repository-origin-url https://github.com/example/workbench.git --issue 29 --format jsonl)"
+  valid="$(printf '%s\n' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["event"])')"
+  [ "$valid" = task-submitted ] || fail "reordered valid lifecycle marker was rejected"
+
+  python3 - "$observation" <<'PY'
+import json
+import sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["comments"][0]["body"] = value["comments"][0]["body"].replace(
+    '{"at":', '{"event":"task-active","at":', 1
+)
+open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(value, separators=(",", ":")) + "\n")
+PY
+  if python3 "$LIFECYCLE_HELPER" markers --observation-file "$observation" \
+    --repository-origin-url https://github.com/example/workbench.git --issue 29 --format jsonl \
+    >"$TMPDIR/lifecycle-duplicate.out" 2>&1; then
+    fail "lifecycle parser accepted a duplicate JSON member"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || [ "$rc" = 2 ] || fail "duplicate lifecycle member returned $rc"
+
+  cp "$valid_snapshot" "$observation"
+  python3 - "$observation" <<'PY'
+import json
+import sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["pagination"]["complete"] = False
+value["pagination"]["failure"] = {"code": "page-unavailable", "ref": "cursor:2"}
+open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(value, separators=(",", ":")) + "\n")
+PY
+  if python3 "$LIFECYCLE_HELPER" markers --observation-file "$observation" \
+    --repository-origin-url https://github.com/example/workbench.git --issue 29 --format jsonl \
+    >"$TMPDIR/lifecycle-partial.out" 2>&1; then
+    fail "lifecycle parser treated incomplete pagination as an empty trusted source"
+  fi
+}
+
+test_status_rejects_forged_current_v2_task_identity() {
+  local repo task_dir actual index original_claim original_descriptor branch out err rc
+  repo="$(setup_workbench status_identity)"
+  task_dir="$(start_task status_identity "$repo")"
+  index="$task_dir/task/index.md"
+  original_claim="$(sed -n 's/^claim_id: *//p' "$index")"
+  original_descriptor="$(sed -n 's/^workspace_authority_descriptor_digest: *//p' "$index")"
+  branch="$(git -C "$task_dir" symbolic-ref --quiet --short HEAD)"
+  actual="$(run_task_in_dir status_identity "$task_dir" status --format json)"
+  assert_contains "$actual" '"task_id":"29"'
+  assert_contains "$actual" '"issue":29'
+  assert_contains "$actual" '"home":null'
+  assert_contains "$actual" '"parent":null'
+  assert_contains "$actual" "\"claim_id\":\"$original_claim\""
+  assert_contains "$actual" "\"branch\":\"$branch\""
+  assert_contains "$actual" "\"workspace_authority_descriptor_digest\":\"$original_descriptor\""
+
+  python3 - "$index" <<'PY'
+import sys
+
+path = sys.argv[1]
+rows = open(path, encoding="utf-8").read().splitlines()
+rows = ["claim_id: forged-local-claim" if row.startswith("claim_id:") else row for row in rows]
+open(path, "w", encoding="utf-8").write("\n".join(rows) + "\n")
+PY
+  out="$TMPDIR/status_identity/forged.out"; err="$TMPDIR/status_identity/forged.err"
+  if run_task_in_dir status_identity "$task_dir" status --format json >"$out" 2>"$err"; then
+    fail "public task status projected a forged current v2 identity"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "forged current v2 status returned $rc"
+  [ ! -s "$out" ] || fail "forged current v2 status emitted a public projection"
+  assert_file_contains "$err" 'task-status-identity-unreconciled'
+}
+
+test_kernel_acceptance_attempt_is_stable_and_crash_reducible() {
+  local repo task_dir out rc attempt acceptance_id actual receipt before_views after_views
+  repo="$(setup_workbench acceptance_attempt)"
+  printf 'web: https://github.com/example/web.git\n' > "$repo/codebases.yaml"
+  git -C "$repo" add codebases.yaml
+  git -C "$repo" commit -q -m "test: register acceptance attempt owner"
+  git -C "$repo" push -q
+  task_dir="$(start_task acceptance_attempt "$repo")"
+  run_task_in_dir acceptance_attempt "$task_dir" deliverable declare --id web-pr --owner web \
+    --kind codebase-pr --external-ref https://github.com/example/web/pull/7 \
+    --revision abc123 --format json >/dev/null
+  run_task_in_dir acceptance_attempt "$task_dir" deliverable update --id web-pr \
+    --state submitted --format json >/dev/null
+  before_views="$(grep -c 'pr view' "$TMPDIR/acceptance_attempt/gh.log" || true)"
+  out="$TMPDIR/acceptance_attempt/pre-probe.out"
+  if WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_ATTEMPT=1 run_task_in_dir acceptance_attempt \
+    "$task_dir" deliverable accept --id web-pr --format json >"$out" 2>&1; then
+    fail "kernel acceptance ignored the pre-probe attempt crash"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "pre-probe attempt crash returned $rc"
+  attempt="$task_dir/task/.workbench/acceptance-attempts/web-pr.record"
+  [ -f "$attempt" ] || fail "kernel acceptance did not persist its attempt before probing"
+  acceptance_id="$(sed -n 's/^acceptance_id=//p' "$attempt")"
+  [ -n "$acceptance_id" ] || fail "acceptance attempt has no stable ID"
+  after_views="$(grep -c 'pr view' "$TMPDIR/acceptance_attempt/gh.log" || true)"
+  [ "$before_views" = "$after_views" ] || fail "pre-probe crash queried the PR"
+
+  out="$TMPDIR/acceptance_attempt/post-probe.out"
+  if WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PROBE=1 run_task_in_dir acceptance_attempt \
+    "$task_dir" deliverable accept --id web-pr --format json >"$out" 2>&1; then
+    fail "kernel acceptance ignored the post-probe crash"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "post-probe acceptance crash returned $rc"
+  [ "$(sed -n 's/^acceptance_id=//p' "$attempt")" = "$acceptance_id" ] \
+    || fail "post-probe retry replaced the stable attempt ID"
+  [ ! -e "$task_dir/task/.workbench/acceptances/$acceptance_id.record" ] \
+    || fail "post-probe crash wrote an acceptance receipt"
+
+  out="$TMPDIR/acceptance_attempt/post-primary.out"
+  if WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY=1 run_task_in_dir acceptance_attempt \
+    "$task_dir" deliverable accept --id web-pr --format json >"$out" 2>&1; then
+    fail "kernel acceptance ignored the post-primary crash"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "post-primary acceptance crash returned $rc"
+  receipt="$task_dir/task/.workbench/acceptances/$acceptance_id.record"
+  [ -f "$receipt" ] || fail "kernel acceptance crash lost its durable receipt"
+  assert_file_contains "$task_dir/task/.workbench/deliverables/web-pr.record" 'state=submitted'
+
+  actual="$(run_task_in_dir acceptance_attempt "$task_dir" deliverable accept \
+    --id web-pr --format json)"
+  assert_contains "$actual" "\"acceptance_id\":\"$acceptance_id\""
+  assert_contains "$actual" '"state":"accepted"'
+  out="$TMPDIR/acceptance_attempt/changed-subject.out"
+  if GH_PR_MERGE=changed789 run_task_in_dir acceptance_attempt "$task_dir" deliverable accept \
+    --id web-pr --format json >"$out" 2>&1; then
+    fail "kernel acceptance retained a receipt after immutable PR subject drift"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "changed immutable acceptance subject returned $rc"
+  assert_file_contains "$out" 'acceptance-authority-mismatch'
+}
+
+test_concurrent_writer_uses_complete_sealed_context_union() {
+  local first second third out rc actual registration registration_backup
+  local first_branch first_head cleanup_tree cleanup_commit corrupt_tree corrupt_commit
+  setup_writer_workbench writer_context_union
+  prepare_writer_task writer_context_union 29; first="$WRITER_TASK_DIR"
+  replace_writer_context "$first" first deny
+  WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+  WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_context_union "$first" add-repo shared-api --format json >/dev/null
+  first_branch="$(sed -n 's/^branch: *//p' "$first/task/index.md")"
+  first_head="$(git -C "$first" rev-parse HEAD)"
+  cleanup_tree="$(git -C "$first" rev-parse 'origin/main^{tree}')"
+  cleanup_commit="$(printf '%s\n' 'test: publish cleanup-only task tip' \
+    | git -C "$first" commit-tree "$cleanup_tree" -p "$first_head")"
+  git -C "$first" push -q origin "$cleanup_commit:refs/heads/$first_branch"
+  prepare_writer_task writer_context_union 31; second="$WRITER_TASK_DIR"
+  replace_writer_context "$second" second allow
+  registration="$first/task/.workbench/policy-context/registration.json"
+  registration_backup="$TMPDIR/writer_context_union/first-registration.json"
+  mv "$registration" "$registration_backup"
+  out="$TMPDIR/writer_context_union/second.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_context_union "$second" add-repo shared-api --format json \
+      >"$out" 2>&1; then
+    fail "concurrent writer omitted the competing sealed deny context"
+  else rc=$?; fi
+  mv "$registration_backup" "$registration"
+  [ "$rc" = 4 ] || fail "complete context union deny returned $rc: $(cat "$out")"
+  actual="$(cat "$out")"
+  assert_contains "$actual" '"context_ref":"toolbox:product/first"'
+  assert_contains "$actual" '"context_ref":"toolbox:product/second"'
+  [ ! -e "$second/task/codebases/shared-api" ] || fail "denied context union created a worktree"
+
+  rm "$first/task/.workbench/policy-context/registration.json"
+  git -C "$first" add -u task/.workbench/policy-context/registration.json
+  git -C "$first" commit -q -m "test: corrupt competing remote context"
+  corrupt_tree="$(git -C "$first" rev-parse 'HEAD^{tree}')"
+  corrupt_commit="$(printf '%s\n' 'test: publish corrupt task snapshot' \
+    | git -C "$first" commit-tree "$corrupt_tree" -p "$cleanup_commit")"
+  git -C "$first" push -q origin "$corrupt_commit:refs/heads/$first_branch"
+  prepare_writer_task writer_context_union 33; third="$WRITER_TASK_DIR"
+  replace_writer_context "$third" third allow
+  out="$TMPDIR/writer_context_union/missing.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_context_union "$third" add-repo shared-api --format json \
+      >"$out" 2>&1; then
+    fail "concurrent writer accepted an incomplete competing sealed context"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "missing competing context returned $rc"
+  assert_file_contains "$out" 'policy-context-unavailable'
+  [ ! -e "$third/task/codebases/shared-api" ] || fail "missing context created a worktree"
+}
+
+test_terminal_writer_join_rejects_remote_claim_without_local_operation() {
+  local task_dir actual operation_id operation_backup out rc
+  setup_writer_workbench writer_bijection
+  prepare_writer_task writer_bijection 29; task_dir="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_bijection "$task_dir" add-repo shared-api --format json)"
+  operation_id="$(json_get "$actual" operation_id)"
+  operation_backup="$TMPDIR/writer_bijection/$operation_id.json"
+  mv "$task_dir/task/.workbench/writer-operations/$operation_id.json" "$operation_backup"
+  out="$TMPDIR/writer_bijection/verify.out"
+  if run_task_in_dir writer_bijection "$task_dir" verify --format json >"$out" 2>&1; then
+    fail "verification accepted an authoritative remote claim without its local operation"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "orphan remote claim returned $rc"
+  assert_file_contains "$out" '"code":"writer-claim-unreconciled"'
+  assert_file_contains "$out" "\"ref\":\"$operation_id\""
+  mv "$operation_backup" "$task_dir/task/.workbench/writer-operations/$operation_id.json"
+}
+
 run_case() {
   local name="$1"
   [ -z "${WORKBENCH_TEST_FILTER:-}" ] || [ "$WORKBENCH_TEST_FILTER" = "$name" ] || return 0
@@ -3379,6 +3979,7 @@ run_case test_harvest_ledger_is_explicit_sealed_and_governed
 run_case test_codebase_only_completion_is_policy_gated_and_cleanup_safe
 run_case test_abandonment_is_terminal_and_distinct_from_cleanup
 run_case test_terminal_outcome_freezes_mutations_and_verification_is_read_only
+run_case test_terminal_lifecycle_rejects_post_terminal_reactivation
 run_case test_forged_local_terminal_has_no_freeze_or_outcome_authority
 run_case test_cleanup_prepared_journal_failure_deletes_nothing
 run_case test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion
@@ -3403,6 +4004,12 @@ run_case test_writer_authority_revalidation_fails_closed_without_compensation
 run_case test_terminal_writer_verification_joins_exact_record_and_lifecycle_provenance
 run_case test_cleanup_retires_consumed_writer_before_local_deletion
 run_case test_status_reports_concurrent_writer_conflicts
+run_case test_v2_submit_reconciles_durable_submission_without_v1_fallback
+run_case test_lifecycle_parser_is_strict_trusted_and_key_order_independent
+run_case test_status_rejects_forged_current_v2_task_identity
+run_case test_kernel_acceptance_attempt_is_stable_and_crash_reducible
+run_case test_concurrent_writer_uses_complete_sealed_context_union
+run_case test_terminal_writer_join_rejects_remote_claim_without_local_operation
 
 [ "$SOURCE_HEAD" = "$(git -C "$SOURCE_REPO" rev-parse HEAD)" ] || fail "test committed in source repo"
 [ "$SOURCE_STATUS" = "$(git -C "$SOURCE_REPO" status --porcelain=v1)" ] || fail "test modified source repo"

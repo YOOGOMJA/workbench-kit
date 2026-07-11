@@ -436,7 +436,9 @@ assert value["source"]["revision"] == source_revision
 
 unsigned = dict(value)
 unsigned["digest"] = None
-raw = (json.dumps(unsigned, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+raw = (
+    json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+).encode("utf-8")
 digest = "sha256:" + hashlib.sha256(raw).hexdigest()
 assert value["digest"] == digest
 
@@ -521,7 +523,7 @@ PY
 }
 
 test_workspace_authority_descriptor_binds_workspace_home() {
-  local descriptor actual missing out err rc
+  local descriptor reordered actual reordered_actual expected_digest missing out err rc
   descriptor="$TMPDIR/authority-with-home.json"
   python3 - "$descriptor" <<'PY'
 import json
@@ -543,6 +545,31 @@ PY
   actual="$(python3 "$ROOT/lib/workbench_contract.py" authority-descriptor "$descriptor")"
   assert_contains "$actual" 'workspace_home=workbench' \
     "authority parser must expose the immutable workspace home"
+  reordered="$TMPDIR/authority-reordered.json"
+  python3 - "$descriptor" "$reordered" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(dict(reversed(list(value.items()))), handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  reordered_actual="$(python3 "$ROOT/lib/workbench_contract.py" authority-descriptor "$reordered")"
+  expected_digest="$(python3 - "$descriptor" <<'PY'
+import hashlib
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+raw = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+print("sha256:" + hashlib.sha256(raw).hexdigest())
+PY
+)"
+  assert_eq "$expected_digest" "$(printf '%s\n' "$actual" | sed -n 's/^descriptor_digest=//p')" \
+    "authority descriptor digest must use sorted-key canonical JSON"
+  assert_eq "$expected_digest" "$(printf '%s\n' "$reordered_actual" | sed -n 's/^descriptor_digest=//p')" \
+    "authority descriptor member order must not change its digest"
 
   missing="$TMPDIR/authority-without-home.json"
   python3 - "$descriptor" "$missing" <<'PY'
@@ -563,6 +590,77 @@ PY
   else rc=$?; fi
   assert_eq 2 "$rc" "missing workspace_home is malformed authority input"
   [ ! -s "$out" ] || fail "invalid authority descriptor must emit no partial output"
+}
+
+test_context_registration_accepts_reordered_nested_receipts() {
+  local workspace policy digest receipt registration parsed sources expected_receipt expected_registration
+  workspace="$TMPDIR/reordered-context"; mkdir -p "$workspace/contexts"
+  policy="$workspace/contexts/acme.policy"
+  printf '%s\n' 'schema=workbench-policy/v1' 'action.task.complete=allow' > "$policy"
+  digest="sha256:$(shasum -a 256 "$policy" | awk '{print $1}')"
+  receipt="$TMPDIR/reordered-context-receipt.json"
+  registration="$TMPDIR/reordered-context-registration.json"
+  python3 - "$receipt" "$registration" "$digest" <<'PY'
+import json
+import sys
+
+receipt = {
+    "contract_version": "workbench-policy-authority-receipt/v1",
+    "authority_identity": "toolbox:authority/acme",
+    "authority_ref": "toolbox:policy/acme",
+    "authority_revision": "sha256:" + "a" * 64,
+    "policy_ref": "contexts/acme.policy",
+    "policy_digest": sys.argv[3],
+    "actor": "owner@example.com",
+    "issued_at": "2026-07-11T03:00:00Z",
+    "source_ref": "toolbox:approval/acme",
+}
+participant = {
+    "context_ref": "toolbox:product/acme",
+    "policy_ref": "contexts/acme.policy",
+    "policy_digest": sys.argv[3],
+    "authority_ref": "toolbox:policy/acme",
+    "authority_receipt": dict(reversed(list(receipt.items()))),
+}
+registration = {
+    "contract_version": "workbench-context-policy-registration/v1",
+    "registration_id": "ctxreg-acme",
+    "task_claim_id": "claim-policy-42",
+    "task_context_ref": "toolbox:product/acme",
+    "participants": [dict(reversed(list(participant.items())))],
+    "task_policy": None,
+    "actor": "owner@example.com",
+    "registered_at": "2026-07-11T03:01:00Z",
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(dict(reversed(list(receipt.items()))), handle, separators=(",", ":"))
+    handle.write("\n")
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(dict(reversed(list(registration.items()))), handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  parsed="$(python3 "$ROOT/lib/workbench_contract.py" registration "$registration" \
+    --workspace-root "$workspace")"
+  sources="$(python3 "$ROOT/lib/workbench_contract.py" registration-sources "$registration" \
+    --workspace-root "$workspace")"
+  expected_receipt="$(python3 - "$receipt" <<'PY'
+import hashlib, json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+print("sha256:" + hashlib.sha256(raw).hexdigest())
+PY
+)"
+  expected_registration="$(python3 - "$registration" <<'PY'
+import hashlib, json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+print("sha256:" + hashlib.sha256(raw).hexdigest())
+PY
+)"
+  assert_eq "$expected_registration" "$(printf '%s\n' "$parsed" | sed -n 's/^registration_digest=//p')" \
+    "context registration digest must match the shared sorted-key fixture"
+  assert_eq "$expected_receipt" "$(printf '%s\n' "$sources" | awk -F '\t' '{print $8}')" \
+    "nested authority receipt digest must match the shared sorted-key fixture"
 }
 
 test_action_request_binds_the_exact_effect_intent() {
@@ -779,7 +877,7 @@ test_writer_ledger_reduces_effect_owner_before_claim_release() {
 }
 
 test_writer_operation_uses_the_exact_recovery_cursor_schema() {
-  local operation reordered actual out err rc
+  local operation reordered actual reordered_actual
   operation="$TMPDIR/writer-operation.json"
   reordered="$TMPDIR/writer-operation-reordered.json"
   python3 - "$operation" "$reordered" <<'PY'
@@ -827,13 +925,9 @@ PY
   actual="$(python3 "$ROOT/lib/workbench_writer.py" operation "$operation" --format json)"
   assert_eq prepared "$(json_path "$actual" stage)" \
     "prepared writer operation must validate"
-  out="$TMPDIR/writer-operation-reordered.out"; err="$TMPDIR/writer-operation-reordered.err"
-  if python3 "$ROOT/lib/workbench_writer.py" operation "$reordered" --format json \
-    >"$out" 2>"$err"; then
-    fail "writer operation with reordered fields must fail"
-  else rc=$?; fi
-  assert_eq 2 "$rc" "reordered operation is malformed input"
-  [ ! -s "$out" ] || fail "invalid writer operation must emit no partial JSON"
+  reordered_actual="$(python3 "$ROOT/lib/workbench_writer.py" operation "$reordered" --format json)"
+  assert_eq prepared "$(json_path "$reordered_actual" stage)" \
+    "writer operation member order must be non-semantic"
 }
 
 test_cleanup_journal_binds_the_exact_removal_plan_prefix() {
@@ -1113,7 +1207,9 @@ value = {
     "source_ref": "conversation:message/bootstrap-approval",
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
-    json.dump(value, handle, separators=(",", ":"))
+    value["proposed_descriptor"] = dict(reversed(list(descriptor.items())))
+    value["protection"] = dict(reversed(list(value["protection"].items())))
+    json.dump(dict(reversed(list(value.items()))), handle, separators=(",", ":"))
     handle.write("\n")
 PY
 }
@@ -1129,12 +1225,12 @@ import hashlib
 import json
 import sys
 
-raw = open(sys.argv[1], "rb").read()
-value = json.loads(raw)
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 descriptor = value["proposed_descriptor"]
 output = {
     "contract_version": "workbench-bootstrap-authority-verification/v1",
-    "approval_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+    "approval_digest": "sha256:" + hashlib.sha256(canonical).hexdigest(),
     "authenticated": True,
     "repository_identity_verified": True,
     "default_ref_protected": True,
@@ -1227,7 +1323,7 @@ import sys
 approval = json.load(open(sys.argv[1], encoding="utf-8"))
 value = json.loads(os.environ["ACTUAL"])
 descriptor_raw = (json.dumps(
-    approval["proposed_descriptor"], separators=(",", ":")
+    approval["proposed_descriptor"], sort_keys=True, separators=(",", ":")
 ) + "\n").encode()
 assert value["contract_version"] == "workbench-legacy-inventory/v1"
 assert value["source_revision"] == value["authority"]["default_revision"]
@@ -1633,9 +1729,12 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
 PY
   descriptor_digest="sha256:$(python3 - "$repo/.workbench/authority.json" <<'PY'
 import hashlib
+import json
 import sys
 
-print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+print(hashlib.sha256(raw).hexdigest())
 PY
 )"
   mkdir -p "$repo/task"
@@ -2015,6 +2114,7 @@ run_case test_contract_show_advertises_the_frozen_g0_surface
 run_case test_public_engine_manifest_is_complete_and_canonical
 run_case test_engine_manifest_rejects_links_and_path_swap
 run_case test_workspace_authority_descriptor_binds_workspace_home
+run_case test_context_registration_accepts_reordered_nested_receipts
 run_case test_action_request_binds_the_exact_effect_intent
 run_case test_applied_effect_reducer_recovers_without_reauthorization
 run_case test_github_probe_separates_stable_subject_from_observation

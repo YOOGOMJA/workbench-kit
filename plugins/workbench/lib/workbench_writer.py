@@ -96,6 +96,23 @@ OPERATION_STAGES = {
     "released",
 }
 
+WRITER_CONTENT_FIELDS = (
+    "operation_id",
+    "claim_id",
+    "owner",
+    "task_claim_id",
+    "branch",
+    "expected_path",
+    "codebase_origin_url",
+    "registry_revision",
+    "registry_digest",
+    "context_policy_set_digest",
+    "action_instance_id",
+    "intent_digest",
+    "policy_manifest_digest",
+    "authorization_ref",
+)
+
 
 def sha256(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -294,8 +311,8 @@ def latest_effect(effects: Sequence[Mapping[str, str]]) -> Optional[Dict[str, st
 def load_operation(file: str) -> Dict[str, Any]:
     with open(file, "r", encoding="utf-8") as handle:
         value = json.load(handle, object_pairs_hook=unique_object)
-    if not isinstance(value, dict) or tuple(value) != OPERATION_FIELDS:
-        raise ValueError("writer operation fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(OPERATION_FIELDS):
+        raise ValueError("writer operation fields do not match the contract")
     if value["contract_version"] != "workbench-writer-operation/v1":
         raise ValueError("unsupported writer operation contract")
     for key in (
@@ -343,7 +360,7 @@ def load_operation(file: str) -> Dict[str, Any]:
         manifest = value["policy_manifest"]
         if (
             not isinstance(manifest, dict)
-            or tuple(manifest) != ("contract_version", "digest", "sources")
+            or set(manifest) != {"contract_version", "digest", "sources"}
             or manifest["contract_version"] != "workbench-policy-manifest/v1"
             or not isinstance(manifest["sources"], list)
         ):
@@ -453,7 +470,7 @@ def action_binding_from_resolution(file: Optional[str]) -> Tuple[Any, Any, Any, 
     manifest = action.get("policy_manifest")
     if (
         not isinstance(manifest, dict)
-        or tuple(manifest) != ("contract_version", "digest", "sources")
+        or set(manifest) != {"contract_version", "digest", "sources"}
         or manifest["contract_version"] != "workbench-policy-manifest/v1"
     ):
         raise ValueError("writer policy manifest is invalid")
@@ -711,8 +728,8 @@ def cmd_conflict(args: argparse.Namespace) -> None:
         "contract_version", "source_revision", "authority", "home_set", "homes",
         "active_claims", "origin_replacements", "complete", "blockers",
     )
-    if not isinstance(legacy, dict) or tuple(legacy) != expected_top:
-        raise ValueError("legacy inventory fields or order do not match the public contract")
+    if not isinstance(legacy, dict) or set(legacy) != set(expected_top):
+        raise ValueError("legacy inventory fields do not match the public contract")
     if (
         legacy["contract_version"] != "workbench-legacy-inventory/v1"
         or legacy["complete"] is not True
@@ -720,10 +737,10 @@ def cmd_conflict(args: argparse.Namespace) -> None:
     ):
         raise ValueError("legacy inventory is not complete")
     home_set = legacy["home_set"]
-    if not isinstance(home_set, dict) or tuple(home_set) != (
+    if not isinstance(home_set, dict) or set(home_set) != {
         "contract_version", "digest", "source_revision"
-    ):
-        raise ValueError("legacy home set fields or order do not match the contract")
+    }:
+        raise ValueError("legacy home set fields do not match the contract")
     if (
         home_set["contract_version"] != "workbench-legacy-home-set/v1"
         or home_set["source_revision"] != legacy["source_revision"]
@@ -816,8 +833,8 @@ def operation_claim_binding(operation: Mapping[str, Any]) -> Dict[str, str]:
 
 
 def validate_status_claim(value: Any) -> Mapping[str, Any]:
-    if not isinstance(value, dict) or tuple(value) != STATUS_CLAIM_FIELDS:
-        raise ValueError("legacy status claim fields or order do not match the contract")
+    if not isinstance(value, dict) or set(value) != set(STATUS_CLAIM_FIELDS):
+        raise ValueError("legacy status claim fields do not match the contract")
     if value["source"] != "legacy-v1" or value["operation_id"] is not None:
         raise ValueError("invalid legacy status claim identity")
     for key in ("claim_id", "task_claim_id", "owner", "branch"):
@@ -995,7 +1012,7 @@ def local_writer_effects_match(operation_path: str, operation: Mapping[str, Any]
         "branch": codebase_branch,
         "codebase_origin_url": operation["codebase_origin_url"],
     }
-    return tuple(marker) == tuple(expected_marker) and marker == expected_marker
+    return marker == expected_marker
 
 
 def operation_local_facts(operation_path: str, operation: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1173,8 +1190,8 @@ def cmd_status_projection(args: argparse.Namespace) -> None:
         "complete",
         "blockers",
     )
-    if not isinstance(legacy, dict) or tuple(legacy) != expected_top:
-        raise ValueError("legacy inventory fields or order do not match the public contract")
+    if not isinstance(legacy, dict) or set(legacy) != set(expected_top):
+        raise ValueError("legacy inventory fields do not match the public contract")
     if (
         legacy["contract_version"] != "workbench-legacy-inventory/v1"
         or legacy["complete"] is not True
@@ -1312,6 +1329,71 @@ def cmd_ledger_state(args: argparse.Namespace) -> None:
             sys.stdout.write("effect_owner_{}={}\n".format(key, "" if effect is None else effect[key]))
 
 
+def cmd_task_bijection(args: argparse.Namespace) -> None:
+    rows, _ = read_ledger(args.ledger_file)
+    operations = [load_operation(path) for path in args.operation_file]
+    local: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for operation in operations:
+        identity = (operation["operation_id"], operation["claim_id"])
+        if identity in local:
+            raise ValueError("duplicate local writer operation identity")
+        if operation["task_claim_id"] != args.task_claim_id:
+            raise ValueError("local writer operation belongs to another task")
+        local[identity] = operation
+
+    remote: DefaultDict[Tuple[str, str], List[Mapping[str, str]]] = defaultdict(list)
+    for row in rows:
+        if row["kind"] == "claim" and row["task_claim_id"] == args.task_claim_id:
+            remote[(row["operation_id"], row["claim_id"])].append(row)
+
+    blockers = set()
+    for identity, claims in remote.items():
+        operation = local.get(identity)
+        if operation is None:
+            blockers.add(identity[0])
+            continue
+        expected = operation_claim_binding(operation)
+        if any(any(row[key] != item for key, item in expected.items()) for row in claims):
+            blockers.add(identity[0])
+
+    unpublished = {"prepared", "authorization-pending", "cancelled"}
+    for identity, operation in local.items():
+        has_remote = identity in remote
+        if operation["stage"] in unpublished:
+            if has_remote:
+                blockers.add(operation["operation_id"])
+        elif not has_remote:
+            blockers.add(operation["operation_id"])
+
+    row_identities = set()
+    for path in args.writer_row_file:
+        row = ordered_record(Path(path), WRITER_CONTENT_FIELDS)
+        identity = (row["operation_id"], row["claim_id"])
+        if identity in row_identities:
+            blockers.add(row["operation_id"])
+            continue
+        row_identities.add(identity)
+        operation = local.get(identity)
+        if (
+            operation is None
+            or operation["stage"] != "consumed"
+            or row["task_claim_id"] != args.task_claim_id
+            or row["owner"] != operation["owner"]
+        ):
+            blockers.add(row["operation_id"])
+
+    consumed_owners = {
+        operation["owner"]
+        for operation in local.values()
+        if operation["stage"] == "consumed"
+    }
+    for owner in args.repo_owner:
+        if owner not in consumed_owners:
+            blockers.add(owner)
+    for item in sorted(blockers):
+        sys.stdout.write("blocker={}\n".format(item))
+
+
 def cmd_operation(args: argparse.Namespace) -> None:
     value = load_operation(args.file)
     if args.format == "json":
@@ -1416,6 +1498,13 @@ def parser() -> argparse.ArgumentParser:
     ledger.add_argument("--operation-file")
     ledger.add_argument("--format", choices=("json", "shell"), required=True)
     ledger.set_defaults(func=cmd_ledger_state)
+    bijection = commands.add_parser("task-bijection")
+    bijection.add_argument("--ledger-file", required=True)
+    bijection.add_argument("--task-claim-id", required=True)
+    bijection.add_argument("--operation-file", action="append", default=[])
+    bijection.add_argument("--writer-row-file", action="append", default=[])
+    bijection.add_argument("--repo-owner", action="append", default=[])
+    bijection.set_defaults(func=cmd_task_bijection)
     validate = commands.add_parser("ledger-validate")
     validate.add_argument("file")
     validate.set_defaults(func=cmd_ledger_validate)

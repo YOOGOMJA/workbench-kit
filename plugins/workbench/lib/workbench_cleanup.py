@@ -120,8 +120,8 @@ def require_relative_path(value: Any, field: str) -> str:
 
 
 def require_fields(value: Any, fields: Sequence[str], name: str) -> Mapping[str, Any]:
-    if not isinstance(value, dict) or tuple(value) != tuple(fields):
-        raise ValueError("{} fields or order do not match the contract".format(name))
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError("{} fields do not match the contract".format(name))
     return value
 
 
@@ -285,7 +285,7 @@ def validate_journal(value: Any) -> Mapping[str, Any]:
 
 def immutable_binding(value: Mapping[str, Any]) -> str:
     selected = {key: value[key] for key in JOURNAL_FIELDS if key not in ("stage", "effect_owner_events", "at")}
-    return json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(selected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def reduce_prefix(values: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:

@@ -130,6 +130,10 @@ legacy_helper() {
   printf '%s/lib/workbench_legacy.py\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 }
 
+lifecycle_helper() {
+  printf '%s/lib/workbench_lifecycle.py\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+}
+
 observe_workspace_authority() {
   local root="$1" expected_digest="${2:-}" bootstrap_origin remote_lines head_ref head_oid
   local descriptor policy parsed line key value descriptor_file policy_file verification_file adapter
@@ -345,43 +349,134 @@ lifecycle_emit_optional() {
 }
 
 lifecycle_markers_for_issue() {
-  local root="$1" home="$2" issue="$3" dir
+  local root="$1" home="$2" issue="$3" dir adapter origin observation
   dir="$(lifecycle_issue_dir "$root" "$home")"
-  [ -d "$dir" ] || return 0
-  (cd "$dir" && gh issue view "$issue" --json comments --jq '.comments[].body' 2>/dev/null) \
-    | grep -E 'workbench-task-lifecycle:v1|^\{"task_contract":"workbench-task/v2"' || true
+  [ -d "$dir" ] || return 1
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] || return 1
+  origin="$(git -C "$dir" remote get-url origin 2>/dev/null)" || return 1
+  observation="$(mktemp "${TMPDIR:-/tmp}/workbench-lifecycle-observation.XXXXXX")"
+  if ! (cd "$dir" && "$adapter" lifecycle --repository "$dir" --issue "$issue" --format json) \
+    > "$observation" 2>/dev/null; then
+    rm -f "$observation"; return 1
+  fi
+  python3 "$(lifecycle_helper)" markers --observation-file "$observation" \
+    --repository-origin-url "$origin" --issue "$issue" --format jsonl
+  local rc=$?; rm -f "$observation"; return "$rc"
 }
 
 lifecycle_field() {
   local line="$1" key="$2"
   case "$line" in
     \{*)
-      local value
-      value="$(printf '%s\n' "$line" | sed -n "s/.*\"$key\":\"\([^\"]*\)\".*/\1/p")"
-      [ -n "$value" ] || value="$(printf '%s\n' "$line" | sed -n "s/.*\"$key\":\([0-9][0-9]*\).*/\1/p")"
-      printf '%s\n' "$value"
+      printf '%s\n' "$line" | python3 -c '
+import json, sys
+value = json.load(sys.stdin).get(sys.argv[1])
+if value is not None:
+    print(value)
+' "$key"
       ;;
     *) printf '%s\n' "$line" | tr ' ' '\n' | sed -n "s/^$key=//p" | head -1 | sed 's/-->$//' ;;
   esac
 }
 
 lifecycle_latest_for_branch() {
-  local root="$1" home="$2" issue="$3" branch="$4" line latest=""
+  local root="$1" home="$2" issue="$3" branch="$4" line latest="" markers
+  markers="$(lifecycle_markers_for_issue "$root" "$home" "$issue")" || return 2
   while IFS= read -r line; do
+    [ -n "$line" ] || continue
     [ "$(lifecycle_field "$line" branch)" = "$branch" ] && latest="$line"
-  done < <(lifecycle_markers_for_issue "$root" "$home" "$issue")
+  done <<< "$markers"
   [ -z "$latest" ] || printf '%s\n' "$latest"
 }
 
 lifecycle_latest_for_issue() {
-  local root="$1" home="$2" issue="$3"
-  lifecycle_markers_for_issue "$root" "$home" "$issue" \
-    | awk '{ line=$0 } END { if (line) print line }'
+  local root="$1" home="$2" issue="$3" markers
+  markers="$(lifecycle_markers_for_issue "$root" "$home" "$issue")" || return 2
+  printf '%s\n' "$markers" | awk '{ line=$0 } END { if (line) print line }'
+}
+
+lifecycle_identity_for_branch() {
+  local root="$1" home="$2" issue="$3" branch="$4" markers line contract="" claim="" descriptor=""
+  local value
+  LIFECYCLE_IDENTITY_CONTRACT=""; LIFECYCLE_IDENTITY_CLAIM_ID=""
+  LIFECYCLE_IDENTITY_DESCRIPTOR_DIGEST=""
+  markers="$(lifecycle_markers_for_issue "$root" "$home" "$issue")" || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$(lifecycle_field "$line" branch)" = "$branch" ] || continue
+    value="$(lifecycle_field "$line" task_contract)"
+    if [ -z "$contract" ]; then contract="$value"; else [ "$contract" = "$value" ] || return 1; fi
+    value="$(lifecycle_field "$line" claim_id)"
+    if [ -z "$claim" ]; then claim="$value"; else [ "$claim" = "$value" ] || return 1; fi
+    [ "$(lifecycle_field "$line" issue)" = "$issue" ] \
+      && [ "$(lifecycle_field "$line" home)" = "$home" ] || return 1
+    if [ "$contract" = workbench-task/v2 ]; then
+      value="$(lifecycle_field "$line" workspace_authority_descriptor_digest)"
+      if [ -z "$descriptor" ]; then descriptor="$value"; else [ "$descriptor" = "$value" ] || return 1; fi
+    fi
+  done <<< "$markers"
+  [ -n "$contract" ] && [ -n "$claim" ] || return 1
+  [ "$contract" != workbench-task/v2 ] || [ -n "$descriptor" ] || return 1
+  LIFECYCLE_IDENTITY_CONTRACT="$contract"
+  LIFECYCLE_IDENTITY_CLAIM_ID="$claim"
+  LIFECYCLE_IDENTITY_DESCRIPTOR_DIGEST="$descriptor"
+}
+
+lifecycle_contract_for_branch() {
+  lifecycle_identity_for_branch "$@" || return 1
+  printf '%s\n' "$LIFECYCLE_IDENTITY_CONTRACT"
+}
+
+terminal_lifecycle_state() {
+  local root="$1" home="$2" issue="$3" branch="$4" claim="$5" descriptor="$6" terminal="$7"
+  local markers line contract event current=false current_pr="" marker_pr terminal_count=0 expected
+  local outcome revision action intent terminal_seen=false cleaned=false
+  outcome="$(record_get "$terminal" outcome)"; expected="task-$outcome"
+  revision="$(record_get "$terminal" revision)"; action="$(record_get "$terminal" action_instance_id)"
+  intent="$(record_get "$terminal" intent_digest)"
+  markers="$(lifecycle_markers_for_issue "$root" "$home" "$issue")" || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$(lifecycle_field "$line" branch)" = "$branch" ] || continue
+    contract="$(lifecycle_field "$line" task_contract)"
+    [ "$contract" = workbench-task/v2 ] \
+      && [ "$(lifecycle_field "$line" claim_id)" = "$claim" ] \
+      && [ "$(lifecycle_field "$line" issue)" = "$issue" ] \
+      && [ "$(lifecycle_field "$line" home)" = "$home" ] \
+      && [ "$(lifecycle_field "$line" workspace_authority_descriptor_digest)" = "$descriptor" ] \
+      || return 1
+    event="$(lifecycle_field "$line" event)"
+    if [ "$terminal_seen" = true ]; then
+      [ "$event" = task-cleaned ] && [ "$cleaned" = false ] || return 1
+      cleaned=true; current=false; current_pr=""
+      continue
+    fi
+    case "$event" in
+      task-submitted) current=true; current_pr="$(lifecycle_field "$line" pr)" ;;
+      task-active) current=false; current_pr="" ;;
+      task-completed|task-abandoned)
+        terminal_count=$((terminal_count + 1))
+        marker_pr="$(lifecycle_field "$line" pr)"
+        [ -z "$marker_pr" ] || { [ "$current" = true ] && [ "$marker_pr" = "$current_pr" ]; } \
+          || return 1
+        [ "$event" = "$expected" ] \
+          && [ "$(lifecycle_field "$line" revision)" = "$revision" ] \
+          && [ "$(lifecycle_field "$line" action_instance_id)" = "$action" ] \
+          && [ "$(lifecycle_field "$line" intent_digest)" = "$intent" ] \
+          || return 1
+        terminal_seen=true
+        ;;
+      task-cleaned) return 1 ;;
+    esac
+  done <<< "$markers"
+  [ "$terminal_count" -eq 0 ] && return 10
+  [ "$terminal_count" -eq 1 ]
 }
 
 lifecycle_claim_for_branch() {
   local root="$1" home="$2" issue="$3" branch="$4" latest claim_id
-  latest="$(lifecycle_latest_for_branch "$root" "$home" "$issue" "$branch")"
+  latest="$(lifecycle_latest_for_branch "$root" "$home" "$issue" "$branch")" || return 1
   claim_id="$(lifecycle_field "$latest" claim_id)"
   printf '%s\n' "${claim_id:-$branch}"
 }
@@ -782,6 +877,8 @@ cmd_add_repo_v1() {
 }
 
 WRITER_COORDINATION_REF=refs/heads/workbench-coordination/writer-claims
+WRITER_CONTEXT_UNION_FILE=""
+WRITER_CONTEXT_UNION_ROOT=""
 
 canonical_workspace_origin_url() {
   local root="$1" url
@@ -1208,6 +1305,114 @@ raise SystemExit(0 if any(item.get("source") == "legacy-v1" for item in json.loa
 '
 }
 
+writer_context_union_cleanup() {
+  [ -z "${WRITER_CONTEXT_UNION_ROOT:-}" ] || rm -rf "$WRITER_CONTEXT_UNION_ROOT"
+  WRITER_CONTEXT_UNION_FILE=""; WRITER_CONTEXT_UNION_ROOT=""
+}
+
+writer_remote_task_oid() {
+  local origin="$1" branch="$2" ref rows count oid advertised
+  ref="refs/heads/$branch"
+  git check-ref-format "$ref" >/dev/null 2>&1 || return 1
+  rows="$(git ls-remote --heads "$origin" "$ref" 2>/dev/null)" || return 1
+  count="$(printf '%s\n' "$rows" | sed '/^$/d' | wc -l | tr -d ' ')"
+  [ "$count" -eq 1 ] || return 1
+  IFS=$'\t' read -r oid advertised <<EOF
+$rows
+EOF
+  [ "$advertised" = "$ref" ] \
+    && printf '%s' "$oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+    || return 1
+  printf '%s\n' "$oid"
+}
+
+writer_materialize_context_snapshot() {
+  local root="$1" revision="$2" destination="$3"
+  command -v tar >/dev/null 2>&1 || return 1
+  mkdir -p "$destination"
+  git -C "$root" archive --format=tar "$revision" 2>/dev/null \
+    | tar -xf - -C "$destination" >/dev/null 2>&1
+}
+
+writer_prepare_context_union() {
+  local root="$1" output source claim task_claim branch digest origin descriptor oid revision revisions
+  local index snapshot parsed line key value task_contract parsed_claim parsed_descriptor found count=0
+  local state registration
+  writer_context_union_cleanup
+  WRITER_CONTEXT_UNION_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/workbench-context-union.XXXXXX")" \
+    || return 1
+  output="$WRITER_CONTEXT_UNION_ROOT/manifest"
+  origin="$(canonical_workspace_origin_url "$root")" \
+    || { writer_context_union_cleanup; return 1; }
+  descriptor="$(index_get workspace_authority_descriptor_digest)"
+  printf '%s' "$descriptor" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+    || { writer_context_union_cleanup; return 1; }
+  printf 'workbench-concurrent-context-union/v1\n' > "$output"
+  while IFS=$'\t' read -r source claim task_claim branch digest; do
+    [ "$source" = ledger-v2 ] || continue
+    oid="$(writer_remote_task_oid "$origin" "$branch")" \
+      || { writer_context_union_cleanup; return 1; }
+    git -C "$root" fetch --quiet --no-tags --no-write-fetch-head "$origin" "$oid" \
+      >/dev/null 2>&1 || { writer_context_union_cleanup; return 1; }
+    [ "$(git -C "$root" cat-file -t "$oid" 2>/dev/null)" = commit ] \
+      || { writer_context_union_cleanup; return 1; }
+    revisions="$(git -C "$root" rev-list --first-parent "$oid" 2>/dev/null)" \
+      || { writer_context_union_cleanup; return 1; }
+    [ -n "$revisions" ] || { writer_context_union_cleanup; return 1; }
+    found=""
+    while IFS= read -r revision; do
+      [ -n "$revision" ] || continue
+      git -C "$root" cat-file -e "$revision:task/index.md" 2>/dev/null || continue
+      index="$WRITER_CONTEXT_UNION_ROOT/index-$count.md"
+      git -C "$root" show "$revision:task/index.md" > "$index" 2>/dev/null \
+        || { writer_context_union_cleanup; return 1; }
+      parsed="$(python3 "$(lifecycle_helper)" task-index --file "$index" \
+        --branch "$branch" --format shell 2>/dev/null)" \
+        || { writer_context_union_cleanup; return 1; }
+      task_contract=""; parsed_claim=""; parsed_descriptor=""
+      while IFS= read -r line; do
+        key="${line%%=*}"; value="${line#*=}"
+        case "$key" in
+          task_contract) task_contract="$value" ;;
+          claim_id) parsed_claim="$value" ;;
+          workspace_authority_descriptor_digest) parsed_descriptor="$value" ;;
+        esac
+      done <<< "$parsed"
+      [ "$task_contract" = workbench-task/v2 ] \
+        && [ "$parsed_claim" = "$task_claim" ] \
+        && [ "$parsed_descriptor" = "$descriptor" ] \
+        || { writer_context_union_cleanup; return 1; }
+      snapshot="$WRITER_CONTEXT_UNION_ROOT/snapshot-$count"
+      writer_materialize_context_snapshot "$root" "$revision" "$snapshot" \
+        || { writer_context_union_cleanup; return 1; }
+      state="$snapshot/task/.workbench/policy-context/state.record"
+      registration="$snapshot/task/.workbench/policy-context/registration.json"
+      [ -f "$state" ] && [ -f "$registration" ] \
+        || { writer_context_union_cleanup; return 1; }
+      python3 "$(contract_helper)" context-snapshot --registration-file "$registration" \
+        --state-file "$state" --workspace-root "$snapshot" --task-claim-id "$task_claim" \
+        --context-digest "$digest" >/dev/null 2>&1 \
+        || { writer_context_union_cleanup; return 1; }
+      found="$snapshot"
+      break
+    done <<< "$revisions"
+    [ -n "$found" ] || { writer_context_union_cleanup; return 1; }
+    state="$found/task/.workbench/policy-context/state.record"
+    registration="$found/task/.workbench/policy-context/registration.json"
+    printf 'context\t%s\t%s\t%s\t%s\n' "$task_claim" "$digest" "$found" "$registration" >> "$output"
+    count=$((count + 1))
+  done < <(printf '%s\n' "${WRITER_CONFLICTS_JSON:-[]}" | python3 -c '
+import json, sys
+for item in json.load(sys.stdin):
+    if item.get("source") == "ledger-v2":
+        print("{}\t{}\t{}\t{}\t{}".format(
+            item["source"], item["claim_id"], item["task_claim_id"],
+            item["branch"], item["context_policy_set_digest"],
+        ))
+')
+  WRITER_CONTEXT_UNION_FILE="$output"
+}
+
 writer_publish_ledger() {
   local root="$1" origin="$2" observed="$3" next="$4" commit
   commit="$(writer_create_coordination_commit "$root" "$next" "$observed")" || return 1
@@ -1587,7 +1792,11 @@ writer_resolve_final() {
     writer_operation_update "$operation" --clear-action-binding --stage prepared
     return 0
   fi
-  writer_load_operation_final "$operation" || return 1
+  writer_prepare_context_union "$(wb_root)" || {
+    echo "error: policy-context-unavailable" >&2
+    return 1
+  }
+  writer_load_operation_final "$operation" || { writer_context_union_cleanup; return 1; }
   [ -n "$instance_id" ] || instance_id="$WRITER_OPERATION_ACTION"
   payload="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-intent.XXXXXX")"
   python3 "$(intent_helper)" build-payload --contract workbench-writer-request/v1 \
@@ -1596,12 +1805,14 @@ writer_resolve_final() {
     --field "expected_path=task/codebases/$WRITER_OWNER" \
     --field "codebase_origin_url=$WRITER_CODEBASE_ORIGIN" \
     --field "context_policy_set_digest=$WRITER_CONTEXT_DIGEST" \
-    --field "conflict_revision=$WRITER_CONFLICT_REVISION" > "$payload" || { rm -f "$payload"; return 1; }
+    --field "conflict_revision=$WRITER_CONFLICT_REVISION" > "$payload" \
+    || { rm -f "$payload"; writer_context_union_cleanup; return 1; }
   writer_conflict_has_legacy && GOVERNED_REQUIRE_EXPLICIT_AUTHORIZATION=1
   resolve_governed_action task.concurrent-write "workbench:codebase/$WRITER_OWNER" \
     "$WRITER_CONFLICT_REVISION" "$instance_id" "$authorization_file" \
     workbench-writer-request/v1 "$payload"
-  rm -f "$payload"; action_rc="$GOVERNED_POLICY_RC"
+  rm -f "$payload"; writer_context_union_cleanup
+  action_rc="$GOVERNED_POLICY_RC"
   policy_file="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-policy.XXXXXX")"
   printf '%s\n' "$GOVERNED_POLICY_OUTPUT" > "$policy_file"
   case "$action_rc" in
@@ -1644,6 +1855,10 @@ writer_revalidate_final() {
     GOVERNED_POLICY_OUTPUT=""; GOVERNED_POLICY_RC=0
     return 0
   fi
+  writer_prepare_context_union "$root" || {
+    echo "error: policy-context-unavailable" >&2
+    return 1
+  }
   [ -n "$instance_id" ] || instance_id="$WRITER_OPERATION_ACTION"
   payload="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-intent.XXXXXX")"
   python3 "$(intent_helper)" build-payload --contract workbench-writer-request/v1 \
@@ -1653,12 +1868,13 @@ writer_revalidate_final() {
     --field "codebase_origin_url=$WRITER_CODEBASE_ORIGIN" \
     --field "context_policy_set_digest=$WRITER_CONTEXT_DIGEST" \
     --field "conflict_revision=$WRITER_CONFLICT_REVISION" > "$payload" \
-    || { rm -f "$payload"; return 1; }
+    || { rm -f "$payload"; writer_context_union_cleanup; return 1; }
   writer_conflict_has_legacy && GOVERNED_REQUIRE_EXPLICIT_AUTHORIZATION=1
   resolve_governed_action task.concurrent-write "workbench:codebase/$WRITER_OWNER" \
     "$WRITER_CONFLICT_REVISION" "$instance_id" "$authorization_file" \
     workbench-writer-request/v1 "$payload"
-  rm -f "$payload"; action_rc="$GOVERNED_POLICY_RC"
+  rm -f "$payload"; writer_context_union_cleanup
+  action_rc="$GOVERNED_POLICY_RC"
   case "$action_rc" in 0|3|4) ;; *) return 1 ;; esac
   policy_file="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-policy.XXXXXX")"
   printf '%s\n' "$GOVERNED_POLICY_OUTPUT" > "$policy_file"
@@ -2489,6 +2705,7 @@ cmd_writer_operation() {
 task_state_dir() { printf '%s/task/.workbench\n' "$TASK_DIR"; }
 deliverable_dir() { printf '%s/deliverables\n' "$(task_state_dir)"; }
 acceptance_dir() { printf '%s/acceptances\n' "$(task_state_dir)"; }
+acceptance_attempt_dir() { printf '%s/acceptance-attempts\n' "$(task_state_dir)"; }
 evidence_dir() { printf '%s/evidence\n' "$(task_state_dir)"; }
 required_check_dir() { printf '%s/required-checks\n' "$(task_state_dir)"; }
 harvest_dir() { printf '%s/harvest\n' "$(task_state_dir)"; }
@@ -2563,17 +2780,13 @@ task_terminal_outcome() {
       --terminal-file "$terminal" --claim-id "$claim" --now "$(utc_now)" \
       --format quiet >/dev/null 2>&1 || return 1
     outcome="$(record_get "$terminal" outcome)"; expected="task-$outcome"
-    latest="$(lifecycle_latest_for_branch "$root" "$home" "$issue" "$branch")"
-    [ "$(lifecycle_field "$latest" event)" = "$expected" ] \
-      && [ "$(lifecycle_field "$latest" claim_id)" = "$claim" ] \
-      && [ "$(lifecycle_field "$latest" revision)" = "$(record_get "$terminal" revision)" ] \
-      && [ "$(lifecycle_field "$latest" action_instance_id)" = "$(record_get "$terminal" action_instance_id)" ] \
-      && [ "$(lifecycle_field "$latest" intent_digest)" = "$(record_get "$terminal" intent_digest)" ] \
-      || return 1
+    terminal_lifecycle_state "$root" "$home" "$issue" "$branch" "$claim" \
+      "$(sed -n '/^---$/,/^---$/p' "$dir/task/index.md" | \
+        sed -n 's/^workspace_authority_descriptor_digest: *//p' | head -1)" "$terminal" || return 1
     printf '%s\n' "$outcome"
     return 0
   fi
-  latest="$(lifecycle_latest_for_branch "$root" "$home" "$issue" "$branch")"
+  latest="$(lifecycle_latest_for_branch "$root" "$home" "$issue" "$branch")" || return 1
   event="$(lifecycle_field "$latest" event)"
   case "$event" in
     task-completed) printf '%s\n' completed ;;
@@ -3097,6 +3310,43 @@ EOF
     --format subject-digest)" || return 1
 }
 
+mint_acceptance_id() {
+  local deliverable_id="$1"
+  printf 'acc-%s-%s-%s-%s\n' "$deliverable_id" "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "${RANDOM:-0}"
+}
+
+write_acceptance_attempt() {
+  local file="$1" acceptance_id="$2" deliverable_id="$3" owner="$4" kind="$5"
+  local external_ref="$6" revision="$7" subject_digest="$8" created_at="$9" probed_at="${10:-}"
+  local tmp="$file.tmp.$$"
+  {
+    printf 'acceptance_id=%s\n' "$acceptance_id"
+    printf 'deliverable_id=%s\n' "$deliverable_id"
+    printf 'owner=%s\n' "$owner"
+    printf 'kind=%s\n' "$kind"
+    printf 'external_ref=%s\n' "$external_ref"
+    printf 'revision=%s\n' "$revision"
+    printf 'subject_authority_digest=%s\n' "$subject_digest"
+    printf 'created_at=%s\n' "$created_at"
+    printf 'probed_at=%s\n' "$probed_at"
+  } > "$tmp" && mv "$tmp" "$file"
+}
+
+acceptance_attempt_matches() {
+  local file="$1" deliverable_id="$2" owner="$3" kind="$4" external_ref="$5" revision="$6"
+  local expected actual
+  [ -f "$file" ] || return 1
+  expected=$'acceptance_id\ndeliverable_id\nowner\nkind\nexternal_ref\nrevision\nsubject_authority_digest\ncreated_at\nprobed_at'
+  actual="$(sed -n 's/^\([^=]*\)=.*$/\1/p' "$file")"
+  [ "$actual" = "$expected" ] \
+    && validate_record_id acceptance_id "$(record_get "$file" acceptance_id)" \
+    && [ "$(record_get "$file" deliverable_id)" = "$deliverable_id" ] \
+    && [ "$(record_get "$file" owner)" = "$owner" ] \
+    && [ "$(record_get "$file" kind)" = "$kind" ] \
+    && [ "$(record_get "$file" external_ref)" = "$external_ref" ] \
+    && [ "$(record_get "$file" revision)" = "$revision" ]
+}
+
 write_acceptance_record() {
   local file="$1" acceptance_id="$2" deliverable_id="$3" owner="$4" kind="$5"
   local owner_context_ref="$6" acceptance_authority_ref="$7" revision="$8"
@@ -3347,16 +3597,15 @@ recover_terminal_effect() {
   [ -f "$action_file" ] && [ -f "$request_file" ] || return 10
   status="$(record_get "$action_file" status)"
   [ -n "$supplied_instance" ] || [ "$status" != consumed ] || return 10
-  latest="$(lifecycle_latest_for_branch "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$CURRENT_BRANCH")"
-  event="$(lifecycle_field "$latest" event)"; expected_event="task-${requested}"
+  expected_event="task-${requested}"
   [ "$requested" = completed ] && governed_action=task.complete || governed_action=task.abandon
-  if [ "$event" = "$expected_event" ] \
-    && [ "$(lifecycle_field "$latest" revision)" = "$(record_get "$terminal" revision)" ] \
-    && [ "$(lifecycle_field "$latest" action_instance_id)" = "$action_id" ] \
-    && [ "$(lifecycle_field "$latest" intent_digest)" = "$(record_get "$terminal" intent_digest)" ]; then
+  if terminal_lifecycle_state "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$CURRENT_BRANCH" \
+    "$CURRENT_CLAIM_ID" "$(index_get workspace_authority_descriptor_digest)" "$terminal"; then
     secondary=exact
-  elif [ "$event" = task-completed ] || [ "$event" = task-abandoned ]; then secondary=incompatible
-  else secondary=missing; fi
+  else
+    local lifecycle_rc=$?
+    [ "$lifecycle_rc" -eq 10 ] && secondary=missing || secondary=incompatible
+  fi
   result="$(python3 "$(effect_helper)" reduce-files --action-file "$action_file" \
     --request-file "$request_file" --primary-file "$terminal" --secondary-state "$secondary")" || return 1
   decision="$(json_string_field "$result" decision)"
@@ -3464,7 +3713,7 @@ cmd_deliverable() {
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
       validate_record_id deliverable_id "$id"
       local file owner kind owner_context_ref acceptance_authority_ref required external_ref revision state
-      local acceptance_ref acceptance_id acceptance_file digest_suffix
+      local acceptance_ref acceptance_id acceptance_file
       file="$(deliverable_dir)/$id.record"; [ -f "$file" ] || die "unknown deliverable_id: $id"
       owner="$(record_get "$file" owner)"; kind="$(record_get "$file" kind)"
       owner_context_ref="$(record_get "$file" owner_context_ref)"
@@ -3482,17 +3731,51 @@ cmd_deliverable() {
             acceptance_receipt_matches "$file" "$acceptance_file" \
               || die "acceptance-authority-mismatch: $id"
             probe_kernel_deliverable "$file" || die "external-not-accepted: $id"
+            [ "$(record_get "$acceptance_file" subject_authority_digest)" = "$PROBE_SUBJECT_DIGEST" ] \
+              || die "acceptance-authority-mismatch: $id"
             print_deliverable_acceptance_json false "$file" "$acceptance_file"; return 0
           fi
           [ "$state" = submitted ] || die "deliverable-not-submitted: $id"
+          local attempt_dir attempt_file attempt_created attempt_subject
+          attempt_dir="$(acceptance_attempt_dir)"; mkdir -p "$attempt_dir" "$(acceptance_dir)"
+          attempt_file="$attempt_dir/$id.record"
+          if [ -f "$attempt_file" ] && acceptance_attempt_matches "$attempt_file" \
+            "$id" "$owner" "$kind" "$external_ref" "$revision"; then
+            acceptance_id="$(record_get "$attempt_file" acceptance_id)"
+            attempt_created="$(record_get "$attempt_file" created_at)"
+          else
+            acceptance_id="$(mint_acceptance_id "$id")"; attempt_created="$(utc_now)"
+            write_acceptance_attempt "$attempt_file" "$acceptance_id" "$id" "$owner" "$kind" \
+              "$external_ref" "$revision" "" "$attempt_created" ""
+          fi
+          [ "${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_ATTEMPT:-0}" != 1 ] \
+            || { echo "error: simulated crash after acceptance attempt" >&2; return 1; }
           probe_kernel_deliverable "$file" || die "external-not-accepted: $id"
-          digest_suffix="${PROBE_DIGEST#sha256:}"; digest_suffix="${digest_suffix:0:12}"
-          acceptance_id="acc-$id-$digest_suffix"; acceptance_ref="workbench:acceptance/$acceptance_id"
-          mkdir -p "$(acceptance_dir)"; acceptance_file="$(acceptance_dir)/$acceptance_id.record"
-          [ ! -e "$acceptance_file" ] || die "conflicting acceptance_id: $acceptance_id"
-          write_acceptance_record "$acceptance_file" "$acceptance_id" "$id" "$owner" "$kind" "" "" "$revision" \
-            kernel-probe workbench-probe/github-pr/v1 "$external_ref" "$PROBE_DIGEST" \
-            "$PROBE_SUBJECT_DIGEST" "" "" "" "" "" "$PROBE_OBSERVED_AT"
+          attempt_subject="$(record_get "$attempt_file" subject_authority_digest)"
+          acceptance_file="$(acceptance_dir)/$acceptance_id.record"
+          if [ -n "$attempt_subject" ] && [ "$attempt_subject" != "$PROBE_SUBJECT_DIGEST" ]; then
+            [ ! -e "$acceptance_file" ] || die "acceptance-authority-mismatch: $id"
+            acceptance_id="$(mint_acceptance_id "$id")"; attempt_created="$(utc_now)"
+          fi
+          write_acceptance_attempt "$attempt_file" "$acceptance_id" "$id" "$owner" "$kind" \
+            "$external_ref" "$revision" "$PROBE_SUBJECT_DIGEST" "$attempt_created" "$PROBE_OBSERVED_AT"
+          [ "${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PROBE:-0}" != 1 ] \
+            || { echo "error: simulated crash after acceptance probe" >&2; return 1; }
+          acceptance_ref="workbench:acceptance/$acceptance_id"
+          acceptance_file="$(acceptance_dir)/$acceptance_id.record"
+          if [ -e "$acceptance_file" ]; then
+            acceptance_receipt_matches "$file" "$acceptance_file" \
+              && [ "$(record_get "$acceptance_file" acceptance_id)" = "$acceptance_id" ] \
+              && [ "$(record_get "$acceptance_file" authority_type)" = kernel-probe ] \
+              && [ "$(record_get "$acceptance_file" subject_authority_digest)" = "$PROBE_SUBJECT_DIGEST" ] \
+              || die "acceptance-authority-mismatch: $id"
+          else
+            write_acceptance_record "$acceptance_file" "$acceptance_id" "$id" "$owner" "$kind" "" "" "$revision" \
+              kernel-probe workbench-probe/github-pr/v1 "$external_ref" "$PROBE_DIGEST" \
+              "$PROBE_SUBJECT_DIGEST" "" "" "" "" "" "$PROBE_OBSERVED_AT"
+          fi
+          [ "${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY:-0}" != 1 ] \
+            || { echo "error: simulated crash after acceptance primary" >&2; return 1; }
           write_deliverable_record "$file" "$id" "$owner" "$kind" "" "" "$required" "$external_ref" "$revision" \
             accepted "$acceptance_ref" "" ""
           print_deliverable_acceptance_json true "$file" "$acceptance_file"
@@ -4322,6 +4605,123 @@ EOF
 
 # ── submit ────────────────────────────────────────────────────────────
 
+submission_index_snapshot() {
+  local branch="$1" output="$2" commit
+  for commit in $(git -C "$TASK_DIR" rev-list --first-parent HEAD); do
+    if git -C "$TASK_DIR" show "$commit:task/index.md" > "$output" 2>/dev/null; then
+      python3 "$(lifecycle_helper)" task-index --file "$output" --branch "$branch" \
+        --format json >/dev/null || return 1
+      printf '%s\n' "$commit"
+      return 0
+    fi
+  done
+  return 1
+}
+
+submission_load_identity() {
+  local file="$1" branch="$2" parsed line key value
+  parsed="$(python3 "$(lifecycle_helper)" task-index --file "$file" --branch "$branch" \
+    --format shell)" || return 1
+  SUBMISSION_TASK_ID=""; SUBMISSION_ISSUE=""; SUBMISSION_HOME=""; SUBMISSION_PARENT=""
+  SUBMISSION_CLAIM_ID=""; SUBMISSION_TASK_CONTRACT=""; SUBMISSION_DESCRIPTOR_DIGEST=""
+  while IFS= read -r line; do
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      id) SUBMISSION_TASK_ID="$value" ;; issue) SUBMISSION_ISSUE="$value" ;;
+      home) SUBMISSION_HOME="$value" ;; parent) SUBMISSION_PARENT="$value" ;;
+      claim_id) SUBMISSION_CLAIM_ID="$value" ;; task_contract) SUBMISSION_TASK_CONTRACT="$value" ;;
+      workspace_authority_descriptor_digest) SUBMISSION_DESCRIPTOR_DIGEST="$value" ;;
+    esac
+  done <<< "$parsed"
+  [ -n "$SUBMISSION_TASK_ID" ] && [ -n "$SUBMISSION_ISSUE" ] \
+    && [ -n "$SUBMISSION_CLAIM_ID" ] && [ -n "$SUBMISSION_TASK_CONTRACT" ]
+}
+
+submission_pr_observe() {
+  local branch="$1" expected_head="$2" expected_url="${3:-}" adapter origin observation parsed state
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] || return 1
+  origin="$(git -C "$TASK_DIR" remote get-url origin 2>/dev/null)" || return 1
+  observation="$(mktemp "${TMPDIR:-/tmp}/workbench-submission-observation.XXXXXX")"
+  if ! (cd "$TASK_DIR" && "$adapter" submission --repository "$TASK_DIR" \
+    --head-branch "$branch" --head-revision "$expected_head" --format json) \
+    > "$observation" 2>/dev/null; then rm -f "$observation"; return 1; fi
+  parsed="$(python3 "$(lifecycle_helper)" submission --observation-file "$observation" \
+    --repository-origin-url "$origin" --head-branch "$branch" --head-revision "$expected_head")" \
+    || { rm -f "$observation"; return 1; }
+  rm -f "$observation"
+  state="$(printf '%s\n' "$parsed" | sed -n 's/^state=//p')"
+  [ "$state" != absent ] || return 10
+  [ "$state" = exact ] || return 1
+  SUBMISSION_PR_NUMBER="$(printf '%s\n' "$parsed" | sed -n 's/^number=//p')"
+  SUBMISSION_PR_URL="$(printf '%s\n' "$parsed" | sed -n 's/^url=//p')"
+  SUBMISSION_PR_HEAD="$(printf '%s\n' "$parsed" | sed -n 's/^head_revision=//p')"
+  [ -z "$expected_url" ] || [ "$SUBMISSION_PR_URL" = "$expected_url" ] || return 1
+  [ -n "$SUBMISSION_PR_NUMBER" ] && [ -n "$SUBMISSION_PR_URL" ] \
+    && [ "$SUBMISSION_PR_HEAD" = "$expected_head" ]
+}
+
+submission_lifecycle_state() {
+  local root="$1" home="$2" issue="$3" claim_id="$4" branch="$5" pr="$6"
+  local revision="$7" task_contract="$8" descriptor_digest="$9" markers line event contract
+  local current_pr="" current_revision="" current=false marker_pr terminal=false cleaned=false
+  markers="$(lifecycle_markers_for_issue "$root" "$home" "$issue")" || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$(lifecycle_field "$line" branch)" = "$branch" ] || continue
+    contract="$(lifecycle_field "$line" task_contract)"
+    [ "$contract" = "$task_contract" ] \
+      && [ "$(lifecycle_field "$line" claim_id)" = "$claim_id" ] \
+      && [ "$(lifecycle_field "$line" issue)" = "$issue" ] \
+      && [ "$(lifecycle_field "$line" home)" = "$home" ] \
+      || return 1
+    if [ "$task_contract" = workbench-task/v2 ]; then
+      [ "$(lifecycle_field "$line" workspace_authority_descriptor_digest)" = "$descriptor_digest" ] \
+        || return 1
+    fi
+    event="$(lifecycle_field "$line" event)"
+    if [ "$terminal" = true ]; then
+      [ "$event" = task-cleaned ] && [ "$cleaned" = false ] || return 1
+      cleaned=true; current=false; current_pr=""; current_revision=""
+      continue
+    fi
+    case "$event" in
+      task-submitted)
+        current=true
+        current_pr="$(lifecycle_field "$line" pr)"
+        current_revision="$(lifecycle_field "$line" revision)"
+        ;;
+      task-active) current=false; current_pr=""; current_revision="" ;;
+      task-completed|task-abandoned)
+        marker_pr="$(lifecycle_field "$line" pr)"
+        [ -z "$marker_pr" ] || { [ "$current" = true ] && [ "$marker_pr" = "$current_pr" ]; } \
+          || return 1
+        terminal=true
+        ;;
+      task-cleaned) return 1 ;;
+    esac
+  done <<< "$markers"
+  [ "$terminal" = false ] || return 1
+  [ "$current" = true ] || return 10
+  [ "$current_pr" = "$pr" ] && [ "$current_revision" = "$revision" ]
+}
+
+submission_lifecycle_reconcile() {
+  local root="$1" home="$2" issue="$3" claim_id="$4" branch="$5" pr="$6"
+  local revision="$7" task_contract="$8" descriptor_digest="$9" state_rc
+  if submission_lifecycle_state "$root" "$home" "$issue" "$claim_id" "$branch" "$pr" \
+    "$revision" "$task_contract" "$descriptor_digest"; then return 0
+  else state_rc=$?; fi
+  if [ "$state_rc" -eq 10 ]; then
+    lifecycle_emit "$root" "$home" "$issue" task-submitted "$claim_id" "$branch" "$pr" \
+      "$revision" "" "$task_contract" "$descriptor_digest" "" || return 1
+    submission_lifecycle_state "$root" "$home" "$issue" "$claim_id" "$branch" "$pr" \
+      "$revision" "$task_contract" "$descriptor_digest"
+    return $?
+  fi
+  return "$state_rc"
+}
+
 cmd_submit() {
   local title="" body_file=""
   while [ $# -gt 0 ]; do
@@ -4342,21 +4742,34 @@ cmd_submit() {
     cmd_check
   fi
 
-  local root branch id issue home claim_id
+  local root branch id issue home claim_id task_contract descriptor_digest snapshot snapshot_commit
   root="$(wb_root)"
   branch="$(git -C "$TASK_DIR" rev-parse --abbrev-ref HEAD)"
   if [ -f "$TASK_DIR/task/index.md" ]; then
-    id="$(index_get id)"
-    issue="$(index_get issue)"
-    home="$(index_get home)"
-    claim_id="$(index_get claim_id)"
+    submission_load_identity "$TASK_DIR/task/index.md" "$branch" \
+      || die "invalid task identity for submission"
+    id="$SUBMISSION_TASK_ID"; issue="$SUBMISSION_ISSUE"; home="$SUBMISSION_HOME"
+    claim_id="$SUBMISSION_CLAIM_ID"; task_contract="$SUBMISSION_TASK_CONTRACT"
+    descriptor_digest="$SUBMISSION_DESCRIPTOR_DIGEST"
   else
-    local parsed
-    parsed="$(branch_home_issue "$branch")" || die "task/index.md 없이 issue/home 복원 실패: $branch"
-    IFS='|' read -r home _ issue <<< "$parsed"
-    id="$issue"
-    [ -n "$home" ] && id="$home#$issue"
-    claim_id="$(lifecycle_claim_for_branch "$root" "$home" "$issue" "$branch")"
+    snapshot="$(mktemp "${TMPDIR:-/tmp}/workbench-submission-index.XXXXXX")"
+    if snapshot_commit="$(submission_index_snapshot "$branch" "$snapshot")"; then
+      submission_load_identity "$snapshot" "$branch" \
+        || { rm -f "$snapshot"; die "invalid historical task identity for submission"; }
+      id="$SUBMISSION_TASK_ID"; issue="$SUBMISSION_ISSUE"; home="$SUBMISSION_HOME"
+      claim_id="$SUBMISSION_CLAIM_ID"; task_contract="$SUBMISSION_TASK_CONTRACT"
+      descriptor_digest="$SUBMISSION_DESCRIPTOR_DIGEST"
+      rm -f "$snapshot"
+    else
+      rm -f "$snapshot"
+      local parsed
+      parsed="$(branch_home_issue "$branch")" || die "task/index.md 없이 issue/home 복원 실패: $branch"
+      IFS='|' read -r home _ issue <<< "$parsed"
+      id="$issue"; [ -n "$home" ] && id="$home#$issue"
+      claim_id="$(lifecycle_claim_for_branch "$root" "$home" "$issue" "$branch" 2>/dev/null || true)"
+      [ -n "$claim_id" ] || claim_id="$branch"
+      task_contract=workbench-task/v1; descriptor_digest=""
+    fi
   fi
   [ -n "$claim_id" ] || claim_id="$branch"
 
@@ -4378,14 +4791,38 @@ cmd_submit() {
 
   info "push: $branch"
   git -C "$TASK_DIR" push -u origin "$branch"
-  info "PR 생성 (squash 머지 전제)"
-  local pr_url pr_number
-  if ! pr_url="$(cd "$TASK_DIR" && gh pr create --base main --head "$branch" --title "$title" --body-file "$body_file")"; then
-    return 1
+  local pr_url pr_number revision
+  revision="$(git -C "$TASK_DIR" rev-parse HEAD)"
+  if [ "$task_contract" != workbench-task/v2 ]; then
+    info "PR 생성 (squash 머지 전제)"
+    pr_url="$(cd "$TASK_DIR" && gh pr create --base main --head "$branch" \
+      --title "$title" --body-file "$body_file")" || return 1
+    pr_number="$(pr_number_from_url "$pr_url")"
+    printf '%s\n' "$pr_url"
+    lifecycle_emit_optional "$root" "$home" "$issue" task-submitted "$claim_id" "$branch" "$pr_number"
+    return 0
   fi
+  SUBMISSION_PR_URL=""; SUBMISSION_PR_NUMBER=""; SUBMISSION_PR_HEAD=""
+  local observe_rc created_url
+  if submission_pr_observe "$branch" "$revision"; then
+    info "기존 PR 검증: $SUBMISSION_PR_URL"
+  else
+    observe_rc=$?
+    [ "$observe_rc" -eq 10 ] \
+      || { echo "error: submission PR mapping unavailable or ambiguous" >&2; return 1; }
+    info "PR 생성 (squash 머지 전제)"
+    if ! created_url="$(cd "$TASK_DIR" && gh pr create --base main --head "$branch" \
+      --title "$title" --body-file "$body_file")"; then return 1; fi
+    submission_pr_observe "$branch" "$revision" "$created_url" \
+      || { echo "error: submission PR identity mismatch" >&2; return 1; }
+  fi
+  pr_url="$SUBMISSION_PR_URL"; pr_number="$SUBMISSION_PR_NUMBER"
   printf '%s\n' "$pr_url"
-  pr_number="$(pr_number_from_url "$pr_url")"
-  lifecycle_emit_optional "$root" "$home" "$issue" task-submitted "$claim_id" "$branch" "$pr_number"
+  printf '%s' "$descriptor_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+    || { echo "error: missing submitted task authority identity" >&2; return 1; }
+  submission_lifecycle_reconcile "$root" "$home" "$issue" "$claim_id" "$branch" \
+    "$pr_number" "$revision" "$task_contract" "$descriptor_digest" \
+    || { echo "error: lifecycle-write-failed: task-submitted" >&2; return 1; }
 }
 
 # ── commit subject policy ─────────────────────────────────────────────
@@ -4613,11 +5050,17 @@ current_task_identity() {
 }
 
 require_mutable_task() {
-  local operation="$1" outcome
+  local operation="$1" outcome terminal
   current_task_identity
   if outcome="$(task_terminal_outcome "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$CURRENT_BRANCH" "$TASK_DIR")"; then
     printf '{"contract_version":"workbench-error/v1","operation":"%s","blockers":[{"code":"terminal-content-frozen","ref":"workbench:task/%s"}]}\n' \
       "$(json_escape "$operation")" "$(json_escape "$CURRENT_CLAIM_ID")"
+    return 1
+  fi
+  terminal="$(task_state_dir)/terminal"
+  if [ -f "$terminal" ] && validate_local_terminal_record; then
+    printf '{"contract_version":"workbench-error/v1","operation":"%s","blockers":[{"code":"action-effect-unreconciled","ref":"%s"}]}\n' \
+      "$(json_escape "$operation")" "$(json_escape "$(record_get "$terminal" action_instance_id)")"
     return 1
   fi
 }
@@ -4636,15 +5079,10 @@ validate_local_terminal_record() {
 }
 
 terminal_lifecycle_matches() {
-  local terminal="$(task_state_dir)/terminal" latest expected outcome
+  local terminal="$(task_state_dir)/terminal"
   validate_local_terminal_record || return 1
-  outcome="$(record_get "$terminal" outcome)"; expected="task-$outcome"
-  latest="$(lifecycle_latest_for_branch "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$CURRENT_BRANCH")"
-  [ "$(lifecycle_field "$latest" event)" = "$expected" ] \
-    && [ "$(lifecycle_field "$latest" claim_id)" = "$CURRENT_CLAIM_ID" ] \
-    && [ "$(lifecycle_field "$latest" revision)" = "$(record_get "$terminal" revision)" ] \
-    && [ "$(lifecycle_field "$latest" action_instance_id)" = "$(record_get "$terminal" action_instance_id)" ] \
-    && [ "$(lifecycle_field "$latest" intent_digest)" = "$(record_get "$terminal" intent_digest)" ]
+  terminal_lifecycle_state "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$CURRENT_BRANCH" \
+    "$CURRENT_CLAIM_ID" "$(index_get workspace_authority_descriptor_digest)" "$terminal"
 }
 
 latest_evidence_for_check() {
@@ -4887,17 +5325,37 @@ add_blocker() {
 
 compute_writer_verification() {
   local root origin ledger file parsed operation_id claim_id owner stage remote row_file writer_row worktree satisfied
-  local state_output effect_event effect_device effect_clone effect_state repo_rows valid incomplete
+  local state_output effect_event effect_device effect_clone effect_state repo_rows valid incomplete bijection blocker
+  local repo_name repo_branch repo_role
+  local -a bijection_args
   WRITER_VERIFY_COUNT=0; WRITER_VERIFY_OPERATION_IDS=(); WRITER_VERIFY_CLAIM_IDS=()
   WRITER_VERIFY_OWNERS=(); WRITER_VERIFY_STAGES=(); WRITER_VERIFY_REMOTE=()
   WRITER_VERIFY_ROWS=(); WRITER_VERIFY_WORKTREES=(); WRITER_VERIFY_SATISFIED=()
-  [ -d "$(writer_operation_dir)" ] || return 0
   root="$CURRENT_ROOT"; origin="$(canonical_workspace_origin_url "$root")" || {
     add_blocker writer-claim-unreconciled "$CURRENT_CLAIM_ID"; return 1
   }
   ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-ledger.XXXXXX")"
   if ! writer_load_remote_ledger "$root" "$origin" "$ledger"; then
     rm -f "$ledger"; add_blocker writer-claim-unreconciled "$CURRENT_CLAIM_ID"; return 1
+  fi
+  bijection_args=(task-bijection --ledger-file "$ledger" --task-claim-id "$CURRENT_CLAIM_ID")
+  for file in "$(writer_operation_dir)"/*.json; do
+    [ -f "$file" ] && bijection_args+=(--operation-file "$file")
+  done
+  for file in "$(writer_row_dir)"/*.record; do
+    [ -f "$file" ] && bijection_args+=(--writer-row-file "$file")
+  done
+  while IFS='|' read -r repo_name repo_branch repo_role; do
+    repo_name="$(printf '%s' "$repo_name" | sed -E 's/^- *| *$//g')"
+    repo_role="$(printf '%s' "$repo_role" | sed -E 's/^ +| +$//g')"
+    [ "$repo_role" = work ] && [ -n "$repo_name" ] && bijection_args+=(--repo-owner "$repo_name")
+  done <<< "$(repos_block)"
+  if bijection="$(python3 "$(writer_helper)" "${bijection_args[@]}")"; then
+    while IFS= read -r blocker; do
+      [ -n "$blocker" ] && add_blocker writer-claim-unreconciled "$blocker"
+    done <<< "$(printf '%s\n' "$bijection" | sed -n 's/^blocker=//p')"
+  else
+    add_blocker writer-claim-unreconciled "$CURRENT_CLAIM_ID"
   fi
   for file in "$(writer_operation_dir)"/*.json; do
     [ -f "$file" ] || continue
@@ -5180,6 +5638,7 @@ resolve_governed_action() {
   if output="$(cd "$TASK_DIR" && \
     WORKBENCH_REQUIRE_EXPLICIT_AUTHORIZATION="${GOVERNED_REQUIRE_EXPLICIT_AUTHORIZATION:-0}" \
     WORKBENCH_ALLOW_ACTION_REPLACEMENT="${GOVERNED_ALLOW_ACTION_REPLACEMENT:-0}" \
+    WORKBENCH_CONCURRENT_CONTEXTS_FILE="${WRITER_CONTEXT_UNION_FILE:-}" \
     "$policy_util" "${args[@]}")"; then rc=0; else rc=$?; fi
   rm -f "$request_file"
   GOVERNED_POLICY_OUTPUT="$output"; GOVERNED_POLICY_RC="$rc"
@@ -5802,13 +6261,19 @@ cmd_done_v2() {
     journal_rc=$?
   fi
   if [ "$journal_rc" -eq 2 ]; then
-    latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")"
+    latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")" || {
+      cleanup_add_blocker lifecycle-write-failed "$branch"
+      rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
+    }
     CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
     cleanup_add_blocker cleanup-journal-unavailable "$branch"
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
   fi
 
-  latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")"
+  latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")" || {
+    cleanup_add_blocker lifecycle-write-failed "$branch"
+    rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
+  }
   event="$(lifecycle_field "$latest" event)"
   if [ "$journal_rc" -eq 0 ]; then
     CLEANUP_CLAIM_ID="$(python3 "$helper" field "$journal_file" claim_id)"
@@ -5876,7 +6341,7 @@ cmd_done_v2() {
       "$revision" "$removal_plan" true true; return 0
   fi
 
-  [ -d "$dir" ] || {
+  [ -d "$dir" ] && [ -f "$dir/task/index.md" ] || {
     CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"; cleanup_add_blocker missing-terminal-outcome "$branch"
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
   }
@@ -5999,8 +6464,18 @@ cmd_done() {
   dir="$root/.worktrees/$(branch_to_dir "$branch")"; task_contract=""
   if [ -f "$dir/task/index.md" ]; then task_contract="$(sed -n '/^---$/,/^---$/p' "$dir/task/index.md" | sed -n 's/^task_contract: *//p' | head -1)"; fi
   if [ -z "$task_contract" ]; then
-    latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")"
-    case "$latest" in \{*) task_contract=workbench-task/v2 ;; *) task_contract=workbench-task/v1 ;; esac
+    latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")" \
+      || die "lifecycle-source-unavailable"
+    if [ -z "$latest" ] && [ "$(workspace_schema "$root")" != workbench/v2 ]; then
+      task_contract=workbench-task/v1
+    else
+      task_contract="$(lifecycle_contract_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")" \
+        || die "lifecycle identity unavailable for task: $branch"
+    fi
+    case "$task_contract" in
+      workbench-task/v1|workbench-task/v2) ;;
+      *) die "lifecycle identity unavailable for task: $branch" ;;
+    esac
   fi
   if [ "$task_contract" = workbench-task/v1 ]; then
     [ -z "$format$instance_id$authorization_file" ] || die "v1 task does not support v2 cleanup options"
@@ -6027,22 +6502,85 @@ work_owners_from_index() {
   done < <(repos_block_from_index "$file")
 }
 
-print_json_string_array_lines() {
-  local line first=1
-  printf '['
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue; [ "$first" = 1 ] || printf ','; first=0
-    printf '"%s"' "$(json_escape "$line")"
-  done
-  printf ']'
+status_task_projection() {
+  local root="$1" index task_path branch parsed identity line key value
+  local task_contract claim issue home descriptor
+  local rows
+  rows="$(mktemp "${TMPDIR:-/tmp}/workbench-status-tasks.XXXXXX")" || return 1
+  observe_workspace_authority "$root" \
+    || { rm -f "$rows"; return 1; }
+  while IFS= read -r index; do
+    [ -f "$index" ] || continue
+    task_path="${index%/task/index.md}"
+    branch="$(git -C "$task_path" symbolic-ref --quiet --short HEAD 2>/dev/null)" \
+      || { rm -f "$rows"; return 1; }
+    parsed="$(python3 "$(lifecycle_helper)" task-index --file "$index" \
+      --branch "$branch" --format json 2>/dev/null)" \
+      || { rm -f "$rows"; return 1; }
+    identity="$(printf '%s\n' "$parsed" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+for key in ("task_contract", "claim_id", "issue", "home", "workspace_authority_descriptor_digest"):
+    item = value[key]
+    print("{}={}".format(key, "" if item is None else item))
+')" || { rm -f "$rows"; return 1; }
+    task_contract=""; claim=""; issue=""; home=""; descriptor=""
+    while IFS= read -r line; do
+      key="${line%%=*}"; value="${line#*=}"
+      case "$key" in
+        task_contract) task_contract="$value" ;; claim_id) claim="$value" ;;
+        issue) issue="$value" ;; home) home="$value" ;;
+        workspace_authority_descriptor_digest) descriptor="$value" ;;
+      esac
+    done <<< "$identity"
+    if [ "$task_contract" = workbench-task/v2 ]; then
+      [ "$descriptor" = "$AUTHORITY_DESCRIPTOR_DIGEST" ] \
+        && lifecycle_identity_for_branch "$root" "$home" "$issue" "$branch" \
+        && [ "$LIFECYCLE_IDENTITY_CONTRACT" = workbench-task/v2 ] \
+        && [ "$LIFECYCLE_IDENTITY_CLAIM_ID" = "$claim" ] \
+        && [ "$LIFECYCLE_IDENTITY_DESCRIPTOR_DIGEST" = "$descriptor" ] \
+        || { rm -f "$rows"; return 1; }
+    fi
+    printf '%s\n' "$parsed" >> "$rows"
+  done < <(find "$root/.worktrees" -mindepth 3 -maxdepth 3 \
+    -path '*/task/index.md' -type f 2>/dev/null | sort)
+  python3 - "$rows" <<'PY'
+import json
+import sys
+
+tasks = []
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        value = json.loads(line)
+        tasks.append({
+            "task_id": value["id"],
+            "issue": value["issue"],
+            "home": value["home"],
+            "parent": value["parent"],
+            "claim_id": value["claim_id"],
+            "task_contract": value["task_contract"],
+            "branch": value["branch"],
+            "workspace_authority_descriptor_digest": value["workspace_authority_descriptor_digest"],
+            "context_ref": value["context_ref"],
+            "work_ref": value["work_ref"],
+            "work_owners": sorted(
+                item["owner"] for item in value["repos"] if item["role"] == "work"
+            ),
+        })
+tasks.sort(key=lambda item: item["branch"])
+json.dump(tasks, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+sys.stdout.write("\n")
+PY
+  local rc=$?; rm -f "$rows"; return "$rc"
 }
 
 cmd_status_json() {
-  local root task_path index claim_id task_contract branch descriptor_digest context_ref work_ref owners owner
-  local task_first=1 ledger inventory projection origin legacy_util operation blocker_count rc=0
+  local root tasks_json ledger inventory projection origin legacy_util operation blocker_count rc=0
   local writer_conflicts='[]' integrity_blockers='[]' args
   root="$(wb_root)"; ledger="$(mktemp "${TMPDIR:-/tmp}/workbench-status-ledger.XXXXXX")"
   inventory="$(mktemp "${TMPDIR:-/tmp}/workbench-status-legacy.XXXXXX")"
+  tasks_json="$(status_task_projection "$root")" \
+    || { rm -f "$ledger" "$inventory"; die "task-status-identity-unreconciled"; }
   origin="$(canonical_workspace_origin_url "$root" || true)"
   legacy_util="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/legacy-inventory"
   args=(status-projection --ledger-file "$ledger" --legacy-inventory-file "$inventory")
@@ -6059,27 +6597,8 @@ cmd_status_json() {
   else
     integrity_blockers='[{"code":"writer-claim-unreconciled","ref":"refs/heads/workbench-coordination/writer-claims"}]'
   fi
-  printf '{"contract_version":"workbench-task-status/v2","tasks":['
-  while IFS= read -r index; do
-    [ -f "$index" ] || continue
-    task_path="${index%/task/index.md}"
-    claim_id="$(sed -n '/^---$/,/^---$/p' "$index" | sed -n 's/^claim_id: *//p' | head -1)"
-    task_contract="$(sed -n '/^---$/,/^---$/p' "$index" | sed -n 's/^task_contract: *//p' | head -1)"; [ -n "$task_contract" ] || task_contract=workbench-task/v1
-    branch="$(sed -n '/^---$/,/^---$/p' "$index" | sed -n 's/^branch: *//p' | head -1)"
-    descriptor_digest="$(sed -n '/^---$/,/^---$/p' "$index" \
-      | sed -n 's/^workspace_authority_descriptor_digest: *//p' | head -1)"
-    context_ref="$(sed -n '/^---$/,/^---$/p' "$index" | sed -n 's/^context_ref: *//p' | head -1)"
-    work_ref="$(sed -n '/^---$/,/^---$/p' "$index" | sed -n 's/^work_ref: *//p' | head -1)"
-    owners="$(work_owners_from_index "$index" | sort -u)"
-    [ "$task_first" = 1 ] || printf ','; task_first=0
-    printf '{"claim_id":"%s","task_contract":"%s","branch":"%s","workspace_authority_descriptor_digest":' \
-      "$(json_escape "$claim_id")" "$task_contract" "$(json_escape "$branch")"
-    json_nullable "$descriptor_digest"; printf ',"context_ref":'
-    json_nullable "$context_ref"; printf ',"work_ref":'; json_nullable "$work_ref"; printf ',"work_owners":'
-    printf '%s\n' "$owners" | print_json_string_array_lines; printf '}'
-  done < <(find "$root/.worktrees" -mindepth 3 -maxdepth 3 -path '*/task/index.md' -type f 2>/dev/null | sort)
-  printf '],"writer_conflicts":%s,"writer_integrity_blockers":%s}\n' \
-    "$writer_conflicts" "$integrity_blockers"
+  printf '{"contract_version":"workbench-task-status/v2","tasks":%s,"writer_conflicts":%s,"writer_integrity_blockers":%s}\n' \
+    "$tasks_json" "$writer_conflicts" "$integrity_blockers"
   blocker_count="$(printf '%s\n' "$integrity_blockers" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
   rm -f "$ledger" "$inventory"
   [ "$blocker_count" -eq 0 ] || rc=1
