@@ -60,8 +60,9 @@ print("" if value is None else value)
 
 write_policy_authorization() {
   local file="$1" instance="$2" action="$3" claim="$4" target="$5" revision="$6"
-  local manifest="$7" source_ref="$8"
-  python3 - "$file" "$instance" "$action" "$claim" "$target" "$revision" "$manifest" "$source_ref" <<'PY'
+  local intent="$7" manifest="$8" source_ref="$9"
+  python3 - "$file" "$instance" "$action" "$claim" "$target" "$revision" \
+    "$intent" "$manifest" "$source_ref" <<'PY'
 import json
 import sys
 
@@ -73,16 +74,48 @@ value = {
     "task_claim_id": sys.argv[4],
     "target_ref": sys.argv[5],
     "revision": sys.argv[6],
-    "policy_manifest_digest": sys.argv[7],
+    "intent_digest": sys.argv[7],
+    "policy_manifest_digest": sys.argv[8],
     "decision": "allow",
     "actor": "human@example.com",
     "authorized_at": "2026-07-11T03:01:00Z",
-    "source_ref": sys.argv[8],
+    "source_ref": sys.argv[9],
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(value, handle, separators=(",", ":"))
     handle.write("\n")
 PY
+}
+
+write_completion_request() {
+  local file="$1" revision="$2" target="${3:-workbench:task/claim-policy-42}"
+  python3 - "$file" "$revision" "$target" <<'PY'
+import json
+import sys
+
+payload = (
+    "workbench-task-complete-intent/v1\n"
+    "outcome\tcompleted\n"
+    "completion_snapshot\t" + sys.argv[2] + "\n"
+)
+value = {
+    "contract_version": "workbench-action-request/v1",
+    "action_id": "task.complete",
+    "task_claim_id": "claim-policy-42",
+    "target_ref": sys.argv[3],
+    "revision": sys.argv[2],
+    "payload_contract": "workbench-task-complete-intent/v1",
+    "payload": payload,
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+}
+
+intent_for_request() {
+  python3 "$ROOT/lib/workbench_intent.py" request "$1" --format json \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["intent_digest"])'
 }
 
 make_workspace() {
@@ -116,8 +149,83 @@ test_fixture_reuse_fails_before_git_mutation() {
 
 run_workbench() {
   local repo="$1"; shift
-  (cd "$repo" && CLAUDE_PLUGIN_ROOT="$ROOT" "$WORKBENCH" "$@")
+  (cd "$repo" && CLAUDE_PLUGIN_ROOT="$ROOT" \
+    WORKBENCH_TRUSTED_HOSTING_ADAPTER="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-$DEFAULT_HOSTING_ADAPTER}" \
+    "$WORKBENCH" "$@")
 }
+
+write_test_hosting_adapter() {
+  local file="$1" protected="${2:-true}" direct_writes="${3:-blocked}"
+  local authority_identity="${4:-}"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    printf 'protected=%q\n' "$protected"
+    printf 'direct_writes=%q\n' "$direct_writes"
+    printf 'authority_identity=%q\n' "$authority_identity"
+    cat <<'EOF'
+command="$1"; shift
+authority=""
+revision=""
+coordination_ref=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --authority-file) authority="$2"; shift 2 ;;
+    --default-revision) revision="$2"; shift 2 ;;
+    --coordination-ref) coordination_ref="$2"; shift 2 ;;
+    --format) [ "$2" = json ]; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+python3 - "$command" "$authority" "$revision" "$coordination_ref" \
+  "$protected" "$direct_writes" "$authority_identity" <<'PY'
+import json
+import sys
+
+(
+    command,
+    authority_file,
+    revision,
+    coordination_ref,
+    protected,
+    direct_writes,
+    authority_identity,
+) = sys.argv[1:]
+authority = json.load(open(authority_file, encoding="utf-8"))
+if command == "authority":
+    value = {
+        "contract_version": "workbench-hosting-authority-verification/v1",
+        "authority_identity": authority_identity or authority["authority_identity"],
+        "origin_url": authority["origin_url"],
+        "default_ref": authority["default_ref"],
+        "default_revision": revision,
+        "default_ref_protected": protected == "true",
+        "direct_task_actor_writes": direct_writes,
+        "permission_source": authority["hosting_ref"] or "fixture:repository/local",
+    }
+elif command == "doctor":
+    value = {
+        "contract_version": "workbench-hosting-readiness/v1",
+        "authority_identity": authority["authority_identity"],
+        "origin_url": authority["origin_url"],
+        "default_ref": authority["default_ref"],
+        "default_revision": revision,
+        "default_ref_protected": protected == "true",
+        "coordination_ref": coordination_ref,
+        "push_permission": "allowed",
+        "permission_source": authority["hosting_ref"] or "fixture:repository/local",
+        "push_ready": True,
+    }
+else:
+    raise SystemExit(2)
+print(json.dumps(value, separators=(",", ":")))
+PY
+EOF
+  } > "$file"
+  chmod +x "$file"
+}
+
+DEFAULT_HOSTING_ADAPTER="$TMPDIR/default-hosting-adapter"
+write_test_hosting_adapter "$DEFAULT_HOSTING_ADAPTER"
 
 readonly_git_snapshot() {
   local repo="$1" common fetch index
@@ -1231,7 +1339,8 @@ assert coordination["permission_source"] == "fixture:repository/local"
 assert coordination["push_ready"] is True and coordination["blocker"] is None
 PY
 
-  if WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
+  if WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/missing-doctor-hosting-adapter" \
+    WORKBENCH_LEGACY_INVENTORY_OBSERVATION="$observation" \
     run_workbench "$repo" doctor --format json >"$out" 2>"$err"; then
     fail "doctor without trusted ref-permission proof must not be ready"
   else rc=$?; fi
@@ -1373,15 +1482,18 @@ EOF
 }
 
 test_policy_uses_canonical_authority_from_a_linked_worktree() {
-  local repo worktree policy
+  local repo worktree policy request revision intent
   repo="$(make_policy_task linked_policy allow)"
   worktree="$TMPDIR/linked policy"
   git -C "$repo" worktree add -q -b linked-policy "$worktree"
   printf 'schema=workbench-policy/v1\naction.task.complete=deny\n' > "$worktree/.workbench/policy.conf"
+  revision="sha256:$(printf '1%.0s' {1..64})"
+  request="$TMPDIR/linked-policy-request.json"
+  write_completion_request "$request" "$revision"
+  intent="$(intent_for_request "$request")"
 
-  policy="$(run_workbench "$worktree" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref workbench:task/claim-policy-42 \
-    --revision sha256:linked --format json)"
+  policy="$(run_workbench "$worktree" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --format json)"
   assert_contains "$policy" '"decision":"allow"' \
     "workspace policy must be read from protected default, not the caller worktree"
   printf '%s\n' "$policy" | python3 -c 'import json, sys; json.load(sys.stdin)' \
@@ -1497,12 +1609,84 @@ EOF
   printf '%s\n' "$repo"
 }
 
+test_policy_requires_authenticated_hosting_authority() {
+  local repo request revision intent before after adapter actual out err rc
+  repo="$(make_policy_task authenticated_policy_authority allow)"
+  revision="sha256:$(printf '8%.0s' {1..64})"
+  request="$TMPDIR/authenticated-policy-request.json"
+  write_completion_request "$request" "$revision"
+  intent="$(intent_for_request "$request")"
+
+  before="$(readonly_git_snapshot "$repo" | sed '/STATUS-BEGIN/,/STATUS-END/d')"
+  actual="$(run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --format json)"
+  after="$(readonly_git_snapshot "$repo" | sed '/STATUS-BEGIN/,/STATUS-END/d')"
+  assert_contains "$actual" '"decision":"allow"' \
+    "authenticated protected-default proof must allow policy resolution"
+  assert_eq "$before" "$after" \
+    "policy authority observation must not write FETCH_HEAD, refs, or the index"
+
+  out="$TMPDIR/policy-authority.out"; err="$TMPDIR/policy-authority.err"
+  if WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/missing-hosting-adapter" \
+    run_workbench "$repo" policy resolve --request-file "$request" \
+      --intent-digest "$intent" --format json >"$out" 2>"$err"; then
+    fail "policy resolution without an executable trusted hosting adapter must fail"
+  else rc=$?; fi
+  assert_eq 1 "$rc" "unavailable trusted authority is an integrity failure"
+  assert_file_contains "$err" "policy-authority-unavailable"
+  [ ! -s "$out" ] || fail "unavailable authority must emit no policy JSON"
+
+  adapter="$TMPDIR/unprotected-hosting-adapter"
+  write_test_hosting_adapter "$adapter" false blocked
+  if WORKBENCH_TRUSTED_HOSTING_ADAPTER="$adapter" run_workbench "$repo" policy resolve \
+    --request-file "$request" --intent-digest "$intent" --format json >"$out" 2>"$err"; then
+    fail "unprotected default ref must not authorize policy resolution"
+  else rc=$?; fi
+  assert_eq 1 "$rc" "unprotected authority is an integrity failure"
+  assert_file_contains "$err" "policy-authority-mismatch"
+
+  adapter="$TMPDIR/direct-writes-hosting-adapter"
+  write_test_hosting_adapter "$adapter" true allowed
+  if WORKBENCH_TRUSTED_HOSTING_ADAPTER="$adapter" run_workbench "$repo" policy resolve \
+    --request-file "$request" --intent-digest "$intent" --format json >"$out" 2>"$err"; then
+    fail "direct task-actor writes to the policy authority must block resolution"
+  else rc=$?; fi
+  assert_eq 1 "$rc" "direct task-actor write permission is an integrity failure"
+  assert_file_contains "$err" "policy-authority-mismatch"
+
+  adapter="$TMPDIR/mismatched-hosting-adapter"
+  write_test_hosting_adapter "$adapter" true blocked fixture:workspace/other
+  if WORKBENCH_TRUSTED_HOSTING_ADAPTER="$adapter" run_workbench "$repo" policy resolve \
+    --request-file "$request" --intent-digest "$intent" --format json >"$out" 2>"$err"; then
+    fail "hosting proof for another authority identity must fail"
+  else rc=$?; fi
+  assert_eq 1 "$rc" "mismatched authority proof is an integrity failure"
+  assert_file_contains "$err" "policy-authority-mismatch"
+}
+
+test_policy_rejects_obsolete_scalar_public_bindings() {
+  local repo out err rc
+  repo="$(make_policy_task obsolete_policy_api allow)"
+  out="$TMPDIR/obsolete-policy.out"; err="$TMPDIR/obsolete-policy.err"
+  if run_workbench "$repo" policy resolve --action-id task.complete \
+    --task-claim-id claim-policy-42 --target-ref workbench:task/claim-policy-42 \
+    --revision "sha256:$(printf '7%.0s' {1..64})" --format json >"$out" 2>"$err"; then
+    fail "public policy resolution must reject obsolete scalar bindings"
+  else rc=$?; fi
+  assert_eq 2 "$rc" "obsolete public policy bindings are malformed input"
+  assert_file_contains "$err" "unknown option: --action-id"
+  [ ! -s "$out" ] || fail "obsolete binding rejection must emit no JSON"
+}
+
 test_policy_defaults_to_ask_and_applies_lattice() {
-  local repo actual platform rc initial_instance replacement_instance
+  local repo actual platform rc initial_instance replacement_instance request revision intent
   repo="$(make_policy_task policy)"
-  if actual="$(run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref toolbox:scenario/SCN-001 \
-    --revision sha256:abc123 --format json)"; then
+  revision="sha256:$(printf 'a%.0s' {1..64})"
+  request="$TMPDIR/policy-default-request.json"
+  write_completion_request "$request" "$revision"
+  intent="$(intent_for_request "$request")"
+  if actual="$(run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --format json)"; then
     fail "missing policy must resolve ask at exit 3"
   else rc=$?; fi
   assert_eq 3 "$rc" "ask must use exit 3"
@@ -1520,9 +1704,8 @@ test_policy_defaults_to_ask_and_applies_lattice() {
 
   if actual="$(WORKBENCH_PLATFORM_POLICY="$platform" \
     WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/default \
-    run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref toolbox:scenario/SCN-001 \
-    --revision sha256:abc123 --action-instance-id "$initial_instance" --format json)"; then
+    run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --action-instance-id "$initial_instance" --format json)"; then
     fail "deny lattice must return exit 4"
   else rc=$?; fi
   assert_eq 4 "$rc" "deny must use exit 4"
@@ -1540,12 +1723,30 @@ test_policy_defaults_to_ask_and_applies_lattice() {
 }
 
 test_policy_rejects_duplicate_context_sources() {
-  local repo out err rc
+  local repo out err rc request revision
   repo="$(make_policy_task unsupported_action)"
+  revision="sha256:$(printf 'b%.0s' {1..64})"
+  request="$TMPDIR/unsupported-action-request.json"
+  python3 - "$request" "$revision" <<'PY'
+import json
+import sys
+
+value = {
+    "contract_version": "workbench-action-request/v1",
+    "action_id": "toolbox.deploy",
+    "task_claim_id": "claim-policy-42",
+    "target_ref": "toolbox:scenario/SCN-001",
+    "revision": sys.argv[2],
+    "payload_contract": "toolbox-deploy-intent/v1",
+    "payload": "toolbox-deploy-intent/v1\n",
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
   out="$TMPDIR/unsupported-action.out"; err="$TMPDIR/unsupported-action.err"
-  if run_workbench "$repo" policy resolve --action-id toolbox.deploy --task-claim-id claim-policy-42 \
-    --target-ref toolbox:scenario/SCN-001 --revision sha256:context \
-    --format json >"$out" 2>"$err"; then
+  if run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "sha256:$(printf 'c%.0s' {1..64})" --format json >"$out" 2>"$err"; then
     fail "namespaced pack action must not enter the kernel registry"
   else rc=$?; fi
   assert_eq 2 "$rc" "unsupported action is malformed input"
@@ -1554,12 +1755,15 @@ test_policy_rejects_duplicate_context_sources() {
 }
 
 test_policy_authorization_resolves_ask_but_not_deny() {
-  local repo actual instance manifest auth rc
+  local repo actual instance manifest auth rc request revision intent
   repo="$(make_policy_task policy_authorization)"
+  revision="sha256:$(printf 'd%.0s' {1..64})"
+  request="$TMPDIR/policy-authorization-request.json"
+  write_completion_request "$request" "$revision"
+  intent="$(intent_for_request "$request")"
 
-  if actual="$(run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref toolbox:scenario/SCN-001 \
-    --revision sha256:aaa111 --format json)"; then
+  if actual="$(run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --format json)"; then
     fail "ask must mint pending instance"
   else rc=$?; fi
   assert_eq 3 "$rc" "pending instance exit"
@@ -1569,31 +1773,43 @@ test_policy_authorization_resolves_ask_but_not_deny() {
 
   auth="$TMPDIR/authorization.json"
   write_policy_authorization "$auth" "$instance" task.complete claim-policy-42 \
-    toolbox:scenario/SCN-001 sha256:aaa111 "$manifest" conversation:message/msg-123
-  actual="$(run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref toolbox:scenario/SCN-001 \
-    --revision sha256:aaa111 --action-instance-id "$instance" \
+    workbench:task/claim-policy-42 "$revision" "$intent" "$manifest" conversation:message/msg-123
+  actual="$(run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --action-instance-id "$instance" \
     --authorization-file "$auth" --format json)"
   assert_contains "$actual" '"status":"authorized"' "matching authorization must authorize instance"
   assert_contains "$actual" '"decision":"allow"' "matching authorization resolves allow"
   assert_contains "$actual" '"authorization_ref":"conversation:message/msg-123"' "source_ref is the authorization reference"
 
-  if run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref toolbox:scenario/SCN-001 \
-    --revision sha256:changed --action-instance-id "$instance" \
+  python3 - "$auth" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+value["intent_digest"] = "sha256:" + "e" * 64
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  if run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --action-instance-id "$instance" \
     --authorization-file "$auth" --format json > "$TMPDIR/mismatch.out" 2> "$TMPDIR/mismatch.err"; then
-    fail "changed binding must reject authorization"
+    fail "authorization for another intent must not be accepted"
   else rc=$?; fi
-  assert_eq 1 "$rc" "binding mismatch must use exit 1"
+  assert_eq 1 "$rc" "authorization intent mismatch must use exit 1"
   [ ! -s "$TMPDIR/mismatch.out" ] || fail "binding mismatch must emit no JSON"
 }
 
 test_policy_authorization_uses_strict_rfc8259_json() {
-  local repo actual instance manifest auth decoded out err rc
+  local repo actual instance manifest auth decoded out err rc request revision intent
   repo="$(make_policy_task strict_authorization)"
-  if actual="$(run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref workbench:task/claim-policy-42 \
-    --revision sha256:strict --format json)"; then
+  revision="sha256:$(printf 'f%.0s' {1..64})"
+  request="$TMPDIR/strict-authorization-request.json"
+  write_completion_request "$request" "$revision"
+  intent="$(intent_for_request "$request")"
+  if actual="$(run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --format json)"; then
     fail "ask must mint a pending strict-JSON fixture"
   else rc=$?; fi
   assert_eq 3 "$rc" "strict-JSON fixture must start pending"
@@ -1601,7 +1817,7 @@ test_policy_authorization_uses_strict_rfc8259_json() {
   manifest="$(json_path "$actual" action_instance.policy_manifest.digest)"
 
   auth="$TMPDIR/strict-authorization.json"
-  python3 - "$auth" "$instance" "$manifest" <<'PY'
+  python3 - "$auth" "$instance" "$revision" "$intent" "$manifest" <<'PY'
 import json
 import sys
 
@@ -1614,8 +1830,9 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
             "action_id": "task.complete",
             "task_claim_id": "claim-policy-42",
             "target_ref": "workbench:task/claim-policy-42",
-            "revision": "sha256:strict",
-            "policy_manifest_digest": sys.argv[3],
+            "revision": sys.argv[3],
+            "intent_digest": sys.argv[4],
+            "policy_manifest_digest": sys.argv[5],
             "decision": "allow",
             "actor": "human@example.com",
             "authorized_at": "2026-07-11T03:01:00Z",
@@ -1624,9 +1841,8 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
         handle,
     )
 PY
-  actual="$(run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref workbench:task/claim-policy-42 \
-    --revision sha256:strict --action-instance-id "$instance" \
+  actual="$(run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --action-instance-id "$instance" \
     --authorization-file "$auth" --format json)"
   decoded="$(printf '%s\n' "$actual" | python3 -c \
     'import json, sys; print(json.load(sys.stdin)["authorization_ref"])')"
@@ -1634,20 +1850,22 @@ PY
     "escaped authorization strings must be decoded and re-serialized"
 
   repo="$(make_policy_task duplicate_authorization)"
-  if actual="$(run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref workbench:task/claim-policy-42 \
-    --revision sha256:duplicate --format json)"; then
+  revision="sha256:$(printf '9%.0s' {1..64})"
+  request="$TMPDIR/duplicate-authorization-request.json"
+  write_completion_request "$request" "$revision"
+  intent="$(intent_for_request "$request")"
+  if actual="$(run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --format json)"; then
     fail "duplicate-key fixture must start pending"
   else rc=$?; fi
   instance="$(json_string_field "$actual" id)"
   manifest="$(json_path "$actual" action_instance.policy_manifest.digest)"
   cat > "$auth" <<EOF
-{"contract_version":"workbench-authorization/v1","authorization_id":"auth_duplicate_1","action_instance_id":"$instance","action_id":"task.complete","task_claim_id":"claim-policy-42","target_ref":"workbench:task/claim-policy-42","revision":"sha256:duplicate","policy_manifest_digest":"$manifest","decision":"allow","actor":"first@example.com","actor":"second@example.com","authorized_at":"2026-07-11T03:01:00Z","source_ref":"conversation:message/msg-duplicate"}
+{"contract_version":"workbench-authorization/v1","authorization_id":"auth_duplicate_1","action_instance_id":"$instance","action_id":"task.complete","task_claim_id":"claim-policy-42","target_ref":"workbench:task/claim-policy-42","revision":"$revision","intent_digest":"$intent","policy_manifest_digest":"$manifest","decision":"allow","actor":"first@example.com","actor":"second@example.com","authorized_at":"2026-07-11T03:01:00Z","source_ref":"conversation:message/msg-duplicate"}
 EOF
   out="$TMPDIR/duplicate-authorization.out"; err="$TMPDIR/duplicate-authorization.err"
-  if run_workbench "$repo" policy resolve --action-id task.complete \
-    --task-claim-id claim-policy-42 --target-ref workbench:task/claim-policy-42 \
-    --revision sha256:duplicate --action-instance-id "$instance" \
+  if run_workbench "$repo" policy resolve --request-file "$request" \
+    --intent-digest "$intent" --action-instance-id "$instance" \
     --authorization-file "$auth" --format json >"$out" 2>"$err"; then
     fail "duplicate authorization members must fail"
   else rc=$?; fi
@@ -1762,6 +1980,8 @@ run_case test_policy_resolution_and_authorization_bind_intent_digest
 run_case test_discovery_uses_the_caller_linked_worktree_and_emits_valid_json
 run_case test_policy_uses_canonical_authority_from_a_linked_worktree
 run_case test_contract_show_rejects_invalid_inputs_without_partial_json
+run_case test_policy_requires_authenticated_hosting_authority
+run_case test_policy_rejects_obsolete_scalar_public_bindings
 run_case test_policy_defaults_to_ask_and_applies_lattice
 run_case test_policy_authorization_resolves_ask_but_not_deny
 run_case test_policy_authorization_uses_strict_rfc8259_json

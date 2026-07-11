@@ -152,6 +152,44 @@ EOF
   chmod +x "$bin_dir/gh"
 }
 
+write_fake_hosting_authority() {
+  local file="$1"
+  cat > "$file" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = authority ] || exit 2
+shift
+authority="" revision=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --authority-file) authority="$2"; shift 2 ;;
+    --default-revision) revision="$2"; shift 2 ;;
+    --format) [ "$2" = json ]; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+python3 - "$authority" "$revision" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    authority = json.load(handle)
+value = {
+    "contract_version": "workbench-hosting-authority-verification/v1",
+    "authority_identity": authority["authority_identity"],
+    "origin_url": authority["origin_url"],
+    "default_ref": authority["default_ref"],
+    "default_revision": sys.argv[2],
+    "default_ref_protected": True,
+    "direct_task_actor_writes": "blocked",
+    "permission_source": authority["hosting_ref"] or "fixture:repository/local",
+}
+print(json.dumps(value, separators=(",", ":")))
+PY
+EOF
+  chmod +x "$file"
+}
+
 setup_workbench() {
   local name="$1" schema="${2-workbench/v2}"
   local repo="$TMPDIR/$name/repo" origin="$TMPDIR/$name/origin.git"
@@ -208,6 +246,7 @@ PY
   git -C "$origin" symbolic-ref HEAD refs/heads/main
   : > "$TMPDIR/$name/gh.log"
   write_fake_gh "$fake_bin"
+  write_fake_hosting_authority "$fake_bin/hosting-authority"
   printf '%s\n' "$repo"
 }
 
@@ -219,6 +258,7 @@ run_task_in_dir() {
   PATH="$TMPDIR/$case_name/bin:$PATH" \
   WORKBENCH_PLATFORM_POLICY="${WORKBENCH_PLATFORM_POLICY:-}" \
   WORKBENCH_PLATFORM_POLICY_REF="${WORKBENCH_PLATFORM_POLICY_REF:-}" \
+    WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/$case_name/bin/hosting-authority" \
     WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY:-0}" \
     WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY:-}" \
     WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM="${WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM:-0}" \
@@ -235,6 +275,7 @@ run_policy_in_dir() {
   PATH="$TMPDIR/$case_name/bin:$PATH" \
   WORKBENCH_PLATFORM_POLICY="${WORKBENCH_PLATFORM_POLICY:-}" \
   WORKBENCH_PLATFORM_POLICY_REF="${WORKBENCH_PLATFORM_POLICY_REF:-}" \
+    WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/$case_name/bin/hosting-authority" \
     bash -c 'dir="$1"; shift; cd "$dir"; "$dir/utils/policy" "$@"' bash "$dir" "$@"
 }
 
@@ -637,7 +678,7 @@ test_refs_are_opaque_and_duplicate_active_work_is_rejected() {
 
 test_policy_context_is_owner_authorized_sealed_and_manifest_bound() {
   local repo task_dir claim registration actual out rc instance target revision intent manifest auth
-  local policy_digest resolved old_instance new_instance
+  local policy_digest resolved old_instance new_instance request
   repo="$(setup_workbench policy_context)"
   printf '%s\n' \
     'schema=workbench-policy/v1' \
@@ -753,12 +794,38 @@ PY
 
   revision="$(json_get "$(run_task_in_dir policy_context "$task_dir" verify --format json)" revision)"
   target="workbench:task/$claim"
+  request="$TMPDIR/policy_context/abandon-request.json"
+  python3 - "$request" "$claim" "$target" "$revision" <<'PY'
+import json
+import sys
+
+payload = (
+    "workbench-task-abandon-intent/v1\n"
+    "outcome\tabandoned\n"
+    "abandonment_revision\t" + sys.argv[4] + "\n"
+    "reason_code\tfixture\n"
+    "reason_ref\tnull\n"
+)
+value = {
+    "contract_version": "workbench-action-request/v1",
+    "action_id": "task.abandon",
+    "task_claim_id": sys.argv[2],
+    "target_ref": sys.argv[3],
+    "revision": sys.argv[4],
+    "payload_contract": "workbench-task-abandon-intent/v1",
+    "payload": payload,
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  intent="$(python3 "$INTENT_HELPER" request "$request" --format shell \
+    | sed -n 's/^intent_digest=//p')"
   printf '%s\n' \
     'schema=workbench-policy/v1' \
     'action.task.abandon=deny' > "$task_dir/.workbench/policy.conf"
   resolved="$(run_policy_in_dir policy_context "$task_dir" resolve \
-    --action-id task.abandon --task-claim-id "$claim" --target-ref "$target" \
-    --revision "$revision" --format json)"
+    --request-file "$request" --intent-digest "$intent" --format json)"
   [ "$(json_get "$resolved" decision)" = allow ] || fail "task-branch workspace policy influenced authority"
   old_instance="$(json_get "$resolved" action_instance.id)"
   assert_contains "$resolved" '"layer":"workspace"'
@@ -773,8 +840,8 @@ PY
     'action.task.abandon=deny' > "$task_dir/contexts/acme.policy"
   out="$TMPDIR/policy_context/tampered.out"
   if run_policy_in_dir policy_context "$task_dir" resolve \
-    --action-id task.abandon --task-claim-id "$claim" --target-ref "$target" \
-    --revision "$revision" --action-instance-id "$old_instance" --format json >"$out" 2>&1; then
+    --request-file "$request" --intent-digest "$intent" \
+    --action-instance-id "$old_instance" --format json >"$out" 2>&1; then
     fail "changed sealed context bytes must fail closed"
   else rc=$?; fi
   [ "$rc" = 1 ] || fail "tampered context must exit 1"
@@ -783,7 +850,7 @@ PY
 }
 
 test_null_context_lazy_seal_and_frozen_action_registry() {
-  local repo task_dir actual out rc claim
+  local repo task_dir actual out rc claim request
   repo="$(setup_workbench lazy_context)"
   task_dir="$(start_task lazy_context "$repo")"
   claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
@@ -807,10 +874,27 @@ test_null_context_lazy_seal_and_frozen_action_registry() {
   assert_file_contains "$out" 'policy-context-immutable'
 
   out="$TMPDIR/lazy_context/unsupported.out"
+  request="$TMPDIR/lazy_context/unsupported-request.json"
+  python3 - "$request" "$claim" <<'PY'
+import json
+import sys
+
+value = {
+    "contract_version": "workbench-action-request/v1",
+    "action_id": "toolbox.deploy",
+    "task_claim_id": sys.argv[2],
+    "target_ref": "workbench:task/" + sys.argv[2],
+    "revision": "sha256:" + "a" * 64,
+    "payload_contract": "toolbox-deploy-intent/v1",
+    "payload": "toolbox-deploy-intent/v1\n",
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
   if run_policy_in_dir lazy_context "$task_dir" resolve \
-    --action-id toolbox.deploy --task-claim-id "$claim" \
-    --target-ref "workbench:task/$claim" \
-    --revision sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --request-file "$request" \
+    --intent-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     --format json >"$out" 2>&1; then
     fail "namespaced pack action must not enter the kernel registry"
   else rc=$?; fi

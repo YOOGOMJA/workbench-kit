@@ -186,7 +186,7 @@ def require_printable_ascii(value: Any, field: str) -> str:
     return value
 
 
-def cmd_authority_descriptor(args: argparse.Namespace) -> None:
+def load_authority_descriptor(file: str) -> Dict[str, Any]:
     fields = (
         "contract_version",
         "authority_identity",
@@ -196,7 +196,7 @@ def cmd_authority_descriptor(args: argparse.Namespace) -> None:
         "hosting_adapter",
         "hosting_ref",
     )
-    with open(args.file, "r", encoding="utf-8") as handle:
+    with open(file, "r", encoding="utf-8") as handle:
         value = json.load(handle, object_pairs_hook=unique_object)
     if not isinstance(value, dict) or tuple(value) != fields:
         raise ValueError("workspace authority fields or order do not match the contract")
@@ -222,10 +222,71 @@ def cmd_authority_descriptor(args: argparse.Namespace) -> None:
         r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git", value["origin_url"]
     ) is None:
         raise ValueError("GitHub origin_url must be canonical HTTPS with .git suffix")
+    return value
+
+
+def cmd_authority_descriptor(args: argparse.Namespace) -> None:
+    fields = (
+        "contract_version",
+        "authority_identity",
+        "origin_url",
+        "default_ref",
+        "workspace_home",
+        "hosting_adapter",
+        "hosting_ref",
+    )
+    value = load_authority_descriptor(args.file)
     sys.stdout.write("descriptor_digest={}\n".format(digest_json(value)))
     for key in fields[1:]:
         field = value[key]
         sys.stdout.write("{}={}\n".format(key, "" if field is None else field))
+
+
+def cmd_hosting_authority(args: argparse.Namespace) -> None:
+    descriptor = load_authority_descriptor(args.authority_file)
+    fields = (
+        "contract_version",
+        "authority_identity",
+        "origin_url",
+        "default_ref",
+        "default_revision",
+        "default_ref_protected",
+        "direct_task_actor_writes",
+        "permission_source",
+    )
+    with open(args.verification_file, "r", encoding="utf-8") as handle:
+        value = json.load(handle, object_pairs_hook=unique_object)
+    if not isinstance(value, dict) or tuple(value) != fields:
+        raise ValueError("hosting authority fields or order do not match the contract")
+    if value["contract_version"] != "workbench-hosting-authority-verification/v1":
+        raise ValueError("unsupported hosting authority verification contract")
+    for key in (
+        "authority_identity",
+        "origin_url",
+        "default_ref",
+        "default_revision",
+        "direct_task_actor_writes",
+        "permission_source",
+    ):
+        require_printable_ascii(value[key], key)
+    if re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", value["default_revision"]) is None:
+        raise ValueError("default_revision must be a canonical Git object ID")
+    expected = {
+        "authority_identity": descriptor["authority_identity"],
+        "origin_url": descriptor["origin_url"],
+        "default_ref": descriptor["default_ref"],
+        "default_revision": args.default_revision,
+    }
+    for key, expected_value in expected.items():
+        if value[key] != expected_value:
+            raise ValueError("hosting authority binding mismatch: {}".format(key))
+    if value["default_ref_protected"] is not True:
+        raise ValueError("default ref is not protected")
+    if value["direct_task_actor_writes"] != "blocked":
+        raise ValueError("direct task actor writes are not blocked")
+    if descriptor["hosting_ref"] is not None and value["permission_source"] != descriptor["hosting_ref"]:
+        raise ValueError("hosting permission source does not bind the descriptor")
+    sys.stdout.write("permission_source={}\n".format(value["permission_source"]))
 
 
 def is_namespaced_ref(value: str) -> bool:
@@ -1166,6 +1227,12 @@ def parser() -> argparse.ArgumentParser:
     authority = commands.add_parser("authority-descriptor")
     authority.add_argument("file")
     authority.set_defaults(func=cmd_authority_descriptor)
+
+    hosting_authority = commands.add_parser("hosting-authority")
+    hosting_authority.add_argument("--authority-file", required=True)
+    hosting_authority.add_argument("--verification-file", required=True)
+    hosting_authority.add_argument("--default-revision", required=True)
+    hosting_authority.set_defaults(func=cmd_hosting_authority)
 
     registration = commands.add_parser("registration")
     registration.add_argument("file")

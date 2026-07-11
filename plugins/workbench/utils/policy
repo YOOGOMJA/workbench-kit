@@ -106,7 +106,7 @@ intent_helper() {
 
 observe_workspace_authority() {
   local expected_digest="$1" bootstrap_origin remote_lines head_ref head_oid descriptor parsed
-  local descriptor_file line key value
+  local descriptor_file verification_file adapter line key value
   bootstrap_origin="$(git -C "$ROOT" remote get-url origin 2>/dev/null)" \
     || integrity_error "policy-authority-unavailable"
   remote_lines="$(git -C "$ROOT" ls-remote --symref "$bootstrap_origin" HEAD 2>/dev/null)" \
@@ -115,16 +115,18 @@ observe_workspace_authority() {
   head_oid="$(printf '%s\n' "$remote_lines" | awk '$2 == "HEAD" && $1 ~ /^[0-9a-f]+$/ { print $1 }')"
   [ -n "$head_ref" ] && printf '%s' "$head_oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
     || integrity_error "policy-authority-unavailable"
-  git -C "$ROOT" fetch --quiet --no-tags "$bootstrap_origin" "$head_oid" >/dev/null 2>&1 \
+  git -C "$ROOT" fetch --quiet --no-tags --no-write-fetch-head \
+    "$bootstrap_origin" "$head_oid" >/dev/null 2>&1 \
     || integrity_error "policy-authority-unavailable"
   descriptor_file="$(mktemp "${TMPDIR:-/tmp}/workbench-authority.XXXXXX")"
+  verification_file="$(mktemp "${TMPDIR:-/tmp}/workbench-hosting-authority.XXXXXX")"
   AUTHORITY_WORKSPACE_POLICY_FILE="$(mktemp "${TMPDIR:-/tmp}/workbench-policy.XXXXXX")"
   git -C "$ROOT" show "$head_oid:.workbench/authority.json" > "$descriptor_file" 2>/dev/null \
-    || { rm -f "$descriptor_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
   git -C "$ROOT" show "$head_oid:.workbench/policy.conf" > "$AUTHORITY_WORKSPACE_POLICY_FILE" 2>/dev/null \
-    || { rm -f "$descriptor_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-source-missing"; }
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-source-missing"; }
   parsed="$(python3 "$(contract_helper)" authority-descriptor "$descriptor_file" 2>/dev/null)" \
-    || { rm -f "$descriptor_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
   AUTHORITY_DESCRIPTOR_DIGEST=""; AUTHORITY_IDENTITY=""; AUTHORITY_ORIGIN_URL=""
   AUTHORITY_DEFAULT_REF=""; AUTHORITY_WORKSPACE_HOME=""; AUTHORITY_REVISION="$head_oid"
   while IFS= read -r line; do
@@ -138,12 +140,21 @@ observe_workspace_authority() {
     esac
   done <<< "$parsed"
   descriptor="${AUTHORITY_DESCRIPTOR_DIGEST:-}"
-  rm -f "$descriptor_file"
   [ -n "$descriptor" ] && [ "$AUTHORITY_ORIGIN_URL" = "$bootstrap_origin" ] \
     && [ "$AUTHORITY_DEFAULT_REF" = "$head_ref" ] \
-    || { rm -f "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-mismatch"; }
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-mismatch"; }
   [ "$descriptor" = "$expected_digest" ] \
-    || { rm -f "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-mismatch"; }
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-mismatch"; }
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
+  "$adapter" authority --authority-file "$descriptor_file" \
+    --default-revision "$head_oid" --format json > "$verification_file" 2>/dev/null \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
+  python3 "$(contract_helper)" hosting-authority --authority-file "$descriptor_file" \
+    --verification-file "$verification_file" --default-revision "$head_oid" >/dev/null 2>&1 \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-mismatch"; }
+  rm -f "$descriptor_file" "$verification_file"
 }
 
 source_add() {
@@ -310,11 +321,9 @@ mint_action_id() {
 }
 
 read_authorization() {
-  local file="$1" helper parsed key value
+  local file="$1" parsed key value
   [ -f "$file" ] || usage_error "authorization file not found: $file"
-  if [ -n "${INTENT_DIGEST:-}" ]; then helper="$(intent_helper)"
-  else helper="$(contract_helper)"; fi
-  parsed="$(python3 "$helper" authorization "$file")" \
+  parsed="$(python3 "$(intent_helper)" authorization "$file")" \
     || usage_error "invalid workbench-authorization/v1 input: $file"
   while IFS='=' read -r key value; do
     case "$key" in
@@ -394,33 +403,26 @@ cmd_resolve() {
     case "$1" in
       --request-file) request_file="$2"; shift 2 ;;
       --intent-digest) asserted_intent="$2"; shift 2 ;;
-      --action-id) ACTION_ID="$2"; shift 2 ;; --task-claim-id) CLAIM_ID="$2"; shift 2 ;;
-      --target-ref) TARGET_REF="$2"; shift 2 ;; --revision) REVISION="$2"; shift 2 ;;
       --format) format="$2"; shift 2 ;; --action-instance-id) instance_id="$2"; shift 2 ;;
       --authorization-file) authorization_file="$2"; shift 2 ;;
       *) usage_error "unknown option: $1" ;;
     esac
   done
-  if [ -n "$request_file" ]; then
-    [ -z "$ACTION_ID$CLAIM_ID$TARGET_REF$REVISION" ] \
-      || usage_error "--request-file cannot be combined with legacy binding options"
-    [ -n "$asserted_intent" ] || usage_error "--intent-digest is required with --request-file"
-    parsed="$(python3 "$(intent_helper)" request "$request_file" \
-      --intent-digest "$asserted_intent" --format shell)" \
-      || usage_error "invalid workbench-action-request/v1 input: $request_file"
-    while IFS='=' read -r key value; do
-      case "$key" in
-        action_id) ACTION_ID="$value" ;;
-        task_claim_id) CLAIM_ID="$value" ;;
-        target_ref) TARGET_REF="$value" ;;
-        subject_revision) REVISION="$value" ;;
-        intent_digest) INTENT_DIGEST="$value" ;;
-      esac
-    done <<< "$parsed"
-    REQUEST_FILE="$request_file"
-  elif [ -n "$asserted_intent" ]; then
-    usage_error "--intent-digest requires --request-file"
-  fi
+  [ -n "$request_file" ] || usage_error "--request-file is required"
+  [ -n "$asserted_intent" ] || usage_error "--intent-digest is required"
+  parsed="$(python3 "$(intent_helper)" request "$request_file" \
+    --intent-digest "$asserted_intent" --format shell)" \
+    || usage_error "invalid workbench-action-request/v1 input: $request_file"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      action_id) ACTION_ID="$value" ;;
+      task_claim_id) CLAIM_ID="$value" ;;
+      target_ref) TARGET_REF="$value" ;;
+      subject_revision) REVISION="$value" ;;
+      intent_digest) INTENT_DIGEST="$value" ;;
+    esac
+  done <<< "$parsed"
+  REQUEST_FILE="$request_file"
   require_token action_id "$ACTION_ID"; require_token task_claim_id "$CLAIM_ID"
   require_token target_ref "$TARGET_REF"; require_token revision "$REVISION"
   action_supported "$ACTION_ID" || usage_error "unsupported-action: $ACTION_ID"
@@ -473,10 +475,8 @@ cmd_resolve() {
         [ "$AUTH_TASK_CLAIM_ID" = "$CLAIM_ID" ] || integrity_error "authorization binding mismatch: task_claim_id"
         [ "$AUTH_TARGET_REF" = "$TARGET_REF" ] || integrity_error "authorization binding mismatch: target_ref"
         [ "$AUTH_REVISION" = "$REVISION" ] || integrity_error "authorization binding mismatch: revision"
-        if [ -n "$INTENT_DIGEST" ]; then
-          [ "$AUTH_INTENT_DIGEST" = "$INTENT_DIGEST" ] \
-            || integrity_error "authorization binding mismatch: intent_digest"
-        fi
+        [ "$AUTH_INTENT_DIGEST" = "$INTENT_DIGEST" ] \
+          || integrity_error "authorization binding mismatch: intent_digest"
         [ "$AUTH_POLICY_MANIFEST_DIGEST" = "$POLICY_MANIFEST_DIGEST" ] \
           || integrity_error "authorization binding mismatch: policy_manifest_digest"
         if [ -n "$authorization_id" ] && [ "$authorization_id" != "$AUTHORIZATION_ID" ]; then
