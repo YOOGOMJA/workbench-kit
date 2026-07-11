@@ -104,6 +104,10 @@ import sys
 snapshot = json.loads(sys.argv[1])
 
 def digest(value):
+    raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+def raw_digest(value):
     raw = (json.dumps(value, separators=(",", ":")) + "\n").encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
@@ -114,7 +118,7 @@ expected_doctor_projection = {
     "contract_version": "workbench-doctor/v1",
     "ready": False,
     "object_digest": digest(snapshot["doctor"]),
-    "source_digest": digest(snapshot["doctor"]),
+    "source_digest": raw_digest(snapshot["doctor"]),
     "writer_coordination_digest": digest(snapshot["doctor"]["writer_coordination"]),
 }
 assert snapshot["doctor_projection"] == expected_doctor_projection, (
@@ -124,7 +128,7 @@ expected_inventory_projection = {
     "contract_version": "workbench-legacy-inventory/v1",
     "command": "bootstrap-show",
     "object_digest": digest(snapshot["legacy_inventory"]),
-    "source_digest": digest(snapshot["legacy_inventory"]),
+    "source_digest": raw_digest(snapshot["legacy_inventory"]),
     "authority_revision": "1" * 40,
     "home_set_digest": "sha256:" + "b" * 64,
     "complete": True,
@@ -197,10 +201,16 @@ expected_staged+="$current_workspace"$'\t'"legacy-inventory bootstrap-show --aut
 
 removal="$(probe removal "$current_workspace" - show true)" \
   || { echo "$removal" >&2; exit 1; }
-python3 - "$removal" <<'PY'
+python3 - "$ROOT/lib" "$removal" <<'PY'
+import copy
+import hashlib
 import json
 import sys
-snapshot = json.loads(sys.argv[1])
+
+sys.path.insert(0, sys.argv[1])
+from workbench_kit_adapter import AdapterError, validate_doctor, validate_engine_manifest
+
+snapshot = json.loads(sys.argv[2])
 assert snapshot["engine_manifest"]["plugin"] == {
     "name": "workbench", "version": "0.2.0"
 }
@@ -211,6 +221,72 @@ assert projection["content_revision"] == snapshot["engine_manifest"]["source"]["
 assert projection["manifest_digest"] == snapshot["engine_manifest"]["digest"]
 assert projection["object_digest"].startswith("sha256:")
 assert projection["source_digest"].startswith("sha256:")
+
+def line(value):
+    return (json.dumps(value, separators=(",", ":")) + "\n").encode()
+
+def digest(raw):
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+def resign(document):
+    tree = bytearray(b"workbench-plugin-tree/v1\n")
+    for path in document["included_paths"]:
+        tree.extend(line(["included_path", path]))
+    for item in document["excluded_paths"]:
+        tree.extend(line(["excluded_path", item["path"], item["match"]]))
+    for node in document["nodes"]:
+        tree.extend(line([
+            "node", node["path"], node["node_type"], node["mode"],
+            node["digest"], node["link_target"],
+        ]))
+    document["source"]["revision"] = digest(bytes(tree))
+    document["digest"] = None
+    document["digest"] = digest(line(document))
+
+def rejected(document):
+    try:
+        validate_engine_manifest(document, "0.2.0")
+    except AdapterError:
+        return
+    raise AssertionError("invalid manifest topology was accepted")
+
+bad = copy.deepcopy(snapshot["engine_manifest"])
+bad["nodes"][1]["digest"] = "sha256:" + "e" * 64
+resign(bad)
+rejected(bad)
+
+bad = copy.deepcopy(snapshot["engine_manifest"])
+bad["nodes"][2]["path"] = "other/workbench"
+resign(bad)
+rejected(bad)
+
+def doctor_rejected(mutator):
+    bad_doctor = copy.deepcopy(snapshot["doctor"])
+    mutator(bad_doctor["writer_coordination"])
+    try:
+        validate_doctor(bad_doctor, 0)
+    except AdapterError:
+        return
+    raise AssertionError("invalid authority grammar was accepted")
+
+doctor_rejected(lambda value: value.update({"default_ref": "refs/heads/a/../b"}))
+doctor_rejected(lambda value: value.update({"default_ref": "refs/heads/a//b"}))
+doctor_rejected(lambda value: value.update({
+    "origin_url": "git@github.com:example/workbench.git"
+}))
+reordered_doctor = copy.deepcopy(snapshot["doctor"])
+reordered_doctor["writer_coordination"] = dict(reversed(list(
+    reordered_doctor["writer_coordination"].items()
+)))
+reordered_doctor = dict(reversed(list(reordered_doctor.items())))
+validate_doctor(reordered_doctor, 0)
+
+reordered_manifest = copy.deepcopy(snapshot["engine_manifest"])
+reordered_manifest["plugin"] = dict(reversed(list(
+    reordered_manifest["plugin"].items()
+)))
+reordered_manifest = dict(reversed(list(reordered_manifest.items())))
+validate_engine_manifest(reordered_manifest, "0.2.0")
 PY
 expected_removal="$current_workspace"$'\t'"contract show --format json"$'\n'
 expected_removal+="$current_workspace"$'\t'"doctor --format json"$'\n'
@@ -251,6 +327,12 @@ def rejected(mutator):
         raise AssertionError("invalid nested inventory was accepted")
 
 rejected(lambda value: value["authority"].update({"future": True}))
+rejected(lambda value: value["authority"].update({
+    "default_ref": "refs/heads/a/../b"
+}))
+rejected(lambda value: value["authority"].update({
+    "default_ref": "refs/heads/a//b"
+}))
 rejected(lambda value: value["homes"][0]["claims"][1].update({
     "task_claim_id": "task__workbench__55-mismatch"
 }))
@@ -264,9 +346,9 @@ rejected(lambda value: value.update({"active_claims": [{
     "pr_head_revision": None, "lifecycle_digest": "sha256:" + "c" * 64,
 }]}))
 rejected(lambda value: value["origin_replacements"][0].update({"status": "unavailable"}))
-rejected(lambda value: value.update({
-    "authority": dict(reversed(list(value["authority"].items())))
-}))
+reordered = copy.deepcopy(valid)
+reordered["authority"] = dict(reversed(list(reordered["authority"].items())))
+assert validate_inventory(reordered, 0, "show") == tasks
 PY
 
 expect_failure() {

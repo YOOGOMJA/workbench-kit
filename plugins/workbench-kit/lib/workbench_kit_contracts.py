@@ -186,6 +186,21 @@ BASE_RECEIPT_ARTIFACT_PATHS = {
     "AGENTS.md",
     "CLAUDE.md",
 }
+MIGRATION_ARTIFACT_SOURCES = {
+    ".workbench/schema": "constant:workbench/v2",
+    ".workbench/profile.conf": "render:workbench-profile/v1",
+    ".workbench/policy.conf": "constant:workbench-policy/v1-conservative-ask",
+    ".workbench/authority.json": (
+        "input:bootstrap-authority-approval#proposed_descriptor"
+    ),
+    ".workbench/migration.json": "render:workbench-kit-migration-receipt/v1",
+    "AGENTS.overlay.md": "input:reviewed-overlay#content",
+    "AGENTS.md": "compose:workbench-kit-compose/v1",
+    "CLAUDE.md": "compose:workbench-kit-compose/v1",
+    ".claude/settings.json": "merge:claude-settings/v1",
+    ".gitignore": "merge:gitignore/v1",
+    ".gitattributes": "merge:gitattributes/v1",
+}
 
 
 class ContractError(ValueError):
@@ -206,6 +221,7 @@ def canonical_bytes(value: Any) -> bytes:
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
+            sort_keys=True,
         )
     except (TypeError, ValueError) as error:
         raise ContractError("canonical-json-invalid", "value") from error
@@ -696,7 +712,10 @@ def validate_relative_path(path: Any, *, allow_dot: bool = False) -> str:
         or any(part in ("", ".", "..") for part in pure.parts)
     ):
         fail(path, "path-invalid")
-    if pure.parts[0] in RESERVED_PREFIXES or pure.parts[:2] == ("task", "codebases"):
+    folded_parts = tuple(part.casefold() for part in pure.parts)
+    if folded_parts[0] in RESERVED_PREFIXES or folded_parts[:2] == (
+        "task", "codebases"
+    ):
         fail(path, "path-reserved")
     return path
 
@@ -860,9 +879,12 @@ def validate_path_set(paths: list[str], ref: str, *, reject_ancestors: bool = Fa
     if len(paths) != len(set(paths)) or len(folded) != len(set(folded)):
         fail(ref, "path-collision")
     if reject_ancestors:
-        for index, path in enumerate(paths):
+        ordered_folded = sorted(folded)
+        for index, path in enumerate(ordered_folded):
             prefix = path + "/"
-            if any(other.startswith(prefix) for other in paths[index + 1 :]):
+            if any(
+                other.startswith(prefix) for other in ordered_folded[index + 1 :]
+            ):
                 fail(ref, "path-overlap")
 
 
@@ -999,10 +1021,9 @@ def validate_migration_receipt(value: Any) -> dict[str, Any]:
     )
     artifact_paths = {item["path"] for item in artifacts}
     expected_paths = set(BASE_RECEIPT_ARTIFACT_PATHS)
-    allowed_paths = (expected_paths, expected_paths | {"AGENTS.overlay.md"})
-    if artifact_paths not in allowed_paths or (
-        reviewed_pair[0] is not None and "AGENTS.overlay.md" not in artifact_paths
-    ):
+    if reviewed_pair[0] is not None:
+        expected_paths.add("AGENTS.overlay.md")
+    if artifact_paths != expected_paths:
         fail("migration-receipt.artifacts")
     receipt["planner"] = planner
     receipt["migration_task"] = task
@@ -1174,6 +1195,10 @@ def validate_plan(value: Any) -> dict[str, Any]:
             "inputs.reviewed_overlay",
             validate_reviewed_overlay,
         )
+    if (legacy["command"] == "bootstrap-show") != (
+        inputs["bootstrap_authority_approval"] is not None
+    ):
+        fail("inputs.bootstrap_authority_approval")
     engine_manifest = (
         validate_engine_manifest(plan["engine_manifest"])
         if plan["engine_manifest"] is not None
@@ -1229,8 +1254,26 @@ def validate_plan(value: Any) -> dict[str, Any]:
     if operations != sorted(operations, key=lambda item: (item["path"], item["op"])):
         fail("operations", "path-order-invalid")
     validate_path_set(operation_paths, "operations", reject_ancestors=True)
-    if set(operation_paths) & {item["path"] for item in preserved}:
-        fail("preserved", "preserved-operation-overlap")
+    expected_parent_paths = sorted(
+        {
+            "/".join(pathlib.PurePosixPath(path).parts[:index])
+            for path in operation_paths
+            for index in range(1, len(pathlib.PurePosixPath(path).parts))
+        },
+        key=lambda path: (path.count("/"), path),
+    )
+    if parent_paths != expected_parent_paths:
+        fail("parent_directories", "parent-operation-mismatch")
+    for operation_path in operation_paths:
+        folded_operation = operation_path.casefold()
+        for preserved_node in preserved:
+            folded_preserved = preserved_node["path"].casefold()
+            if (
+                folded_operation == folded_preserved
+                or folded_operation.startswith(folded_preserved + "/")
+                or folded_preserved.startswith(folded_operation + "/")
+            ):
+                fail("preserved", "preserved-operation-overlap")
 
     artifact_by_path = {item["path"]: item for item in artifacts}
     modifying = [item for item in operations if item["op"] in ("create", "update")]
@@ -1252,6 +1295,68 @@ def validate_plan(value: Any) -> dict[str, Any]:
             or operation["artifact_source_digest"] != artifact["source_digest"]
         ):
             fail("operations", "artifact-operation-mismatch")
+
+        expected_source_ref = MIGRATION_ARTIFACT_SOURCES.get(operation["path"])
+        if expected_source_ref is None or artifact["source_ref"] != expected_source_ref:
+            fail("operations", "operation-path-not-owned")
+        if inputs["bootstrap_authority_approval"] is None:
+            fail("operations", "bootstrap-authority-approval-required")
+        expected_content = None
+        if operation["path"] == ".workbench/schema":
+            expected_content = b"workbench/v2\n"
+        elif operation["path"] == ".workbench/profile.conf":
+            expected_content = (
+                "schema=workbench-profile/v1\nlanguage="
+                + inputs["language"]["tag"]
+                + "\n"
+            ).encode("ascii")
+        elif operation["path"] == ".workbench/policy.conf":
+            expected_content = b"schema=workbench-policy/v1\n"
+        elif operation["path"] == ".workbench/authority.json":
+            expected_content = canonical_bytes(
+                inputs["bootstrap_authority_approval"]["receipt"][
+                    "proposed_descriptor"
+                ]
+            )
+        elif operation["path"] == "AGENTS.overlay.md":
+            if inputs["reviewed_overlay"] is None:
+                fail("operations", "reviewed-overlay-required")
+            expected_content = decode_canonical_base64(
+                inputs["reviewed_overlay"]["receipt"]["content_base64"],
+                "inputs.reviewed_overlay.content_base64",
+            )
+        elif operation["path"] == ".workbench/migration.json":
+            migration_receipt = validate_migration_receipt(
+                strict_load(content, ".workbench/migration.json")
+            )
+            reviewed_input = inputs["reviewed_overlay"]
+            if (
+                content != canonical_bytes(migration_receipt)
+                or migration_receipt["source_revision"] != workspace["source_revision"]
+                or migration_receipt["source_tree_digest"]
+                != workspace["source_tree_digest"]
+                or migration_receipt["planner"] != planner
+                or migration_receipt["migration_task"] != migration_task
+                or migration_receipt["language"] != inputs["language"]
+                or migration_receipt["authority_approval_object_digest"]
+                != inputs["bootstrap_authority_approval"]["object_digest"]
+                or migration_receipt["authority_approval_source_digest"]
+                != inputs["bootstrap_authority_approval"]["source_digest"]
+                or migration_receipt["reviewed_overlay_object_digest"]
+                != (reviewed_input["object_digest"] if reviewed_input else None)
+                or migration_receipt["reviewed_overlay_source_digest"]
+                != (reviewed_input["source_digest"] if reviewed_input else None)
+                or migration_receipt["legacy_inventory_object_digest"]
+                != legacy["object_digest"]
+                or migration_receipt["legacy_inventory_source_digest"]
+                != legacy["source_digest"]
+                or migration_receipt["active_v1_tasks_digest"]
+                != plan["active_v1_tasks"]["digest"]
+                or migration_receipt["embedded_engine"] != embedded
+            ):
+                fail("artifacts", "migration-receipt-plan-drift")
+        if expected_content is not None and content != expected_content:
+            fail("artifacts", "artifact-content-drift")
 
     remove_operations = [item for item in operations if item["op"] == "remove"]
     if plugin_equivalence is not None:
@@ -1651,7 +1756,9 @@ def validate_effect(value: Any, journal_id: str) -> dict[str, Any]:
             fail("effect.ensure-directory")
     elif effect["kind"] in ("create", "update"):
         if effect["kind"] == "create":
-            if before["node_type"] != "absent" or after["node_type"] != "file":
+            if before["node_type"] != "absent" or after["node_type"] not in (
+                "file", "symlink"
+            ):
                 fail("effect.create")
         elif (
             before["node_type"] not in ("file", "symlink")
@@ -1691,8 +1798,11 @@ def validate_effect(value: Any, journal_id: str) -> dict[str, Any]:
     return effect
 
 
-def validate_journal(value: Any) -> dict[str, Any]:
+def validate_journal(
+    value: Any, plan: dict[str, Any] | None = None
+) -> dict[str, Any]:
     journal = exact_object(value, JOURNAL_FIELDS, "upgrade-journal")
+    normalized_plan = validate_plan(plan) if plan is not None else None
     if journal["contract_version"] != "workbench-kit-upgrade-journal/v1":
         fail("upgrade-journal.contract_version")
     if not isinstance(journal["journal_id"], str) or UPGRADE_ID.fullmatch(
@@ -1740,6 +1850,51 @@ def validate_journal(value: Any) -> dict[str, Any]:
     validate_path_set(
         [item["path"] for item in operations], "journal.effects", reject_ancestors=True
     )
+    folded_effect_paths = [item["path"].casefold() for item in effects]
+    if len(folded_effect_paths) != len(set(folded_effect_paths)):
+        fail("journal.effects", "path-collision")
+    operation_paths = [item["path"].casefold() for item in operations]
+    if any(
+        not any(path.startswith(parent.casefold() + "/") for path in operation_paths)
+        for parent in directory_paths
+    ):
+        fail("journal.effects", "parent-operation-mismatch")
+    if normalized_plan is not None:
+        if normalized_plan["plan_digest"] != journal["plan_digest"]:
+            fail("journal.plan_digest")
+        expected_effects: list[tuple[str, dict[str, Any]]] = []
+        for parent in normalized_plan["parent_directories"]:
+            if parent["before_type"] is None:
+                expected_effects.append(("ensure-directory", parent))
+        expected_effects.extend(
+            (operation["op"], operation)
+            for operation in normalized_plan["operations"]
+        )
+        if len(effects) != len(expected_effects):
+            fail("journal.effects", "plan-effect-mismatch")
+        for effect, (kind, planned) in zip(effects, expected_effects):
+            if effect["kind"] != kind or effect["path"] != planned["path"]:
+                fail("journal.effects", "plan-effect-mismatch")
+            if kind == "ensure-directory":
+                if (
+                    effect["before"]["node_type"] != "absent"
+                    or effect["after"]["node_type"] != "directory"
+                    or effect["after"]["mode"] != planned["after_mode"]
+                ):
+                    fail("journal.effects", "plan-effect-mismatch")
+            elif (
+                effect["before"]["node_type"] != (planned["before_type"] or "absent")
+                or effect["before"]["mode"] != planned["before_mode"]
+                or effect["before"]["digest"] != planned["before_digest"]
+                or effect["after"]["node_type"] != (planned["after_type"] or "absent")
+                or effect["after"]["mode"] != planned["after_mode"]
+                or effect["after"]["digest"] != planned["after_digest"]
+                or effect["artifact_source_digest"]
+                != planned["artifact_source_digest"]
+                or effect["equivalence_receipt_ref"]
+                != planned["equivalence_receipt_ref"]
+            ):
+                fail("journal.effects", "plan-effect-mismatch")
 
     applied = array(journal["applied"], "journal.applied")
     if not all(isinstance(item, str) for item in applied):

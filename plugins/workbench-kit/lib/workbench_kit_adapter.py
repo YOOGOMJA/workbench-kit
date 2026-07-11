@@ -33,6 +33,10 @@ GIT_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 HOME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+DEFAULT_REF = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
+GITHUB_ORIGIN = re.compile(
+    r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$"
+)
 INVENTORY_FIELDS = (
     "contract_version", "source_revision", "authority", "home_set", "homes",
     "active_claims", "origin_replacements", "complete", "blockers",
@@ -98,6 +102,7 @@ def canonical_digest(value: Any) -> str:
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
+            sort_keys=True,
         )
         + "\n"
     ).encode("utf-8")
@@ -106,6 +111,19 @@ def canonical_digest(value: Any) -> str:
 
 def source_digest(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def valid_default_ref(value: str) -> bool:
+    return (
+        DEFAULT_REF.fullmatch(value) is not None
+        and ".." not in value
+        and "//" not in value
+    )
+
+
+def require_origin(value: str, authority_identity: str, ref: str) -> None:
+    if authority_identity.startswith("github:") and GITHUB_ORIGIN.fullmatch(value) is None:
+        raise AdapterError("public-contract-invalid", ref)
 
 
 def require_object(value: Any, ref: str) -> dict[str, Any]:
@@ -125,9 +143,21 @@ def inventory_error(ref: str) -> None:
 
 
 def inventory_object(value: Any, fields: tuple[str, ...], ref: str) -> dict[str, Any]:
-    if not isinstance(value, dict) or tuple(value) != fields:
+    if (
+        not isinstance(value, dict)
+        or set(value) != set(fields)
+        or len(value) != len(fields)
+    ):
         inventory_error(ref)
     return value
+
+
+def exact_fields(value: Any, fields: tuple[str, ...]) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == set(fields)
+        and len(value) == len(fields)
+    )
 
 
 def inventory_array(value: Any, ref: str) -> list[Any]:
@@ -296,7 +326,9 @@ def validate_contract(
 
 def validate_doctor(document: dict[str, Any], status: int) -> None:
     ref = "workbench doctor"
-    if tuple(document) != DOCTOR_FIELDS or document.get("contract_version") != "workbench-doctor/v1":
+    if not exact_fields(document, DOCTOR_FIELDS) or document.get(
+        "contract_version"
+    ) != "workbench-doctor/v1":
         raise AdapterError("public-contract-invalid", ref)
     ready = document.get("ready")
     if not isinstance(ready, bool) or (ready and status != 0) or (not ready and status != 1):
@@ -304,7 +336,7 @@ def validate_doctor(document: dict[str, Any], status: int) -> None:
     coordination = require_object(
         document.get("writer_coordination"), f"{ref}.writer_coordination"
     )
-    if tuple(coordination) != COORDINATION_FIELDS:
+    if not exact_fields(coordination, COORDINATION_FIELDS):
         raise AdapterError("public-contract-invalid", f"{ref}.writer_coordination")
 
     def optional_text(field: str) -> str | None:
@@ -319,6 +351,19 @@ def validate_doctor(document: dict[str, Any], status: int) -> None:
 
     for field in ("authority_identity", "origin_url", "default_ref", "permission_source"):
         optional_text(field)
+    if coordination["default_ref"] is not None and not valid_default_ref(
+        coordination["default_ref"]
+    ):
+        raise AdapterError("public-contract-invalid", f"{ref}.default_ref")
+    if (
+        coordination["authority_identity"] is not None
+        and coordination["origin_url"] is not None
+    ):
+        require_origin(
+            coordination["origin_url"],
+            coordination["authority_identity"],
+            f"{ref}.origin_url",
+        )
     for field in ("default_ref_revision", "revision"):
         value = optional_text(field)
         if value is not None and GIT_OID.fullmatch(value) is None:
@@ -338,7 +383,7 @@ def validate_doctor(document: dict[str, Any], status: int) -> None:
 
     blocker = coordination["blocker"]
     if blocker is not None:
-        if not isinstance(blocker, dict) or tuple(blocker) != BLOCKER_FIELDS:
+        if not exact_fields(blocker, BLOCKER_FIELDS):
             raise AdapterError("public-contract-invalid", f"{ref}.blocker")
         if blocker.get("code") != "writer-lock-unavailable" or blocker.get("ref") != COORDINATION_REF:
             raise AdapterError("public-contract-invalid", f"{ref}.blocker")
@@ -371,9 +416,11 @@ def validate_inventory(
     source_revision = inventory_oid(document["source_revision"], f"{ref}.source_revision")
 
     authority = inventory_object(document["authority"], AUTHORITY_FIELDS, f"{ref}.authority")
-    inventory_text(authority["authority_identity"], f"{ref}.authority_identity")
+    authority_identity = inventory_text(
+        authority["authority_identity"], f"{ref}.authority_identity"
+    )
     default_ref = inventory_text(authority["default_ref"], f"{ref}.default_ref")
-    if not default_ref.startswith("refs/heads/"):
+    if not valid_default_ref(default_ref):
         inventory_error(f"{ref}.default_ref")
     if inventory_oid(authority["default_revision"], f"{ref}.default_revision") != source_revision:
         inventory_error(f"{ref}.default_revision")
@@ -397,7 +444,8 @@ def validate_inventory(
         home = inventory_object(home_value, HOME_FIELDS, f"{ref}.homes[]")
         home_name = inventory_home(home["home"], f"{ref}.home")
         home_names.append(home_name)
-        inventory_text(home["origin_url"], f"{ref}.origin_url")
+        origin_url = inventory_text(home["origin_url"], f"{ref}.origin_url")
+        require_origin(origin_url, authority_identity, f"{ref}.origin_url")
         if home["membership"] not in ("current", "removed", "origin-replaced"):
             inventory_error(f"{ref}.membership")
 
@@ -574,11 +622,15 @@ def validate_inventory(
         replacement_homes.append(
             inventory_home(replacement["home"], f"{ref}.origin_replacement.home")
         )
-        inventory_text(
+        previous_origin = inventory_text(
             replacement["previous_origin_url"], f"{ref}.previous_origin_url"
         )
+        require_origin(previous_origin, authority_identity, f"{ref}.previous_origin_url")
         if replacement["current_origin_url"] is not None:
-            inventory_text(replacement["current_origin_url"], f"{ref}.current_origin_url")
+            current_origin = inventory_text(
+                replacement["current_origin_url"], f"{ref}.current_origin_url"
+            )
+            require_origin(current_origin, authority_identity, f"{ref}.current_origin_url")
         if replacement["status"] not in (
             "unchanged", "removed-clean", "removed-in-use", "replaced-clean",
             "replaced-in-use", "unavailable",
@@ -611,17 +663,17 @@ def validate_inventory(
 
 def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> None:
     ref = "workbench engine-manifest show"
-    if tuple(document) != ENGINE_MANIFEST_FIELDS:
+    if not exact_fields(document, ENGINE_MANIFEST_FIELDS):
         raise AdapterError("public-contract-invalid", ref)
     if document["contract_version"] != ENGINE_MANIFEST_CONTRACT:
         raise AdapterError("public-contract-invalid", f"{ref}.contract_version")
     plugin = require_object(document["plugin"], f"{ref}.plugin")
-    if tuple(plugin) != PLUGIN_FIELDS or plugin.get("name") != "workbench":
+    if not exact_fields(plugin, PLUGIN_FIELDS) or plugin.get("name") != "workbench":
         raise AdapterError("public-contract-invalid", f"{ref}.plugin")
     if plugin.get("version") != engine_version or SEMVER.fullmatch(engine_version) is None:
         raise AdapterError("public-engine-mismatch", ref)
     source = require_object(document["source"], f"{ref}.source")
-    if tuple(source) != SOURCE_FIELDS or source.get("ref") != ENGINE_SOURCE_REF:
+    if not exact_fields(source, SOURCE_FIELDS) or source.get("ref") != ENGINE_SOURCE_REF:
         raise AdapterError("public-contract-invalid", f"{ref}.source")
     if not isinstance(source.get("revision"), str) or SHA256.fullmatch(source["revision"]) is None:
         raise AdapterError("public-contract-invalid", f"{ref}.source.revision")
@@ -629,7 +681,7 @@ def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> N
         raise AdapterError("public-contract-invalid", f"{ref}.included_paths")
     exclusions = require_array(document["excluded_paths"], f"{ref}.excluded_paths")
     if exclusions != ENGINE_EXCLUSIONS or any(
-        not isinstance(item, dict) or tuple(item) != EXCLUSION_FIELDS for item in exclusions
+        not exact_fields(item, EXCLUSION_FIELDS) for item in exclusions
     ):
         raise AdapterError("public-contract-invalid", f"{ref}.excluded_paths")
 
@@ -637,7 +689,7 @@ def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> N
     node_paths: list[str] = []
     for node_value in nodes:
         node = require_object(node_value, f"{ref}.node")
-        if tuple(node) != MANIFEST_NODE_FIELDS:
+        if not exact_fields(node, MANIFEST_NODE_FIELDS):
             raise AdapterError("public-contract-invalid", f"{ref}.node")
         path = node.get("path")
         if not isinstance(path, str) or not path or "\x00" in path:
@@ -678,6 +730,38 @@ def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> N
             json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
         ).encode("utf-8")
 
+    nodes_by_path = {node["path"]: node for node in nodes}
+    children: dict[str, list[dict[str, Any]]] = {
+        node["path"]: [] for node in nodes if node["node_type"] == "directory"
+    }
+    for node in nodes[1:]:
+        parent = node["path"].rsplit("/", 1)[0] if "/" in node["path"] else "."
+        if parent not in children:
+            raise AdapterError("public-contract-invalid", f"{ref}.node.parent")
+        children[parent].append(node)
+    for directory_path, direct_children in children.items():
+        rows = bytearray(b"workbench-plugin-directory/v1\n")
+        for child in sorted(
+            direct_children, key=lambda item: item["path"].rsplit("/", 1)[-1]
+        ):
+            rows.extend(
+                canonical_line(
+                    [
+                        "child",
+                        child["path"].rsplit("/", 1)[-1],
+                        child["node_type"],
+                        child["mode"],
+                        child["digest"],
+                        child["link_target"],
+                    ]
+                )
+            )
+        expected_directory_digest = source_digest(bytes(rows))
+        if nodes_by_path[directory_path]["digest"] != expected_directory_digest:
+            raise AdapterError(
+                "public-contract-invalid", f"{ref}.node.directory_digest"
+            )
+
     tree_bytes = bytearray(b"workbench-plugin-tree/v1\n")
     for path in document["included_paths"]:
         tree_bytes.extend(canonical_line(["included_path", path]))
@@ -701,8 +785,19 @@ def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> N
     expected_revision = "sha256:" + hashlib.sha256(tree_bytes).hexdigest()
     if source["revision"] != expected_revision:
         raise AdapterError("public-contract-invalid", f"{ref}.source.revision")
-    digest_input = dict(document)
-    digest_input["digest"] = None
+    digest_input = {
+        "contract_version": document["contract_version"],
+        "plugin": {field: plugin[field] for field in PLUGIN_FIELDS},
+        "source": {field: source[field] for field in SOURCE_FIELDS},
+        "included_paths": document["included_paths"],
+        "excluded_paths": [
+            {field: item[field] for field in EXCLUSION_FIELDS} for item in exclusions
+        ],
+        "nodes": [
+            {field: node[field] for field in MANIFEST_NODE_FIELDS} for node in nodes
+        ],
+        "digest": None,
+    }
     expected_digest = "sha256:" + hashlib.sha256(canonical_line(digest_input)).hexdigest()
     if document["digest"] != expected_digest:
         raise AdapterError("public-contract-invalid", f"{ref}.digest")

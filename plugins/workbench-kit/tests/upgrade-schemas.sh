@@ -22,6 +22,7 @@ from workbench_kit_contracts import (
     validate_generator_receipt,
     validate_migration_receipt,
     validate_plan,
+    validate_path_set,
     validate_relative_path,
     validate_removal_approval,
     validate_result,
@@ -30,6 +31,11 @@ from workbench_kit_contracts import (
 
 SHA = "sha256:" + "a" * 64
 OID = "1" * 40
+
+unordered = {"z": 1, "a": {"y": 2, "b": 3}}
+reordered = {"a": {"b": 3, "y": 2}, "z": 1}
+assert canonical_bytes(unordered) == canonical_bytes(reordered)
+assert canonical_digest(unordered) == canonical_digest(reordered)
 
 
 def rejected(callable_):
@@ -93,8 +99,12 @@ rejected(lambda: parse_reviewed_overlay(canonical_bytes(bad)))
 
 for path in ("docs/index.md", ".workbench/schema", "AGENTS.md"):
     assert validate_relative_path(path) == path
-for path in ("/tmp/x", "../x", "a/../x", ".git/config", ".worktrees/x", "task/codebases/x"):
+for path in (
+    "/tmp/x", "../x", "a/../x", ".git/config", ".GIT/config",
+    ".worktrees/x", ".WorkTrees/x", "task/codebases/x", "TASK/CODEBASES/x",
+):
     rejected(lambda path=path: validate_relative_path(path))
+rejected(lambda: validate_path_set(["A", "a/x"], "paths", reject_ancestors=True))
 
 language = {
     "contract_version": "workbench-kit-language-decision/v1",
@@ -257,6 +267,27 @@ changed["changed"] = True
 changed["actionable"] = True
 changed["plan_digest"] = canonical_digest(changed, null_field="plan_digest")
 assert validate_plan(changed)["operations"] == changed["operations"]
+bad = copy.deepcopy(changed)
+bad["plan_digest"] = None
+bad["parent_directories"][0]["path"] = ".workbench/schema"
+bad["plan_digest"] = canonical_digest(bad, null_field="plan_digest")
+rejected(lambda: validate_plan(bad))
+bad = copy.deepcopy(changed)
+bad["plan_digest"] = None
+bad["preserved"] = [{
+    "path": ".WORKBENCH/schema",
+    "node_type": "file",
+    "mode": "100644",
+    "digest": SHA,
+    "link_target": None,
+}]
+bad["plan_digest"] = canonical_digest(bad, null_field="plan_digest")
+rejected(lambda: validate_plan(bad))
+bad = copy.deepcopy(changed)
+bad["plan_digest"] = None
+bad["inputs"]["bootstrap_authority_approval"] = None
+bad["plan_digest"] = canonical_digest(bad, null_field="plan_digest")
+rejected(lambda: validate_plan(bad))
 
 reviewed_plan = copy.deepcopy(changed)
 reviewed_plan["plan_digest"] = None
@@ -302,6 +333,82 @@ bad = copy.deepcopy(changed)
 bad["artifacts"] = []
 bad["plan_digest"] = canonical_digest(bad, null_field="plan_digest")
 rejected(lambda: validate_plan(bad))
+
+bad = copy.deepcopy(changed)
+bad["plan_digest"] = None
+bad["parent_directories"] = []
+bad["artifacts"][0]["path"] = "README.md"
+bad["operations"][0]["path"] = "README.md"
+bad["plan_digest"] = canonical_digest(bad, null_field="plan_digest")
+rejected(lambda: validate_plan(bad))
+
+overlay_plan = copy.deepcopy(changed)
+overlay_plan["plan_digest"] = None
+overlay_plan["parent_directories"] = []
+overlay_plan["artifacts"] = [{
+    "path": "AGENTS.overlay.md",
+    "node_type": "file",
+    "mode": "100644",
+    "content_base64": base64.b64encode(overlay_bytes).decode(),
+    "link_target": None,
+    "source_ref": "input:reviewed-overlay#content",
+    "source_digest": canonical_digest(overlay_bytes, raw=True),
+}]
+overlay_plan["operations"] = [{
+    "op": "create",
+    "path": "AGENTS.overlay.md",
+    "before_type": None,
+    "before_mode": None,
+    "before_digest": None,
+    "after_type": "file",
+    "after_mode": "100644",
+    "after_digest": node_digest("file", "100644", content=overlay_bytes),
+    "artifact_source_digest": canonical_digest(overlay_bytes, raw=True),
+    "equivalence_receipt_ref": None,
+}]
+overlay_plan["plan_digest"] = canonical_digest(
+    overlay_plan, null_field="plan_digest"
+)
+rejected(lambda: validate_plan(overlay_plan))
+overlay_plan["plan_digest"] = None
+overlay_plan["inputs"]["reviewed_overlay"] = {
+    "receipt": reviewed["receipt"],
+    "object_digest": reviewed["object_digest"],
+    "source_digest": reviewed["source_digest"],
+}
+overlay_plan["plan_digest"] = canonical_digest(
+    overlay_plan, null_field="plan_digest"
+)
+assert validate_plan(overlay_plan)["artifacts"] == overlay_plan["artifacts"]
+
+symlink_plan = copy.deepcopy(changed)
+symlink_plan["plan_digest"] = None
+symlink_plan["parent_directories"] = []
+symlink_plan["artifacts"] = [{
+    "path": "CLAUDE.md",
+    "node_type": "symlink",
+    "mode": "120000",
+    "content_base64": None,
+    "link_target": "AGENTS.md",
+    "source_ref": "compose:workbench-kit-compose/v1",
+    "source_digest": canonical_digest(b"AGENTS.md", raw=True),
+}]
+symlink_plan["operations"] = [{
+    "op": "create",
+    "path": "CLAUDE.md",
+    "before_type": None,
+    "before_mode": None,
+    "before_digest": None,
+    "after_type": "symlink",
+    "after_mode": "120000",
+    "after_digest": node_digest("symlink", "120000", link_target="AGENTS.md"),
+    "artifact_source_digest": canonical_digest(b"AGENTS.md", raw=True),
+    "equivalence_receipt_ref": None,
+}]
+symlink_plan["plan_digest"] = canonical_digest(
+    symlink_plan, null_field="plan_digest"
+)
+assert validate_plan(symlink_plan)["operations"] == symlink_plan["operations"]
 
 receipt_artifact_paths = sorted([
     ".claude/settings.json",
@@ -380,13 +487,69 @@ known_overlay_receipt["artifacts"] = sorted(
 known_overlay_receipt["candidate_basis_digest"] = canonical_digest(
     known_overlay_receipt, null_field="candidate_basis_digest"
 )
-assert validate_migration_receipt(known_overlay_receipt) == known_overlay_receipt
+rejected(lambda: validate_migration_receipt(known_overlay_receipt))
+reviewed_overlay_receipt = copy.deepcopy(known_overlay_receipt)
+reviewed_overlay_receipt["candidate_basis_digest"] = None
+reviewed_overlay_receipt["reviewed_overlay_object_digest"] = SHA
+reviewed_overlay_receipt["reviewed_overlay_source_digest"] = "sha256:" + "b" * 64
+reviewed_overlay_receipt["candidate_basis_digest"] = canonical_digest(
+    reviewed_overlay_receipt, null_field="candidate_basis_digest"
+)
+assert validate_migration_receipt(reviewed_overlay_receipt) == reviewed_overlay_receipt
 bad = copy.deepcopy(migration_receipt)
 bad["reviewed_overlay_object_digest"] = SHA
 bad["candidate_basis_digest"] = canonical_digest(
     bad, null_field="candidate_basis_digest"
 )
 rejected(lambda: validate_migration_receipt(bad))
+
+receipt_plan = copy.deepcopy(changed)
+receipt_plan["plan_digest"] = None
+receipt_bytes = canonical_bytes(migration_receipt)
+receipt_plan["artifacts"] = [{
+    "path": ".workbench/migration.json",
+    "node_type": "file",
+    "mode": "100644",
+    "content_base64": base64.b64encode(receipt_bytes).decode(),
+    "link_target": None,
+    "source_ref": "render:workbench-kit-migration-receipt/v1",
+    "source_digest": canonical_digest(receipt_bytes, raw=True),
+}]
+receipt_plan["operations"] = [{
+    "op": "create",
+    "path": ".workbench/migration.json",
+    "before_type": None,
+    "before_mode": None,
+    "before_digest": None,
+    "after_type": "file",
+    "after_mode": "100644",
+    "after_digest": node_digest("file", "100644", content=receipt_bytes),
+    "artifact_source_digest": canonical_digest(receipt_bytes, raw=True),
+    "equivalence_receipt_ref": None,
+}]
+receipt_plan["plan_digest"] = canonical_digest(
+    receipt_plan, null_field="plan_digest"
+)
+assert validate_plan(receipt_plan)["artifacts"] == receipt_plan["artifacts"]
+bad = copy.deepcopy(receipt_plan)
+bad["plan_digest"] = None
+bad_receipt = copy.deepcopy(migration_receipt)
+bad_receipt["candidate_basis_digest"] = None
+bad_receipt["authority_approval_object_digest"] = "sha256:" + "f" * 64
+bad_receipt["candidate_basis_digest"] = canonical_digest(
+    bad_receipt, null_field="candidate_basis_digest"
+)
+bad_bytes = canonical_bytes(bad_receipt)
+bad["artifacts"][0]["content_base64"] = base64.b64encode(bad_bytes).decode()
+bad["artifacts"][0]["source_digest"] = canonical_digest(bad_bytes, raw=True)
+bad["operations"][0]["after_digest"] = node_digest(
+    "file", "100644", content=bad_bytes
+)
+bad["operations"][0]["artifact_source_digest"] = canonical_digest(
+    bad_bytes, raw=True
+)
+bad["plan_digest"] = canonical_digest(bad, null_field="plan_digest")
+rejected(lambda: validate_plan(bad))
 
 header = b"# Workbench\n\n"
 core = b"# Core\n"
@@ -570,6 +733,13 @@ removal_basis = {
 }
 removal_plan["removal_plan_basis_digest"] = canonical_digest(removal_basis)
 removal_plan["preserved"] = [preserved_node]
+removal_plan["parent_directories"] = [{
+    "path": "utils",
+    "before_type": "directory",
+    "before_mode": "040755",
+    "after_type": "directory",
+    "after_mode": "040755",
+}]
 removal_plan["operations"] = [remove_operation]
 removal_plan["blockers"] = [{
     "code": "removal-approval-required",
@@ -729,9 +899,51 @@ journal = {
     "updated_at": "2026-07-11T00:00:00Z",
 }
 assert validate_journal(journal) == journal
+assert validate_journal(journal, changed) == journal
 bad = copy.deepcopy(journal)
 bad["cursor"] = 1
 rejected(lambda: validate_journal(bad))
+bad = copy.deepcopy(journal)
+bad["effects"][0]["path"] = ".workbench/schema"
+rejected(lambda: validate_journal(bad))
+bad = copy.deepcopy(journal)
+duplicate_parent = copy.deepcopy(bad["effects"][0])
+bad["effects"] = [duplicate_parent, copy.deepcopy(duplicate_parent), bad["effects"][1]]
+for index, effect in enumerate(bad["effects"], 1):
+    effect["effect_id"] = f"effect-{index:04d}"
+bad["effects"][2]["temp_path"] = (
+    ".workbench/.workbench-kit.upgrade-" + journal_hex + ".effect-0003.tmp"
+)
+rejected(lambda: validate_journal(bad))
+bad = copy.deepcopy(journal)
+bad["effects"] = [bad["effects"][1]]
+bad["effects"][0]["effect_id"] = "effect-0001"
+bad["effects"][0]["temp_path"] = (
+    ".workbench/.workbench-kit.upgrade-" + journal_hex + ".effect-0001.tmp"
+)
+rejected(lambda: validate_journal(bad, changed))
+
+symlink_journal = copy.deepcopy(journal)
+symlink_hex = symlink_plan["plan_digest"].removeprefix("sha256:")
+symlink_journal["journal_id"] = "upgrade-" + symlink_hex
+symlink_journal["plan_digest"] = symlink_plan["plan_digest"]
+symlink_journal["effects"] = [{
+    "effect_id": "effect-0001",
+    "kind": "create",
+    "path": "CLAUDE.md",
+    "temp_path": ".workbench-kit.upgrade-" + symlink_hex + ".effect-0001.tmp",
+    "before": absent_image,
+    "after": {
+        "node_type": "symlink",
+        "mode": "120000",
+        "content_base64": None,
+        "link_target": "AGENTS.md",
+        "digest": node_digest("symlink", "120000", link_target="AGENTS.md"),
+    },
+    "artifact_source_digest": canonical_digest(b"AGENTS.md", raw=True),
+    "equivalence_receipt_ref": None,
+}]
+assert validate_journal(symlink_journal, symlink_plan) == symlink_journal
 completed = copy.deepcopy(journal)
 completed["stage"] = "completed"
 completed["direction"] = "none"
