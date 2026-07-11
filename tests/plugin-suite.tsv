@@ -1,0 +1,13 @@
+test	plugins/toolbox/tests/delivery-skills.sh
+test	plugins/toolbox/tests/discovery-design-skills.sh
+test	plugins/toolbox/tests/packaging.sh
+test	plugins/toolbox/tests/policy-bridge.sh
+test	plugins/toolbox/tests/portfolio-state.sh
+test	plugins/toolbox/tests/primary-workflow-skills.sh
+test	plugins/toolbox/tests/product-start-skill.sh
+test	plugins/toolbox/tests/product-state.sh
+test	plugins/toolbox/tests/product-workflows.sh
+test	plugins/toolbox/tests/run-planning.sh
+test	plugins/toolbox/tests/state-contracts.sh
+test	plugins/toolbox/tests/workbench-contract.sh
+test	plugins/workbench/tests/task-lifecycle.sh

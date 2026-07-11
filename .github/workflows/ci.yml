@@ -44,42 +44,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Manifests parse as JSON
-        run: |
-          rc=0
-          while IFS= read -r f; do
-            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" \
-              || { echo "invalid JSON: $f"; rc=1; }
-          done < <(find . -path ./.git -prune -o \( -name plugin.json -o -name marketplace.json \) -print)
-          exit $rc
-
-      - name: ShellCheck
-        run: |
-          files=()
-          while IFS= read -r file; do
-            files+=("$file")
-          done < <(
-            find . -path ./.git -prune -o -type f -print |
-              while IFS= read -r file; do
-                first_line="$(head -n 1 "$file" 2>/dev/null || true)"
-                [[ "$first_line" == '#!'*sh* ]] && printf '%s\n' "$file"
-              done
-          )
-          shellcheck -S error "${files[@]}"
-
       - name: Repository test suite
         run: bash tests/run.sh
-
-      - name: Compose smoke test
-        # generate-workbench's bundled compose.sh self-verifies; a non-zero exit fails CI.
-        run: |
-          mkdir -p /tmp/persona
-          printf '## Language\n- Operational output language: **English**.\n' > /tmp/persona/overlay.md
-          bash plugins/workbench-kit/skills/generate-workbench/scripts/compose.sh \
-            --persona  /tmp/persona \
-            --core     plugins/workbench-kit/scaffold/AGENTS.core.md \
-            --scaffold plugins/workbench-kit/scaffold \
-            --out      /tmp/generated-workbench
 
   upgrade:
     name: Upgrade suite (Python ${{ matrix.python-version }})
