@@ -759,7 +759,9 @@ def build_current_plan(
         operations.sort(key=lambda item: (item["path"], item["op"]))
         operation_paths = {operation["path"] for operation in operations}
         parents = _parent_directories(root, sorted(operation_paths))
-        preserved = _preserved_nodes(root, operation_paths)
+        preserved = (
+            _preserved_nodes(root, operation_paths) if operation_paths else []
+        )
 
         removal_plan_basis_digest = None
         blockers = []

@@ -1054,7 +1054,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
         f"{cli_root}\ttask status --format json",
     ]
 
-    hardlink = cli_root / ".workbench/migration-hardlink.json"
+    hardlink = external_root / "migration-hardlink.json"
     os.link(cli_root / ".workbench/migration.json", hardlink)
     unsafe_historical = subprocess.run(
         command,
@@ -1062,12 +1062,23 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
         check=False,
         env=current_environment,
     )
-    assert unsafe_historical.returncode == 1
-    assert unsafe_historical.stdout == b""
-    assert b"workbench-kit: node-hardlink: .workbench/migration.json" in (
-        unsafe_historical.stderr
-    )
-    assert b"Traceback" not in unsafe_historical.stderr
+    assert unsafe_historical.returncode == 0, unsafe_historical.stderr.decode()
+    assert unsafe_historical.stderr == b""
+    unsafe_plan = strict_load(unsafe_historical.stdout, "unsafe-historical-current")
+    assert unsafe_plan["classification_before"] == "already-current"
+    assert unsafe_plan["changed"] is False
+    assert unsafe_plan["provenance_before"] == {
+        "kind": "migration",
+        "state": "invalid",
+        "receipt_digest": None,
+        "ref": ".workbench/migration.json",
+    }
+    assert current_log.read_text().splitlines()[-4:] == [
+        f"{cli_root}\tcontract show --format json",
+        f"{cli_root}\tdoctor --format json",
+        f"{cli_root}\tlegacy-inventory show --format json",
+        f"{cli_root}\ttask status --format json",
+    ]
     hardlink.unlink()
 
 print("PASS: deterministic migration planner and preservation manifest")

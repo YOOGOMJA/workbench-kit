@@ -522,9 +522,7 @@ def _staged_inventory_mode(root: pathlib.Path) -> str | None:
         if node["content"] != canonical_bytes(receipt):
             return None
         return "bootstrap-if-not-ready"
-    except StaticInspectionError as error:
-        raise CliError(error.code, error.ref) from error
-    except (ContractError, OSError):
+    except (StaticInspectionError, ContractError, OSError):
         return None
 
 
@@ -583,8 +581,8 @@ def _dry_run_upgrade_locked(
         public_snapshot = inspect_public_kernel(
             root,
             authority_approval_file=authority_path,
-            inventory_mode=_staged_inventory_mode(root),
             include_engine_manifest=include_manifest,
+            inventory_mode_resolver=lambda: _staged_inventory_mode(root),
         )
     except AdapterError as error:
         if error.code in INDETERMINATE_ADAPTER_ERRORS:
