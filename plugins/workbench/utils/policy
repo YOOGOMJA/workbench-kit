@@ -251,6 +251,7 @@ load_context_policy_sources() {
   while IFS=$'\t' read -r layer context_ref policy_ref expected_digest authority_identity \
     authority_ref authority_revision receipt_digest; do
     [ -n "$layer" ] || continue
+    [ "$context_ref" != null ] || context_ref=""
     local file="$TOP/$policy_ref" actual_digest
     actual_digest="$(sha256_file "$file")" || integrity_error "policy-source-tampered"
     [ "$actual_digest" = "$expected_digest" ] || integrity_error "policy-source-tampered"
@@ -282,15 +283,55 @@ load_concurrent_context_sources() {
       --workspace-root "$workspace" 2>/dev/null)" || integrity_error "policy-context-unavailable"
     while IFS=$'\t' read -r layer context_ref policy_ref expected_policy_digest authority_identity \
       authority_ref authority_revision receipt_digest; do
-      [ "$layer" = context ] || continue
+      case "$layer" in context|task) ;; *) integrity_error "policy-context-unavailable" ;; esac
+      [ "$context_ref" != null ] || context_ref=""
       file="$workspace/$policy_ref"
       actual_digest="$(sha256_file "$file")" || integrity_error "policy-context-unavailable"
       [ "$actual_digest" = "$expected_policy_digest" ] \
         || integrity_error "policy-context-unavailable"
-      source_add context "$context_ref" "$policy_ref" "$file" "$authority_identity" \
+      source_add "$layer" "$context_ref" "$policy_ref" "$file" "$authority_identity" \
         "$authority_ref" "$authority_revision" "$receipt_digest"
     done <<< "$rows"
   done < <(tail -n +2 "$manifest")
+}
+
+sort_policy_sources() {
+  local order i rank sorted_index count=0
+  local sorted_layers=() sorted_contexts=() sorted_policy_refs=() sorted_policy_digests=()
+  local sorted_identities=() sorted_authority_refs=() sorted_revisions=()
+  local sorted_receipts=() sorted_decisions=()
+  order="$(mktemp "${TMPDIR:-/tmp}/workbench-policy-order.XXXXXX")" \
+    || integrity_error "policy-source-invalid"
+  for ((i=0; i<SOURCE_COUNT; i++)); do
+    case "${SOURCE_LAYERS[$i]}" in
+      platform) rank=0 ;; workspace) rank=1 ;; context) rank=2 ;; task) rank=3 ;;
+      *) rm -f "$order"; integrity_error "policy-source-invalid" ;;
+    esac
+    printf '%s\t%s\t%s\t%s\t%s\n' "$rank" "${SOURCE_CONTEXT_REFS[$i]}" \
+      "${SOURCE_AUTHORITY_IDENTITIES[$i]}" "${SOURCE_POLICY_REFS[$i]}" "$i" >> "$order"
+  done
+  while IFS= read -r sorted_index; do
+    sorted_layers[$count]="${SOURCE_LAYERS[$sorted_index]}"
+    sorted_contexts[$count]="${SOURCE_CONTEXT_REFS[$sorted_index]}"
+    sorted_policy_refs[$count]="${SOURCE_POLICY_REFS[$sorted_index]}"
+    sorted_policy_digests[$count]="${SOURCE_POLICY_DIGESTS[$sorted_index]}"
+    sorted_identities[$count]="${SOURCE_AUTHORITY_IDENTITIES[$sorted_index]}"
+    sorted_authority_refs[$count]="${SOURCE_AUTHORITY_REFS[$sorted_index]}"
+    sorted_revisions[$count]="${SOURCE_AUTHORITY_REVISIONS[$sorted_index]}"
+    sorted_receipts[$count]="${SOURCE_RECEIPT_DIGESTS[$sorted_index]}"
+    sorted_decisions[$count]="${SOURCE_DECISIONS[$sorted_index]}"
+    count=$((count + 1))
+  done < <(LC_ALL=C sort -t $'\t' -k1,1n -k2,2 -k3,3 -k4,4 "$order" | cut -f5)
+  rm -f "$order"
+  SOURCE_LAYERS=("${sorted_layers[@]}")
+  SOURCE_CONTEXT_REFS=("${sorted_contexts[@]}")
+  SOURCE_POLICY_REFS=("${sorted_policy_refs[@]}")
+  SOURCE_POLICY_DIGESTS=("${sorted_policy_digests[@]}")
+  SOURCE_AUTHORITY_IDENTITIES=("${sorted_identities[@]}")
+  SOURCE_AUTHORITY_REFS=("${sorted_authority_refs[@]}")
+  SOURCE_AUTHORITY_REVISIONS=("${sorted_revisions[@]}")
+  SOURCE_RECEIPT_DIGESTS=("${sorted_receipts[@]}")
+  SOURCE_DECISIONS=("${sorted_decisions[@]}")
 }
 
 build_policy_manifest() {
@@ -323,6 +364,7 @@ build_policy_manifest() {
     *) load_context_policy_sources sealed ;;
   esac
   [ "$ACTION_ID" != task.concurrent-write ] || load_concurrent_context_sources
+  sort_policy_sources
 
   manifest="$(mktemp "${TMPDIR:-/tmp}/workbench-policy-manifest.XXXXXX")"
   printf 'workbench-policy-manifest/v1\n' > "$manifest"

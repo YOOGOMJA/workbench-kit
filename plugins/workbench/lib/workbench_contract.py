@@ -620,7 +620,10 @@ def cmd_registration(args: argparse.Namespace) -> None:
 def cmd_registration_sources(args: argparse.Namespace) -> None:
     value = load_registration(args.file, args.workspace_root)
     for row in registration_rows(value):
-        sys.stdout.write("\t".join(row) + "\n")
+        projected = list(row)
+        if projected[0] == "task":
+            projected[1] = "null"
+        sys.stdout.write("\t".join(projected) + "\n")
 
 
 def cmd_registration_owner(args: argparse.Namespace) -> None:

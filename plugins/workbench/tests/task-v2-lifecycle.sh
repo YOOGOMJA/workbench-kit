@@ -2712,6 +2712,41 @@ test_required_check_waive_is_reasoned_revision_bound_and_idempotent() {
   assert_contains "$actual" '"verified":true'
 }
 
+test_governed_authorization_ref_is_parsed_as_json() {
+  local task_dir out rc pending instance revision intent manifest auth actual expected record
+  prepare_governed_fixture governed_escaped_authorization; task_dir="$GOVERNED_TASK_DIR"
+  run_task_in_dir governed_escaped_authorization "$task_dir" required-check declare \
+    --id advisory --owner workbench --format json >/dev/null
+  out="$TMPDIR/governed_escaped_authorization/pending.out"
+  if WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_escaped_authorization "$task_dir" required-check waive \
+      --id advisory --reason-code not-applicable --format json >"$out"; then
+    fail "escaped authorization fixture must first require authorization"
+  else rc=$?; fi
+  [ "$rc" = 3 ] || fail "escaped authorization pending returned $rc"
+  pending="$(cat "$out")"; instance="$(json_get "$pending" action_instance.id)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  expected='conversation:message/escaped"quote\path'
+  auth="$TMPDIR/governed_escaped_authorization/authorization.json"
+  write_authorization "$auth" "$instance" task.required-check.waive "$GOVERNED_CLAIM" \
+    workbench:required-check/advisory "$revision" "$manifest" allow reviewer@example.com \
+    2026-07-11T04:33:00Z "$expected" "$intent"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_escaped_authorization "$task_dir" required-check waive \
+      --id advisory --reason-code not-applicable --action-instance-id "$instance" \
+      --authorization-file "$auth" --format json)"
+  [ "$(json_get "$actual" required_check.authorization_ref)" = "$expected" ] \
+    || fail "governed result did not preserve escaped authorization_ref"
+  record="$task_dir/task/.workbench/required-checks/advisory.record"
+  [ "$(sed -n 's/^authorization_ref=//p' "$record")" = "$expected" ] \
+    || fail "governed primary truncated escaped authorization_ref"
+  assert_file_contains "$task_dir/task/.workbench/actions/$instance.record" 'status=consumed'
+}
+
 test_governed_primary_revalidates_policy_after_authorization() {
   local task_dir out rc pending instance revision intent manifest auth hook state
   prepare_governed_fixture governed_final_gate; task_dir="$GOVERNED_TASK_DIR"
@@ -6517,6 +6552,111 @@ test_concurrent_writer_uses_complete_sealed_context_union() {
   [ ! -e "$third/task/codebases/shared-api" ] || fail "missing context created a worktree"
 }
 
+test_concurrent_policy_union_includes_competing_task_policy() {
+  local current competing claim policy digest registration state output set_digest
+  local registration_ref registration_digest union payload request intent actual rc current_claim
+  setup_writer_workbench writer_task_policy_union
+  prepare_writer_task writer_task_policy_union 29; current="$WRITER_TASK_DIR"
+  prepare_writer_task writer_task_policy_union 31; competing="$WRITER_TASK_DIR"
+  replace_writer_context "$competing" competing allow
+  claim="$(sed -n 's/^claim_id: *//p' "$competing/task/index.md")"
+  policy="$competing/task/.workbench/policy.conf"
+  printf '%s\n' 'schema=workbench-policy/v1' 'action.task.concurrent-write=deny' > "$policy"
+  digest="sha256:$(python3 - "$policy" <<'PY'
+import hashlib
+import sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+PY
+)"
+  registration="$competing/task/.workbench/policy-context/registration.json"
+  python3 - "$registration" "$digest" <<'PY'
+import json
+import sys
+
+path, digest = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    value = json.load(handle)
+receipt = {
+    "contract_version": "workbench-policy-authority-receipt/v1",
+    "authority_identity": "toolbox:authority/competing-task",
+    "authority_ref": "toolbox:policy/competing-task",
+    "authority_revision": "sha256:" + "b" * 64,
+    "policy_ref": "task/.workbench/policy.conf",
+    "policy_digest": digest,
+    "actor": "owner@example.com",
+    "issued_at": "2026-07-11T05:03:00Z",
+    "source_ref": "toolbox:approval/competing-task",
+}
+value["task_policy"] = {
+    "policy_ref": "task/.workbench/policy.conf",
+    "policy_digest": digest,
+    "authority_ref": "toolbox:policy/competing-task",
+    "authority_receipt": receipt,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  output="$(python3 "$CONTRACT_HELPER" context-set --registration-file "$registration" \
+    --workspace-root "$competing" --sealed true --changed true --format shell)"
+  set_digest="$(printf '%s\n' "$output" | sed -n 's/^digest=//p')"
+  registration_ref="$(printf '%s\n' "$output" | sed -n 's/^registration_ref=//p')"
+  registration_digest="$(printf '%s\n' "$output" | sed -n 's/^registration_digest=//p')"
+  state="$competing/task/.workbench/policy-context/state.record"
+  sed -e "s|^registration_ref=.*|registration_ref=$registration_ref|" \
+    -e "s|^registration_digest=.*|registration_digest=$registration_digest|" \
+    -e "s|^digest=.*|digest=$set_digest|" "$state" > "$state.next"
+  mv "$state.next" "$state"
+
+  union="$TMPDIR/writer_task_policy_union/union.manifest"
+  {
+    printf '%s\n' 'workbench-concurrent-context-union/v1'
+    printf 'context\t%s\t%s\t%s\t%s\n' "$claim" "$set_digest" "$competing" "$registration"
+  } > "$union"
+  current_claim="$(sed -n 's/^claim_id: *//p' "$current/task/index.md")"
+  payload="$TMPDIR/writer_task_policy_union/payload.txt"
+  python3 "$INTENT_HELPER" build-payload --contract workbench-writer-request/v1 \
+    --field operation_id=wop_task_policy_union --field claim_id=wc_task_policy_union \
+    --field owner=shared-api \
+    --field "branch=$(git -C "$current" branch --show-current)" \
+    --field expected_path=task/codebases/shared-api \
+    --field codebase_origin_url=https://github.com/example/shared-api.git \
+    --field "context_policy_set_digest=$(sed -n 's/^digest=//p' \
+      "$current/task/.workbench/policy-context/state.record")" \
+    --field conflict_revision=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    > "$payload"
+  request="$TMPDIR/writer_task_policy_union/request.json"
+  python3 "$INTENT_HELPER" build-request --action-id task.concurrent-write \
+    --task-claim-id "$current_claim" \
+    --target-ref workbench:codebase/shared-api \
+    --revision sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --payload-contract workbench-writer-request/v1 --payload-file "$payload" \
+    > "$request"
+  intent="$(python3 "$INTENT_HELPER" request "$request" --format shell \
+    | sed -n 's/^intent_digest=//p')"
+  if WORKBENCH_CONCURRENT_CONTEXTS_FILE="$union" \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_policy_in_dir writer_task_policy_union "$current" resolve --request-file "$request" \
+      --intent-digest "$intent" --format json \
+      > "$TMPDIR/writer_task_policy_union/resolution.json"; then
+    fail "concurrent policy union dropped a competing task-level deny"
+  else rc=$?; fi
+  [ "$rc" = 4 ] || fail "competing task policy deny returned $rc"
+  actual="$(cat "$TMPDIR/writer_task_policy_union/resolution.json")"
+  assert_contains "$actual" '"layer":"task"'
+  python3 - "$TMPDIR/writer_task_policy_union/resolution.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    sources = json.load(handle)["action_instance"]["policy_manifest"]["sources"]
+rank = {"platform": 0, "workspace": 1, "context": 2, "task": 3}
+keys = [(rank[item["layer"]], item["context_ref"] or "", item["authority_identity"], item["policy_ref"]) for item in sources]
+assert keys == sorted(keys), keys
+PY
+}
+
 test_terminal_writer_join_rejects_remote_claim_without_local_operation() {
   local task_dir actual operation_id operation_backup out rc
   setup_writer_workbench writer_bijection
@@ -6564,6 +6704,7 @@ run_case test_pack_deliverable_owner_binding_is_immutable_and_authorized
 run_case test_pack_acceptance_recovers_from_durable_primary
 run_case test_deliverable_governed_effect_is_single_bound_reasoned_and_resettable
 run_case test_required_check_waive_is_reasoned_revision_bound_and_idempotent
+run_case test_governed_authorization_ref_is_parsed_as_json
 run_case test_governed_primary_revalidates_policy_after_authorization
 run_case test_governed_primary_revalidates_local_preimage
 run_case test_governed_revalidation_does_not_recreate_missing_context
@@ -6635,6 +6776,7 @@ run_case test_lifecycle_parser_is_strict_trusted_and_key_order_independent
 run_case test_status_rejects_forged_current_v2_task_identity
 run_case test_kernel_acceptance_attempt_is_stable_and_crash_reducible
 run_case test_concurrent_writer_uses_complete_sealed_context_union
+run_case test_concurrent_policy_union_includes_competing_task_policy
 run_case test_terminal_writer_join_rejects_remote_claim_without_local_operation
 
 [ "$SOURCE_HEAD" = "$(git -C "$SOURCE_REPO" rev-parse HEAD)" ] || fail "test committed in source repo"

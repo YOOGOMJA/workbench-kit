@@ -6154,8 +6154,23 @@ write_terminal_outcome() {
 }
 
 json_string_field() {
-  local json="$1" key="$2"
-  printf '%s\n' "$json" | sed -n "s/.*\"$key\":\"\([^\"]*\)\".*/\1/p" | head -1
+  local json="$1" path="$2"
+  printf '%s\n' "$json" | python3 -c '
+import json
+import sys
+
+value = json.load(sys.stdin)
+for part in sys.argv[1].split("."):
+    value = value[int(part)] if isinstance(value, list) else value[part]
+if value is None:
+    print("")
+elif isinstance(value, bool):
+    print(str(value).lower())
+elif isinstance(value, (dict, list)):
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+else:
+    print(value)
+' "$path"
 }
 
 task_target_ref() {
@@ -6214,7 +6229,7 @@ resolve_governed_action() {
     "$policy_util" "${args[@]}")"; then rc=0; else rc=$?; fi
   rm -f "$request_file"
   GOVERNED_POLICY_OUTPUT="$output"; GOVERNED_POLICY_RC="$rc"
-  GOVERNED_ACTION_INSTANCE_ID="$(json_string_field "$output" id)"
+  GOVERNED_ACTION_INSTANCE_ID="$(json_string_field "$output" action_instance.id)"
   GOVERNED_INTENT_DIGEST="$intent_digest"
   GOVERNED_ACTION_RECORD_DIGEST=""
   if [ -n "$GOVERNED_ACTION_INSTANCE_ID" ]; then
