@@ -18,9 +18,11 @@ from workbench_lifecycle import (
     load_comment_observation,
     open_submission_lock,
     open_submission_directory,
+    parse_comment,
     parse_index,
     parse_v2,
     read_submission_recovery_at,
+    reduce_lifecycle_marker,
     submission_snapshot_index,
     validate_cleanup_revision,
     validate_recovery_snapshot,
@@ -615,6 +617,19 @@ def cmd_terminal_checkpoint_find_observation(args: argparse.Namespace) -> None:
     comments = load_comment_observation(
         args.observation_file, args.repository_origin_url, args.issue
     )
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    claim_actors: Dict[Tuple[str, str], str] = {}
+    for comment in comments:
+        for marker in parse_comment(
+            comment["body"], comment["author_identity"], args.issue
+        ):
+            if marker["task_contract"] != "workbench-task/v2":
+                continue
+            reduce_lifecycle_marker(groups, marker)
+            if marker["event"] == "task-claimed":
+                claim_actors[(marker["branch"], marker["claim_id"])] = marker[
+                    "actor"
+                ]
     for comment in comments:
         body = comment["body"]
         matches = list(TERMINAL_CHECKPOINT_MARKER.finditer(body))
@@ -672,6 +687,31 @@ def cmd_terminal_checkpoint_find_observation(args: argparse.Namespace) -> None:
             }
             if any(marker[field] != item for field, item in expected.items()):
                 raise ValueError("terminal checkpoint lifecycle binding mismatch")
+            key = (value["branch"], value["claim_id"])
+            group = groups.get(key)
+            other_live_claims = [
+                candidate
+                for candidate_key, candidate in groups.items()
+                if candidate_key != key
+                and candidate["branch"] == value["branch"]
+                and not candidate["conflicted"]
+            ]
+            if (
+                group is None
+                or group["conflicted"]
+                or group["phase"] != "terminal"
+                or other_live_claims
+            ):
+                raise ValueError("terminal checkpoint has no unique winning claim")
+            trusted_actor = claim_actors.get(key)
+            if trusted_actor is None or comment["author_identity"] != trusted_actor:
+                raise ValueError("terminal checkpoint actor does not own the winning claim")
+            action = value["terminal_action"]
+            if (
+                action["authorization_ref"]
+                and action["authorization_actor"] != trusted_actor
+            ):
+                raise ValueError("terminal checkpoint authorization actor is untrusted")
             values.append(value)
     if not values:
         raise LookupError("terminal checkpoint not found")
@@ -693,6 +733,21 @@ def cmd_terminal_checkpoint_field(args: argparse.Namespace) -> None:
         sys.stdout.write("\n")
     else:
         sys.stdout.write(str(item) + "\n")
+
+
+def cmd_terminal_checkpoint_project(args: argparse.Namespace) -> None:
+    value = validate_terminal_checkpoint(load_json(args.file))
+    if args.projection == "action-record":
+        sys.stdout.buffer.write(record_bytes(value["terminal_action"], ACTION_FIELDS))
+    else:
+        sys.stdout.write(
+            json.dumps(
+                value["terminal_request"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
 
 
 def immutable_binding(value: Mapping[str, Any]) -> str:
@@ -1226,6 +1281,12 @@ def parser() -> argparse.ArgumentParser:
     checkpoint_field.add_argument("file")
     checkpoint_field.add_argument("field")
     checkpoint_field.set_defaults(func=cmd_terminal_checkpoint_field)
+    checkpoint_project = commands.add_parser("terminal-checkpoint-project")
+    checkpoint_project.add_argument("file")
+    checkpoint_project.add_argument(
+        "projection", choices=("action-record", "request")
+    )
+    checkpoint_project.set_defaults(func=cmd_terminal_checkpoint_project)
     return root
 
 

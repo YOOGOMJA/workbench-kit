@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_REPO="$(git -C "$PLUGIN_ROOT" rev-parse --show-toplevel)"
@@ -153,6 +154,14 @@ case "${1:-} ${2:-}" in
     if [ -n "${GH_CLEANUP_RACE_DIRTY_WORKTREE:-}" ] \
       && grep -Fq '"stage":"prepared"' "$body_file"; then
       printf '%s\n' dirty-after-prepared > "$GH_CLEANUP_RACE_DIRTY_WORKTREE/RACE.txt"
+    fi
+    if [ -n "${GH_CLEANUP_RACE_COMMIT_WORKTREE:-}" ] \
+      && grep -Fq '"stage":"prepared"' "$body_file"; then
+      printf '%s\n' committed-after-prepared \
+        > "$GH_CLEANUP_RACE_COMMIT_WORKTREE/COMMITTED.txt"
+      git -C "$GH_CLEANUP_RACE_COMMIT_WORKTREE" add COMMITTED.txt
+      git -C "$GH_CLEANUP_RACE_COMMIT_WORKTREE" commit -q \
+        -m 'test: commit after prepared cleanup'
     fi
     if [ -n "${GH_CLEANUP_RACE_SYMLINK_WORKTREE:-}" ] \
       && [ -n "${GH_CLEANUP_RACE_SYMLINK_TARGET:-}" ] \
@@ -616,6 +625,7 @@ run_task_in_dir() {
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
+    GH_CLEANUP_RACE_COMMIT_WORKTREE="${GH_CLEANUP_RACE_COMMIT_WORKTREE:-}" \
     GH_PR_STATE="${GH_PR_STATE:-}" GH_PR_HEAD="${GH_PR_HEAD:-}" GH_PR_MERGE="${GH_PR_MERGE:-}" \
     WRITER_BARRIER_ID="${WRITER_BARRIER_ID:-}" \
     bash -c 'dir="$1"; shift; cd "$dir"; "$dir/utils/task" "$@"' bash "$dir" "$@"
@@ -3412,6 +3422,64 @@ test_cleanup_prepared_journal_failure_deletes_nothing() {
   if grep -Fq 'workbench-task-cleanup:v1' "$TMPDIR/cleanup_prepared_failure/comments/29.comments"; then
     fail "failed prepared journal must not appear durable"
   fi
+}
+
+test_cleanup_revalidates_outer_task_before_forced_removal() {
+  local out retry branch rc comments recovered
+  prepare_cleanup_fixture cleanup_outer_dirty_race
+  branch="task/29-v2-lifecycle-fixture-29"
+  comments="$TMPDIR/cleanup_outer_dirty_race/comments/29.comments"
+  out="$TMPDIR/cleanup_outer_dirty_race/first.out"
+  if GH_CLEANUP_RACE_DIRTY_WORKTREE="$CLEANUP_TASK_DIR" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_outer_dirty_race "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup deleted outer task bytes created after its prepared journal"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "outer dirty cleanup race returned $rc"
+  assert_file_contains "$out" '"code":"dirty-task-worktree"'
+  [ -f "$CLEANUP_TASK_DIR/RACE.txt" ] || fail "outer dirty cleanup race lost user bytes"
+  assert_file_contains "$comments" '"stage":"prepared"'
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "outer dirty cleanup race removed the task workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "outer dirty cleanup race removed the local branch"
+
+  rm -f "$CLEANUP_TASK_DIR/RACE.txt"
+  recovered="$CLEANUP_TASK_DIR/task/.workbench/actions/RECOVERED.record"
+  printf '%s\n' recovered-after-crash > "$recovered"
+  retry="$TMPDIR/cleanup_outer_dirty_race/retry.out"
+  if WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_outer_dirty_race "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$retry" 2>&1; then
+    fail "prepared cleanup retry deleted newly recovered user bytes"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "outer dirty cleanup retry returned $rc"
+  assert_file_contains "$retry" '"code":"dirty-task-worktree"'
+  [ -f "$recovered" ] || fail "prepared cleanup retry lost recovered action bytes"
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "prepared cleanup retry removed the task workspace"
+}
+
+test_cleanup_revalidates_clean_head_after_prepared_journal() {
+  local out branch rc
+  prepare_cleanup_fixture cleanup_outer_clean_race
+  branch="task/29-v2-lifecycle-fixture-29"
+  out="$TMPDIR/cleanup_outer_clean_race/done.out"
+  if GH_CLEANUP_RACE_COMMIT_WORKTREE="$CLEANUP_TASK_DIR" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_outer_clean_race "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup deleted a clean commit created after its prepared journal"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "outer clean cleanup race returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-ownership-mismatch"'
+  [ -f "$CLEANUP_TASK_DIR/COMMITTED.txt" ] \
+    || fail "outer clean cleanup race lost committed user bytes"
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "outer clean cleanup race removed the task workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "outer clean cleanup race removed the local branch"
 }
 
 test_cleanup_rejects_untrusted_prepared_journal() {
@@ -6230,6 +6298,7 @@ test_v2_terminal_checkpoint_rejects_adversarial_observations() {
       --repository "$SUBMISSION_REPO" --issue 29 --format json > "$valid"
   python3 - "$valid" "$TMPDIR/submit_checkpoint_adversarial" <<'PY'
 import copy
+import hashlib
 import json
 import pathlib
 import re
@@ -6268,6 +6337,22 @@ observed["comments"][index]["author_identity"] = "attacker@example.invalid"
 with open(target / "adversarial-wrong-author.json", "w", encoding="utf-8") as handle:
     json.dump(observed, handle, separators=(",", ":")); handle.write("\n")
 
+observed = copy.deepcopy(source)
+observed["comments"][index]["author_identity"] = "attacker@example.invalid"
+lifecycle_pattern = re.compile(r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->")
+lifecycle_match = lifecycle_pattern.search(body)
+assert lifecycle_match is not None
+lifecycle = json.loads(lifecycle_match.group(1))
+lifecycle["actor"] = "attacker@example.invalid"
+forged_lifecycle = json.dumps(lifecycle, separators=(",", ":"))
+observed["comments"][index]["body"] = (
+    body[:lifecycle_match.start(1)]
+    + forged_lifecycle
+    + body[lifecycle_match.end(1):]
+)
+with open(target / "adversarial-self-authored-terminal.json", "w", encoding="utf-8") as handle:
+    json.dump(observed, handle, separators=(",", ":")); handle.write("\n")
+
 emit("duplicate", checkpoint, body[:match.end()] + "\n" + marker + body[match.end():])
 observed = copy.deepcopy(source)
 terminal_body = body[:match.start()] + body[match.end():]
@@ -6283,6 +6368,16 @@ value = copy.deepcopy(checkpoint); value["terminal"]["revision"] = "sha256:" + "
 emit("terminal", value)
 value = copy.deepcopy(checkpoint); value["terminal_action"]["intent_digest"] = "sha256:" + "2" * 64
 emit("action", value)
+value = copy.deepcopy(checkpoint)
+for item in (value["terminal"], value["terminal_action"]):
+    item["policy_manifest_digest"] = "sha256:" + "5" * 64
+terminal_record = "".join(
+    "{}={}\n".format(key, item) for key, item in value["terminal"].items()
+).encode("utf-8")
+primary_digest = "sha256:" + hashlib.sha256(terminal_record).hexdigest()
+value["terminal_primary_digest"] = primary_digest
+value["terminal_action"]["consumed_provenance_digest"] = primary_digest
+emit("policy", value)
 value = copy.deepcopy(checkpoint)
 value["terminal_request"]["payload"] = value["terminal_request"]["payload"].replace(
     value["terminal"]["revision"], "sha256:" + "3" * 64
@@ -6311,7 +6406,7 @@ PY
 
   before="$(grep -c 'workbench-task-cleanup:v1' "$comments" || true)"
   rm -rf "$SUBMISSION_REPO"
-  for mode in wrong-author duplicate split malformed terminal action request claim descriptor \
+  for mode in wrong-author self-authored-terminal duplicate split malformed terminal action policy request claim descriptor \
     pr-head pr-url at top-order terminal-order action-order request-order; do
     observation="$TMPDIR/submit_checkpoint_adversarial/adversarial-$mode.json"
     clone="$TMPDIR/submit_checkpoint_adversarial/device-$mode"
@@ -6859,6 +6954,8 @@ run_case test_terminal_outcome_freezes_mutations_and_verification_is_read_only
 run_case test_terminal_lifecycle_rejects_post_terminal_reactivation
 run_case test_forged_local_terminal_has_no_freeze_or_outcome_authority
 run_case test_cleanup_prepared_journal_failure_deletes_nothing
+run_case test_cleanup_revalidates_outer_task_before_forced_removal
+run_case test_cleanup_revalidates_clean_head_after_prepared_journal
 run_case test_cleanup_rejects_untrusted_prepared_journal
 run_case test_cleanup_rejects_prepared_journal_without_terminal_action_join
 run_case test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion

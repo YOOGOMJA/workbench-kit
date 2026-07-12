@@ -2,6 +2,7 @@
 # Deterministic canonical policy resolution. This utility never prompts.
 set -euo pipefail
 export LC_ALL=C
+export PYTHONDONTWRITEBYTECODE=1
 
 usage_error() { echo "error: $*" >&2; exit 2; }
 integrity_error() { echo "error: $*" >&2; exit 1; }
@@ -690,6 +691,57 @@ cmd_revalidate() {
     || integrity_error "action-binding-stale"
 }
 
+cmd_revalidate_terminal_checkpoint() {
+  [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
+  local action_file="" request_file="" parsed key value authorization
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --action-file) action_file="$2"; shift 2 ;;
+      --request-file) request_file="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ -f "$action_file" ] && [ -f "$request_file" ] \
+    || integrity_error "terminal checkpoint provenance is unavailable"
+  TOP="$(task_root)"; ROOT="$(workspace_root)"
+  ACTION_ID="$(record_get "$action_file" action_id)"
+  CLAIM_ID="$(record_get "$action_file" task_claim_id)"
+  TARGET_REF="$(record_get "$action_file" target_ref)"
+  REVISION="$(record_get "$action_file" revision)"
+  INTENT_DIGEST="$(record_get "$action_file" intent_digest)"
+  REQUEST_FILE="$request_file"
+  case "$ACTION_ID" in task.complete|task.abandon) ;; *) integrity_error "terminal checkpoint action is unsupported" ;; esac
+  [ "$(index_get claim_id)" = "$CLAIM_ID" ] || integrity_error "task claim binding mismatch"
+  [ "$(record_get "$action_file" status)" = consumed ] \
+    || integrity_error "terminal checkpoint action is not consumed"
+  parsed="$(python3 "$(intent_helper)" request "$request_file" \
+    --intent-digest "$INTENT_DIGEST" --format shell)" \
+    || integrity_error "terminal checkpoint request is invalid"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      action_id) [ "$value" = "$ACTION_ID" ] || integrity_error "action-binding-stale" ;;
+      task_claim_id) [ "$value" = "$CLAIM_ID" ] || integrity_error "action-binding-stale" ;;
+      target_ref) [ "$value" = "$TARGET_REF" ] || integrity_error "action-binding-stale" ;;
+      subject_revision) [ "$value" = "$REVISION" ] || integrity_error "action-binding-stale" ;;
+      intent_digest) [ "$value" = "$INTENT_DIGEST" ] || integrity_error "action-binding-stale" ;;
+    esac
+  done <<< "$parsed"
+  authorization="$(record_get "$action_file" authorization_id)$(record_get "$action_file" authorization_ref)$(record_get "$action_file" authorization_actor)$(record_get "$action_file" authorization_at)"
+  if [ -n "$authorization" ]; then
+    [ -n "$(record_get "$action_file" authorization_id)" ] \
+      && [ -n "$(record_get "$action_file" authorization_ref)" ] \
+      && [ -n "$(record_get "$action_file" authorization_actor)" ] \
+      && [ -n "$(record_get "$action_file" authorization_at)" ] \
+      || integrity_error "terminal checkpoint authorization is partial"
+  fi
+  POLICY_REVALIDATING=true build_policy_manifest
+  [ "$(record_get "$action_file" policy_manifest_digest)" = "$POLICY_MANIFEST_DIGEST" ] \
+    || integrity_error "action-binding-stale"
+  [ "$POLICY_DECISION" != deny ] || integrity_error "terminal checkpoint policy is denied"
+  [ -n "$authorization" ] || [ "$POLICY_DECISION" = allow ] \
+    || integrity_error "terminal checkpoint authorization is required"
+}
+
 cmd_invalidate_context() {
   [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
   local claim_id="" target_ref="" file status
@@ -760,6 +812,7 @@ cmd_consume() {
 case "${1:-}" in
   resolve) shift; cmd_resolve "$@" ;;
   revalidate) shift; cmd_revalidate "$@" ;;
+  revalidate-terminal-checkpoint) shift; cmd_revalidate_terminal_checkpoint "$@" ;;
   invalidate-context) shift; cmd_invalidate_context "$@" ;;
   consume) shift; cmd_consume "$@" ;;
   *) usage_error "usage: workbench policy resolve ..." ;;

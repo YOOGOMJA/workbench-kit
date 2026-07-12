@@ -2089,6 +2089,144 @@ def cmd_cleanup_descriptor(args: argparse.Namespace) -> None:
     write_json(descriptor)
 
 
+def cleanup_task_content_digest(task_path: str, mutable_action_id: str) -> str:
+    digest = hashlib.sha256()
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    file_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        file_flags |= os.O_NOFOLLOW
+
+    def update(kind: str, relative: str, value: os.stat_result) -> None:
+        size = value.st_size if kind == "file" else 0
+        row = json.dumps(
+            [kind, relative, stat.S_IMODE(value.st_mode), size],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(row).to_bytes(8, "big"))
+        digest.update(row)
+
+    def walk(directory: int, prefix: str) -> None:
+        for name in sorted(os.listdir(directory), key=lambda item: os.fsencode(item)):
+            relative = name if not prefix else prefix + "/" + name
+            if relative in (
+                ".git",
+                "task/codebases",
+                "task/.workbench/actions/{}.record".format(mutable_action_id),
+            ):
+                continue
+            value = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(value.st_mode):
+                update("directory", relative, value)
+                child = os.open(name, directory_flags, dir_fd=directory)
+                try:
+                    observed = os.fstat(child)
+                    if (observed.st_dev, observed.st_ino) != (
+                        value.st_dev,
+                        value.st_ino,
+                    ):
+                        raise ValueError("cleanup task directory changed during inspection")
+                    walk(child, relative)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(value.st_mode):
+                update("file", relative, value)
+                child = os.open(name, file_flags, dir_fd=directory)
+                try:
+                    observed = os.fstat(child)
+                    if (observed.st_dev, observed.st_ino) != (
+                        value.st_dev,
+                        value.st_ino,
+                    ):
+                        raise ValueError("cleanup task file changed during inspection")
+                    while True:
+                        chunk = os.read(child, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    final = os.fstat(child)
+                    if (
+                        final.st_size != value.st_size
+                        or final.st_mtime_ns != value.st_mtime_ns
+                    ):
+                        raise ValueError("cleanup task file changed during inspection")
+                finally:
+                    os.close(child)
+            elif stat.S_ISLNK(value.st_mode):
+                update("symlink", relative, value)
+                target = os.fsencode(os.readlink(name, dir_fd=directory))
+                digest.update(len(target).to_bytes(8, "big"))
+                digest.update(target)
+            else:
+                raise ValueError("cleanup task contains an unsupported file type")
+
+    root = os.open(task_path, directory_flags)
+    try:
+        root_value = os.fstat(root)
+        update("directory", ".", root_value)
+        walk(root, "")
+    finally:
+        os.close(root)
+    return "sha256:" + digest.hexdigest()
+
+
+def cmd_cleanup_task_descriptor(args: argparse.Namespace) -> None:
+    if not os.path.isabs(args.workspace_root):
+        raise ValueError("workspace root must be absolute")
+    if (
+        re.fullmatch(r"act_[A-Za-z0-9][A-Za-z0-9._-]*", args.mutable_action_id)
+        is None
+    ):
+        raise ValueError("cleanup mutable action ID is invalid")
+    root_raw = os.path.normpath(args.workspace_root)
+    root = Path(root_raw)
+    expected = os.path.join(root_raw, ".worktrees", args.branch.replace("/", "__"))
+    task_arg = os.path.normpath(args.task_dir)
+    if task_arg != expected:
+        raise ValueError("cleanup task path does not bind its branch")
+    task_lexical, task_real = exact_managed_path(root, task_arg, "task workspace")
+    task_common, task_common_real = exact_git_path(
+        root, task_arg, "--git-common-dir", "task common directory"
+    )
+    root_common, root_common_real = exact_git_path(
+        root, root_raw, "--git-common-dir", "workspace common directory"
+    )
+    if (task_common, task_common_real) != (root_common, root_common_real):
+        raise ValueError("cleanup task does not use the workspace common directory")
+    task_git_dir, task_git_dir_real = exact_git_path(
+        root, task_arg, "--git-dir", "task git directory"
+    )
+    if git_value(Path(task_arg), "symbolic-ref", "--short", "HEAD") != args.branch:
+        raise ValueError("cleanup task branch changed")
+    if git_value(Path(task_arg), "remote", "get-url", "origin") != args.origin_url:
+        raise ValueError("cleanup task origin changed")
+    exact_worktree_record(root_raw, task_arg, args.branch)
+    head = git_value(Path(task_arg), "rev-parse", "HEAD")
+    if OID.fullmatch(head) is None:
+        raise ValueError("cleanup task head is invalid")
+    write_json(
+        {
+            "contract_version": "workbench-cleanup-task-ownership/v1",
+            "lexical_path": task_lexical,
+            "real_path": task_real,
+            "workspace_common_dir": root_common,
+            "workspace_common_dir_real": root_common_real,
+            "task_common_dir": task_common,
+            "task_common_dir_real": task_common_real,
+            "task_git_dir": task_git_dir,
+            "task_git_dir_real": task_git_dir_real,
+            "branch": args.branch,
+            "origin_url": args.origin_url,
+            "head_revision": head,
+            "content_digest": cleanup_task_content_digest(
+                task_arg, args.mutable_action_id
+            ),
+        }
+    )
+
+
 def parse_worktree_porcelain(file: str) -> List[Dict[str, Any]]:
     with open(file, "rb") as handle:
         raw = handle.read()
@@ -2221,6 +2359,13 @@ def parser() -> argparse.ArgumentParser:
     cleanup_descriptor.add_argument("--operation-file", required=True)
     cleanup_descriptor.add_argument("--codebase-branch", required=True)
     cleanup_descriptor.set_defaults(func=cmd_cleanup_descriptor)
+    cleanup_task_descriptor = commands.add_parser("cleanup-task-descriptor")
+    cleanup_task_descriptor.add_argument("--workspace-root", required=True)
+    cleanup_task_descriptor.add_argument("--task-dir", required=True)
+    cleanup_task_descriptor.add_argument("--branch", required=True)
+    cleanup_task_descriptor.add_argument("--origin-url", required=True)
+    cleanup_task_descriptor.add_argument("--mutable-action-id", required=True)
+    cleanup_task_descriptor.set_defaults(func=cmd_cleanup_task_descriptor)
     operation_status = commands.add_parser("operation-status")
     operation_status.add_argument("--operation-file", required=True)
     operation_status.add_argument("--ledger-file", required=True)

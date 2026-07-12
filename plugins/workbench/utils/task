@@ -5612,10 +5612,14 @@ current_task_identity() {
 }
 
 activate_v2_task_once() {
-  local latest event recovered=false reactivation_revision
+  local operation="${1:-}" latest event recovered=false reactivation_revision
   latest="$(lifecycle_latest_for_branch "$CURRENT_ROOT" "$CURRENT_HOME" \
     "$CURRENT_ISSUE" "$CURRENT_BRANCH" 2>/dev/null)" || return 1
   event="$(lifecycle_field "$latest" event)"
+  if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ] \
+    && [ "$operation" = task.deliverable.accept ]; then
+    case "$event" in task-submitted|task-verified) return 0 ;; esac
+  fi
   case "$event" in
     task-active)
       submission_recovery_reactivate "$TASK_DIR" "$CURRENT_BRANCH" "$CURRENT_CLAIM_ID" \
@@ -5660,7 +5664,7 @@ require_mutable_task() {
       "$(json_escape "$operation")" "$(json_escape "$(record_get "$terminal" action_instance_id)")"
     return 1
   fi
-  activate_v2_task_once
+  activate_v2_task_once "$operation"
 }
 
 validate_tracked_v2_records() {
@@ -6356,6 +6360,25 @@ terminal_checkpoint_field() {
   python3 "$(cleanup_contract_helper)" terminal-checkpoint-field "$1" "$2"
 }
 
+terminal_checkpoint_revalidate_policy() {
+  local checkpoint="$1" dir="$2" helper policy_util action request
+  helper="$(cleanup_contract_helper)"
+  policy_util="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/policy"
+  action="$(mktemp "${TMPDIR:-/tmp}/workbench-terminal-action.XXXXXX")"
+  request="$(mktemp "${TMPDIR:-/tmp}/workbench-terminal-request.XXXXXX")"
+  if ! python3 "$helper" terminal-checkpoint-project "$checkpoint" action-record \
+      > "$action" \
+    || ! python3 "$helper" terminal-checkpoint-project "$checkpoint" request \
+      > "$request" \
+    || ! (cd "$dir" && WORKBENCH_INTERNAL=1 \
+      "$policy_util" revalidate-terminal-checkpoint \
+        --action-file "$action" --request-file "$request") >/dev/null 2>&1; then
+    rm -f "$action" "$request"
+    return 1
+  fi
+  rm -f "$action" "$request"
+}
+
 submission_terminal_checkpoint_recover() {
   local root="$1" dir="$2" branch="$3" checkpoint="$4"
   local descriptor origin default_ref default_branch snapshot cleanup pr pr_url outcome
@@ -6427,6 +6450,12 @@ submission_terminal_checkpoint_recover() {
     --checkpoint-file "$checkpoint" --repository "$dir" --branch "$branch" \
     --removal-plan-digest "$TERMINAL_REMOVAL_PLAN_DIGEST" \
     >/dev/null || return 1
+  if ! terminal_checkpoint_revalidate_policy "$checkpoint" "$dir"; then
+    python3 "$(lifecycle_helper)" submission-recovery-unrestore \
+      --repository "$dir" --branch "$branch" \
+      --claim-id "$SUBMISSION_RECOVERY_CLAIM_ID" >/dev/null || return 1
+    return 1
+  fi
   SUBMISSION_RECOVERY_ACTIVE=true
 }
 
@@ -6846,6 +6875,8 @@ cleanup_journal_emit() {
 cleanup_load_plan() {
   local journal_file="$1" helper operation claim disposition owner path
   helper="$(cleanup_contract_helper)"
+  CLEANUP_PLAN_ACTION_ID="$(python3 "$helper" field "$journal_file" action_instance_id)" \
+    || return 1
   CLEANUP_PLAN_WRITER_COUNT=0; CLEANUP_PLAN_COUNT=0
   CLEANUP_PLAN_OPERATION_IDS=(); CLEANUP_PLAN_WRITER_IDS=(); CLEANUP_PLAN_DISPOSITIONS=()
   CLEANUP_PLAN_WORKTREE_OPERATION_IDS=(); CLEANUP_PLAN_WORKTREE_CLAIM_IDS=()
@@ -7006,6 +7037,59 @@ cleanup_worktree_descriptor() {
     --workspace-origin-url "$origin" --task-dir "$dir" --worktree "$wt" \
     --clone "$clone" --operation-file "$operation_file" \
     --codebase-branch "$WRITER_CODEBASE_BRANCH"
+}
+
+cleanup_status_excluding_action() {
+  local dir="$1" action_id="$2" line path
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    if [ -n "$action_id" ]; then
+      case "$path" in
+        "task/.workbench/actions/$action_id.record"|\
+        "task/.workbench/actions/$action_id.request.json") continue ;;
+      esac
+    fi
+    printf '%s\n' "$line"
+  done < <(git -C "$dir" status --porcelain --untracked-files=all)
+}
+
+cleanup_verify_task_removal_preconditions() {
+  local root="$1" dir="$2" branch="$3" origin descriptor dirty wt name allowed path
+  CLEANUP_TASK_BLOCKER=""; CLEANUP_TASK_BLOCKER_REF=""
+  origin="$(canonical_workspace_origin_url "$root")" \
+    || { CLEANUP_TASK_BLOCKER=cleanup-ownership-mismatch; return 1; }
+  [ -n "${CLEANUP_PLAN_ACTION_ID:-}" ] \
+    || { CLEANUP_TASK_BLOCKER=cleanup-ownership-mismatch; return 1; }
+  descriptor="$(python3 "$(writer_helper)" cleanup-task-descriptor \
+    --workspace-root "$root" --task-dir "$dir" --branch "$branch" \
+    --origin-url "$origin" --mutable-action-id "$CLEANUP_PLAN_ACTION_ID" 2>/dev/null)" \
+    || { CLEANUP_TASK_BLOCKER=cleanup-ownership-mismatch; return 1; }
+  CLEANUP_TASK_DESCRIPTOR="$descriptor"
+  if git -C "$dir" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
+    allowed="task/.workbench/actions/$CLEANUP_PLAN_ACTION_ID.record"
+    dirty=""
+    git -C "$dir" diff --cached --quiet -- || dirty=staged
+    git -C "$dir" diff --quiet -- . ":(exclude)$allowed" || dirty=tracked
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      case "$path" in
+        "task/.workbench/actions/$CLEANUP_PLAN_ACTION_ID.record"|\
+        "task/.workbench/actions/$CLEANUP_PLAN_ACTION_ID.request.json") ;;
+        *) dirty=untracked ;;
+      esac
+    done < <(git -C "$dir" ls-files --others --exclude-standard)
+  else
+    dirty="$(git -C "$dir" status --porcelain --untracked-files=normal \
+      | grep -v '^?? task/$' || true)"
+  fi
+  [ -z "$dirty" ] || { CLEANUP_TASK_BLOCKER=dirty-task-worktree; return 1; }
+  for wt in "$dir"/task/codebases/*/; do
+    [ -d "$wt" ] || continue
+    name="$(basename "${wt%/}")"
+    [ -z "$(git -C "$wt" status --porcelain --untracked-files=all)" ] \
+      || { CLEANUP_TASK_BLOCKER=dirty-codebase-worktree; CLEANUP_TASK_BLOCKER_REF="$name"; return 1; }
+  done
 }
 
 cleanup_remove_local_writer_effects() {
@@ -7199,13 +7283,24 @@ cleanup_verify_external_writer_operations() {
 }
 
 cleanup_apply_removal_plan() {
-  local root="$1" dir="$2" branch="$3" journal_file="$4" i name
+  local root="$1" dir="$2" branch="$3" journal_file="$4" i name task_descriptor=""
   CLEANUP_REMOVED_WRITER_COUNT=0; CLEANUP_REMOVED_COUNT=0
   CLEANUP_REMOVED_OPERATION_IDS=(); CLEANUP_REMOVED_WRITER_IDS=(); CLEANUP_REMOVED_NAMES=()
   CLEANUP_TASK_WORKSPACE_REMOVED=false; CLEANUP_LOCAL_BRANCH_REMOVED=false
   if [ -L "$dir" ]; then
     cleanup_add_blocker cleanup-ownership-mismatch "$dir"
     return 1
+  fi
+  if [ -d "$dir" ] && ! cleanup_verify_task_removal_preconditions "$root" "$dir" "$branch"; then
+    cleanup_add_blocker "$CLEANUP_TASK_BLOCKER" "${CLEANUP_TASK_BLOCKER_REF:-$branch}"
+    return 1
+  fi
+  if [ -d "$dir" ]; then
+    task_descriptor="${CLEANUP_EXPECTED_TASK_DESCRIPTOR:-$CLEANUP_TASK_DESCRIPTOR}"
+    if [ "$CLEANUP_TASK_DESCRIPTOR" != "$task_descriptor" ]; then
+      cleanup_add_blocker cleanup-ownership-mismatch "$branch"
+      return 1
+    fi
   fi
 
   if [ "$CLEANUP_PLAN_WRITER_COUNT" -gt 0 ]; then
@@ -7228,6 +7323,14 @@ cleanup_apply_removal_plan() {
   done
 
   if [ -d "$dir" ]; then
+    if ! cleanup_verify_task_removal_preconditions "$root" "$dir" "$branch"; then
+      cleanup_add_blocker "$CLEANUP_TASK_BLOCKER" "${CLEANUP_TASK_BLOCKER_REF:-$branch}"
+      return 1
+    fi
+    if [ "$CLEANUP_TASK_DESCRIPTOR" != "$task_descriptor" ]; then
+      cleanup_add_blocker cleanup-ownership-mismatch "$branch"
+      return 1
+    fi
     git -C "$root" worktree remove --force "$dir" || return 1
   fi
   [ ! -d "$dir" ] || return 1
@@ -7332,6 +7435,12 @@ cmd_done_v2() {
     stage="$(python3 "$helper" field "$journal_file" stage)"
     cleanup_load_plan "$journal_file"
     [ "$remote_terminal" != true ] || retry_checkpoint="$checkpoint_file"
+    if [ -d "$dir" ] \
+      && ! cleanup_verify_task_removal_preconditions "$root" "$dir" "$branch"; then
+      cleanup_add_blocker "$CLEANUP_TASK_BLOCKER" "${CLEANUP_TASK_BLOCKER_REF:-$branch}"
+      rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
+        "$authorization_ref" "$revision" "$removal_plan" false false; return 1
+    fi
     if ! cleanup_validate_retry_snapshot "$root" "$dir" "$branch" "$journal_file" \
       "$retry_checkpoint"; then
       cleanup_add_blocker cleanup-journal-unreconciled "$branch"
@@ -7449,7 +7558,7 @@ cmd_done_v2() {
   if [ "$recovered_submission" = true ]; then
     dirty="$(git -C "$dir" status --porcelain | grep -v '^?? task/$' || true)"
   else
-    dirty="$(git -C "$dir" status --porcelain | grep -v ' task/.workbench/actions/' || true)"
+    dirty="$(cleanup_status_excluding_action "$dir" "$instance_id")"
   fi
   [ -z "$dirty" ] || cleanup_add_blocker dirty-task-worktree "$branch"
   for wt in "$dir"/task/codebases/*/; do
@@ -7542,6 +7651,14 @@ cmd_done_v2() {
   rm -f "$policy_file" "$plan_file"
   manifest="$(python3 "$helper" field "$journal_file" policy_manifest | sed -n 's/.*"digest":"\([^"]*\)".*/\1/p')"
   authorization_ref="$(python3 "$helper" field "$journal_file" authorization_ref)"
+  if ! cleanup_load_plan "$journal_file" \
+    || ! cleanup_verify_task_removal_preconditions "$root" "$dir" "$branch"; then
+    cleanup_add_blocker "${CLEANUP_TASK_BLOCKER:-cleanup-ownership-mismatch}" \
+      "${CLEANUP_TASK_BLOCKER_REF:-$branch}"
+    rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
+      "$authorization_ref" "$revision" "$removal_plan" false false; return 1
+  fi
+  CLEANUP_EXPECTED_TASK_DESCRIPTOR="$CLEANUP_TASK_DESCRIPTOR"
   if ! cleanup_journal_emit "$root" "$HOME_REPO" "$ISSUE" "$journal_file"; then
     cleanup_add_blocker cleanup-journal-unavailable "$branch"
     rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
@@ -7553,7 +7670,6 @@ cmd_done_v2() {
     rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
       "$authorization_ref" "$revision" "$removal_plan" false false; return 1
   fi
-  cleanup_load_plan "$journal_file"
   if ! cleanup_apply_removal_plan "$root" "$dir" "$branch" "$journal_file"; then
     [ "$CLEANUP_BLOCKER_COUNT" -gt 0 ] || cleanup_add_blocker cleanup-reconciliation-failed "$branch"
     task_workspace="$CLEANUP_TASK_WORKSPACE_REMOVED"; local_branch="$CLEANUP_LOCAL_BRANCH_REMOVED"

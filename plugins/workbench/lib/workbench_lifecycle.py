@@ -2457,6 +2457,47 @@ def cmd_submission_recovery_restore(args: argparse.Namespace) -> None:
         os.close(directory)
 
 
+def cmd_submission_recovery_unrestore(args: argparse.Namespace) -> None:
+    directory = open_submission_directory(args.repository, False)
+    if directory is None:
+        raise ValueError("submission recovery record is unavailable")
+    lock = -1
+    root = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        value = read_submission_recovery_at(directory, args.branch)
+        if value is None or value["stage"] != "restored":
+            raise ValueError("submission recovery is not restored")
+        if value["claim_id"] != args.claim_id:
+            raise ValueError("submission recovery claim changed")
+        validate_recovery_snapshot(args.repository, value)
+        validate_cleanup_revision(args.repository, value, value["cleanup_revision"])
+        validate_recovery_worktree(args.repository, value)
+        entries = snapshot_task_entries(args.repository, value["snapshot_revision"])
+        root = os.open(os.path.abspath(args.repository), secure_directory_flags())
+        validate_owned_directory(root, "worktree root")
+        validate_materialized_task(root, "task", entries)
+        temporary = submission_task_staging_name(value)
+        try:
+            os.stat(temporary, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("submission recovery staging is occupied")
+        rename_noreplace(root, "task", directory, temporary)
+        os.fsync(root); os.fsync(directory)
+        validate_materialized_task(directory, temporary, entries)
+        value["stage"] = "submitted"
+        write_submission_recovery_at(directory, args.branch, value)
+        sys.stdout.write("changed=true\n")
+    finally:
+        if root >= 0:
+            os.close(root)
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
 def codebases_parking_name(branch: str) -> str:
     return "submission-codebases-{}".format(
         hashlib.sha256(branch.encode("utf-8")).hexdigest()
@@ -3044,6 +3085,11 @@ def parser() -> argparse.ArgumentParser:
     recovery_restore.add_argument("--repository", required=True)
     recovery_restore.add_argument("--branch", required=True)
     recovery_restore.set_defaults(func=cmd_submission_recovery_restore)
+    recovery_unrestore = commands.add_parser("submission-recovery-unrestore")
+    recovery_unrestore.add_argument("--repository", required=True)
+    recovery_unrestore.add_argument("--branch", required=True)
+    recovery_unrestore.add_argument("--claim-id", required=True)
+    recovery_unrestore.set_defaults(func=cmd_submission_recovery_unrestore)
     recovery_codebases = commands.add_parser("submission-recovery-codebases")
     recovery_codebases.add_argument("--repository", required=True)
     recovery_codebases.add_argument("--branch", required=True)
