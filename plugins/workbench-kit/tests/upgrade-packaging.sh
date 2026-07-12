@@ -21,7 +21,10 @@ required = {
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
     "bin/workbench-kit",
+    "lib/workbench_kit_schema.py",
     "receipts/upgrade-runtime.json",
+    "schemas/README.md",
+    "schemas/requirements.txt",
     "skills/upgrade-workbench/SKILL.md",
     "skills/upgrade-workbench/agents/openai.yaml",
     "skills/upgrade-workbench/references/cli.md",
@@ -40,6 +43,12 @@ required.update({
 })
 missing = sorted(path for path in required if not (plugin / path).is_file())
 assert not missing, missing
+assert (plugin / "schemas/requirements.txt").read_text() == (
+    "jsonschema==4.25.1\nreferencing==0.36.2\n"
+)
+schema_readme = (plugin / "schemas/README.md").read_text()
+assert "load_schema_suite" in schema_readme
+assert "PYTHONPATH=lib" in schema_readme
 
 claude_manifest = json.loads(
     (plugin / ".claude-plugin/plugin.json").read_text(encoding="utf-8")

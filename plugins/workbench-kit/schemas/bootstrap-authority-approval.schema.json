@@ -16,7 +16,7 @@
   ],
   "properties": {
     "contract_version": { "const": "workbench-bootstrap-authority-approval/v1" },
-    "approval_id": { "type": "string", "minLength": 1 },
+    "approval_id": { "$ref": "#/$defs/printableAscii" },
     "proposed_descriptor": {
       "type": "object",
       "additionalProperties": false,
@@ -31,16 +31,16 @@
       ],
       "properties": {
         "contract_version": { "const": "workbench-workspace-authority/v1" },
-        "authority_identity": { "type": "string", "minLength": 1 },
-        "origin_url": { "type": "string", "minLength": 1 },
+        "authority_identity": { "$ref": "#/$defs/printableAscii" },
+        "origin_url": { "type": "string", "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git$" },
         "default_ref": { "type": "string", "pattern": "^(?!.*//)(?!.*(?:^|/)\\.\\.(?:/|$))refs/heads/[A-Za-z0-9._/-]+$" },
         "workspace_home": {
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
           "not": { "pattern": "^[0-9]+$" }
         },
-        "hosting_adapter": { "type": "string", "minLength": 1 },
-        "hosting_ref": { "type": "string", "minLength": 1 }
+        "hosting_adapter": { "$ref": "#/$defs/printableAscii" },
+        "hosting_ref": { "$ref": "#/$defs/printableAscii" }
       }
     },
     "default_revision": { "$ref": "#/$defs/oid" },
@@ -59,15 +59,16 @@
         "revision": { "$ref": "#/$defs/oid" },
         "direct_task_actor_writes": { "const": "blocked" },
         "verified_at": { "$ref": "#/$defs/timestamp" },
-        "evidence_ref": { "type": "string", "minLength": 1 }
+        "evidence_ref": { "$ref": "#/$defs/printableAscii" }
       }
     },
-    "actor": { "type": "string", "minLength": 1 },
+    "actor": { "$ref": "#/$defs/printableAscii" },
     "approved_at": { "$ref": "#/$defs/timestamp" },
-    "source_ref": { "type": "string", "minLength": 1 }
+    "source_ref": { "$ref": "#/$defs/printableAscii" }
   },
   "$defs": {
     "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "printableAscii": { "type": "string", "pattern": "^[\\u0020-\\u007E]+$" },
     "timestamp": {
       "type": "string",
       "format": "date-time",

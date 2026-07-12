@@ -7,19 +7,14 @@ command -v uv >/dev/null || {
   exit 1
 }
 PYTHONDONTWRITEBYTECODE=1 uv run --quiet \
-  --with-requirements "$ROOT/tests/requirements-schema.txt" \
+  --with-requirements "$ROOT/schemas/requirements.txt" \
   python3 - "$ROOT/lib" "$ROOT/schemas" <<'PY'
 import base64
-import binascii
 import copy
 import hashlib
 import json
 import pathlib
 import sys
-import unicodedata
-
-from jsonschema import Draft202012Validator, FormatChecker
-from referencing import Registry, Resource
 
 sys.path.insert(0, sys.argv[1])
 from workbench_kit_contracts import (
@@ -42,52 +37,23 @@ from workbench_kit_contracts import (
     validate_result,
     validate_journal,
 )
+from workbench_kit_schema import load_schema_suite
 
 SHA = "sha256:" + "a" * 64
 OID = "1" * 40
 schema_dir = pathlib.Path(sys.argv[2])
-schema_documents = {
-    path.name: json.loads(path.read_bytes())
-    for path in schema_dir.glob("*.schema.json")
-}
-schema_registry = Registry().with_resources(
-    (document["$id"], Resource.from_contents(document))
-    for document in schema_documents.values()
-)
-schema_format_checker = FormatChecker()
-
-
-@schema_format_checker.checks(
-    "canonical-base64", raises=(ValueError, binascii.Error)
-)
-def canonical_base64(value):
-    if not isinstance(value, str):
-        return True
-    decoded = base64.b64decode(value, validate=True)
-    return base64.b64encode(decoded).decode("ascii") == value
-
-
-@schema_format_checker.checks("nfc")
-def normalized_nfc(value):
-    return not isinstance(value, str) or unicodedata.normalize("NFC", value) == value
+schema_suite = load_schema_suite(schema_dir)
+schema_documents = schema_suite.documents
 
 
 def schema_accepts(filename, value):
-    validator = Draft202012Validator(
-        schema_documents[filename],
-        registry=schema_registry,
-        format_checker=schema_format_checker,
-    )
+    validator = schema_suite.validator(filename)
     errors = list(validator.iter_errors(value))
     assert not errors, (filename, errors[0].json_path, errors[0].message)
 
 
 def schema_rejects(filename, value):
-    validator = Draft202012Validator(
-        schema_documents[filename],
-        registry=schema_registry,
-        format_checker=schema_format_checker,
-    )
+    validator = schema_suite.validator(filename)
     assert list(validator.iter_errors(value)), filename
 
 unordered = {"z": 1, "a": {"y": 2, "b": 3}}
@@ -1105,11 +1071,46 @@ for filename, document in (
     ("migration-receipt.schema.json", migration_receipt),
     ("plugin-equivalence.schema.json", equivalence),
     ("removal-approval.schema.json", removal),
+    ("reviewed-overlay.schema.json", overlay),
     ("upgrade-plan.schema.json", changed),
     ("upgrade-result.schema.json", result),
     ("upgrade-journal.schema.json", journal),
 ):
     schema_accepts(filename, document)
+
+bad_overlay = copy.deepcopy(overlay)
+bad_overlay["content_base64"] = "AB=="
+bad_overlay["content_digest"] = canonical_digest(b"\x00", raw=True)
+rejected(lambda: parse_reviewed_overlay(canonical_bytes(bad_overlay)))
+schema_rejects("reviewed-overlay.schema.json", bad_overlay)
+
+bad_generator = copy.deepcopy(generator)
+bad_generator["header_base64"] = "AB=="
+bad_generator["receipt_digest"] = canonical_digest(
+    bad_generator, null_field="receipt_digest"
+)
+rejected(lambda: validate_generator_receipt(bad_generator))
+schema_rejects("generator-receipt.schema.json", bad_generator)
+
+bad_authority = copy.deepcopy(authority)
+bad_authority["actor"] = "bad\nactor"
+rejected(lambda: parse_authority_approval(canonical_bytes(bad_authority)))
+schema_rejects("bootstrap-authority-approval.schema.json", bad_authority)
+
+bad_equivalence = copy.deepcopy(equivalence)
+bad_equivalence["legacy_source"]["source_ref"] = "bad\nsource"
+rejected(lambda: validate_equivalence_receipt(bad_equivalence))
+schema_rejects("plugin-equivalence.schema.json", bad_equivalence)
+
+bad_removal = copy.deepcopy(removal)
+bad_removal["actor"] = "actor:\uc124\uacc4"
+rejected(lambda: validate_removal_approval(bad_removal))
+schema_rejects("removal-approval.schema.json", bad_removal)
+
+bad_generation = copy.deepcopy(generation_receipt)
+bad_generation["artifacts"][0]["path"] = "Cafe\u0301"
+rejected(lambda: validate_generation_receipt(bad_generation))
+schema_rejects("generation-receipt.schema.json", bad_generation)
 
 bad_schema_plan = copy.deepcopy(changed)
 bad_schema_plan["changed"] = False

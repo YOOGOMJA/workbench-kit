@@ -7,21 +7,21 @@ command -v uv >/dev/null || {
   exit 1
 }
 PYTHONDONTWRITEBYTECODE=1 uv run --quiet \
-  --with-requirements "$ROOT/tests/requirements-schema.txt" \
-  python3 - "$ROOT/schemas" <<'PY'
+  --with-requirements "$ROOT/schemas/requirements.txt" \
+  python3 - "$ROOT/lib" "$ROOT/schemas" <<'PY'
 import copy
 import base64
-import binascii
 import json
 import pathlib
 import re
 import sys
-import unicodedata
 
-from jsonschema import Draft202012Validator, FormatChecker
-from referencing import Registry, Resource
+from jsonschema import Draft202012Validator
 
-schema_dir = pathlib.Path(sys.argv[1])
+sys.path.insert(0, sys.argv[1])
+from workbench_kit_schema import load_schema_suite
+
+schema_dir = pathlib.Path(sys.argv[2])
 contracts = {
     "bootstrap-authority-approval.schema.json": "workbench-bootstrap-authority-approval/v1",
     "generation-receipt.schema.json": "workbench-kit-generation-receipt/v1",
@@ -65,40 +65,16 @@ for filename, contract in contracts.items():
     assert document["properties"]["contract_version"] == {"const": contract}
     assert_closed_objects(document, filename)
 
-registry = Registry().with_resources(
-    (document["$id"], Resource.from_contents(document))
-    for document in documents.values()
-)
-format_checker = FormatChecker()
-
-
-@format_checker.checks("canonical-base64", raises=(ValueError, binascii.Error))
-def canonical_base64(value):
-    if not isinstance(value, str):
-        return True
-    decoded = base64.b64decode(value, validate=True)
-    return base64.b64encode(decoded).decode("ascii") == value
-
-
-@format_checker.checks("nfc")
-def normalized_nfc(value):
-    return not isinstance(value, str) or unicodedata.normalize("NFC", value) == value
+schema_suite = load_schema_suite(schema_dir)
+assert schema_suite.documents == documents
 
 
 def validator_for(filename):
-    return Draft202012Validator(
-        documents[filename], registry=registry, format_checker=format_checker
-    )
+    return schema_suite.validator(filename)
 
 
 def definition_accepts(filename, name, value):
-    wrapper = {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$ref": documents[filename]["$id"] + f"#/$defs/{name}",
-    }
-    validator = Draft202012Validator(
-        wrapper, registry=registry, format_checker=format_checker
-    )
+    validator = schema_suite.definition_validator(filename, name)
     return not list(validator.iter_errors(value))
 
 generation = json.loads((schema_dir / "generation-receipt.schema.json").read_bytes())
@@ -165,6 +141,7 @@ reserved_guards = {
     "^[tT][aA][sS][kK]/[cC][oO][dD][eE][bB][aA][sS][eE][sS](?:/|$)",
 }
 for path_schema in path_schemas:
+    assert path_schema["format"] == "nfc"
     assert {
         item["not"]["pattern"] for item in path_schema["allOf"]
     } == reserved_guards
@@ -179,6 +156,14 @@ for path_schema in path_schemas:
             for item in path_schema["allOf"]
         )
         assert not (base_match and guard_match), invalid
+for filename in (
+    "generation-receipt.schema.json",
+    "generator-receipt.schema.json",
+    "migration-receipt.schema.json",
+    "plugin-equivalence.schema.json",
+    "upgrade-plan.schema.json",
+):
+    assert not definition_accepts(filename, "path", "Cafe\u0301"), filename
 
 SHA = "sha256:" + "a" * 64
 OID = "1" * 40
@@ -212,6 +197,39 @@ for bad_ref in ("refs/heads/a/../b", "refs/heads/a//b"):
     candidate = copy.deepcopy(authority)
     candidate["proposed_descriptor"]["default_ref"] = bad_ref
     assert list(authority_validator.iter_errors(candidate)), bad_ref
+for field, invalid in (("actor", "bad\nactor"), ("source_ref", "source:\uc124\uacc4")):
+    candidate = copy.deepcopy(authority)
+    candidate[field] = invalid
+    assert list(authority_validator.iter_errors(candidate)), (field, invalid)
+
+overlay = {
+    "contract_version": "workbench-kit-reviewed-overlay/v1",
+    "review_id": "review-schema",
+    "content_base64": base64.b64encode(b"reviewed\n").decode("ascii"),
+    "content_digest": SHA,
+    "actor": "github:user/example",
+    "reviewed_at": "2026-07-11T00:00:00Z",
+    "source_ref": "github:review/example",
+}
+overlay_validator = validator_for("reviewed-overlay.schema.json")
+assert not list(overlay_validator.iter_errors(overlay))
+plain_overlay_validator = Draft202012Validator(
+    documents["reviewed-overlay.schema.json"]
+)
+assert list(plain_overlay_validator.iter_errors({**overlay, "content_base64": "AB=="}))
+assert list(plain_overlay_validator.iter_errors({**overlay, "actor": "bad\nactor"}))
+assert not list(plain_overlay_validator.iter_errors({
+    **overlay,
+    "content_base64": base64.b64encode(b"no-newline").decode("ascii"),
+}))
+for invalid in (
+    {**overlay, "content_base64": "AB=="},
+    {**overlay, "content_base64": base64.b64encode(b"no-newline").decode("ascii")},
+    {**overlay, "content_base64": base64.b64encode(b"\xff\n").decode("ascii")},
+    {**overlay, "actor": "bad\nactor"},
+    {**overlay, "source_ref": "source:\uc124\uacc4"},
+):
+    assert list(overlay_validator.iter_errors(invalid)), invalid
 
 absent_provenance = {
     "kind": None, "state": "absent", "receipt_digest": None, "ref": None,

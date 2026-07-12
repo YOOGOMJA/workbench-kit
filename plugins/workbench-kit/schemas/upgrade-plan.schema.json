@@ -129,6 +129,7 @@
       "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
     },
     "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "text": { "type": "string", "pattern": "^[^\\u0000-\\u001F\\u007F]+$" },
     "nullableOid": {
       "oneOf": [{ "$ref": "#/$defs/oid" }, { "type": "null" }]
     },
@@ -184,7 +185,7 @@
         "kind": { "enum": ["generation", "migration", null] },
         "state": { "enum": ["absent", "valid", "stale", "invalid"] },
         "receipt_digest": { "$ref": "#/$defs/nullableDigest" },
-        "ref": { "type": ["string", "null"] }
+        "ref": { "oneOf": [{ "$ref": "#/$defs/text" }, { "type": "null" }] }
       },
       "allOf": [
         {
@@ -223,10 +224,10 @@
       "additionalProperties": false,
       "required": ["task_id", "claim_id", "task_contract", "branch", "index_digest"],
       "properties": {
-        "task_id": { "type": "string", "minLength": 1 },
-        "claim_id": { "type": "string", "minLength": 1 },
+        "task_id": { "$ref": "#/$defs/text" },
+        "claim_id": { "$ref": "#/$defs/text" },
         "task_contract": { "enum": ["workbench-task/v1", "workbench-task/v2"] },
-        "branch": { "type": "string", "minLength": 1 },
+        "branch": { "$ref": "#/$defs/text" },
         "index_digest": { "$ref": "#/$defs/digest" }
       }
     },
@@ -241,7 +242,7 @@
         "migration_task"
       ],
       "properties": {
-        "root": { "type": "string", "pattern": "^/" },
+        "root": { "type": "string", "pattern": "^/[^\\u0000-\\u001F\\u007F]*$" },
         "source_revision": { "$ref": "#/$defs/oid" },
         "default_revision": { "$ref": "#/$defs/oid" },
         "source_tree_digest": {
@@ -411,13 +412,13 @@
       "properties": {
         "source": { "const": "legacy-inventory:homes[].claims" },
         "home": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
-        "claim_id": { "type": "string", "minLength": 1 },
-        "task_claim_id": { "type": "string", "minLength": 1 },
+        "claim_id": { "$ref": "#/$defs/text" },
+        "task_claim_id": { "$ref": "#/$defs/text" },
         "task_contract": { "const": "workbench-task/v1" },
         "issue": { "type": "integer", "minimum": 1 },
         "parent": { "type": ["integer", "null"], "minimum": 1 },
-        "branch": { "type": "string", "minLength": 1 },
-        "lifecycle_state": { "type": "string", "minLength": 1 },
+        "branch": { "$ref": "#/$defs/text" },
+        "lifecycle_state": { "$ref": "#/$defs/text" },
         "lifecycle_digest": { "$ref": "#/$defs/digest" },
         "source_revision": { "$ref": "#/$defs/oid" },
         "pr_head_revision": { "$ref": "#/$defs/nullableOid" },
@@ -444,7 +445,11 @@
         "node_type": { "enum": ["file", "symlink"] },
         "mode": { "enum": ["100644", "100755", "120000"] },
         "digest": { "$ref": "#/$defs/digest" },
-        "link_target": { "type": ["string", "null"] }
+        "link_target": {
+          "type": ["string", "null"],
+          "format": "nfc",
+          "pattern": "^(?!/)(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$"
+        }
       },
       "allOf": [
         {
@@ -499,14 +504,18 @@
           "oneOf": [
             {
               "type": "string",
-              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?$",
               "format": "canonical-base64",
               "contentEncoding": "base64"
             },
             { "type": "null" }
           ]
         },
-        "link_target": { "type": ["string", "null"] },
+        "link_target": {
+          "type": ["string", "null"],
+          "format": "nfc",
+          "pattern": "^(?!/)(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$"
+        },
         "source_ref": { "type": "string", "pattern": "^[\\u0020-\\u007E]+$" },
         "source_digest": { "$ref": "#/$defs/digest" }
       },
@@ -546,7 +555,9 @@
         "after_mode": { "enum": ["100644", "100755", "120000", null] },
         "after_digest": { "$ref": "#/$defs/nullableDigest" },
         "artifact_source_digest": { "$ref": "#/$defs/nullableDigest" },
-        "equivalence_receipt_ref": { "type": ["string", "null"] }
+        "equivalence_receipt_ref": {
+          "oneOf": [{ "$ref": "#/$defs/text" }, { "type": "null" }]
+        }
       },
       "allOf": [
         {
@@ -625,8 +636,8 @@
       "additionalProperties": false,
       "required": ["code", "ref"],
       "properties": {
-        "code": { "type": "string", "minLength": 1 },
-        "ref": { "type": "string", "minLength": 1 }
+        "code": { "$ref": "#/$defs/text" },
+        "ref": { "$ref": "#/$defs/text" }
       }
     }
   }
