@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -803,6 +808,398 @@ def cmd_ledger_validate(args: argparse.Namespace) -> None:
             "contract_version": "workbench-writer-ledger-validation/v1",
             "digest": sha256(raw),
             "events": len(rows),
+        }
+    )
+
+
+def git_bytes(repository: str, *arguments: str) -> bytes:
+    environment = dict(os.environ)
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return subprocess.check_output(
+        ["git", "-C", repository, *arguments],
+        stderr=subprocess.DEVNULL,
+        env=environment,
+    )
+
+
+def coordination_commit(repository: str, oid: str) -> Tuple[str, List[str]]:
+    if git_bytes(repository, "cat-file", "-t", oid).strip() != b"commit":
+        raise ValueError("writer coordination history contains a non-commit object")
+    raw = git_bytes(repository, "cat-file", "-p", oid)
+    header = raw.split(b"\n\n", 1)[0].splitlines()
+    trees = [line[5:].decode("ascii") for line in header if line.startswith(b"tree ")]
+    parents = [line[7:].decode("ascii") for line in header if line.startswith(b"parent ")]
+    if len(trees) != 1 or len(parents) > 1:
+        raise ValueError("writer coordination history is not a single-parent chain")
+    return trees[0], parents
+
+
+def coordination_descends_from(repository: str, tip: str, anchor: str) -> bool:
+    seen = set()
+    current = tip
+    while current not in seen:
+        if current == anchor:
+            return True
+        seen.add(current)
+        _, parents = coordination_commit(repository, current)
+        if not parents:
+            return False
+        current = parents[0]
+    raise ValueError("writer coordination history contains a cycle")
+
+
+def secure_directory_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    except AttributeError as exc:
+        raise ValueError("secure anchor directory operations are unavailable") from exc
+
+
+def secure_file_flags(access: int) -> int:
+    try:
+        return access | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    except AttributeError as exc:
+        raise ValueError("secure anchor file operations are unavailable") from exc
+
+
+def validate_anchor_inode(status: os.stat_result, kind: str) -> None:
+    if not stat.S_ISREG(status.st_mode):
+        raise ValueError("writer {} is not a regular file".format(kind))
+    if status.st_nlink != 1:
+        raise ValueError("writer {} must have exactly one link".format(kind))
+    if status.st_uid != os.geteuid() or status.st_mode & 0o022:
+        raise ValueError("writer {} ownership or mode is unsafe".format(kind))
+
+
+def open_anchor_directory(common_dir: str, create: bool) -> Optional[int]:
+    common = os.open(common_dir, secure_directory_flags())
+    created = False
+    try:
+        if create:
+            try:
+                os.mkdir("workbench-v2", 0o700, dir_fd=common)
+                created = True
+                os.fsync(common)
+            except FileExistsError:
+                pass
+        try:
+            directory = os.open(
+                "workbench-v2", secure_directory_flags(), dir_fd=common
+            )
+        except FileNotFoundError:
+            if create:
+                raise
+            return None
+    finally:
+        os.close(common)
+    status = os.fstat(directory)
+    if not stat.S_ISDIR(status.st_mode):
+        os.close(directory)
+        raise ValueError("writer anchor parent is not a directory")
+    if status.st_uid != os.geteuid() or status.st_mode & 0o022:
+        os.close(directory)
+        raise ValueError("writer anchor parent ownership or mode is unsafe")
+    if created:
+        os.fchmod(directory, 0o700)
+        os.fsync(directory)
+    return directory
+
+
+def open_anchor_lock(directory: int) -> int:
+    name = "writer-coordination-anchor.lock"
+    flags = secure_file_flags(os.O_RDWR)
+    lock = -1
+    for _ in range(8):
+        try:
+            lock = os.open(
+                name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory
+            )
+            break
+        except FileExistsError:
+            try:
+                lock = os.open(name, flags, dir_fd=directory)
+                break
+            except FileNotFoundError:
+                continue
+        except FileNotFoundError:
+            continue
+    if lock < 0:
+        raise OSError("writer coordination anchor lock could not be opened")
+    try:
+        validate_anchor_inode(os.fstat(lock), "anchor lock")
+        os.fchmod(lock, 0o600)
+    except Exception:
+        os.close(lock)
+        raise
+    return lock
+
+
+def acquire_anchor_lock(lock: int, exclusive: bool, timeout: float = 5.0) -> None:
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(lock, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("writer coordination anchor lock timed out")
+            time.sleep(0.01)
+
+
+def read_anchor_at(directory: int) -> Optional[str]:
+    name = "writer-coordination-anchor"
+    try:
+        before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    validate_anchor_inode(before, "coordination anchor")
+    descriptor = os.open(
+        name, secure_file_flags(os.O_RDONLY), dir_fd=directory
+    )
+    try:
+        after = os.fstat(descriptor)
+        validate_anchor_inode(after, "coordination anchor")
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("writer coordination anchor changed while opening")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read()
+    finally:
+        os.close(descriptor)
+    if re.fullmatch(b"[0-9a-f]{40}([0-9a-f]{24})?\\n", raw) is None:
+        raise ValueError("writer coordination anchor is not canonical")
+    return raw[:-1].decode("ascii")
+
+
+def read_coordination_anchor(common_dir: str) -> Optional[str]:
+    directory = open_anchor_directory(common_dir, False)
+    if directory is None:
+        return None
+    lock = -1
+    try:
+        lock = open_anchor_lock(directory)
+        acquire_anchor_lock(lock, False)
+        return read_anchor_at(directory)
+    finally:
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def write_coordination_anchor(
+    common_dir: str, oid: str, repository: Optional[str] = None
+) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", oid) is None:
+        raise ValueError("writer coordination anchor is not a Git object ID")
+    directory = open_anchor_directory(common_dir, True)
+    if directory is None:
+        raise ValueError("writer anchor parent is unavailable")
+    lock = -1
+    temporary = ""
+    descriptor = -1
+    try:
+        lock = open_anchor_lock(directory)
+        acquire_anchor_lock(lock, True)
+        current = read_anchor_at(directory)
+        if current is not None:
+            if current == oid:
+                return
+            if repository is None:
+                raise ValueError("writer coordination anchor cannot move backwards")
+            if coordination_descends_from(repository, current, oid):
+                return
+            if not coordination_descends_from(repository, oid, current):
+                raise ValueError("writer coordination anchor histories diverged")
+        temporary = ".writer-coordination-anchor.tmp-{}".format(
+            secrets.token_hex(16)
+        )
+        descriptor = os.open(
+            temporary,
+            secure_file_flags(os.O_WRONLY) | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory,
+        )
+        os.fchmod(descriptor, 0o600)
+        payload = (oid + "\n").encode("ascii")
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("short writer coordination anchor write")
+            offset += written
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        validate_anchor_inode(opened, "anchor temporary file")
+        named = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
+        validate_anchor_inode(named, "anchor temporary file")
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise ValueError("writer anchor temporary path changed before replace")
+        # The owner-controlled, non-group-writable directory plus this advisory lock is
+        # the concurrency boundary for supported writer processes. A same-UID process
+        # that ignores the lock can already rewrite the surrounding Git common dir.
+        os.replace(
+            temporary,
+            "writer-coordination-anchor",
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        installed = os.stat(
+            "writer-coordination-anchor", dir_fd=directory, follow_symlinks=False
+        )
+        validate_anchor_inode(installed, "coordination anchor")
+        if (opened.st_dev, opened.st_ino) != (installed.st_dev, installed.st_ino):
+            raise ValueError("writer coordination anchor replacement was not exact")
+        os.fsync(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        # Preserve an exclusive temp inode on failure. Name-based cleanup would add a
+        # check/unlink race and could remove a concurrently substituted directory entry.
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def cmd_coordination_anchor_read(args: argparse.Namespace) -> None:
+    anchor = read_coordination_anchor(args.common_dir)
+    if anchor is not None:
+        print(anchor)
+
+
+def cmd_coordination_anchor_write(args: argparse.Namespace) -> None:
+    write_coordination_anchor(args.common_dir, args.oid, args.repository)
+
+
+def coordination_ledger_bytes(repository: str, oid: str) -> bytes:
+    raw = git_bytes(repository, "ls-tree", "-z", oid)
+    entries = [entry for entry in raw.split(b"\0") if entry]
+    if len(entries) != 1:
+        raise ValueError("writer coordination tree must contain exactly one entry")
+    metadata, separator, name = entries[0].partition(b"\t")
+    fields = metadata.split(b" ")
+    if separator != b"\t" or name != b"writer-claims.tsv" or fields[:2] != [b"100644", b"blob"]:
+        raise ValueError("writer coordination tree entry is not canonical")
+    return git_bytes(repository, "show", oid + ":writer-claims.tsv")
+
+
+def ledger_row_identity(row: Mapping[str, str]) -> Tuple[str, ...]:
+    fields = CLAIM_FIELDS if row["kind"] == "claim" else EFFECT_FIELDS
+    return tuple(row[field] for field in fields)
+
+
+def validate_coordination_transition(
+    previous: Sequence[Mapping[str, str]], current: Sequence[Mapping[str, str]]
+) -> None:
+    prior = {ledger_row_identity(row): row for row in previous}
+    present = {ledger_row_identity(row): row for row in current}
+    if not set(prior).issubset(present) or len(present) != len(prior) + 1:
+        raise ValueError("writer coordination commit must append exactly one immutable row")
+    added_identity = next(iter(set(present) - set(prior)))
+    added = present[added_identity]
+    identity = (added["operation_id"], added["claim_id"])
+    claims = [
+        row
+        for row in previous
+        if row["kind"] == "claim"
+        and (row["operation_id"], row["claim_id"]) == identity
+    ]
+    effects = [
+        row
+        for row in previous
+        if row["kind"] == "effect-owner"
+        and (row["operation_id"], row["claim_id"]) == identity
+    ]
+    if added["kind"] == "claim":
+        if added["state"] == "active":
+            if claims or effects or any(
+                row["operation_id"] == added["operation_id"]
+                or row["claim_id"] == added["claim_id"]
+                for row in previous
+            ):
+                raise ValueError("writer active claim is not the first event for its identity")
+            return
+        if len(claims) != 1 or claims[0]["state"] != "active":
+            raise ValueError("writer claim release has no unique active predecessor")
+        if any(
+            added[field] != claims[0][field] for field in CLAIM_FIELDS[1:-1]
+        ):
+            raise ValueError("writer claim release rewrites its active binding")
+        effect = latest_effect(effects)
+        if effect is not None and effect["state"] == "acquired":
+            raise ValueError("writer claim released before its effect owner")
+        return
+
+    if len(claims) != 1 or claims[0]["state"] != "active":
+        raise ValueError("writer effect event requires a currently active claim")
+    if any(
+        row["event_id"] == added["event_id"]
+        for row in previous
+        if row["kind"] == "effect-owner"
+    ):
+        raise ValueError("writer effect event ID was reused")
+    prior_event_ids = [
+        row["event_id"] for row in previous if row["kind"] == "effect-owner"
+    ]
+    if prior_event_ids and added["event_id"] <= max(prior_event_ids):
+        raise ValueError("writer effect event ID did not advance monotonically")
+    effect = latest_effect(effects)
+    owner = (added["device_id"], added["clone_id"])
+    if added["state"] == "acquired":
+        if effect is not None and effect["state"] == "acquired":
+            raise ValueError("writer effect owner was acquired discontinuously")
+    elif (
+        effect is None
+        or effect["state"] != "acquired"
+        or (effect["device_id"], effect["clone_id"]) != owner
+    ):
+        raise ValueError("writer effect owner release has no matching acquisition")
+
+
+def cmd_coordination_history(args: argparse.Namespace) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", args.tip) is None:
+        raise ValueError("writer coordination tip is not a Git object ID")
+    reverse_chain: List[str] = []
+    seen = set()
+    current = args.tip
+    while True:
+        if current in seen:
+            raise ValueError("writer coordination history contains a cycle")
+        seen.add(current)
+        reverse_chain.append(current)
+        _, parents = coordination_commit(args.repository, current)
+        if not parents:
+            break
+        current = parents[0]
+    chain = list(reversed(reverse_chain))
+    for anchor in args.anchor:
+        if re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", anchor) is None:
+            raise ValueError("writer coordination anchor is not a Git object ID")
+        if anchor not in seen:
+            raise ValueError("writer coordination history does not descend from a trusted anchor")
+    previous_rows: List[Dict[str, str]] = []
+    final_raw = b""
+    with tempfile.TemporaryDirectory(prefix="workbench-writer-history-") as directory:
+        for index, oid in enumerate(chain):
+            raw = coordination_ledger_bytes(args.repository, oid)
+            ledger = os.path.join(directory, "{}.tsv".format(index))
+            with open(ledger, "wb") as handle:
+                handle.write(raw)
+            rows, final_raw = read_ledger(ledger)
+            if index == 0:
+                if rows:
+                    raise ValueError("writer coordination root must be header-only")
+            else:
+                validate_coordination_transition(previous_rows, rows)
+            previous_rows = rows
+    with open(args.output, "wb") as handle:
+        handle.write(final_raw)
+    write_json(
+        {
+            "contract_version": "workbench-writer-history-validation/v1",
+            "tip": args.tip,
+            "root": chain[0],
+            "commits": len(chain),
+            "events": len(previous_rows),
         }
     )
 
@@ -1689,6 +2086,20 @@ def parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("ledger-validate")
     validate.add_argument("file")
     validate.set_defaults(func=cmd_ledger_validate)
+    history = commands.add_parser("coordination-history")
+    history.add_argument("--repository", required=True)
+    history.add_argument("--tip", required=True)
+    history.add_argument("--output", required=True)
+    history.add_argument("--anchor", action="append", default=[])
+    history.set_defaults(func=cmd_coordination_history)
+    anchor_read = commands.add_parser("coordination-anchor-read")
+    anchor_read.add_argument("--common-dir", required=True)
+    anchor_read.set_defaults(func=cmd_coordination_anchor_read)
+    anchor_write = commands.add_parser("coordination-anchor-write")
+    anchor_write.add_argument("--common-dir", required=True)
+    anchor_write.add_argument("--repository", required=True)
+    anchor_write.add_argument("--oid", required=True)
+    anchor_write.set_defaults(func=cmd_coordination_anchor_write)
     status = commands.add_parser("status-projection")
     status.add_argument("--ledger-file", required=True)
     status.add_argument("--legacy-inventory-file", required=True)

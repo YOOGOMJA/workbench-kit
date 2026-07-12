@@ -488,6 +488,7 @@ run_task_in_dir() {
     WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY:-}" \
     WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM="${WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM:-0}" \
     WORKBENCH_TEST_FAIL_WRITER_STAGE="${WORKBENCH_TEST_FAIL_WRITER_STAGE:-}" \
+    WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT="${WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT:-0}" \
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
@@ -978,6 +979,184 @@ fi
 exec "$real_git" "\$@"
 EOF
   chmod +x "$TMPDIR/$case_name/bin/git"
+}
+
+corrupt_writer_coordination_history() {
+  local case_name="$1" mode="$2" ref tip ledger blob tree commit side
+  ref=refs/heads/workbench-coordination/writer-claims
+  tip="$(git --git-dir="$TMPDIR/$case_name/origin.git" rev-parse "$ref")"
+  ledger="$TMPDIR/$case_name/corrupt-writer-claims.tsv"
+  git --git-dir="$TMPDIR/$case_name/origin.git" show "$tip:writer-claims.tsv" > "$ledger"
+  case "$mode" in
+    rewritten-tip)
+      tree="$(git -C "$WRITER_REPO" rev-parse "$tip^{tree}")"
+      commit="$(printf '%s\n' 'test: rewrite valid-looking writer tip' \
+        | git -C "$WRITER_REPO" commit-tree "$tree" -p "$tip")"
+      ;;
+    valid-rebuild)
+      local rebuilt parent prefix row
+      rebuilt="$TMPDIR/$case_name/rebuilt-writer-claims.tsv"
+      printf '%s\n' workbench-writer-claims/v1 > "$rebuilt"
+      blob="$(git -C "$WRITER_REPO" hash-object -w "$rebuilt")"
+      tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" \
+        | git -C "$WRITER_REPO" mktree)"
+      parent="$(printf '%s\n' 'test: rebuilt writer root' \
+        | git -C "$WRITER_REPO" commit-tree "$tree")"
+      while IFS= read -r row; do
+        [ "$row" = workbench-writer-claims/v1 ] && continue
+        printf '%s\n' "$row" >> "$rebuilt"
+        blob="$(git -C "$WRITER_REPO" hash-object -w "$rebuilt")"
+        tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" \
+          | git -C "$WRITER_REPO" mktree)"
+        parent="$(printf '%s\n' 'test: rebuild legal writer event' \
+          | git -C "$WRITER_REPO" commit-tree "$tree" -p "$parent")"
+      done < "$ledger"
+      commit="$parent"
+      ;;
+    new-root)
+      tree="$(git -C "$WRITER_REPO" rev-parse "$tip^{tree}")"
+      commit="$(printf '%s\n' 'test: replace writer history root' \
+        | git -C "$WRITER_REPO" commit-tree "$tree")"
+      ;;
+    row-removal)
+      printf '%s\n' workbench-writer-claims/v1 > "$ledger"
+      blob="$(git -C "$WRITER_REPO" hash-object -w "$ledger")"
+      tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" \
+        | git -C "$WRITER_REPO" mktree)"
+      commit="$(printf '%s\n' 'test: remove writer rows' \
+        | git -C "$WRITER_REPO" commit-tree "$tree" -p "$tip")"
+      ;;
+    historical-rewrite)
+      python3 - "$ledger" <<'PY'
+import sys
+
+path = sys.argv[1]
+lines = open(path, encoding="utf-8").read().splitlines()
+for index, line in enumerate(lines):
+    fields = line.split("\t")
+    if fields[0] == "claim" and fields[-1] == "active":
+        fields[4] = "alternate-api"
+        lines[index] = "\t".join(fields)
+        break
+else:
+    raise AssertionError("missing active claim")
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(lines) + "\n")
+PY
+      blob="$(git -C "$WRITER_REPO" hash-object -w "$ledger")"
+      tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" \
+        | git -C "$WRITER_REPO" mktree)"
+      commit="$(printf '%s\n' 'test: rewrite historical writer row' \
+        | git -C "$WRITER_REPO" commit-tree "$tree" -p "$tip")"
+      ;;
+    discontinuous-event)
+      python3 - "$ledger" <<'PY'
+import sys
+
+path = sys.argv[1]
+lines = open(path, encoding="utf-8").read().splitlines()
+events = [line.split("\t") for line in lines if line.startswith("effect-owner\t")]
+assert events and events[-1][-1] == "acquired", events
+last = events[-1]
+lines.extend((
+    "\t".join(("effect-owner", "event_zz_release", last[2], last[3], last[4], last[5], "released")),
+    "\t".join(("effect-owner", "event_zzzz_acquire", last[2], last[3], last[4], last[5], "acquired")),
+))
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(lines) + "\n")
+PY
+      blob="$(git -C "$WRITER_REPO" hash-object -w "$ledger")"
+      tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" \
+        | git -C "$WRITER_REPO" mktree)"
+      commit="$(printf '%s\n' 'test: append discontinuous writer events' \
+        | git -C "$WRITER_REPO" commit-tree "$tree" -p "$tip")"
+      ;;
+    extra-tree-entry)
+      blob="$(printf '%s\n' unexpected | git -C "$WRITER_REPO" hash-object -w --stdin)"
+      tree="$({
+        git -C "$WRITER_REPO" ls-tree "$tip"
+        printf '100644 blob %s\textra.txt\n' "$blob"
+      } | git -C "$WRITER_REPO" mktree)"
+      commit="$(printf '%s\n' 'test: add extra writer tree entry' \
+        | git -C "$WRITER_REPO" commit-tree "$tree" -p "$tip")"
+      ;;
+    operation-id-reuse|claim-id-reuse|global-event-id-reuse)
+      local first_claim first_effect next_ledger first_commit reused_operation reused_claim
+      first_claim="$(sed -n '/^claim\t/{p;q;}' "$ledger")"
+      first_effect="$(sed -n '/^effect-owner\t/{p;q;}' "$ledger")"
+      next_ledger="$TMPDIR/$case_name/reused-writer-claims.tsv"
+      python3 - "$ledger" "$next_ledger" "$mode" <<'PY'
+import sys
+
+source, output, mode = sys.argv[1:]
+lines = open(source, encoding="utf-8").read().splitlines()
+claims = [line.split("\t") for line in lines[1:] if line.startswith("claim\t")]
+effects = [line.split("\t") for line in lines[1:] if line.startswith("effect-owner\t")]
+assert len(claims) == 1 and len(effects) == 1
+row = list(claims[0])
+if mode != "operation-id-reuse":
+    row[1] = "wop_reused_identity"
+if mode != "claim-id-reuse":
+    row[2] = "wc_reused_identity"
+row[3] = "task__reused_identity"
+row[4] = "zz-api"
+row[5] = "task/99-reused-identity"
+row[6] = "task/codebases/zz-api"
+claims.append(row)
+claims.sort(key=lambda item: (item[4], item[3], item[1], item[2], 0 if item[-1] == "active" else 1))
+with open(output, "w", encoding="utf-8") as handle:
+    handle.write(lines[0] + "\n")
+    for item in claims:
+        handle.write("\t".join(item) + "\n")
+    for item in effects:
+        handle.write("\t".join(item) + "\n")
+PY
+      blob="$(git -C "$WRITER_REPO" hash-object -w "$next_ledger")"
+      tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" \
+        | git -C "$WRITER_REPO" mktree)"
+      first_commit="$(printf '%s\n' 'test: append reused writer identity' \
+        | git -C "$WRITER_REPO" commit-tree "$tree" -p "$tip")"
+      if [ "$mode" = global-event-id-reuse ]; then
+        reused_operation="$(sed -n '2p' "$next_ledger" | cut -f2)"
+        reused_claim="$(sed -n '2p' "$next_ledger" | cut -f3)"
+        case "$(sed -n '2p' "$next_ledger" | cut -f4)" in
+          task__reused_identity) ;;
+          *) reused_operation="$(sed -n '3p' "$next_ledger" | cut -f2)"; reused_claim="$(sed -n '3p' "$next_ledger" | cut -f3)" ;;
+        esac
+        printf 'effect-owner\t%s\t%s\t%s\t%s\t%s\tacquired\n' \
+          "$(printf '%s\n' "$first_effect" | cut -f2)" "$reused_operation" "$reused_claim" \
+          "$(printf '%s\n' "$first_effect" | cut -f5)" \
+          "$(printf '%s\n' "$first_effect" | cut -f6)" >> "$next_ledger"
+        blob="$(git -C "$WRITER_REPO" hash-object -w "$next_ledger")"
+        tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" \
+          | git -C "$WRITER_REPO" mktree)"
+        commit="$(printf '%s\n' 'test: reuse global writer event ID' \
+          | git -C "$WRITER_REPO" commit-tree "$tree" -p "$first_commit")"
+      else
+        commit="$first_commit"
+      fi
+      ;;
+    merge)
+      printf '%s\n' workbench-writer-claims/v1 > "$ledger"
+      blob="$(git -C "$WRITER_REPO" hash-object -w "$ledger")"
+      tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" \
+        | git -C "$WRITER_REPO" mktree)"
+      side="$(printf '%s\n' 'test: side writer root' \
+        | git -C "$WRITER_REPO" commit-tree "$tree")"
+      tree="$(git -C "$WRITER_REPO" rev-parse "$tip^{tree}")"
+      commit="$(printf '%s\n' 'test: merge writer coordination history' \
+        | git -C "$WRITER_REPO" commit-tree "$tree" -p "$tip" -p "$side")"
+      ;;
+    *) fail "unknown writer history corruption: $mode" ;;
+  esac
+  git -C "$WRITER_REPO" push -q --force origin "$commit:$ref"
+}
+
+writer_anchor_path() {
+  local root="$1" common
+  common="$(git -C "$root" rev-parse --git-common-dir)"
+  case "$common" in /*) ;; *) common="$root/$common" ;; esac
+  printf '%s/workbench-v2/writer-coordination-anchor\n' "$common"
 }
 
 test_v1_rejects_v2_mutation_but_keeps_legacy_start() {
@@ -2598,6 +2777,223 @@ assert any(line.startswith("push-failed:") for line in lines), lines
 PY
 }
 
+test_writer_rejects_non_append_only_coordination_history() {
+  local mode case_name first second out status_out rc
+  for mode in rewritten-tip valid-rebuild new-root row-removal historical-rewrite \
+    discontinuous-event extra-tree-entry operation-id-reuse claim-id-reuse \
+    global-event-id-reuse merge; do
+    case_name="writer_history_${mode//-/_}"
+    setup_writer_workbench "$case_name"
+    prepare_writer_task "$case_name" 29 history; first="$WRITER_TASK_DIR"
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$first" add-repo shared-api --format json >/dev/null
+    corrupt_writer_coordination_history "$case_name" "$mode"
+    status_out="$TMPDIR/$case_name/status.out"
+    if run_task "$case_name" "$WRITER_REPO" status --format json >"$status_out" 2>&1; then
+      fail "status accepted corrupt coordination history: $mode"
+    fi
+    assert_file_contains "$status_out" '"code":"writer-lock-unavailable"'
+    prepare_writer_task "$case_name" 31 history; second="$WRITER_TASK_DIR"
+    out="$TMPDIR/$case_name/rejected.out"
+    if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+      WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+      run_task_in_dir "$case_name" "$second" add-repo shared-api --format json >"$out" 2>&1; then
+      fail "writer accepted corrupt coordination history: $mode"
+    else rc=$?; fi
+    [ "$rc" = 1 ] || fail "corrupt writer history $mode returned $rc"
+    assert_file_contains "$out" '"code":"writer-lock-unavailable"'
+    [ ! -e "$second/task/codebases/shared-api" ] \
+      || fail "corrupt writer history $mode created a worktree"
+    ! grep -Fq -- '- shared-api |' "$second/task/index.md" \
+      || fail "corrupt writer history $mode created a repo row"
+  done
+}
+
+test_writer_anchor_is_nofollow_and_exact() {
+  local first second actual anchor saved out rc
+  setup_writer_workbench writer_anchor_nofollow
+  prepare_writer_task writer_anchor_nofollow 29 anchor; first="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_anchor_nofollow "$first" add-repo shared-api --format json)"
+  anchor="$(writer_anchor_path "$WRITER_REPO")"
+  [ -f "$anchor" ] || fail "writer publication did not persist a coordination anchor"
+  saved="$TMPDIR/writer_anchor_nofollow/saved-anchor"
+  mv "$anchor" "$saved"; ln -s "$saved" "$anchor"
+  prepare_writer_task writer_anchor_nofollow 31 anchor; second="$WRITER_TASK_DIR"
+  out="$TMPDIR/writer_anchor_nofollow/rejected.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_anchor_nofollow "$second" add-repo shared-api --format json \
+      >"$out" 2>&1; then
+    fail "writer followed a symlinked coordination anchor"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "symlinked writer anchor returned $rc"
+  assert_file_contains "$out" '"code":"writer-lock-unavailable"'
+  [ ! -e "$second/task/codebases/shared-api" ] || fail "symlinked anchor created a worktree"
+}
+
+test_writer_anchor_rejects_symlinked_parent() {
+  local task_dir anchor parent saved out rc
+  setup_writer_workbench writer_anchor_parent
+  prepare_writer_task writer_anchor_parent 29 anchor; task_dir="$WRITER_TASK_DIR"
+  anchor="$(writer_anchor_path "$WRITER_REPO")"
+  parent="$(dirname "$anchor")"
+  saved="$TMPDIR/writer_anchor_parent/saved-workbench-v2"
+  mkdir -p "$saved"; ln -s "$saved" "$parent"
+  out="$TMPDIR/writer_anchor_parent/rejected.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_anchor_parent "$task_dir" add-repo shared-api --format json \
+      >"$out" 2>&1; then
+    fail "writer accepted a symlinked anchor parent"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "symlinked writer anchor parent returned $rc"
+  assert_file_contains "$out" '"code":"writer-lock-unavailable"'
+  [ ! -e "$saved/writer-coordination-anchor" ] \
+    || fail "writer wrote its trusted anchor through a symlinked parent"
+  [ ! -e "$task_dir/task/codebases/shared-api" ] \
+    || fail "symlinked anchor parent created a worktree"
+}
+
+test_writer_anchor_rejects_hardlink() {
+  local task_dir anchor linked out
+  setup_writer_workbench writer_anchor_hardlink
+  prepare_writer_task writer_anchor_hardlink 29 anchor; task_dir="$WRITER_TASK_DIR"
+  WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+  WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_anchor_hardlink "$task_dir" add-repo shared-api --format json >/dev/null
+  anchor="$(writer_anchor_path "$WRITER_REPO")"
+  linked="$anchor.link"; ln "$anchor" "$linked"
+  out="$TMPDIR/writer_anchor_hardlink/rejected.out"
+  if run_task writer_anchor_hardlink "$WRITER_REPO" status --format json >"$out" 2>&1; then
+    fail "writer accepted a multiply linked coordination anchor"
+  fi
+  assert_file_contains "$out" '"code":"writer-lock-unavailable"'
+  python3 - "$linked" <<'PY' || fail "writer altered the hardlinked anchor while rejecting it"
+import os
+import sys
+
+assert os.stat(sys.argv[1], follow_symlinks=False).st_nlink == 2
+PY
+}
+
+test_writer_anchor_temp_creation_is_exclusive() {
+  local common victim
+  common="$TMPDIR/writer_anchor_temp/common"
+  victim="$TMPDIR/writer_anchor_temp/victim"
+  mkdir -p "$common/workbench-v2"
+  printf '%s\n' unchanged > "$victim"
+  python3 - "$SOURCE_REPO/plugins/workbench/lib/workbench_writer.py" "$common" "$victim" <<'PY'
+import importlib.util
+import os
+import sys
+
+module_path, common, victim = sys.argv[1:]
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("workbench_writer", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module.secrets.token_hex = lambda _: "fixed"
+temporary = os.path.join(
+    common, "workbench-v2", ".writer-coordination-anchor.tmp-fixed"
+)
+os.symlink(victim, temporary)
+try:
+    module.write_coordination_anchor(common, "a" * 40)
+except (OSError, ValueError):
+    pass
+else:
+    raise AssertionError("writer anchor replaced a pre-existing temporary path")
+assert open(victim, encoding="utf-8").read() == "unchanged\n"
+assert os.path.islink(temporary)
+os.unlink(temporary)
+
+module.secrets.token_hex = lambda _: "residue"
+residue = os.path.join(
+    common, "workbench-v2", ".writer-coordination-anchor.tmp-residue"
+)
+real_replace = module.os.replace
+def fail_replace(*args, **kwargs):
+    raise OSError("simulated atomic replace failure")
+module.os.replace = fail_replace
+try:
+    module.write_coordination_anchor(common, "b" * 40)
+except OSError:
+    pass
+else:
+    raise AssertionError("writer anchor ignored its atomic replace failure")
+finally:
+    module.os.replace = real_replace
+assert os.path.isfile(residue) and not os.path.islink(residue)
+assert open(residue, encoding="ascii").read() == "b" * 40 + "\n"
+PY
+}
+
+test_writer_root_initialization_recovers_once() {
+  local task_dir out actual rc ref ledger
+  setup_writer_workbench writer_root_recovery
+  prepare_writer_task writer_root_recovery 29 root; task_dir="$WRITER_TASK_DIR"
+  out="$TMPDIR/writer_root_recovery/interrupted.out"
+  if WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT=1 \
+    WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_root_recovery "$task_dir" add-repo shared-api --format json \
+      >"$out" 2>&1; then
+    fail "writer root interruption unexpectedly completed the first claim"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "writer root interruption returned $rc"
+  assert_file_contains "$out" '"code":"writer-lock-unavailable"'
+  ref=refs/heads/workbench-coordination/writer-claims
+  [ "$(git --git-dir="$TMPDIR/writer_root_recovery/origin.git" rev-list --count "$ref")" = 1 ] \
+    || fail "writer root interruption published a non-root event"
+  [ "$(git --git-dir="$TMPDIR/writer_root_recovery/origin.git" show "$ref:writer-claims.tsv")" \
+    = workbench-writer-claims/v1 ] || fail "writer initialization root is not header-only"
+  [ ! -e "$task_dir/task/codebases/shared-api" ] || fail "root interruption created a worktree"
+
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_root_recovery "$task_dir" add-repo shared-api --format json)"
+  assert_contains "$actual" '"changed":true'
+  [ "$(git --git-dir="$TMPDIR/writer_root_recovery/origin.git" rev-list --count "$ref")" = 3 ] \
+    || fail "writer root retry did not append claim and owner exactly once"
+  ledger="$TMPDIR/writer_root_recovery/writer-claims.tsv"
+  git --git-dir="$TMPDIR/writer_root_recovery/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  [ "$(grep -c '^claim\t' "$ledger")" = 1 ] || fail "writer root retry duplicated its claim"
+  [ "$(grep -c '^effect-owner\t' "$ledger")" = 1 ] || fail "writer root retry duplicated owner acquisition"
+}
+
+test_writer_first_observation_adopts_durable_anchor() {
+  local first second anchor nested out rc
+  setup_writer_workbench writer_anchor_adoption
+  prepare_writer_task writer_anchor_adoption 29 anchor; first="$WRITER_TASK_DIR"
+  WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+  WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_anchor_adoption "$first" add-repo shared-api --format json >/dev/null
+  nested="$first/task/codebases/shared-api"
+  git -C "$WRITER_REPO/.codebases/shared-api" worktree remove --force "$nested"
+  git -C "$WRITER_REPO" worktree remove --force "$first"
+  anchor="$(writer_anchor_path "$WRITER_REPO")"; rm -f "$anchor"
+
+  run_task writer_anchor_adoption "$WRITER_REPO" status --format json >/dev/null \
+    || fail "fresh writer observation rejected a valid remote history"
+  [ -f "$anchor" ] && [ "$(wc -l < "$anchor" | tr -d ' ')" = 1 ] \
+    || fail "first valid writer observation did not adopt a durable anchor"
+  corrupt_writer_coordination_history writer_anchor_adoption valid-rebuild
+  prepare_writer_task writer_anchor_adoption 31 anchor; second="$WRITER_TASK_DIR"
+  out="$TMPDIR/writer_anchor_adoption/rejected.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_anchor_adoption "$second" add-repo shared-api --format json \
+      >"$out" 2>&1; then
+    fail "writer accepted a legal force-rebuild after adopting the prior tip"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "post-observation force-rebuild returned $rc"
+  assert_file_contains "$out" '"code":"writer-lock-unavailable"'
+}
+
 test_writer_local_failure_releases_remote_claim_before_new_id() {
   local task_dir out actual first_claim second_claim ledger ref operation
   setup_writer_workbench writer_compensation
@@ -2813,6 +3209,7 @@ PY
 
 test_writer_zero_history_rejects_nonexact_remote_binding() {
   local mode case_name task_dir out operation_id operation ledger ref old blob tree commit retry
+  local header root_commit anchor
   for mode in expected-path origin context action; do
     case_name="writer_zero_binding_${mode//-/_}"
     setup_writer_workbench "$case_name"
@@ -2856,14 +3253,25 @@ with open(path, "w", encoding="utf-8") as handle:
     handle.write("\n".join("\t".join(item) for item in rows) + "\n")
 PY
     old="$(git --git-dir="$TMPDIR/$case_name/origin.git" rev-parse "$ref")"
+    header="$TMPDIR/$case_name/writer-root.tsv"
+    printf '%s\n' workbench-writer-claims/v1 > "$header"
+    blob="$(git --git-dir="$TMPDIR/$case_name/origin.git" hash-object -w "$header")"
+    tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" | \
+      git --git-dir="$TMPDIR/$case_name/origin.git" mktree)"
+    root_commit="$(printf '%s\n' "test: rebuild writer root" | \
+      GIT_AUTHOR_NAME='Test User' GIT_AUTHOR_EMAIL=test@example.invalid \
+      GIT_COMMITTER_NAME='Test User' GIT_COMMITTER_EMAIL=test@example.invalid \
+      git --git-dir="$TMPDIR/$case_name/origin.git" commit-tree "$tree")"
     blob="$(git --git-dir="$TMPDIR/$case_name/origin.git" hash-object -w "$ledger")"
     tree="$(printf '100644 blob %s\twriter-claims.tsv\n' "$blob" | \
       git --git-dir="$TMPDIR/$case_name/origin.git" mktree)"
     commit="$(printf '%s\n' "test: mutate writer binding" | \
       GIT_AUTHOR_NAME='Test User' GIT_AUTHOR_EMAIL=test@example.invalid \
       GIT_COMMITTER_NAME='Test User' GIT_COMMITTER_EMAIL=test@example.invalid \
-      git --git-dir="$TMPDIR/$case_name/origin.git" commit-tree "$tree" -p "$old")"
+      git --git-dir="$TMPDIR/$case_name/origin.git" commit-tree "$tree" -p "$root_commit")"
     git --git-dir="$TMPDIR/$case_name/origin.git" update-ref "$ref" "$commit" "$old"
+    anchor="$(writer_anchor_path "$WRITER_REPO")"
+    rm -f "$anchor"
 
     retry="$TMPDIR/$case_name/retry.out"
     if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
@@ -4453,6 +4861,13 @@ run_case test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion
 run_case test_cleanup_deleted_retry_rejects_tampered_immutable_intent
 run_case test_v2_cleanup_requires_terminal_outcome_even_with_force
 run_case test_writer_claim_cas_retry_rechecks_conflict_before_local_creation
+run_case test_writer_rejects_non_append_only_coordination_history
+run_case test_writer_anchor_is_nofollow_and_exact
+run_case test_writer_anchor_rejects_symlinked_parent
+run_case test_writer_anchor_rejects_hardlink
+run_case test_writer_anchor_temp_creation_is_exclusive
+run_case test_writer_root_initialization_recovers_once
+run_case test_writer_first_observation_adopts_durable_anchor
 run_case test_writer_local_failure_releases_remote_claim_before_new_id
 run_case test_writer_binds_protected_registry_and_rejects_cache_origin
 run_case test_writer_conflict_uses_complete_legacy_and_v2_union

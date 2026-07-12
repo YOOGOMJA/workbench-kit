@@ -917,21 +917,75 @@ writer_remote_oid() {
   printf '%s\n' "$oid"
 }
 
+writer_coordination_common_dir() {
+  local root="$1" common
+  common="$(git -C "$root" rev-parse --git-common-dir)" || return 1
+  common="$(cd "$root" && cd "$common" && pwd -P)" || return 1
+  printf '%s\n' "$common"
+}
+
+writer_coordination_anchor_file() {
+  local common
+  common="$(writer_coordination_common_dir "$1")" || return 1
+  printf '%s/workbench-v2/writer-coordination-anchor\n' "$common"
+}
+
+writer_record_coordination_anchor() {
+  local root="$1" oid="$2" common
+  common="$(writer_coordination_common_dir "$root")" || return 1
+  python3 "$(writer_helper)" coordination-anchor-write --common-dir "$common" \
+    --repository "$root" --oid "$oid" >/dev/null 2>&1
+}
+
+writer_read_coordination_anchor() {
+  local common
+  common="$(writer_coordination_common_dir "$1")" || return 1
+  python3 "$(writer_helper)" coordination-anchor-read --common-dir "$common" \
+    2>/dev/null
+}
+
+writer_history_anchor_args() {
+  local root="$1" operation parsed anchor
+  WRITER_HISTORY_ANCHOR_ARGS=()
+  WRITER_HISTORY_ANCHOR_COUNT=0
+  anchor="$(writer_read_coordination_anchor "$root")" || return 1
+  if [ -n "$anchor" ]; then
+    WRITER_HISTORY_ANCHOR_ARGS+=(--anchor "$anchor")
+    WRITER_HISTORY_ANCHOR_COUNT=$((WRITER_HISTORY_ANCHOR_COUNT + 1))
+  fi
+  while IFS= read -r operation; do
+    [ -f "$operation" ] || continue
+    parsed="$(python3 "$(writer_helper)" operation "$operation" --format shell)" || return 1
+    anchor="$(printf '%s\n' "$parsed" | sed -n 's/^coordination_oid=//p')"
+    if [ -n "$anchor" ]; then
+      WRITER_HISTORY_ANCHOR_ARGS+=(--anchor "$anchor")
+      WRITER_HISTORY_ANCHOR_COUNT=$((WRITER_HISTORY_ANCHOR_COUNT + 1))
+    fi
+  done < <(find "$root/.worktrees" \
+    -path '*/task/.workbench/writer-operations/*.json' -type f 2>/dev/null | sort)
+}
+
 writer_load_remote_ledger() {
-  local root="$1" origin_url="$2" output="$3" oid tree
+  local root="$1" origin_url="$2" output="$3" oid
+  writer_history_anchor_args "$root" || return 1
   oid="$(writer_remote_oid "$origin_url")" || return 1
   if [ -z "$oid" ]; then
+    [ "$WRITER_HISTORY_ANCHOR_COUNT" -eq 0 ] || return 1
     printf 'workbench-writer-claims/v1\n' > "$output"
     WRITER_OBSERVED_OID=""
     return 0
   fi
   git -C "$root" fetch --no-write-fetch-head --quiet --no-tags "$origin_url" "$oid" \
     >/dev/null 2>&1 || return 1
-  [ "$(git -C "$root" cat-file -t "$oid" 2>/dev/null)" = commit ] || return 1
-  tree="$(git -C "$root" ls-tree "$oid")" || return 1
-  printf '%s\n' "$tree" | grep -Eq '^100644 blob [0-9a-f]+[[:space:]]+writer-claims\.tsv$' || return 1
-  [ "$(printf '%s\n' "$tree" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ] || return 1
-  git -C "$root" show "$oid:writer-claims.tsv" > "$output" 2>/dev/null || return 1
+  if [ "$WRITER_HISTORY_ANCHOR_COUNT" -gt 0 ]; then
+    python3 "$(writer_helper)" coordination-history --repository "$root" \
+      --tip "$oid" --output "$output" "${WRITER_HISTORY_ANCHOR_ARGS[@]}" \
+      >/dev/null 2>&1 || return 1
+  else
+    python3 "$(writer_helper)" coordination-history --repository "$root" \
+      --tip "$oid" --output "$output" >/dev/null 2>&1 || return 1
+  fi
+  writer_record_coordination_anchor "$root" "$oid" || return 1
   WRITER_OBSERVED_OID="$oid"
 }
 
@@ -1414,9 +1468,21 @@ for item in json.load(sys.stdin):
 }
 
 writer_publish_ledger() {
-  local root="$1" origin="$2" observed="$3" next="$4" commit
+  local root="$1" origin="$2" observed="$3" next="$4" commit root_commit empty
+  if [ -z "$observed" ]; then
+    empty="$(mktemp "${TMPDIR:-/tmp}/workbench-writer-root.XXXXXX")" || return 1
+    printf 'workbench-writer-claims/v1\n' > "$empty"
+    root_commit="$(writer_create_coordination_commit "$root" "$empty" "")" \
+      || { rm -f "$empty"; return 1; }
+    rm -f "$empty"
+    writer_push_cas "$root" "$origin" "" "$root_commit" || return 1
+    writer_record_coordination_anchor "$root" "$root_commit" || return 1
+    [ "${WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT:-0}" != 1 ] || return 9
+    observed="$root_commit"
+  fi
   commit="$(writer_create_coordination_commit "$root" "$next" "$observed")" || return 1
-  writer_push_cas "$root" "$origin" "$observed" "$commit"
+  writer_push_cas "$root" "$origin" "$observed" "$commit" || return 1
+  writer_record_coordination_anchor "$root" "$commit"
 }
 
 writer_append_active_final() {
@@ -1449,8 +1515,12 @@ writer_append_active_final() {
         [ "$state" = active ] && return 0
       else rm -f "$ledger"; fi
       return 1
+    else
+      state=$?
     fi
-    rm -f "$ledger" "$next"; return 3
+    rm -f "$ledger" "$next"
+    [ "$state" -ne 9 ] || return 9
+    return 3
   done
   return 1
 }
@@ -6725,15 +6795,15 @@ cmd_status_json() {
   while IFS= read -r operation; do
     [ -f "$operation" ] && args+=(--operation-file "$operation")
   done < <(find "$root/.worktrees" -path '*/task/.workbench/writer-operations/*.json' -type f 2>/dev/null | sort)
-  if [ -n "$origin" ] && writer_load_remote_ledger "$root" "$origin" "$ledger" \
-    && "$legacy_util" show --format json > "$inventory" 2>/dev/null \
-    && projection="$(python3 "$(writer_helper)" "${args[@]}" 2>/dev/null)"; then
+  if [ -z "$origin" ] || ! writer_load_remote_ledger "$root" "$origin" "$ledger"; then
+    integrity_blockers='[{"code":"writer-lock-unavailable","ref":"refs/heads/workbench-coordination/writer-claims"}]'
+  elif ! "$legacy_util" show --format json > "$inventory" 2>/dev/null; then
+    integrity_blockers='[{"code":"legacy-writer-source-unavailable","ref":"workbench legacy-inventory show"}]'
+  elif ! projection="$(python3 "$(writer_helper)" "${args[@]}" 2>/dev/null)"; then
+    integrity_blockers='[{"code":"writer-claim-unreconciled","ref":"refs/heads/workbench-coordination/writer-claims"}]'
+  else
     writer_conflicts="$(writer_json_query "$projection" writer_conflicts)"
     integrity_blockers="$(writer_json_query "$projection" writer_integrity_blockers)"
-  elif [ ! -s "$inventory" ]; then
-    integrity_blockers='[{"code":"legacy-writer-source-unavailable","ref":"workbench legacy-inventory show"}]'
-  else
-    integrity_blockers='[{"code":"writer-claim-unreconciled","ref":"refs/heads/workbench-coordination/writer-claims"}]'
   fi
   printf '{"contract_version":"workbench-task-status/v2","tasks":%s,"writer_conflicts":%s,"writer_integrity_blockers":%s}\n' \
     "$tasks_json" "$writer_conflicts" "$integrity_blockers"
