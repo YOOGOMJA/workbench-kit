@@ -63,4 +63,15 @@ if grep -Fq 'land on `main`, bump the version' "$ROOT/CONTRIBUTING.md"; then
   fail "CONTRIBUTING must not instruct a post-main version bump"
 fi
 
+GENERATE_SKILL="$ROOT/plugins/workbench-kit/skills/generate-workbench/SKILL.md"
+CORE="$ROOT/plugins/workbench-kit/scaffold/AGENTS.core.md"
+grep -Fq 'CLAUDE.md real file' "$GENERATE_SKILL" \
+  || fail "generate-workbench must describe the real CLAUDE.md output"
+grep -Fq '$task-start' "$GENERATE_SKILL" \
+  || fail "generate-workbench must hand Codex users to $task-start"
+for entrypoint in '/workbench:task-start' '$task-start'; do
+  grep -Fq "$entrypoint" "$CORE" \
+    || fail "generated core must explain entrypoint $entrypoint"
+done
+
 echo "PASS reader documentation contracts"

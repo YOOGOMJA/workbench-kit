@@ -54,6 +54,34 @@ def entries_by_name(document, relative):
     return result
 
 
+def validate_codex_interface(manifest, relative):
+    interface = manifest.get("interface")
+    if not isinstance(interface, dict):
+        raise SystemExit(f"{relative}: interface must be an object")
+    text_fields = {
+        "displayName",
+        "shortDescription",
+        "longDescription",
+        "developerName",
+        "category",
+        "defaultPrompt",
+    }
+    missing = sorted(text_fields - set(interface))
+    if missing:
+        raise SystemExit(f"{relative}: interface fields missing: {missing}")
+    for field in sorted(text_fields):
+        value = interface[field]
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit(f"{relative}: interface.{field} must be non-empty text")
+    capabilities = interface.get("capabilities")
+    if not isinstance(capabilities, list) or not capabilities or not all(
+        isinstance(value, str) and value.strip() for value in capabilities
+    ):
+        raise SystemExit(
+            f"{relative}: interface.capabilities must be a non-empty text array"
+        )
+
+
 expected = {"workbench", "workbench-kit", "toolbox"}
 expected_marketplace = "workbench-kit"
 semver = re.compile(
@@ -100,6 +128,8 @@ for name in sorted(expected):
         version = manifest.get("version")
         if not isinstance(version, str) or semver.fullmatch(version) is None:
             raise SystemExit(f"{manifest_path}: version must be valid SemVer")
+        if tool == ".codex-plugin":
+            validate_codex_interface(manifest, str(manifest_path))
         versions[str(manifest_path)] = version
 
 unique_versions = set(versions.values())

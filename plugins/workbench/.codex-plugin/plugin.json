@@ -6,5 +6,18 @@
   "homepage": "https://github.com/YOOGOMJA/workbench-kit",
   "repository": "https://github.com/YOOGOMJA/workbench-kit",
   "license": "MIT",
-  "skills": "./skills/"
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Workbench",
+    "shortDescription": "Governed task lifecycle and knowledge accumulation",
+    "longDescription": "Tool-neutral workbench engine for isolated tasks, governed delivery, and reusable knowledge.",
+    "developerName": "YOOGOMJA",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Task lifecycle",
+      "Policy enforcement",
+      "Knowledge harvest"
+    ],
+    "defaultPrompt": "Use $task-start to begin governed work from an issue."
+  }
 }

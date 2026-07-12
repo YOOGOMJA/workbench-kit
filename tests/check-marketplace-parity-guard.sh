@@ -73,6 +73,22 @@ rm "$TMP/plugins/toolbox/.codex-plugin/plugin.json"
 if run_checker >/dev/null 2>&1; then
   fail "a missing manifest must fail"
 fi
+cp "$ROOT/plugins/toolbox/.codex-plugin/plugin.json" \
+  "$TMP/plugins/toolbox/.codex-plugin/"
+
+python3 - "$TMP/plugins/toolbox/.codex-plugin/plugin.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+document = json.loads(path.read_text())
+del document["interface"]
+path.write_text(json.dumps(document))
+PY
+if run_checker >/dev/null 2>&1; then
+  fail "a Codex manifest without interface metadata must fail"
+fi
 
 grep -Fq 'tests/check-marketplace-parity.sh' "$ROOT/tests/run.sh" \
   || fail "the root test runner must run the marketplace parity contract"

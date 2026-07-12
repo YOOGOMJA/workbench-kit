@@ -10,11 +10,15 @@
   "interface": {
     "displayName": "Workbench Kit",
     "shortDescription": "Bootstrap and safely upgrade workbenches",
-    "longDescription": "Create personalized workbenches and migrate existing ones through governed dry-run plans, human approval, and recoverable apply transactions.",
+    "longDescription": "Interview for a persona, generate a minimal tool-neutral workbench, or migrate an existing one through governed dry-run plans and recoverable apply transactions.",
     "developerName": "YOOGOMJA",
-    "category": "Development",
-    "capabilities": ["Skills"],
+    "category": "Developer Tools",
+    "capabilities": [
+      "Persona interview",
+      "Workbench generation",
+      "Governed workbench upgrade"
+    ],
     "websiteURL": "https://github.com/YOOGOMJA/workbench-kit",
-    "defaultPrompt": "Use $upgrade-workbench to diagnose and safely migrate an existing workbench."
+    "defaultPrompt": "Use $interview-for-personalizing to create a new workbench or $upgrade-workbench to migrate an existing one."
   }
 }
