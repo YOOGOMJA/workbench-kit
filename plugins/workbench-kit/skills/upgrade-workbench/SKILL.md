@@ -16,6 +16,10 @@ interpreting exit status, or preparing external evidence and journal paths.
 
 - Work only in a dedicated migration task workspace containing `task/index.md`.
 - Resolve the workspace and every input/output path to absolute paths.
+- Require the workspace parent to be owned by the current user, not writable by
+  group or other users, and on the same filesystem as every mutable worktree and
+  Git-admin directory. Shared sticky parents such as `/tmp` fail closed; place the
+  task workspace under a private parent before retrying.
 - Keep plans, approvals, results, and optional journals outside the workspace.
 - Use `workbench-kit` from `PATH`; in Claude Code, fall back to
   `${CLAUDE_PLUGIN_ROOT}/bin/workbench-kit`.

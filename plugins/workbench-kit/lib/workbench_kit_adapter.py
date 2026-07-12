@@ -106,7 +106,8 @@ class AdapterError(Exception):
         self.ref = ref
 
 
-def canonical_digest(value: Any) -> str:
+def canonical_public_digest(value: Any) -> str:
+    """Hash extensible public observations independent of JSON member order."""
     raw = (
         json.dumps(
             value,
@@ -593,7 +594,8 @@ def _remove_state_node_at(
     name: str,
     expected: tuple[str, int | None, bytes | str | None],
     ref: str,
-) -> tuple[str, int]:
+    quarantine: dict[str, Any],
+) -> None:
     try:
         observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as error:
@@ -622,7 +624,9 @@ def _remove_state_node_at(
         raise AdapterError("public-adapter-restore-failed", ref)
     handle = _open_state_handle_at(parent_fd, name, expected[0], ref)
     try:
-        private_fd, private_name = _open_private_namespace(parent_fd, ref)
+        quarantine_fd, entry_name = _open_quarantine_entry(
+            quarantine, observed.st_dev, ref
+        )
     except BaseException:
         os.close(handle)
         raise
@@ -635,62 +639,35 @@ def _remove_state_node_at(
                 observed.st_ino,
             ):
                 raise AdapterError("public-adapter-restore-failed", ref)
-            _rename_noreplace(
-                parent_fd, name, private_fd, "node", ref
-            )
+            _rename_noreplace(parent_fd, name, quarantine_fd, "node", ref)
             moved = True
+            _fsync_quarantine_transition(
+                quarantine, quarantine_fd, parent_fd, ref
+            )
+            _mark_quarantine_residue(
+                quarantine, quarantine_fd, entry_name, ref
+            )
             quarantined = os.stat(
-                "node", dir_fd=private_fd, follow_symlinks=False
+                "node", dir_fd=quarantine_fd, follow_symlinks=False
             )
             if (quarantined.st_dev, quarantined.st_ino) != (
                 opened.st_dev,
                 opened.st_ino,
             ):
                 raise AdapterError("public-adapter-restore-failed", ref)
-            private = os.fstat(private_fd)
-            return private_name, stat.S_IMODE(private.st_mode)
         except OSError as error:
             raise AdapterError("public-adapter-restore-failed", ref) from error
     finally:
-        os.close(handle)
-        os.close(private_fd)
-        if not moved:
-            try:
-                os.rmdir(private_name, dir_fd=parent_fd)
-            except OSError as error:
-                raise AdapterError(
-                    "public-adapter-restore-failed", ref
-                ) from error
-
-
-def _record_private_residue(
-    manifest: dict[str, tuple[str, int | None, bytes | str | None]],
-    relative: str,
-    residue: tuple[str, int],
-) -> None:
-    source = pathlib.PurePosixPath(relative)
-    source_prefix = relative + "/"
-    moved = {
-        path: image
-        for path, image in manifest.items()
-        if path == relative or path.startswith(source_prefix)
-    }
-    for path in moved:
-        manifest.pop(path)
-    private_name, private_mode = residue
-    private_root = (
-        pathlib.PurePosixPath(private_name)
-        if source.parent == pathlib.PurePosixPath(".")
-        else source.parent / private_name
-    )
-    private_relative = private_root.as_posix()
-    manifest[private_relative] = ("directory", private_mode, None)
-    for path, image in moved.items():
-        suffix = pathlib.PurePosixPath(path).relative_to(source)
-        destination = private_root / "node"
-        if suffix.parts:
-            destination /= suffix
-        manifest[destination.as_posix()] = image
+        try:
+            os.close(handle)
+        finally:
+            _close_quarantine_entry(
+                quarantine,
+                quarantine_fd,
+                entry_name,
+                preserve=moved,
+                ref=ref,
+            )
 
 
 def _open_state_handle_at(
@@ -721,12 +698,162 @@ def _open_state_handle_at(
         raise AdapterError("public-adapter-restore-failed", ref) from error
 
 
-def _open_private_namespace(parent_fd: int, ref: str) -> tuple[int, str]:
-    prefix = f".workbench-kit-private-{os.getpid()}-"
+def _new_external_quarantine(
+    workspace: pathlib.Path, workspace_fd: int
+) -> dict[str, Any]:
+    parent_path = workspace.parent
+    parent_fd = None
+    try:
+        parent_node = os.lstat(parent_path)
+        parent_fd = os.open(
+            parent_path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        parent_opened = os.fstat(parent_fd)
+        workspace_node = os.stat(
+            workspace.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        workspace_opened = os.fstat(workspace_fd)
+    except OSError as error:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise AdapterError(
+            "public-adapter-restore-failed", str(parent_path)
+        ) from error
+    if (
+        not workspace.name
+        or not stat.S_ISDIR(parent_node.st_mode)
+        or stat.S_ISLNK(parent_node.st_mode)
+        or not stat.S_ISDIR(parent_opened.st_mode)
+        or (parent_node.st_dev, parent_node.st_ino)
+        != (parent_opened.st_dev, parent_opened.st_ino)
+        or parent_opened.st_uid != os.getuid()
+        or parent_opened.st_mode & 0o022
+        or (workspace_node.st_dev, workspace_node.st_ino)
+        != (workspace_opened.st_dev, workspace_opened.st_ino)
+    ):
+        os.close(parent_fd)
+        raise AdapterError(
+            "public-adapter-restore-failed", str(parent_path)
+        )
+    return {
+        "workspace": str(workspace),
+        "workspace_fd": workspace_fd,
+        "workspace_name": workspace.name,
+        "workspace_binding": (workspace_opened.st_dev, workspace_opened.st_ino),
+        "parent_path": str(parent_path),
+        "parent_fd": parent_fd,
+        "parent_binding": (parent_opened.st_dev, parent_opened.st_ino),
+        "device": parent_opened.st_dev,
+        "root_name": None,
+        "root_fd": None,
+        "root_binding": None,
+        "residues": {},
+    }
+
+
+def _external_quarantine_ref(quarantine: dict[str, Any]) -> str:
+    root_name = quarantine["root_name"]
+    if root_name is None:
+        return quarantine["parent_path"]
+    return str(pathlib.Path(quarantine["parent_path"]) / root_name)
+
+
+def _fsync_directory(descriptor: int, ref: str) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        raise AdapterError("public-adapter-restore-failed", ref) from error
+
+
+def _fsync_quarantine_transition(
+    quarantine: dict[str, Any],
+    entry_fd: int,
+    source_or_target_fd: int,
+    ref: str,
+) -> None:
+    for descriptor in (
+        source_or_target_fd,
+        entry_fd,
+        quarantine["root_fd"],
+        quarantine["parent_fd"],
+    ):
+        _fsync_directory(descriptor, ref)
+
+
+def _require_external_quarantine(
+    quarantine: dict[str, Any], ref: str
+) -> None:
+    try:
+        parent = os.fstat(quarantine["parent_fd"])
+        parent_path = os.lstat(quarantine["parent_path"])
+        workspace = os.stat(
+            quarantine["workspace_name"],
+            dir_fd=quarantine["parent_fd"],
+            follow_symlinks=False,
+        )
+        workspace_opened = os.fstat(quarantine["workspace_fd"])
+    except OSError as error:
+        raise AdapterError("public-adapter-restore-failed", ref) from error
+    if (
+        (parent.st_dev, parent.st_ino) != quarantine["parent_binding"]
+        or (parent_path.st_dev, parent_path.st_ino) != quarantine["parent_binding"]
+        or parent.st_uid != os.getuid()
+        or parent.st_mode & 0o022
+        or (workspace.st_dev, workspace.st_ino)
+        != quarantine["workspace_binding"]
+        or (workspace_opened.st_dev, workspace_opened.st_ino)
+        != quarantine["workspace_binding"]
+    ):
+        raise AdapterError("public-adapter-restore-failed", ref)
+    if quarantine["root_fd"] is None:
+        return
+    try:
+        root = os.fstat(quarantine["root_fd"])
+        root_path = os.stat(
+            quarantine["root_name"],
+            dir_fd=quarantine["parent_fd"],
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise AdapterError(
+            "public-adapter-restore-failed",
+            _external_quarantine_ref(quarantine),
+        ) from error
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or (root.st_dev, root.st_ino) != quarantine["root_binding"]
+        or (root_path.st_dev, root_path.st_ino) != quarantine["root_binding"]
+        or root.st_uid != os.getuid()
+        or stat.S_IMODE(root.st_mode) != 0o700
+    ):
+        raise AdapterError(
+            "public-adapter-restore-failed",
+            _external_quarantine_ref(quarantine),
+        )
+
+
+def _require_quarantine_device(
+    quarantine: dict[str, Any], target_device: int, ref: str
+) -> None:
+    _require_external_quarantine(quarantine, ref)
+    if quarantine["device"] != target_device:
+        raise AdapterError("public-adapter-restore-failed", ref)
+
+
+def _ensure_quarantine_root(
+    quarantine: dict[str, Any], ref: str
+) -> None:
+    if quarantine["root_fd"] is not None:
+        _require_external_quarantine(quarantine, ref)
+        return
+    prefix = f".workbench-kit-quarantine-{os.getpid()}-"
     for _ in range(1024):
         name = prefix + os.urandom(16).hex()
         try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            os.mkdir(name, mode=0o700, dir_fd=quarantine["parent_fd"])
         except FileExistsError:
             continue
         except OSError as error:
@@ -738,22 +865,320 @@ def _open_private_namespace(parent_fd: int, ref: str) -> tuple[int, str]:
                 os.O_RDONLY
                 | getattr(os, "O_DIRECTORY", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=parent_fd,
+                dir_fd=quarantine["parent_fd"],
             )
-            node = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            os.fchmod(descriptor, 0o700)
+            node = os.stat(
+                name,
+                dir_fd=quarantine["parent_fd"],
+                follow_symlinks=False,
+            )
             opened = os.fstat(descriptor)
-            if (node.st_dev, node.st_ino) != (opened.st_dev, opened.st_ino):
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (node.st_dev, node.st_ino) != (opened.st_dev, opened.st_ino)
+                or opened.st_dev != quarantine["device"]
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
                 raise AdapterError("public-adapter-restore-failed", ref)
+            quarantine["root_name"] = name
+            quarantine["root_fd"] = descriptor
+            quarantine["root_binding"] = (opened.st_dev, opened.st_ino)
+            _require_external_quarantine(quarantine, ref)
+            _fsync_directory(descriptor, ref)
+            _fsync_directory(quarantine["parent_fd"], ref)
+            return
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.rmdir(name, dir_fd=quarantine["parent_fd"])
+            except OSError:
+                pass
+            raise
+    raise AdapterError("public-adapter-restore-failed", ref)
+
+
+def _open_quarantine_entry(
+    quarantine: dict[str, Any], target_device: int, ref: str
+) -> tuple[int, str]:
+    _require_quarantine_device(quarantine, target_device, ref)
+    _ensure_quarantine_root(quarantine, ref)
+    for _ in range(1024):
+        name = "entry-" + os.urandom(16).hex()
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=quarantine["root_fd"])
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise AdapterError("public-adapter-restore-failed", ref) from error
+        descriptor = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=quarantine["root_fd"],
+            )
+            os.fchmod(descriptor, 0o700)
+            node = os.stat(
+                name,
+                dir_fd=quarantine["root_fd"],
+                follow_symlinks=False,
+            )
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (node.st_dev, node.st_ino) != (opened.st_dev, opened.st_ino)
+                or opened.st_dev != target_device
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
+                raise AdapterError("public-adapter-restore-failed", ref)
+            _fsync_directory(descriptor, ref)
+            _fsync_directory(quarantine["root_fd"], ref)
+            _fsync_directory(quarantine["parent_fd"], ref)
             return descriptor, name
         except BaseException:
             if descriptor is not None:
                 os.close(descriptor)
             try:
-                os.rmdir(name, dir_fd=parent_fd)
+                os.rmdir(name, dir_fd=quarantine["root_fd"])
             except OSError:
                 pass
             raise
     raise AdapterError("public-adapter-restore-failed", ref)
+
+
+def _quarantine_entry_snapshot(
+    quarantine: dict[str, Any],
+    entry_fd: int,
+    entry_name: str,
+    ref: str,
+    *,
+    require_node: bool,
+) -> dict[str, Any]:
+    _require_external_quarantine(quarantine, ref)
+    try:
+        opened = os.fstat(entry_fd)
+        current = os.stat(
+            entry_name,
+            dir_fd=quarantine["root_fd"],
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise AdapterError(
+            "public-adapter-restore-failed",
+            _external_quarantine_ref(quarantine),
+        ) from error
+    binding = (opened.st_dev, opened.st_ino)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or (current.st_dev, current.st_ino) != binding
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        raise AdapterError(
+            "public-adapter-restore-failed",
+            _external_quarantine_ref(quarantine),
+        )
+    manifest: dict[str, tuple[str, int | None, bytes | str | None]] = {}
+    try:
+        _manifest_visit(entry_fd, pathlib.PurePosixPath(), manifest)
+        node = os.stat("node", dir_fd=entry_fd, follow_symlinks=False)
+        node_binding = (node.st_dev, node.st_ino)
+    except FileNotFoundError:
+        node_binding = None
+    except (AdapterError, OSError) as error:
+        raise AdapterError(
+            "public-adapter-restore-failed",
+            _external_quarantine_ref(quarantine),
+        ) from error
+    if require_node and (
+        node_binding is None
+        or not manifest
+        or any(
+            path != "node" and not path.startswith("node/")
+            for path in manifest
+        )
+    ):
+        raise AdapterError(
+            "public-adapter-restore-failed",
+            _external_quarantine_ref(quarantine),
+        )
+    return {
+        "entry_binding": binding,
+        "node_binding": node_binding,
+        "manifest": manifest,
+    }
+
+
+def _mark_quarantine_residue(
+    quarantine: dict[str, Any],
+    entry_fd: int,
+    entry_name: str,
+    ref: str,
+) -> None:
+    snapshot = _quarantine_entry_snapshot(
+        quarantine,
+        entry_fd,
+        entry_name,
+        ref,
+        require_node=True,
+    )
+    expected = quarantine["residues"].get(entry_name)
+    if expected is not None and snapshot != expected:
+        raise AdapterError(
+            "public-adapter-restore-failed",
+            _external_quarantine_ref(quarantine),
+        )
+    quarantine["residues"][entry_name] = snapshot
+    _fsync_directory(entry_fd, _external_quarantine_ref(quarantine))
+    _fsync_directory(
+        quarantine["root_fd"], _external_quarantine_ref(quarantine)
+    )
+    _fsync_directory(
+        quarantine["parent_fd"], _external_quarantine_ref(quarantine)
+    )
+
+
+def _close_quarantine_entry(
+    quarantine: dict[str, Any],
+    entry_fd: int,
+    entry_name: str,
+    *,
+    preserve: bool,
+    ref: str,
+) -> None:
+    failure: BaseException | None = None
+    try:
+        if preserve:
+            _mark_quarantine_residue(
+                quarantine, entry_fd, entry_name, ref
+            )
+        else:
+            try:
+                os.rmdir(entry_name, dir_fd=quarantine["root_fd"])
+                _fsync_directory(quarantine["root_fd"], ref)
+                _fsync_directory(quarantine["parent_fd"], ref)
+            except OSError as error:
+                try:
+                    quarantine["residues"][entry_name] = (
+                        _quarantine_entry_snapshot(
+                            quarantine,
+                            entry_fd,
+                            entry_name,
+                            ref,
+                            require_node=False,
+                        )
+                    )
+                except BaseException:
+                    pass
+                failure = AdapterError(
+                    "public-adapter-restore-failed",
+                    _external_quarantine_ref(quarantine),
+                )
+                failure.__cause__ = error
+    except BaseException as error:
+        failure = error
+    try:
+        os.close(entry_fd)
+    except OSError as error:
+        if failure is None:
+            failure = AdapterError(
+                "public-adapter-restore-failed",
+                _external_quarantine_ref(quarantine),
+            )
+            failure.__cause__ = error
+    if failure is not None:
+        raise failure
+
+
+def _close_external_quarantine(quarantine: dict[str, Any]) -> None:
+    failure = None
+    root_fd = quarantine["root_fd"]
+    if root_fd is not None:
+        try:
+            _require_external_quarantine(
+                quarantine, _external_quarantine_ref(quarantine)
+            )
+            names = set(os.listdir(root_fd))
+            if names != set(quarantine["residues"]):
+                raise AdapterError(
+                    "public-adapter-restore-failed",
+                    _external_quarantine_ref(quarantine),
+                )
+            for name, expected in quarantine["residues"].items():
+                entry_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=root_fd,
+                )
+                try:
+                    observed = _quarantine_entry_snapshot(
+                        quarantine,
+                        entry_fd,
+                        name,
+                        _external_quarantine_ref(quarantine),
+                        require_node=expected["node_binding"] is not None,
+                    )
+                    if observed != expected:
+                        raise AdapterError(
+                            "public-adapter-restore-failed",
+                            _external_quarantine_ref(quarantine),
+                        )
+                finally:
+                    os.close(entry_fd)
+            _fsync_directory(
+                root_fd, _external_quarantine_ref(quarantine)
+            )
+            _fsync_directory(
+                quarantine["parent_fd"],
+                _external_quarantine_ref(quarantine),
+            )
+        except BaseException as error:
+            failure = error
+        try:
+            os.close(root_fd)
+        except OSError as error:
+            if failure is None:
+                failure = AdapterError(
+                    "public-adapter-restore-failed",
+                    _external_quarantine_ref(quarantine),
+                )
+                failure.__cause__ = error
+        quarantine["root_fd"] = None
+        if not quarantine["residues"] and failure is None:
+            try:
+                os.rmdir(
+                    quarantine["root_name"],
+                    dir_fd=quarantine["parent_fd"],
+                )
+                _fsync_directory(
+                    quarantine["parent_fd"],
+                    _external_quarantine_ref(quarantine),
+                )
+            except OSError as error:
+                failure = AdapterError(
+                    "public-adapter-restore-failed",
+                    _external_quarantine_ref(quarantine),
+                )
+                failure.__cause__ = error
+    try:
+        os.close(quarantine["parent_fd"])
+    except OSError as error:
+        if failure is None:
+            failure = AdapterError(
+                "public-adapter-restore-failed",
+                _external_quarantine_ref(quarantine),
+            )
+            failure.__cause__ = error
+    if failure is not None:
+        raise failure
 
 
 def _rename_noreplace(
@@ -801,6 +1226,7 @@ def _create_state_node_at(
     name: str,
     image: tuple[str, int | None, bytes | str | None],
     ref: str,
+    quarantine: dict[str, Any],
 ) -> None:
     if _state_node_at(parent_fd, name, ref) != ABSENT_STATE:
         raise AdapterError("public-adapter-restore-failed", ref)
@@ -811,7 +1237,13 @@ def _create_state_node_at(
         except OSError as error:
             raise AdapterError("public-adapter-restore-failed", ref) from error
         return
-    private_fd, private_name = _open_private_namespace(parent_fd, ref)
+    try:
+        parent = os.fstat(parent_fd)
+    except OSError as error:
+        raise AdapterError("public-adapter-restore-failed", ref) from error
+    quarantine_fd, entry_name = _open_quarantine_entry(
+        quarantine, parent.st_dev, ref
+    )
     staged = False
     installed = False
     try:
@@ -822,7 +1254,7 @@ def _create_state_node_at(
                 | os.O_EXCL
                 | getattr(os, "O_NOFOLLOW", 0)
             )
-            descriptor = os.open("node", flags, mode, dir_fd=private_fd)
+            descriptor = os.open("node", flags, mode, dir_fd=quarantine_fd)
             staged = True
             try:
                 view = memoryview(payload)
@@ -832,28 +1264,33 @@ def _create_state_node_at(
                         raise OSError("short state restore write")
                     view = view[written:]
                 os.fchmod(descriptor, mode)
+                os.fsync(descriptor)
             finally:
                 os.close(descriptor)
         elif kind == "symlink":
-            os.symlink(payload, "node", dir_fd=private_fd)
+            os.symlink(payload, "node", dir_fd=quarantine_fd)
             staged = True
         else:
             raise AdapterError("public-adapter-restore-failed", ref)
         if _state_node_at(parent_fd, name, ref) != ABSENT_STATE:
             raise AdapterError("public-adapter-restore-failed", ref)
-        _rename_noreplace(private_fd, "node", parent_fd, name, ref)
+        _rename_noreplace(quarantine_fd, "node", parent_fd, name, ref)
         installed = True
+        _fsync_quarantine_transition(
+            quarantine, quarantine_fd, parent_fd, ref
+        )
     except AdapterError:
         raise
     except OSError as error:
         raise AdapterError("public-adapter-restore-failed", ref) from error
     finally:
-        os.close(private_fd)
-        if installed or not staged:
-            try:
-                os.rmdir(private_name, dir_fd=parent_fd)
-            except OSError as error:
-                raise AdapterError("public-adapter-restore-failed", ref) from error
+        _close_quarantine_entry(
+            quarantine,
+            quarantine_fd,
+            entry_name,
+            preserve=staged and not installed,
+            ref=ref,
+        )
 
 
 def _chmod_directory_at(
@@ -1259,6 +1696,26 @@ def _capture_directory_access(
         raise
 
 
+def _preflight_quarantine_devices(
+    quarantine: dict[str, Any], groups: list[dict[str, Any]]
+) -> None:
+    _require_external_quarantine(
+        quarantine, quarantine["workspace"]
+    )
+    for group in groups:
+        for record in group["records"]:
+            try:
+                device = os.fstat(record["fd"]).st_dev
+            except OSError as error:
+                raise AdapterError(
+                    "public-adapter-restore-failed", record["path"]
+                ) from error
+            if device != quarantine["device"]:
+                raise AdapterError(
+                    "public-adapter-restore-failed", record["path"]
+                )
+
+
 def _raise_access_descriptor_limit(
     state: dict[str, Any],
 ) -> tuple[int, int] | None:
@@ -1439,11 +1896,22 @@ def _worktree_parent(
     return _open_relative_parent(root_fd, relative, relative)
 
 
+def _drop_manifest_subtree(
+    manifest: dict[str, tuple[str, int | None, bytes | str | None]],
+    relative: str,
+) -> None:
+    prefix = relative + "/"
+    for path in list(manifest):
+        if path == relative or path.startswith(prefix):
+            manifest.pop(path)
+
+
 def _restore_worktree(
     workspace: pathlib.Path,
     state: dict[str, Any],
     after: dict[str, Any],
     root_fd: int,
+    quarantine: dict[str, Any],
 ) -> dict[str, tuple[str, int | None, bytes | str | None]]:
     before_manifest = state["worktree"]
     expected = dict(after["worktree"])
@@ -1529,12 +1997,12 @@ def _restore_worktree(
         )
         parent_fd, name = _worktree_parent(workspace, root_fd, relative)
         try:
-            residue = _remove_state_node_at(
-                parent_fd, name, expected[relative], relative
+            _remove_state_node_at(
+                parent_fd, name, expected[relative], relative, quarantine
             )
         finally:
             os.close(parent_fd)
-        _record_private_residue(expected, relative, residue)
+        _drop_manifest_subtree(expected, relative)
         _require_workspace_root(workspace, root_fd, restore=True)
         _require_worktree_cas(
             workspace, root_fd, expected, expected_root_mode
@@ -1549,7 +2017,11 @@ def _restore_worktree(
         parent_fd, name = _worktree_parent(workspace, root_fd, relative)
         try:
             _create_state_node_at(
-                parent_fd, name, before_manifest[relative], relative
+                parent_fd,
+                name,
+                before_manifest[relative],
+                relative,
+                quarantine,
             )
         finally:
             os.close(parent_fd)
@@ -1567,12 +2039,12 @@ def _restore_worktree(
             )
             parent_fd, name = _worktree_parent(workspace, root_fd, relative)
             try:
-                residue = _remove_state_node_at(
-                    parent_fd, name, current, relative
+                _remove_state_node_at(
+                    parent_fd, name, current, relative, quarantine
                 )
             finally:
                 os.close(parent_fd)
-            _record_private_residue(expected, relative, residue)
+            _drop_manifest_subtree(expected, relative)
             _require_workspace_root(workspace, root_fd, restore=True)
             _require_worktree_cas(
                 workspace, root_fd, expected, expected_root_mode
@@ -1583,7 +2055,11 @@ def _restore_worktree(
         parent_fd, name = _worktree_parent(workspace, root_fd, relative)
         try:
             _create_state_node_at(
-                parent_fd, name, before_manifest[relative], relative
+                parent_fd,
+                name,
+                before_manifest[relative],
+                relative,
+                quarantine,
             )
         finally:
             os.close(parent_fd)
@@ -1635,8 +2111,10 @@ def _restore_worktree(
             ) from error
         expected_root_mode = state["root_mode"]
         _require_workspace_root(workspace, root_fd, restore=True)
-    _require_worktree_cas(workspace, root_fd, expected, state["root_mode"])
-    return expected
+    _require_worktree_cas(
+        workspace, root_fd, before_manifest, state["root_mode"]
+    )
+    return before_manifest
 
 
 def _path_for_manifest(root: pathlib.Path, relative: str) -> pathlib.Path:
@@ -1697,6 +2175,7 @@ def _restore_admin_manifest(
     object_relative: str | None,
     before: dict[str, tuple[str, int | None, bytes | str | None]],
     after: dict[str, tuple[str, int | None, bytes | str | None]],
+    quarantine: dict[str, Any],
 ) -> dict[str, tuple[str, int | None, bytes | str | None]]:
     try:
         root_fd = os.open(
@@ -1717,6 +2196,7 @@ def _restore_admin_manifest(
             object_relative,
             before,
             after,
+            quarantine,
         )
     finally:
         os.close(root_fd)
@@ -1731,6 +2211,7 @@ def _restore_admin_manifest_open(
     object_relative: str | None,
     before: dict[str, tuple[str, int | None, bytes | str | None]],
     after: dict[str, tuple[str, int | None, bytes | str | None]],
+    quarantine: dict[str, Any],
 ) -> dict[str, tuple[str, int | None, bytes | str | None]]:
     expected = dict(after)
     if before.get(".", ABSENT_STATE)[0] != after.get(".", ABSENT_STATE)[0]:
@@ -1851,12 +2332,16 @@ def _restore_admin_manifest_open(
         path = _path_for_manifest(root, relative)
         parent_fd, name = _open_relative_parent(root_fd, relative, str(path))
         try:
-            residue = _remove_state_node_at(
-                parent_fd, name, expected[relative], str(path)
+            _remove_state_node_at(
+                parent_fd,
+                name,
+                expected[relative],
+                str(path),
+                quarantine,
             )
         finally:
             os.close(parent_fd)
-        _record_private_residue(expected, relative, residue)
+        _drop_manifest_subtree(expected, relative)
         _require_admin_cas(
             workspace,
             workspace_fd,
@@ -1882,7 +2367,13 @@ def _restore_admin_manifest_open(
         path = _path_for_manifest(root, relative)
         parent_fd, name = _open_relative_parent(root_fd, relative, str(path))
         try:
-            _create_state_node_at(parent_fd, name, before[relative], str(path))
+            _create_state_node_at(
+                parent_fd,
+                name,
+                before[relative],
+                str(path),
+                quarantine,
+            )
         finally:
             os.close(parent_fd)
         expected[relative] = before[relative]
@@ -1911,12 +2402,16 @@ def _restore_admin_manifest_open(
             )
             parent_fd, name = _open_relative_parent(root_fd, relative, str(path))
             try:
-                residue = _remove_state_node_at(
-                    parent_fd, name, current, str(path)
+                _remove_state_node_at(
+                    parent_fd,
+                    name,
+                    current,
+                    str(path),
+                    quarantine,
                 )
             finally:
                 os.close(parent_fd)
-            _record_private_residue(expected, relative, residue)
+            _drop_manifest_subtree(expected, relative)
             _require_admin_cas(
                 workspace,
                 workspace_fd,
@@ -1937,7 +2432,13 @@ def _restore_admin_manifest_open(
         )
         parent_fd, name = _open_relative_parent(root_fd, relative, str(path))
         try:
-            _create_state_node_at(parent_fd, name, before[relative], str(path))
+            _create_state_node_at(
+                parent_fd,
+                name,
+                before[relative],
+                str(path),
+                quarantine,
+            )
         finally:
             os.close(parent_fd)
         expected[relative] = before[relative]
@@ -2017,9 +2518,9 @@ def _restore_admin_manifest_open(
         root_fd,
         binding,
         object_relative,
-        expected,
+        before,
     )
-    return expected
+    return before
 
 
 def _restore_git_pointer(
@@ -2027,30 +2528,30 @@ def _restore_git_pointer(
     root_fd: int,
     before: tuple[str, int | None, bytes | str | None],
     after: tuple[str, int | None, bytes | str | None],
-) -> dict[str, tuple[str, int | None, bytes | str | None]]:
+    quarantine: dict[str, Any],
+) -> None:
     path = workspace / ".git"
     if before == after or before[0] == "directory":
-        return {}
-    residue_manifest = {".git": after}
+        return
     _require_workspace_root(workspace, root_fd, restore=True)
     if _state_node_at(root_fd, ".git", str(path)) != after:
         raise AdapterError("public-adapter-restore-failed", str(path))
     if after[0] != "absent":
-        residue = _remove_state_node_at(
-            root_fd, ".git", after, str(path)
+        _remove_state_node_at(
+            root_fd, ".git", after, str(path), quarantine
         )
-        _record_private_residue(residue_manifest, ".git", residue)
         _require_workspace_root(workspace, root_fd, restore=True)
         if _state_node_at(root_fd, ".git", str(path)) != ABSENT_STATE:
             raise AdapterError("public-adapter-restore-failed", str(path))
     if before[0] != "absent":
         if _state_node_at(root_fd, ".git", str(path)) != ABSENT_STATE:
             raise AdapterError("public-adapter-restore-failed", str(path))
-        _create_state_node_at(root_fd, ".git", before, str(path))
+        _create_state_node_at(
+            root_fd, ".git", before, str(path), quarantine
+        )
         _require_workspace_root(workspace, root_fd, restore=True)
         if _state_node_at(root_fd, ".git", str(path)) != before:
             raise AdapterError("public-adapter-restore-failed", str(path))
-    return residue_manifest if after[0] != "absent" else {}
 
 
 def _restore_caller_state(
@@ -2058,6 +2559,7 @@ def _restore_caller_state(
     root_fd: int,
     state: dict[str, Any],
     after: dict[str, Any],
+    quarantine: dict[str, Any],
 ) -> None:
     try:
         _require_workspace_root(workspace, root_fd, restore=True)
@@ -2069,15 +2571,15 @@ def _restore_caller_state(
                 "public-adapter-restore-failed", str(workspace)
             )
         expected_worktree = _restore_worktree(
-            workspace, state, after, root_fd
+            workspace, state, after, root_fd, quarantine
         )
-        pointer_residue = _restore_git_pointer(
+        _restore_git_pointer(
             workspace,
             root_fd,
             state["git_pointer"],
             after["git_pointer"],
+            quarantine,
         )
-        expected_worktree.update(pointer_residue)
         _require_worktree_cas(
             workspace, root_fd, expected_worktree, state["root_mode"]
         )
@@ -2105,6 +2607,7 @@ def _restore_caller_state(
                 before_admin[path]["object_relative"],
                 before_admin[path]["manifest"],
                 after_admin[path]["manifest"],
+                quarantine,
             )
             expected_item = dict(before_admin[path])
             expected_item["manifest"] = expected_manifest
@@ -2118,9 +2621,20 @@ def _restore_caller_state(
             raise AdapterError("public-adapter-restore-failed", str(workspace))
         if _raw_git_binding(workspace, strict=True) != state["git_binding"]:
             raise AdapterError("public-adapter-restore-failed", str(workspace))
-        if expected_state != state:
-            raise AdapterError("public-adapter-restore-failed", str(workspace))
-    except AdapterError:
+        if quarantine["residues"]:
+            _require_external_quarantine(
+                quarantine, _external_quarantine_ref(quarantine)
+            )
+            raise AdapterError(
+                "public-adapter-restore-failed",
+                _external_quarantine_ref(quarantine),
+            )
+    except AdapterError as error:
+        if quarantine["residues"]:
+            raise AdapterError(
+                "public-adapter-restore-failed",
+                _external_quarantine_ref(quarantine),
+            ) from error
         raise
     except (OSError, UnicodeError) as error:
         raise AdapterError("public-adapter-restore-failed", str(workspace)) from error
@@ -2855,9 +3369,9 @@ def _inspect_public_kernel(
         "doctor_projection": {
             "contract_version": doctor["contract_version"],
             "ready": doctor["ready"],
-            "object_digest": canonical_digest(doctor),
+            "object_digest": canonical_public_digest(doctor),
             "source_digest": doctor_source_digest,
-            "writer_coordination_digest": canonical_digest(
+            "writer_coordination_digest": canonical_public_digest(
                 doctor["writer_coordination"]
             ),
         },
@@ -2865,7 +3379,7 @@ def _inspect_public_kernel(
         "legacy_inventory_projection": {
             "contract_version": inventory["contract_version"],
             "command": inventory_command,
-            "object_digest": canonical_digest(inventory),
+            "object_digest": canonical_public_digest(inventory),
             "source_digest": inventory_source_digest,
             "authority_revision": inventory["authority"]["default_revision"],
             "home_set_digest": inventory["home_set"]["digest"],
@@ -2886,7 +3400,7 @@ def _inspect_public_kernel(
         snapshot["engine_manifest_projection"] = {
             "contract_version": manifest["contract_version"],
             "command": "engine-manifest show",
-            "object_digest": canonical_digest(manifest),
+            "object_digest": canonical_public_digest(manifest),
             "source_digest": manifest_source_digest,
             "content_revision": manifest["source"]["revision"],
             "manifest_digest": manifest["digest"],
@@ -2905,7 +3419,7 @@ def _inspect_public_kernel(
         snapshot["task_status"] = task_status
         snapshot["task_status_projection"] = {
             "contract_version": task_status.get("contract_version"),
-            "object_digest": canonical_digest(task_status),
+            "object_digest": canonical_public_digest(task_status),
             "source_digest": task_status_source_digest,
         }
         snapshot["migration_task_claim"] = _task_claim(task_status, branch)
@@ -2923,10 +3437,13 @@ def inspect_public_kernel(
     root_fd = _open_workspace_root(workspace)
     access_groups: list[dict[str, Any]] = []
     descriptor_limit: tuple[int, int] | None = None
+    quarantine: dict[str, Any] | None = None
     try:
         before = _capture_caller_state(workspace, root_fd)
         descriptor_limit = _raise_access_descriptor_limit(before)
         access_groups = _capture_directory_access(workspace, root_fd, before)
+        quarantine = _new_external_quarantine(workspace, root_fd)
+        _preflight_quarantine_devices(quarantine, access_groups)
         result: dict[str, Any] | None = None
         failure: BaseException | None = None
         try:
@@ -2958,7 +3475,9 @@ def inspect_public_kernel(
                     "public-adapter-restore-failed", str(workspace)
                 ) from failure
             if after != before:
-                _restore_caller_state(workspace, root_fd, before, after)
+                _restore_caller_state(
+                    workspace, root_fd, before, after, quarantine
+                )
             raise AdapterError(
                 "public-adapter-mutated", str(workspace)
             ) from failure
@@ -2968,9 +3487,13 @@ def inspect_public_kernel(
         return result
     finally:
         try:
-            _close_directory_access(access_groups)
+            if quarantine is not None:
+                _close_external_quarantine(quarantine)
         finally:
             try:
-                os.close(root_fd)
+                _close_directory_access(access_groups)
             finally:
-                _restore_access_descriptor_limit(descriptor_limit)
+                try:
+                    os.close(root_fd)
+                finally:
+                    _restore_access_descriptor_limit(descriptor_limit)
