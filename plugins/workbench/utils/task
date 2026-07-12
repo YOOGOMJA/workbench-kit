@@ -6329,6 +6329,7 @@ write_terminal_outcome() {
 
 json_string_field() {
   local json="$1" path="$2"
+  [ -n "$json" ] || return 0
   printf '%s\n' "$json" | python3 -c '
 import json
 import sys

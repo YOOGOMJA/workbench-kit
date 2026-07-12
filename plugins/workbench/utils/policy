@@ -284,6 +284,7 @@ load_concurrent_context_sources() {
       --workspace-root "$workspace" 2>/dev/null)" || integrity_error "policy-context-unavailable"
     while IFS=$'\t' read -r layer context_ref policy_ref expected_policy_digest authority_identity \
       authority_ref authority_revision receipt_digest; do
+      [ -n "$layer" ] || continue
       case "$layer" in context|task) ;; *) integrity_error "policy-context-unavailable" ;; esac
       [ "$context_ref" != null ] || context_ref=""
       file="$workspace/$policy_ref"

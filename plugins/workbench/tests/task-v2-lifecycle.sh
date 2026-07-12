@@ -3969,6 +3969,32 @@ assert any(line.startswith("push-failed:") for line in lines), lines
 PY
 }
 
+test_writer_policy_failure_does_not_leak_json_parser_traceback() {
+  local first second out rc
+  setup_writer_workbench writer_policy_error
+  prepare_writer_task writer_policy_error 29; first="$WRITER_TASK_DIR"
+  WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+  WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_policy_error "$first" add-repo shared-api --format json >/dev/null
+
+  prepare_writer_task writer_policy_error 31; second="$WRITER_TASK_DIR"
+  rm "$second/task/.workbench/policy-context/registration.json"
+  out="$TMPDIR/writer_policy_error/second.out"
+  if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir writer_policy_error "$second" add-repo shared-api --format json \
+      >"$out" 2>&1; then
+    fail "writer accepted a missing current policy registration"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "missing current policy registration returned $rc"
+  assert_file_contains "$out" 'policy-source-tampered'
+  if grep -Fq 'Traceback' "$out"; then
+    fail "writer policy failure leaked an internal JSON parser traceback"
+  fi
+  [ ! -e "$second/task/codebases/shared-api" ] \
+    || fail "policy failure created a local worktree"
+}
+
 test_writer_rejects_non_append_only_coordination_history() {
   local mode case_name first second out status_out rc
   for mode in rewritten-tip valid-rebuild new-root row-removal historical-rewrite \
@@ -6960,6 +6986,9 @@ test_concurrent_writer_uses_complete_sealed_context_union() {
   else rc=$?; fi
   [ "$rc" = 1 ] || fail "missing competing context returned $rc"
   assert_file_contains "$out" 'policy-context-unavailable'
+  if grep -Fq 'Traceback' "$out"; then
+    fail "missing competing context leaked an internal JSON parser traceback"
+  fi
   [ ! -e "$third/task/codebases/shared-api" ] || fail "missing context created a worktree"
 }
 
@@ -7145,6 +7174,7 @@ run_case test_cleanup_releases_work_ref_reservation_after_workspace_removal
 run_case test_cleanup_deleted_retry_rejects_tampered_immutable_intent
 run_case test_v2_cleanup_requires_terminal_outcome_even_with_force
 run_case test_writer_claim_cas_retry_rechecks_conflict_before_local_creation
+run_case test_writer_policy_failure_does_not_leak_json_parser_traceback
 run_case test_writer_rejects_non_append_only_coordination_history
 run_case test_writer_anchor_is_nofollow_and_exact
 run_case test_writer_anchor_rejects_symlinked_parent
