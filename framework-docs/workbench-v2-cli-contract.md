@@ -2413,7 +2413,12 @@ the otherwise frozen task-content repo row; a consumed operation therefore begin
 the `worktree` cursor and never edits that frozen row. Cleanup appends the matching remote
 `released` row only after persisting `release-pending` with next `claim`, then refetches it and
 advances finish. All operation releases must be verified before
-the task workspace or local task branch is deleted.
+the task workspace or local task branch is deleted. Immediately before task-workspace
+removal, the kernel rechecks the exact workspace descriptor and dirty state, stages only the
+cleanup action's mutable private files or the authenticated untracked submission restoration
+outside the workspace, and invokes non-forced `git worktree remove`. If any concurrent byte
+appears at that boundary, Git refuses deletion; the kernel restores its staged private state
+and leaves the workspace and local branch for retry.
 
 Release changes coordination state, not frozen task content. Ambiguous/external worktrees or
 CAS failure keep the task workspace and remote claim active and return

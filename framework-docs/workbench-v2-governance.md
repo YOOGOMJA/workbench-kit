@@ -428,8 +428,11 @@ it persists a `prepared` cleanup journal in the task home's issue comments; retr
 that external receipt's writer operation/claim pairs and every intended/verified effect-owner
 event through exact worktree retirement, verified CAS release, `completed`, and
 `task-cleaned`. All releases finish before task
-workspace deletion; a post-delete retry uses the external journal and remote ledger. Release
-does not mutate frozen task content.
+workspace deletion. The final deletion rechecks ownership and dirtiness, temporarily stages
+only cleanup-owned mutable action state (or an authenticated submitted-state restoration),
+and uses non-forced worktree removal. A concurrent byte makes removal fail and the staged
+state is restored for retry. A post-delete retry uses the external journal and remote ledger.
+Release does not mutate frozen task content.
 
 Completion and abandonment both freeze every revision-affecting fact. Refs, context set,
 deliverables and acceptance, required checks, evidence, harvest, and writer claims reject

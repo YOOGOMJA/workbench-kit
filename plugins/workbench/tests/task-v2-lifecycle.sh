@@ -627,6 +627,7 @@ run_task_in_dir() {
     WORKBENCH_TEST_LIFECYCLE_OBSERVATION="${WORKBENCH_TEST_LIFECYCLE_OBSERVATION:-}" \
     WORKBENCH_TEST_GOVERNED_FINAL_HOOK="${WORKBENCH_TEST_GOVERNED_FINAL_HOOK:-}" \
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
+    WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK="${WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK:-}" \
     WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="${WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK:-}" \
     WORKBENCH_TEST_WORK_REF_BARRIER_DIR="${WORKBENCH_TEST_WORK_REF_BARRIER_DIR:-}" \
     WORKBENCH_TEST_WORK_REF_BARRIER_ID="${WORKBENCH_TEST_WORK_REF_BARRIER_ID:-}" \
@@ -635,6 +636,7 @@ run_task_in_dir() {
     WORKBENCH_TEST_LOCAL_WRITE_READY="${WORKBENCH_TEST_LOCAL_WRITE_READY:-}" \
     WORKBENCH_TEST_LOCAL_WRITE_RELEASE="${WORKBENCH_TEST_LOCAL_WRITE_RELEASE:-}" \
     WORKBENCH_TEST_REAL_MV="${WORKBENCH_TEST_REAL_MV:-}" \
+    WORKBENCH_TEST_CLEANUP_RACE_MARKER="${WORKBENCH_TEST_CLEANUP_RACE_MARKER:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_LOSE_LIFECYCLE_RESPONSE="${GH_LOSE_LIFECYCLE_RESPONSE:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
@@ -4070,6 +4072,44 @@ test_cleanup_revalidates_outer_task_before_forced_removal() {
   assert_file_contains "$retry" '"code":"dirty-task-worktree"'
   [ -f "$recovered" ] || fail "prepared cleanup retry lost recovered action bytes"
   [ -d "$CLEANUP_TASK_DIR" ] || fail "prepared cleanup retry removed the task workspace"
+}
+
+test_cleanup_refuses_bytes_created_at_task_removal_boundary() {
+  local out branch rc hook injected action
+  prepare_cleanup_fixture cleanup_task_removal_boundary
+  branch="task/29-v2-lifecycle-fixture-29"
+  hook="$TMPDIR/cleanup_task_removal_boundary/inject-removal-race"
+  injected="$TMPDIR/cleanup_task_removal_boundary/removal-boundary-injected"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' dirty-at-removal-boundary > "$1/BOUNDARY.txt"
+printf '%s\n' injected > "$WORKBENCH_TEST_CLEANUP_RACE_MARKER"
+SH
+  chmod +x "$hook"
+
+  out="$TMPDIR/cleanup_task_removal_boundary/done.out"
+  if WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK="$hook" \
+    WORKBENCH_TEST_CLEANUP_RACE_MARKER="$injected" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_task_removal_boundary "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    [ -f "$injected" ] \
+      || fail "task removal boundary injection was not reached"
+    fail "cleanup deleted bytes created at the task removal boundary"
+  else rc=$?; fi
+  [ -f "$injected" ] \
+    || fail "task removal boundary injection was not reached"
+  [ "$rc" = 1 ] || fail "task removal boundary race returned $rc"
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "task removal boundary race removed the workspace"
+  [ -f "$CLEANUP_TASK_DIR/BOUNDARY.txt" ] \
+    || fail "task removal boundary race lost user bytes"
+  action="$CLEANUP_TASK_DIR/task/.workbench/actions/$CLEANUP_ACTION_INSTANCE.record"
+  [ "$(sed -n 's/^status=//p' "$action")" = consumed ] \
+    || fail "task removal boundary race did not restore the consumed cleanup action"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "task removal boundary race removed the local branch"
 }
 
 test_cleanup_revalidates_clean_head_after_prepared_journal() {
@@ -7734,6 +7774,7 @@ run_case test_terminal_lifecycle_rejects_post_terminal_reactivation
 run_case test_forged_local_terminal_has_no_freeze_or_outcome_authority
 run_case test_cleanup_prepared_journal_failure_deletes_nothing
 run_case test_cleanup_revalidates_outer_task_before_forced_removal
+run_case test_cleanup_refuses_bytes_created_at_task_removal_boundary
 run_case test_cleanup_revalidates_clean_head_after_prepared_journal
 run_case test_cleanup_rejects_untrusted_prepared_journal
 run_case test_cleanup_rejects_prepared_journal_without_terminal_action_join

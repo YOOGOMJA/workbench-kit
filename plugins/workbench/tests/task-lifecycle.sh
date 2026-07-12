@@ -160,6 +160,7 @@ setup_workbench() {
   git -C "$repo" commit -q -m "init"
   git -C "$repo" remote add origin "$origin"
   git -C "$repo" push -q -u origin main
+  git -C "$origin" symbolic-ref HEAD refs/heads/main
 
   : > "$TMPDIR/$name/gh.log"
   write_fake_gh "$fake_bin"

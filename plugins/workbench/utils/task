@@ -7789,6 +7789,122 @@ cleanup_verify_external_writer_operations() {
   done
 }
 
+cleanup_stage_mutable_action_file() {
+  local dir="$1" relative="$2" backup="$3" target existed=false
+  target="$dir/$relative"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] || return 1
+    mv "$target" "$backup" || return 1
+    existed=true
+  fi
+  if git -C "$dir" ls-files --error-unmatch "$relative" >/dev/null 2>&1; then
+    if ! git -C "$dir" checkout -q HEAD -- "$relative"; then
+      if [ "$existed" = true ]; then
+        [ ! -d "$target" ] || return 1
+        rm -f "$target" || return 1
+        mv "$backup" "$target" || return 1
+      else
+        [ ! -d "$target" ] || return 1
+        rm -f "$target" || return 1
+      fi
+      return 1
+    fi
+  else
+    [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+  fi
+  printf '%s\n' "$existed"
+}
+
+cleanup_restore_mutable_action_file() {
+  local dir="$1" relative="$2" backup="$3" existed="$4" target
+  target="$dir/$relative"
+  [ -d "$dir" ] || return 1
+  if [ "$existed" = true ]; then
+    [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+    [ ! -d "$target" ] || return 1
+    rm -f "$target" || return 1
+    mv "$backup" "$target" || return 1
+  else
+    [ ! -d "$target" ] || return 1
+    rm -f "$target" || return 1
+  fi
+}
+
+cleanup_restore_recovered_task() {
+  local dir="$1" backup="$2" conflict
+  [ -d "$dir" ] && [ -d "$backup/task" ] && [ ! -L "$backup/task" ] || return 1
+  if [ -e "$dir/task" ] || [ -L "$dir/task" ]; then
+    conflict="$dir/task.cleanup-race.$$"
+    [ ! -e "$conflict" ] && [ ! -L "$conflict" ] || return 1
+    mv "$dir/task" "$conflict" || return 1
+  fi
+  mv "$backup/task" "$dir/task"
+}
+
+cleanup_restore_staged_task_state() {
+  local dir="$1" backup="$2" recovered_task="$3" record="$4" request="$5"
+  local record_existed="$6" request_existed="$7" rc=0
+  if [ "$recovered_task" = true ]; then
+    cleanup_restore_recovered_task "$dir" "$backup" || rc=1
+  else
+    cleanup_restore_mutable_action_file "$dir" "$request" "$backup/request" \
+      "$request_existed" || rc=1
+    cleanup_restore_mutable_action_file "$dir" "$record" "$backup/record" \
+      "$record_existed" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    rm -rf "$backup"
+  else
+    echo "error: cleanup state restore failed; backup retained: $backup" >&2
+  fi
+  return "$rc"
+}
+
+cleanup_remove_task_worktree() {
+  local root="$1" dir="$2" action_id="$3" backup record request record_existed request_existed
+  local recovered_task=false
+  record_existed=false; request_existed=false
+  record="task/.workbench/actions/$action_id.record"
+  request="task/.workbench/actions/$action_id.request.json"
+  backup="$(mktemp -d "${TMPDIR:-/tmp}/workbench-cleanup-action.XXXXXX")" || return 1
+  chmod 700 "$backup" || { rmdir "$backup"; return 1; }
+  if ! git -C "$dir" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
+    [ -d "$dir/task" ] && [ ! -L "$dir/task" ] \
+      || { rmdir "$backup"; return 1; }
+    mv "$dir/task" "$backup/task" || { rmdir "$backup"; return 1; }
+    recovered_task=true
+  else
+    if ! record_existed="$(cleanup_stage_mutable_action_file "$dir" "$record" "$backup/record")"; then
+      rmdir "$backup" 2>/dev/null || true
+      return 1
+    fi
+    if ! request_existed="$(cleanup_stage_mutable_action_file "$dir" "$request" "$backup/request")"; then
+      if cleanup_restore_mutable_action_file "$dir" "$record" "$backup/record" "$record_existed"; then
+        rm -f "$backup/request"
+        rmdir "$backup" 2>/dev/null || true
+      else
+        echo "error: cleanup state restore failed; backup retained: $backup" >&2
+      fi
+      return 1
+    fi
+  fi
+  if [ -n "${WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK:-}" ]; then
+    if [ ! -x "$WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK" ] \
+      || ! "$WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK" "$dir"; then
+      cleanup_restore_staged_task_state "$dir" "$backup" "$recovered_task" \
+        "$record" "$request" "$record_existed" "$request_existed" || true
+      return 1
+    fi
+  fi
+  if git -C "$root" worktree remove "$dir"; then
+    rm -rf "$backup"
+    return 0
+  fi
+  cleanup_restore_staged_task_state "$dir" "$backup" "$recovered_task" \
+    "$record" "$request" "$record_existed" "$request_existed" || true
+  return 1
+}
+
 cleanup_apply_removal_plan() {
   local root="$1" dir="$2" branch="$3" journal_file="$4" i name task_descriptor=""
   CLEANUP_REMOVED_WRITER_COUNT=0; CLEANUP_REMOVED_COUNT=0
@@ -7838,7 +7954,7 @@ cleanup_apply_removal_plan() {
       cleanup_add_blocker cleanup-ownership-mismatch "$branch"
       return 1
     fi
-    git -C "$root" worktree remove --force "$dir" || return 1
+    cleanup_remove_task_worktree "$root" "$dir" "$CLEANUP_PLAN_ACTION_ID" || return 1
   fi
   [ ! -d "$dir" ] || return 1
   CLEANUP_TASK_WORKSPACE_REMOVED=true
