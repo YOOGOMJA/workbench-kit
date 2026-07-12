@@ -1365,7 +1365,7 @@ def validate_recovery_authority(repository: str, value: Dict[str, Any]) -> None:
         repository, "show", revisions[0] + ":.workbench/authority.json"
     )
     descriptor = json.loads(raw, object_pairs_hook=unique_object)
-    expected_fields = {
+    expected_fields = (
         "contract_version",
         "authority_identity",
         "origin_url",
@@ -1373,17 +1373,17 @@ def validate_recovery_authority(repository: str, value: Dict[str, Any]) -> None:
         "workspace_home",
         "hosting_adapter",
         "hosting_ref",
-    }
-    require_fields(descriptor, expected_fields, "submission recovery authority")
+    )
+    require_fields(descriptor, set(expected_fields), "submission recovery authority")
     if (
         descriptor["contract_version"] != "workbench-workspace-authority/v1"
         or descriptor["origin_url"] != origin
         or descriptor["default_ref"] != value["default_ref"]
     ):
         raise ValueError("submission recovery authority descriptor mismatch")
+    normalized = {field: descriptor[field] for field in expected_fields}
     canonical = (
-        json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
+        json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n"
     ).encode("utf-8")
     digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
     if digest != value["workspace_authority_descriptor_digest"]:
