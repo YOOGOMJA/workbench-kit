@@ -231,7 +231,13 @@ load_context_policy_sources() {
   if [ "$ACTION_ID" = task.policy-context.register ]; then return 0; fi
   if [ ! -f "$state" ]; then
     context_ref="$(index_get context_ref)"
-    if [ -z "$context_ref" ]; then create_auto_null_context; else integrity_error "policy-context-unsealed"; fi
+    if [ "${POLICY_REVALIDATING:-false}" = true ]; then
+      integrity_error "policy-context-unavailable"
+    elif [ -z "$context_ref" ]; then
+      create_auto_null_context
+    else
+      integrity_error "policy-context-unsealed"
+    fi
   fi
   state="$state_dir/state.record"; registration_file="$state_dir/registration.json"
   [ -f "$registration_file" ] || integrity_error "policy-source-tampered"
@@ -570,6 +576,105 @@ cmd_resolve() {
   case "$CURRENT_DECISION" in allow) return 0 ;; ask) return 3 ;; deny) return 4 ;; esac
 }
 
+cmd_revalidate() {
+  [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
+  local instance_id="" action_id="" claim_id="" target_ref="" revision="" intent_digest=""
+  local action_record_digest="" file request_file parsed key value status authorization
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --action-instance-id) instance_id="$2"; shift 2 ;;
+      --action-id) action_id="$2"; shift 2 ;;
+      --task-claim-id) claim_id="$2"; shift 2 ;;
+      --target-ref) target_ref="$2"; shift 2 ;;
+      --revision) revision="$2"; shift 2 ;;
+      --intent-digest) intent_digest="$2"; shift 2 ;;
+      --action-record-digest) action_record_digest="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  for value in "$instance_id" "$action_id" "$claim_id" "$target_ref" "$revision" \
+    "$intent_digest" "$action_record_digest"; do
+    require_token governed_revalidation "$value"
+  done
+  case "$instance_id" in *[!A-Za-z0-9._-]*|'') integrity_error "invalid action instance ID" ;; esac
+  printf '%s' "$action_record_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+    || integrity_error "invalid action record digest"
+  action_supported "$action_id" || usage_error "unsupported-action: $action_id"
+
+  TOP="$(task_root)"; ROOT="$(workspace_root)"; ACTION_ID="$action_id"
+  CLAIM_ID="$claim_id"; TARGET_REF="$target_ref"; REVISION="$revision"
+  INTENT_DIGEST="$intent_digest"; REQUEST_FILE=""
+  [ "$(index_get claim_id)" = "$CLAIM_ID" ] || integrity_error "task claim binding mismatch"
+  file="$TOP/task/.workbench/actions/$instance_id.record"
+  request_file="$TOP/task/.workbench/actions/$instance_id.request.json"
+  [ -f "$file" ] && [ -f "$request_file" ] \
+    || integrity_error "action-effect-unreconciled: missing action provenance"
+  [ "$(sha256_file "$file")" = "$action_record_digest" ] \
+    || integrity_error "action-binding-stale"
+  [ "$(record_get "$file" id)" = "$instance_id" ] \
+    && [ "$(record_get "$file" action_id)" = "$ACTION_ID" ] \
+    && [ "$(record_get "$file" task_claim_id)" = "$CLAIM_ID" ] \
+    && [ "$(record_get "$file" target_ref)" = "$TARGET_REF" ] \
+    && [ "$(record_get "$file" revision)" = "$REVISION" ] \
+    && [ "$(record_get "$file" intent_digest)" = "$INTENT_DIGEST" ] \
+    || integrity_error "action-binding-stale"
+  status="$(record_get "$file" status)"
+  [ "$status" = authorized ] || integrity_error "action instance is not authorized"
+
+  parsed="$(python3 "$(intent_helper)" request "$request_file" \
+    --intent-digest "$INTENT_DIGEST" --format shell)" \
+    || integrity_error "action-effect-unreconciled: invalid stored request"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      action_id) [ "$value" = "$ACTION_ID" ] || integrity_error "action-binding-stale" ;;
+      task_claim_id) [ "$value" = "$CLAIM_ID" ] || integrity_error "action-binding-stale" ;;
+      target_ref) [ "$value" = "$TARGET_REF" ] || integrity_error "action-binding-stale" ;;
+      subject_revision) [ "$value" = "$REVISION" ] || integrity_error "action-binding-stale" ;;
+      intent_digest) [ "$value" = "$INTENT_DIGEST" ] || integrity_error "action-binding-stale" ;;
+    esac
+  done <<< "$parsed"
+
+  authorization="$(record_get "$file" authorization_id)$(record_get "$file" authorization_ref)$(record_get "$file" authorization_actor)$(record_get "$file" authorization_at)"
+  if [ -n "$authorization" ]; then
+    [ -n "$(record_get "$file" authorization_id)" ] \
+      && [ -n "$(record_get "$file" authorization_ref)" ] \
+      && [ -n "$(record_get "$file" authorization_actor)" ] \
+      && [ -n "$(record_get "$file" authorization_at)" ] \
+      || integrity_error "action-effect-unreconciled: partial authorization"
+  fi
+  POLICY_REVALIDATING=true build_policy_manifest
+  [ "$(record_get "$file" policy_manifest_digest)" = "$POLICY_MANIFEST_DIGEST" ] \
+    || integrity_error "action-binding-stale"
+}
+
+cmd_invalidate_context() {
+  [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
+  local claim_id="" target_ref="" file status
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --task-claim-id) claim_id="$2"; shift 2 ;;
+      --target-ref) target_ref="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  require_token task_claim_id "$claim_id"; require_token target_ref "$target_ref"
+  TOP="$(task_root)"
+  [ "$(index_get claim_id)" = "$claim_id" ] || integrity_error "task claim binding mismatch"
+  for file in "$TOP/task/.workbench/actions"/*.record; do
+    [ -f "$file" ] || continue
+    [ "$(record_get "$file" action_id)" = task.policy-context.register ] || continue
+    [ "$(record_get "$file" task_claim_id)" = "$claim_id" ] \
+      && [ "$(record_get "$file" target_ref)" = "$target_ref" ] \
+      || integrity_error "context registration action identity mismatch"
+    status="$(record_get "$file" status)"
+    case "$status" in
+      pending|authorized) rewrite_action_status "$file" superseded ;;
+      consumed|denied|superseded) ;;
+      *) integrity_error "invalid action instance status" ;;
+    esac
+  done
+}
+
 cmd_consume() {
   [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
   local instance_id="" action_id="" claim_id="" target_ref="" revision="" intent_digest=""
@@ -611,6 +716,8 @@ cmd_consume() {
 
 case "${1:-}" in
   resolve) shift; cmd_resolve "$@" ;;
+  revalidate) shift; cmd_revalidate "$@" ;;
+  invalidate-context) shift; cmd_invalidate_context "$@" ;;
   consume) shift; cmd_consume "$@" ;;
   *) usage_error "usage: workbench policy resolve ..." ;;
 esac

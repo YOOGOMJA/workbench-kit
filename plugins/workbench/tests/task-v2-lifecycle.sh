@@ -610,6 +610,7 @@ run_task_in_dir() {
     WORKBENCH_TEST_FAIL_SUBMISSION_STAGE="${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" \
     WORKBENCH_TEST_SUBMISSION_OBSERVATION="${WORKBENCH_TEST_SUBMISSION_OBSERVATION:-}" \
     WORKBENCH_TEST_LIFECYCLE_OBSERVATION="${WORKBENCH_TEST_LIFECYCLE_OBSERVATION:-}" \
+    WORKBENCH_TEST_GOVERNED_FINAL_HOOK="${WORKBENCH_TEST_GOVERNED_FINAL_HOOK:-}" \
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
@@ -812,6 +813,49 @@ prepare_governed_fixture() {
   GOVERNED_PLATFORM_POLICY="$TMPDIR/$case_name/platform.policy"
   cp "$GOVERNED_REPO/.workbench/policy.conf" "$GOVERNED_PLATFORM_POLICY"
   run_task_in_dir "$case_name" "$GOVERNED_TASK_DIR" policy-context seal --format json >/dev/null
+}
+
+write_context_registration() {
+  local file="$1" claim="$2" context_ref="$3" policy_ref="$4" policy_digest="$5"
+  local registration_id="$6" actor="$7" registered_at="$8"
+  python3 - "$file" "$claim" "$context_ref" "$policy_ref" "$policy_digest" \
+    "$registration_id" "$actor" "$registered_at" <<'PY'
+import json
+import sys
+
+path, claim, context_ref, policy_ref, policy_digest, registration_id, actor, registered_at = sys.argv[1:]
+authority_ref = "toolbox:policy/" + context_ref.rsplit("/", 1)[-1]
+receipt = {
+    "contract_version": "workbench-policy-authority-receipt/v1",
+    "authority_identity": "toolbox:authority/product-owner",
+    "authority_ref": authority_ref,
+    "authority_revision": "sha256:" + "a" * 64,
+    "policy_ref": policy_ref,
+    "policy_digest": policy_digest,
+    "actor": actor,
+    "issued_at": registered_at,
+    "source_ref": "toolbox:approval/" + registration_id,
+}
+value = {
+    "contract_version": "workbench-context-policy-registration/v1",
+    "registration_id": registration_id,
+    "task_claim_id": claim,
+    "task_context_ref": context_ref,
+    "participants": [{
+        "context_ref": context_ref,
+        "policy_ref": policy_ref,
+        "policy_digest": policy_digest,
+        "authority_ref": authority_ref,
+        "authority_receipt": receipt,
+    }],
+    "task_policy": None,
+    "actor": actor,
+    "registered_at": registered_at,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
 }
 
 prepare_pack_fixture() {
@@ -1968,6 +2012,7 @@ value = {
     "payload_contract": "toolbox-deploy-intent/v1",
     "payload": "toolbox-deploy-intent/v1\n",
 }
+
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(value, handle, separators=(",", ":"))
     handle.write("\n")
@@ -1980,6 +2025,66 @@ PY
   else rc=$?; fi
   [ "$rc" = 2 ] || fail "unsupported action must exit 2"
   assert_file_contains "$out" 'unsupported-action'
+}
+
+test_unsealed_policy_context_replacement_invalidates_old_actions() {
+  local repo task_dir claim registration policy_digest out rc pending instance revision intent manifest auth
+  repo="$(setup_workbench context_replace)"
+  printf '%s\n' 'schema=workbench-policy/v1' \
+    'action.task.policy-context.register=allow' > "$repo/.workbench/policy.conf"
+  git -C "$repo" add .workbench/policy.conf
+  git -C "$repo" commit -q -m "test: allow context replacement"
+  git -C "$repo" push -q
+  task_dir="$(start_task context_replace "$repo")"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  mkdir -p "$task_dir/contexts"
+  printf '%s\n' 'schema=workbench-policy/v1' > "$task_dir/contexts/acme.policy"
+  policy_digest="sha256:$(shasum -a 256 "$task_dir/contexts/acme.policy" | awk '{print $1}')"
+  registration="$TMPDIR/context_replace/acme.json"
+  write_context_registration "$registration" "$claim" toolbox:product/acme \
+    contexts/acme.policy "$policy_digest" ctxreg-acme owner@example.com 2026-07-12T15:10:00Z
+  run_task_in_dir context_replace "$task_dir" refs set \
+    --context-ref toolbox:product/acme --format json >/dev/null
+  out="$TMPDIR/context_replace/acme-pending.out"
+  if run_task_in_dir context_replace "$task_dir" policy-context register \
+    --registration-file "$registration" --format json >"$out"; then
+    fail "context replacement fixture must first require authorization"
+  else rc=$?; fi
+  [ "$rc" = 3 ] || fail "context replacement pending action returned $rc"
+  pending="$(cat "$out")"; instance="$(json_get "$pending" action_instance.id)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  auth="$TMPDIR/context_replace/acme-auth.json"
+  write_authorization "$auth" "$instance" task.policy-context.register "$claim" \
+    "workbench:task/$claim" "$revision" "$manifest" allow owner@example.com \
+    2026-07-12T15:10:00Z conversation:message/context-acme "$intent"
+  run_task_in_dir context_replace "$task_dir" policy-context register \
+    --registration-file "$registration" --action-instance-id "$instance" \
+    --authorization-file "$auth" --format json >/dev/null
+  assert_file_contains "$task_dir/task/.workbench/policy-context/state.record" 'sealed=false'
+
+  run_task_in_dir context_replace "$task_dir" refs set \
+    --context-ref toolbox:product/beta --format json >/dev/null
+  [ ! -e "$task_dir/task/.workbench/policy-context" ] \
+    || fail "context replacement retained the old unsealed projection"
+  assert_file_contains "$task_dir/task/.workbench/actions/$instance.record" 'status=consumed'
+
+  printf '%s\n' 'schema=workbench-policy/v1' > "$task_dir/contexts/beta.policy"
+  policy_digest="sha256:$(shasum -a 256 "$task_dir/contexts/beta.policy" | awk '{print $1}')"
+  registration="$TMPDIR/context_replace/beta.json"
+  write_context_registration "$registration" "$claim" toolbox:product/beta \
+    contexts/beta.policy "$policy_digest" ctxreg-beta owner@example.com 2026-07-12T15:11:00Z
+  out="$TMPDIR/context_replace/beta-pending.out"
+  if run_task_in_dir context_replace "$task_dir" policy-context register \
+    --registration-file "$registration" --format json >"$out"; then
+    fail "replacement registration must require authorization"
+  else rc=$?; fi
+  [ "$rc" = 3 ] || fail "replacement registration pending action returned $rc"
+  instance="$(json_get "$(cat "$out")" action_instance.id)"
+  run_task_in_dir context_replace "$task_dir" refs set \
+    --context-ref toolbox:product/gamma --format json >/dev/null
+  assert_file_contains "$task_dir/task/.workbench/actions/$instance.record" 'status=superseded'
 }
 
 test_deliverables_and_revision_bound_evidence() {
@@ -2567,6 +2672,191 @@ test_required_check_waive_is_reasoned_revision_bound_and_idempotent() {
   assert_contains "$actual" '"changed":false'
   actual="$(run_task_in_dir governed_check "$task_dir" verify --format json)"
   assert_contains "$actual" '"verified":true'
+}
+
+test_governed_primary_revalidates_policy_after_authorization() {
+  local task_dir out rc pending instance revision intent manifest auth hook state
+  prepare_governed_fixture governed_final_gate; task_dir="$GOVERNED_TASK_DIR"
+  run_task_in_dir governed_final_gate "$task_dir" required-check declare \
+    --id advisory --owner workbench --format json >/dev/null
+
+  out="$TMPDIR/governed_final_gate/pending.out"
+  if WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_final_gate "$task_dir" required-check waive --id advisory \
+      --reason-code not-applicable --format json >"$out"; then
+    fail "governed final-gate fixture must first require authorization"
+  else rc=$?; fi
+  [ "$rc" = 3 ] || fail "governed final-gate pending action returned $rc"
+  pending="$(cat "$out")"; instance="$(json_get "$pending" action_instance.id)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  auth="$TMPDIR/governed_final_gate/authorization.json"
+  write_authorization "$auth" "$instance" task.required-check.waive "$GOVERNED_CLAIM" \
+    workbench:required-check/advisory "$revision" "$manifest" allow reviewer@example.com \
+    2026-07-12T15:00:00Z conversation:message/final-gate "$intent"
+  hook="$TMPDIR/governed_final_gate/change-policy"
+  cat > "$hook" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' 'schema=workbench-policy/v1' 'action.task.required-check.waive=deny' > '$GOVERNED_PLATFORM_POLICY'
+EOF
+  chmod +x "$hook"
+
+  out="$TMPDIR/governed_final_gate/rejected.out"
+  if WORKBENCH_TEST_GOVERNED_FINAL_HOOK="$hook" \
+    WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_final_gate "$task_dir" required-check waive --id advisory \
+      --reason-code not-applicable --action-instance-id "$instance" \
+      --authorization-file "$auth" --format json >"$out" 2>&1; then
+    fail "governed primary ignored policy drift after authorization"
+  fi
+  state="$(sed -n 's/^state=//p' "$task_dir/task/.workbench/required-checks/advisory.record")"
+  [ "$state" = required ] || fail "stale governed action wrote its primary"
+  assert_file_contains "$task_dir/task/.workbench/actions/$instance.record" 'status=authorized'
+}
+
+test_governed_primary_revalidates_local_preimage() {
+  local task_dir record out rc pending instance revision intent manifest auth hook
+  prepare_governed_fixture governed_preimage_gate; task_dir="$GOVERNED_TASK_DIR"
+  run_task_in_dir governed_preimage_gate "$task_dir" required-check declare \
+    --id advisory --owner workbench --format json >/dev/null
+  record="$task_dir/task/.workbench/required-checks/advisory.record"
+  out="$TMPDIR/governed_preimage_gate/pending.out"
+  if WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_preimage_gate "$task_dir" required-check waive --id advisory \
+      --reason-code not-applicable --format json >"$out"; then
+    fail "governed preimage fixture must first require authorization"
+  else rc=$?; fi
+  [ "$rc" = 3 ] || fail "governed preimage pending action returned $rc"
+  pending="$(cat "$out")"; instance="$(json_get "$pending" action_instance.id)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  auth="$TMPDIR/governed_preimage_gate/authorization.json"
+  write_authorization "$auth" "$instance" task.required-check.waive "$GOVERNED_CLAIM" \
+    workbench:required-check/advisory "$revision" "$manifest" allow reviewer@example.com \
+    2026-07-12T15:01:00Z conversation:message/preimage-gate "$intent"
+  hook="$TMPDIR/governed_preimage_gate/change-record"
+  cat > "$hook" <<EOF
+#!/usr/bin/env bash
+python3 - '$record' <<'PY'
+from pathlib import Path
+path = Path(__import__('sys').argv[1])
+path.write_text(path.read_text().replace('owner=workbench\n', 'owner=tampered\n'))
+PY
+EOF
+  chmod +x "$hook"
+  out="$TMPDIR/governed_preimage_gate/rejected.out"
+  if WORKBENCH_TEST_GOVERNED_FINAL_HOOK="$hook" \
+    WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_preimage_gate "$task_dir" required-check waive --id advisory \
+      --reason-code not-applicable --action-instance-id "$instance" \
+      --authorization-file "$auth" --format json >"$out" 2>&1; then
+    fail "governed primary ignored its changed local preimage"
+  fi
+  assert_file_contains "$record" 'owner=tampered'
+  assert_file_contains "$record" 'state=required'
+  assert_file_contains "$task_dir/task/.workbench/actions/$instance.record" 'status=authorized'
+}
+
+test_governed_revalidation_does_not_recreate_missing_context() {
+  local task_dir out rc pending instance revision intent manifest auth hook record
+  prepare_governed_fixture governed_read_only_gate; task_dir="$GOVERNED_TASK_DIR"
+  run_task_in_dir governed_read_only_gate "$task_dir" required-check declare \
+    --id advisory --owner workbench --format json >/dev/null
+  record="$task_dir/task/.workbench/required-checks/advisory.record"
+
+  out="$TMPDIR/governed_read_only_gate/pending.out"
+  if WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_read_only_gate "$task_dir" required-check waive --id advisory \
+      --reason-code not-applicable --format json >"$out"; then
+    fail "governed read-only fixture must first require authorization"
+  else rc=$?; fi
+  [ "$rc" = 3 ] || fail "governed read-only pending action returned $rc"
+  pending="$(cat "$out")"; instance="$(json_get "$pending" action_instance.id)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  auth="$TMPDIR/governed_read_only_gate/authorization.json"
+  write_authorization "$auth" "$instance" task.required-check.waive "$GOVERNED_CLAIM" \
+    workbench:required-check/advisory "$revision" "$manifest" allow reviewer@example.com \
+    2026-07-12T15:02:00Z conversation:message/read-only-gate "$intent"
+  hook="$TMPDIR/governed_read_only_gate/remove-context"
+  cat > "$hook" <<EOF
+#!/usr/bin/env bash
+rm -rf '$task_dir/task/.workbench/policy-context'
+EOF
+  chmod +x "$hook"
+
+  out="$TMPDIR/governed_read_only_gate/rejected.out"
+  if WORKBENCH_TEST_GOVERNED_FINAL_HOOK="$hook" \
+    WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_read_only_gate "$task_dir" required-check waive --id advisory \
+      --reason-code not-applicable --action-instance-id "$instance" \
+      --authorization-file "$auth" --format json >"$out" 2>&1; then
+    fail "governed primary accepted a missing policy context"
+  fi
+  [ ! -e "$task_dir/task/.workbench/policy-context" ] \
+    || fail "read-only governed revalidation recreated policy context state"
+  assert_file_contains "$record" 'state=required'
+  assert_file_contains "$task_dir/task/.workbench/actions/$instance.record" 'status=authorized'
+}
+
+test_governed_revalidation_binds_exact_action_record() {
+  local task_dir out rc pending instance revision intent manifest auth hook record action_record
+  prepare_governed_fixture governed_action_record_gate; task_dir="$GOVERNED_TASK_DIR"
+  run_task_in_dir governed_action_record_gate "$task_dir" required-check declare \
+    --id advisory --owner workbench --format json >/dev/null
+  record="$task_dir/task/.workbench/required-checks/advisory.record"
+
+  out="$TMPDIR/governed_action_record_gate/pending.out"
+  if WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_action_record_gate "$task_dir" required-check waive --id advisory \
+      --reason-code not-applicable --format json >"$out"; then
+    fail "governed action-record fixture must first require authorization"
+  else rc=$?; fi
+  [ "$rc" = 3 ] || fail "governed action-record pending action returned $rc"
+  pending="$(cat "$out")"; instance="$(json_get "$pending" action_instance.id)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  auth="$TMPDIR/governed_action_record_gate/authorization.json"
+  write_authorization "$auth" "$instance" task.required-check.waive "$GOVERNED_CLAIM" \
+    workbench:required-check/advisory "$revision" "$manifest" allow reviewer@example.com \
+    2026-07-12T15:03:00Z conversation:message/action-record-gate "$intent"
+  action_record="$task_dir/task/.workbench/actions/$instance.record"
+  hook="$TMPDIR/governed_action_record_gate/change-action-record"
+  cat > "$hook" <<EOF
+#!/usr/bin/env bash
+python3 - '$action_record' <<'PY'
+from pathlib import Path
+path = Path(__import__('sys').argv[1])
+path.write_text(path.read_text().replace(
+    'authorization_actor=reviewer@example.com\n',
+    'authorization_actor=other@example.com\n',
+))
+PY
+EOF
+  chmod +x "$hook"
+
+  out="$TMPDIR/governed_action_record_gate/rejected.out"
+  if WORKBENCH_TEST_GOVERNED_FINAL_HOOK="$hook" \
+    WORKBENCH_PLATFORM_POLICY="$GOVERNED_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/governed \
+    run_task_in_dir governed_action_record_gate "$task_dir" required-check waive --id advisory \
+      --reason-code not-applicable --action-instance-id "$instance" \
+      --authorization-file "$auth" --format json >"$out" 2>&1; then
+    fail "governed primary accepted a changed authorization record"
+  fi
+  assert_file_contains "$record" 'state=required'
+  assert_file_contains "$action_record" 'authorization_actor=other@example.com'
 }
 
 test_submitted_and_failed_deliverables_block_verification() {
@@ -6236,8 +6526,13 @@ run_case test_pack_deliverable_owner_binding_is_immutable_and_authorized
 run_case test_pack_acceptance_recovers_from_durable_primary
 run_case test_deliverable_governed_effect_is_single_bound_reasoned_and_resettable
 run_case test_required_check_waive_is_reasoned_revision_bound_and_idempotent
+run_case test_governed_primary_revalidates_policy_after_authorization
+run_case test_governed_primary_revalidates_local_preimage
+run_case test_governed_revalidation_does_not_recreate_missing_context
+run_case test_governed_revalidation_binds_exact_action_record
 run_case test_policy_context_is_owner_authorized_sealed_and_manifest_bound
 run_case test_null_context_lazy_seal_and_frozen_action_registry
+run_case test_unsealed_policy_context_replacement_invalidates_old_actions
 run_case test_submitted_and_failed_deliverables_block_verification
 run_case test_harvest_ledger_is_explicit_sealed_and_governed
 run_case test_codebase_only_completion_is_policy_gated_and_cleanup_safe
