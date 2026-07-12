@@ -2955,6 +2955,30 @@ def cmd_lifecycle_reduce(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_lifecycle_claim_state(args: argparse.Namespace) -> None:
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    with open(args.markers_file, encoding="utf-8") as handle:
+        for raw in handle:
+            if not raw.endswith("\n"):
+                raise ValueError("lifecycle marker stream is not LF-terminated")
+            marker = json.loads(raw, object_pairs_hook=unique_object)
+            require_fields(marker, MARKER_FIELDS, "lifecycle marker stream row")
+            if marker["task_contract"] == "workbench-task/v2":
+                reduce_lifecycle_marker(groups, marker)
+    group = groups.get((args.branch, args.claim_id))
+    if group is None:
+        sys.stdout.write("phase=absent\n")
+        return
+    expected_home = None if args.home == "-" else args.home
+    if (
+        group["issue"] != args.issue
+        or group["home"] != expected_home
+        or group["workspace_authority_descriptor_digest"] != args.descriptor_digest
+    ):
+        raise ValueError("lifecycle claim identity mismatch")
+    sys.stdout.write("phase={}\n".format(group["phase"]))
+
+
 def load_submission_observation(
     path: str,
     repository_origin: str,
@@ -3116,6 +3140,14 @@ def parser() -> argparse.ArgumentParser:
     lifecycle_reduce.add_argument("--home", required=True)
     lifecycle_reduce.add_argument("--descriptor-digest", required=True)
     lifecycle_reduce.set_defaults(func=cmd_lifecycle_reduce)
+    claim_state = commands.add_parser("lifecycle-claim-state")
+    claim_state.add_argument("--markers-file", required=True)
+    claim_state.add_argument("--branch", required=True)
+    claim_state.add_argument("--claim-id", required=True)
+    claim_state.add_argument("--issue", type=int, required=True)
+    claim_state.add_argument("--home", required=True)
+    claim_state.add_argument("--descriptor-digest", required=True)
+    claim_state.set_defaults(func=cmd_lifecycle_claim_state)
     return value
 
 

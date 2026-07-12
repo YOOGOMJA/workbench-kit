@@ -151,6 +151,10 @@ case "${1:-} ${2:-}" in
       cat "$body_file"
       printf '%s\n' '<!-- fixture-comment-end -->'
     } >> "$GH_COMMENTS_DIR/$issue.comments"
+    if [ -n "${GH_LOSE_LIFECYCLE_RESPONSE:-}" ] \
+      && grep -Fq "\"event\":\"$GH_LOSE_LIFECYCLE_RESPONSE\"" "$body_file"; then
+      exit 44
+    fi
     if [ -n "${GH_CLEANUP_RACE_DIRTY_WORKTREE:-}" ] \
       && grep -Fq '"stage":"prepared"' "$body_file"; then
       printf '%s\n' dirty-after-prepared > "$GH_CLEANUP_RACE_DIRTY_WORKTREE/RACE.txt"
@@ -627,7 +631,12 @@ run_task_in_dir() {
     WORKBENCH_TEST_WORK_REF_BARRIER_DIR="${WORKBENCH_TEST_WORK_REF_BARRIER_DIR:-}" \
     WORKBENCH_TEST_WORK_REF_BARRIER_ID="${WORKBENCH_TEST_WORK_REF_BARRIER_ID:-}" \
     WORKBENCH_TEST_WORK_REF_RELEASE_FAIL="${WORKBENCH_TEST_WORK_REF_RELEASE_FAIL:-0}" \
+    WORKBENCH_TEST_LOCAL_WRITE_ID="${WORKBENCH_TEST_LOCAL_WRITE_ID:-}" \
+    WORKBENCH_TEST_LOCAL_WRITE_READY="${WORKBENCH_TEST_LOCAL_WRITE_READY:-}" \
+    WORKBENCH_TEST_LOCAL_WRITE_RELEASE="${WORKBENCH_TEST_LOCAL_WRITE_RELEASE:-}" \
+    WORKBENCH_TEST_REAL_MV="${WORKBENCH_TEST_REAL_MV:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
+    GH_LOSE_LIFECYCLE_RESPONSE="${GH_LOSE_LIFECYCLE_RESPONSE:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
     GH_CLEANUP_RACE_COMMIT_WORKTREE="${GH_CLEANUP_RACE_COMMIT_WORKTREE:-}" \
     GH_PR_STATE="${GH_PR_STATE:-}" GH_PR_HEAD="${GH_PR_HEAD:-}" GH_PR_MERGE="${GH_PR_MERGE:-}" \
@@ -1594,6 +1603,37 @@ assert len({item["claim_id"] for item in claims} - {conflicts[0]["claim_id"]}) =
 PY
 }
 
+test_start_retires_claim_after_lost_publish_response() {
+  local repo out rc comments
+  repo="$(setup_workbench start_claim_lost_response)"
+  out="$TMPDIR/start_claim_lost_response/start.out"
+  if GH_LOSE_LIFECYCLE_RESPONSE=task-claimed \
+    run_task start_claim_lost_response "$repo" start 29 lost-response --format json \
+      >"$out" 2>&1; then
+    fail "start succeeded after the task-claimed response was lost"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "lost task-claimed response returned $rc"
+  comments="$TMPDIR/start_claim_lost_response/comments/29.comments"
+  python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+markers = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+]
+claims = [item for item in markers if item["event"] == "task-claimed"]
+conflicts = [item for item in markers if item["event"] == "task-claim-conflict"]
+assert len(claims) == 1, markers
+assert len(conflicts) == 1, markers
+assert conflicts[0]["claim_id"] == claims[0]["claim_id"], markers
+PY
+}
+
 test_verified_result_change_reactivates_before_primary() {
   local repo task_dir comments out rc actual
   repo="$(setup_workbench lifecycle_reactivation)"
@@ -1728,8 +1768,9 @@ SH
 }
 
 test_work_ref_selection_serializes_same_claim_changes() {
-  local repo task_dir claim old first second barrier hook first_out second_out
-  local first_rc second_rc winner loser winner_ref loser_ref selection_ref actual
+  local repo task_dir clone clone_task branch claim old first second barrier hook
+  local first_out second_out first_rc second_rc winner loser winner_task loser_task
+  local winner_ref loser_ref selection_ref actual
   repo="$(setup_workbench work_ref_selection_cas)"
   task_dir="$(start_task work_ref_selection_cas "$repo" 29)"
   claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
@@ -1738,6 +1779,17 @@ test_work_ref_selection_serializes_same_claim_changes() {
   second=toolbox:scenario/SCN-SECOND
   run_task_in_dir work_ref_selection_cas "$task_dir" refs set \
     --work-ref "$old" --format json >/dev/null
+  git -C "$task_dir" add task/index.md
+  git -C "$task_dir" commit -q -m "test: persist selection race base"
+  git -C "$task_dir" push -q
+  branch="$(git -C "$task_dir" branch --show-current)"
+  clone="$TMPDIR/work_ref_selection_cas/device-two"
+  git clone -q "$TMPDIR/work_ref_selection_cas/origin.git" "$clone"
+  git -C "$clone" config user.name "Test User"
+  git -C "$clone" config user.email "test@example.invalid"
+  mkdir -p "$clone/.worktrees"
+  clone_task="$(task_dir_for "$clone")"
+  git -C "$clone" worktree add -q -b "$branch" "$clone_task" "origin/$branch"
 
   barrier="$TMPDIR/work_ref_selection_cas/barrier"; mkdir -p "$barrier"
   hook="$TMPDIR/work_ref_selection_cas/work-ref-barrier"
@@ -1772,7 +1824,7 @@ SH
     WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="$hook" \
     WORKBENCH_TEST_WORK_REF_BARRIER_DIR="$barrier" \
     WORKBENCH_TEST_WORK_REF_BARRIER_ID=second \
-      run_task_in_dir work_ref_selection_cas "$task_dir" refs set \
+      run_task_in_dir work_ref_selection_cas "$clone_task" refs set \
         --work-ref "$second" --format json >"$second_out" 2>&1
     printf '%s\n' "$?" > "$TMPDIR/work_ref_selection_cas/second.rc"
   ) &
@@ -1782,8 +1834,12 @@ SH
   second_rc="$(cat "$TMPDIR/work_ref_selection_cas/second.rc")"
   [ "$first_rc$second_rc" = 01 ] || [ "$first_rc$second_rc" = 10 ] \
     || fail "same-claim selection CAS did not choose one winner: first=$first_rc second=$second_rc"
-  if [ "$first_rc" = 0 ]; then winner="$first"; loser="$second"; else winner="$second"; loser="$first"; fi
-  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$winner" ] \
+  if [ "$first_rc" = 0 ]; then
+    winner="$first"; loser="$second"; winner_task="$task_dir"; loser_task="$clone_task"
+  else
+    winner="$second"; loser="$first"; winner_task="$clone_task"; loser_task="$task_dir"
+  fi
+  [ "$(sed -n 's/^work_ref: *//p' "$winner_task/task/index.md")" = "$winner" ] \
     || fail "same-claim selection winner did not own the local primary"
   winner_ref="$(work_ref_remote_ref "$winner")"
   loser_ref="$(work_ref_remote_ref "$loser")"
@@ -1794,14 +1850,184 @@ SH
   [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_selection_cas/origin.git" "$selection_ref")" ] \
     || fail "same-claim selection CAS did not publish its serialization ref"
 
-  actual="$(run_task_in_dir work_ref_selection_cas "$task_dir" refs set \
+  actual="$(run_task_in_dir work_ref_selection_cas "$loser_task" refs set \
     --work-ref "$loser" --format json)"
   assert_contains "$actual" '"changed":true'
-  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$loser" ] \
+  [ "$(sed -n 's/^work_ref: *//p' "$loser_task/task/index.md")" = "$loser" ] \
     || fail "selection retry did not transition to the requested work_ref"
   [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_selection_cas/origin.git" "$winner_ref")" ] \
     && [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_selection_cas/origin.git" "$loser_ref")" ] \
     || fail "selection retry did not atomically replace the winner reservation"
+}
+
+test_work_ref_selection_serializes_remote_and_local_primary() {
+  local repo task_dir claim old first second wrapper real_mv ready release first_out second_out
+  local first_rc second_rc selection tip remote_value local_value
+  repo="$(setup_workbench work_ref_local_serialization)"
+  task_dir="$(start_task work_ref_local_serialization "$repo" 29)"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  old=toolbox:scenario/SCN-LOCAL-OLD
+  first=toolbox:scenario/SCN-LOCAL-FIRST
+  second=toolbox:scenario/SCN-LOCAL-SECOND
+  run_task_in_dir work_ref_local_serialization "$task_dir" refs set \
+    --work-ref "$old" --format json >/dev/null
+
+  real_mv="$(command -v mv)"
+  wrapper="$TMPDIR/work_ref_local_serialization/bin/mv"
+  cat > "$wrapper" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+target=""
+for value in "$@"; do target="$value"; done
+if [ "${WORKBENCH_TEST_LOCAL_WRITE_ID:-}" = first ] \
+  && [[ "$target" == */task/index.md ]]; then
+  : "${WORKBENCH_TEST_LOCAL_WRITE_READY:?}"
+  : "${WORKBENCH_TEST_LOCAL_WRITE_RELEASE:?}"
+  touch "$WORKBENCH_TEST_LOCAL_WRITE_READY"
+  for _ in $(seq 1 400); do
+    [ -f "$WORKBENCH_TEST_LOCAL_WRITE_RELEASE" ] && break
+    sleep 0.01
+  done
+  [ -f "$WORKBENCH_TEST_LOCAL_WRITE_RELEASE" ] || exit 1
+fi
+exec "$WORKBENCH_TEST_REAL_MV" "$@"
+SH
+  chmod +x "$wrapper"
+  ready="$TMPDIR/work_ref_local_serialization/first.ready"
+  release="$TMPDIR/work_ref_local_serialization/release"
+  first_out="$TMPDIR/work_ref_local_serialization/first.out"
+  second_out="$TMPDIR/work_ref_local_serialization/second.out"
+  (
+    set +e
+    WORKBENCH_TEST_LOCAL_WRITE_ID=first \
+    WORKBENCH_TEST_LOCAL_WRITE_READY="$ready" \
+    WORKBENCH_TEST_LOCAL_WRITE_RELEASE="$release" \
+    WORKBENCH_TEST_REAL_MV="$real_mv" \
+      run_task_in_dir work_ref_local_serialization "$task_dir" refs set \
+        --work-ref "$first" --format json >"$first_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/work_ref_local_serialization/first.rc"
+  ) &
+  local first_pid=$!
+  for _ in $(seq 1 400); do [ -f "$ready" ] && break; sleep 0.01; done
+  [ -f "$ready" ] || fail "first work-ref transition did not reach its delayed local write"
+  (
+    set +e
+    WORKBENCH_TEST_LOCAL_WRITE_ID=second WORKBENCH_TEST_REAL_MV="$real_mv" \
+      run_task_in_dir work_ref_local_serialization "$task_dir" refs set \
+        --work-ref "$second" --format json >"$second_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/work_ref_local_serialization/second.rc"
+  ) &
+  local second_pid=$!
+  for _ in $(seq 1 200); do
+    [ -f "$TMPDIR/work_ref_local_serialization/second.rc" ] && break
+    sleep 0.01
+  done
+  touch "$release"
+  wait "$first_pid"; wait "$second_pid"
+  first_rc="$(cat "$TMPDIR/work_ref_local_serialization/first.rc")"
+  second_rc="$(cat "$TMPDIR/work_ref_local_serialization/second.rc")"
+  [ "$first_rc$second_rc" = 00 ] \
+    || fail "serialized local transitions failed: first=$first_rc second=$second_rc"
+
+  selection="$(work_ref_selection_remote_ref "$claim")"
+  tip="$(git ls-remote --heads "$TMPDIR/work_ref_local_serialization/origin.git" \
+    "$selection" | cut -f1)"
+  [ -n "$tip" ] || fail "serialized local transition lost its remote selection"
+  git -C "$repo" fetch -q --no-tags origin "$tip"
+  remote_value="$(git -C "$repo" show "$tip:work-ref-selection.json" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["work_ref"] or "")')"
+  local_value="$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")"
+  [ "$local_value" = "$remote_value" ] \
+    || fail "local work_ref diverged from remote selection: local=$local_value remote=$remote_value"
+}
+
+test_work_ref_local_lock_fails_closed_on_symlink() {
+  local repo task_dir claim common digest lock target work_ref reservation out rc
+  repo="$(setup_workbench work_ref_local_lock_symlink)"
+  task_dir="$(start_task work_ref_local_lock_symlink "$repo" 29)"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  common="$(git -C "$task_dir" rev-parse --path-format=absolute --git-common-dir)"
+  digest="$(printf '%s' "$claim" | python3 -c \
+    'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  mkdir -p "$common/workbench-v2"
+  chmod 700 "$common/workbench-v2"
+  lock="$common/workbench-v2/work-ref-local-$digest.lock"
+  target="$TMPDIR/work_ref_local_lock_symlink/attacker-lock"
+  printf '%s\n' attacker > "$target"
+  ln -s "$target" "$lock"
+  work_ref=toolbox:scenario/SCN-LOCK-SYMLINK
+  reservation="$(work_ref_remote_ref "$work_ref")"
+  out="$TMPDIR/work_ref_local_lock_symlink/rejected.out"
+  if run_task_in_dir work_ref_local_lock_symlink "$task_dir" refs set \
+    --work-ref "$work_ref" --format json >"$out" 2>&1; then
+    fail "symlinked work-ref local lock was accepted"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "symlinked work-ref local lock returned $rc"
+  assert_file_contains "$out" "work-ref local lock"
+  [ -z "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" ] \
+    || fail "symlinked work-ref local lock changed local metadata"
+  [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_local_lock_symlink/origin.git" \
+    "$reservation")" ] || fail "symlinked work-ref local lock changed remote reservation"
+  [ "$(cat "$target")" = attacker ] || fail "symlinked work-ref local lock changed its target"
+}
+
+test_work_ref_selection_reports_duplicate_after_existing_selection_race() {
+  local repo first_task second_task first_old second_old desired barrier hook first_out second_out
+  local first_rc second_rc loser_out
+  repo="$(setup_workbench work_ref_existing_selection_duplicate)"
+  first_task="$(start_task work_ref_existing_selection_duplicate "$repo" 29)"
+  second_task="$(start_task work_ref_existing_selection_duplicate "$repo" 31)"
+  first_old=toolbox:scenario/SCN-DUP-OLD-FIRST
+  second_old=toolbox:scenario/SCN-DUP-OLD-SECOND
+  desired=toolbox:scenario/SCN-DUP-SHARED
+  run_task_in_dir work_ref_existing_selection_duplicate "$first_task" refs set \
+    --work-ref "$first_old" --format json >/dev/null
+  run_task_in_dir work_ref_existing_selection_duplicate "$second_task" refs set \
+    --work-ref "$second_old" --format json >/dev/null
+
+  barrier="$TMPDIR/work_ref_existing_selection_duplicate/barrier"; mkdir -p "$barrier"
+  hook="$TMPDIR/work_ref_existing_selection_duplicate/work-ref-barrier"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+touch "$WORKBENCH_TEST_WORK_REF_BARRIER_DIR/$WORKBENCH_TEST_WORK_REF_BARRIER_ID.ready"
+for _ in $(seq 1 200); do
+  [ "$(find "$WORKBENCH_TEST_WORK_REF_BARRIER_DIR" -name '*.ready' | wc -l | tr -d ' ')" -ge 2 ] \
+    && exit 0
+  sleep 0.05
+done
+exit 1
+SH
+  chmod +x "$hook"
+  first_out="$TMPDIR/work_ref_existing_selection_duplicate/first.out"
+  second_out="$TMPDIR/work_ref_existing_selection_duplicate/second.out"
+  (
+    set +e
+    WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="$hook" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_DIR="$barrier" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_ID=first \
+      run_task_in_dir work_ref_existing_selection_duplicate "$first_task" refs set \
+        --work-ref "$desired" --format json >"$first_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/work_ref_existing_selection_duplicate/first.rc"
+  ) &
+  local first_pid=$!
+  (
+    set +e
+    WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="$hook" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_DIR="$barrier" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_ID=second \
+      run_task_in_dir work_ref_existing_selection_duplicate "$second_task" refs set \
+        --work-ref "$desired" --format json >"$second_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/work_ref_existing_selection_duplicate/second.rc"
+  ) &
+  local second_pid=$!
+  wait "$first_pid"; wait "$second_pid"
+  first_rc="$(cat "$TMPDIR/work_ref_existing_selection_duplicate/first.rc")"
+  second_rc="$(cat "$TMPDIR/work_ref_existing_selection_duplicate/second.rc")"
+  [ "$first_rc$second_rc" = 01 ] || [ "$first_rc$second_rc" = 10 ] \
+    || fail "existing-selection duplicate race did not choose one owner: first=$first_rc second=$second_rc"
+  if [ "$first_rc" = 1 ]; then loser_out="$first_out"; else loser_out="$second_out"; fi
+  assert_file_contains "$loser_out" "duplicate active work_ref: $desired"
 }
 
 test_work_ref_selection_repairs_local_state_after_remote_success() {
@@ -7457,10 +7683,14 @@ run_case test_v1_rejects_v2_mutation_but_keeps_legacy_start
 run_case test_start_rejects_noncanonical_schema_slug_and_home
 run_case test_v2_start_and_resume_are_authority_bound_skeletons
 run_case test_concurrent_start_retires_the_losing_claim
+run_case test_start_retires_claim_after_lost_publish_response
 run_case test_verified_result_change_reactivates_before_primary
 run_case test_refs_are_opaque_and_duplicate_active_work_is_rejected
 run_case test_work_ref_reservation_is_atomic_across_tasks
 run_case test_work_ref_selection_serializes_same_claim_changes
+run_case test_work_ref_selection_serializes_remote_and_local_primary
+run_case test_work_ref_local_lock_fails_closed_on_symlink
+run_case test_work_ref_selection_reports_duplicate_after_existing_selection_race
 run_case test_work_ref_selection_repairs_local_state_after_remote_success
 run_case test_work_ref_selection_rejects_non_append_only_history
 run_case test_work_ref_reservation_rejects_malformed_remote_owner

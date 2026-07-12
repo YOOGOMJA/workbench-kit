@@ -649,13 +649,58 @@ $matches
 
 start_claim_compensate() {
   [ "${START_CLAIM_PENDING:-false}" = true ] || return 0
-  if lifecycle_emit "$START_CLAIM_ROOT" "$START_CLAIM_HOME" "$START_CLAIM_ISSUE" \
+  if [ "$START_CLAIM_CONTRACT" = workbench-task/v2 ]; then
+    local phase="" attempt
+    for attempt in 1 2 3; do
+      phase="$(start_claim_observe_phase 2>/dev/null)" && break
+      sleep 0.05
+    done
+    case "$phase" in
+      absent|claim-conflict) START_CLAIM_PENDING=false; return 0 ;;
+      claimed) ;;
+      *) return 1 ;;
+    esac
+  fi
+  if [ "$START_CLAIM_CONTRACT" != workbench-task/v2 ]; then
+    if lifecycle_emit "$START_CLAIM_ROOT" "$START_CLAIM_HOME" "$START_CLAIM_ISSUE" \
+      task-claim-conflict "$START_CLAIM_ID" "$START_CLAIM_BRANCH" - "" "" \
+      "$START_CLAIM_CONTRACT" "$START_CLAIM_DESCRIPTOR"; then
+      START_CLAIM_PENDING=false
+      return 0
+    fi
+    return 1
+  fi
+  lifecycle_emit "$START_CLAIM_ROOT" "$START_CLAIM_HOME" "$START_CLAIM_ISSUE" \
     task-claim-conflict "$START_CLAIM_ID" "$START_CLAIM_BRANCH" - "" "" \
-    "$START_CLAIM_CONTRACT" "$START_CLAIM_DESCRIPTOR"; then
+    "$START_CLAIM_CONTRACT" "$START_CLAIM_DESCRIPTOR" || true
+  local phase="" attempt
+  for attempt in 1 2 3; do
+    phase="$(start_claim_observe_phase 2>/dev/null)" && break
+    sleep 0.05
+  done
+  if [ "$phase" = claim-conflict ]; then
     START_CLAIM_PENDING=false
     return 0
   fi
   return 1
+}
+
+start_claim_observe_phase() {
+  local markers output phase
+  markers="$(mktemp "${TMPDIR:-/tmp}/workbench-start-claim.XXXXXX")"
+  if ! lifecycle_markers_for_issue "$START_CLAIM_ROOT" "$START_CLAIM_HOME" \
+    "$START_CLAIM_ISSUE" > "$markers"; then
+    rm -f "$markers"; return 1
+  fi
+  output="$(python3 "$(lifecycle_helper)" lifecycle-claim-state \
+    --markers-file "$markers" --branch "$START_CLAIM_BRANCH" \
+    --claim-id "$START_CLAIM_ID" --issue "$START_CLAIM_ISSUE" \
+    --home "${START_CLAIM_HOME:--}" --descriptor-digest "$START_CLAIM_DESCRIPTOR")" \
+    || { rm -f "$markers"; return 1; }
+  rm -f "$markers"
+  phase="$(printf '%s\n' "$output" | sed -n 's/^phase=//p')"
+  [ -n "$phase" ] || return 1
+  printf '%s\n' "$phase"
 }
 
 start_claim_exit() {
@@ -740,13 +785,26 @@ cmd_start() {
   local dir="$root/.worktrees/$(branch_to_dir "$branch")"
   local claim_id; claim_id="$(make_claim_id "$branch")"
 
-  lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-claimed "$claim_id" "$branch" - "" "" \
-    "${new_task_contract:-workbench-task/v1}" "$authority_descriptor_digest"
-  START_CLAIM_ROOT="$root"; START_CLAIM_HOME="$HOME_REPO"; START_CLAIM_ISSUE="$ISSUE"
-  START_CLAIM_ID="$claim_id"; START_CLAIM_BRANCH="$branch"
-  START_CLAIM_CONTRACT="${new_task_contract:-workbench-task/v1}"
-  START_CLAIM_DESCRIPTOR="$authority_descriptor_digest"; START_CLAIM_PENDING=true
-  trap start_claim_exit EXIT
+  if [ -n "$new_task_contract" ]; then
+    START_CLAIM_ROOT="$root"; START_CLAIM_HOME="$HOME_REPO"; START_CLAIM_ISSUE="$ISSUE"
+    START_CLAIM_ID="$claim_id"; START_CLAIM_BRANCH="$branch"
+    START_CLAIM_CONTRACT="$new_task_contract"
+    START_CLAIM_DESCRIPTOR="$authority_descriptor_digest"; START_CLAIM_PENDING=true
+    trap start_claim_exit EXIT
+    if ! lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-claimed "$claim_id" \
+      "$branch" - "" "" "$new_task_contract" "$authority_descriptor_digest"; then
+      start_claim_compensate || true
+      die "task claim publication could not be confirmed: $branch"
+    fi
+  else
+    lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-claimed "$claim_id" "$branch" - "" "" \
+      workbench-task/v1 "$authority_descriptor_digest"
+    START_CLAIM_ROOT="$root"; START_CLAIM_HOME="$HOME_REPO"; START_CLAIM_ISSUE="$ISSUE"
+    START_CLAIM_ID="$claim_id"; START_CLAIM_BRANCH="$branch"
+    START_CLAIM_CONTRACT=workbench-task/v1
+    START_CLAIM_DESCRIPTOR="$authority_descriptor_digest"; START_CLAIM_PENDING=true
+    trap start_claim_exit EXIT
+  fi
 
   # 최신 원격 main 기준으로 분기 — 로컬 main은 다른 task 머지 뒤 낡아 있을 수
   # 있어, 그대로 쓰면 새 워크트리에 직전 증분이 빠지고 수동 rebase를 부른다.
@@ -3273,6 +3331,15 @@ work_ref_selection_transition() {
   fi
   if git -C "$root" "${push_args[@]}" "$origin" "${refspecs[@]}" \
     >/dev/null 2>&1; then push_ok=true; fi
+  if [ "$push_ok" = false ] && [ -n "$value" ]; then
+    if work_ref_reservation_observe "$root" "$origin" "$value" \
+      "$WORK_REF_RESERVATION_REF"; then
+      [ "$WORK_REF_REMOTE_OID" = "$WORK_REF_RESERVATION_OID" ] || return 3
+    else
+      observed_rc=$?
+      [ "$observed_rc" -eq 1 ] || return 2
+    fi
+  fi
   if work_ref_selection_observe "$root" "$claim_id" "$branch" "$descriptor"; then
     if [ "$WORK_REF_SELECTION_OID" != "$WORK_REF_NEXT_SELECTION_OID" ]; then
       [ "$push_ok" = false ] && [ "$WORK_REF_SELECTION_OID" = "$expected_selection" ] \
@@ -3364,6 +3431,7 @@ invalidate_unsealed_policy_context() {
 }
 
 cmd_refs() {
+  local -a original=("$@")
   local sub="${1:-}"; [ $# -gt 0 ] && shift || true
   case "$sub" in
     show)
@@ -3404,6 +3472,22 @@ cmd_refs() {
       [ -z "$set_work$clear_work" ] || [ -z "$set_work" ] || [ -z "$clear_work" ] || usage_error "work set and clear are mutually exclusive"
       require_v2_task task.refs.set
       require_mutable_task task.refs.set || return 1
+      if [ -n "$set_work$clear_work" ] \
+        && [ "${WORKBENCH_WORK_REF_LOCAL_LOCKED:-0}" != 1 ]; then
+        local common claim lock_rc
+        require_task_worktree
+        [ -f "$TASK_DIR/task/index.md" ] || die "task/index.md not found"
+        common="$(writer_coordination_common_dir "$(wb_root)")" \
+          || die "work-ref-local-lock-unavailable"
+        claim="$(index_get claim_id)"; [ -n "$claim" ] || die "work-ref-local-lock-unavailable"
+        if WORKBENCH_WORK_REF_LOCAL_LOCKED=1 python3 "$(writer_helper)" \
+          work-ref-local-lock-run --common-dir "$common" --claim-id "$claim" -- \
+          "$0" refs "${original[@]}"; then
+          return 0
+        else
+          lock_rc=$?; return "$lock_rc"
+        fi
+      fi
       root="$(wb_root)"
       if [ -n "$set_context$clear_context" ] \
         && [ -f "$(task_state_dir)/policy-context/state.record" ] \
@@ -3465,6 +3549,18 @@ cmd_refs() {
       elif [ -n "$clear_work" ] && [ -n "$(index_get work_ref)" ]; then
         frontmatter_delete "$TASK_DIR/task/index.md" work_ref
         changed=true
+      fi
+      if [ -n "$set_work$clear_work" ]; then
+        work_ref_selection_reconcile_local "$root" \
+          || die "work-ref-selection-unavailable: $(index_get claim_id)"
+        [ "$WORK_REF_LOCAL_RECONCILED" = false ] || changed=true
+        if [ -n "$set_work" ] \
+          && [ "$WORK_REF_SELECTION_WORK_REF" != "$work_ref" ]; then
+          die "work-ref-selection-conflict: $work_ref"
+        elif [ -n "$clear_work" ] \
+          && [ -n "$WORK_REF_SELECTION_WORK_REF" ]; then
+          die "work-ref-selection-conflict"
+        fi
       fi
       print_refs_json "$changed"
       ;;

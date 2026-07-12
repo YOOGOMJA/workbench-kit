@@ -186,6 +186,16 @@
   51. Return a plain diagnostic when submitted private-state inspection is unsafe. Mutation
       callers need a stable machine decision; every such path now returns the operation-bound
       `submission-recovery-unavailable` blocker envelope before any effect.
+  52. Let a remote selection winner write local task metadata without a claim-scoped process
+      lock and final observation. A later remote winner could return first and then be locally
+      overwritten by the older process; the complete reconcile/transition/local publication
+      interval is now serialized per claim in each clone and checked again after the write.
+  53. Install start compensation only after `task-claimed` returns success. A host may persist
+      the comment while the client loses the response; the guard is now armed first and uses a
+      fresh trusted exact-claim reduction to decide whether conflict compensation is required.
+  54. Diagnose a requested reservation owner only when no selection exists. A claim with prior
+      selection history could misclassify a real cross-task duplicate as infrastructure failure;
+      every failed atomic push now re-observes the requested reservation before classification.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing

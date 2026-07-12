@@ -131,8 +131,13 @@ claim. Each claim therefore also owns an append-only selection chain at
 value, matching reservation ref/OID, and previous selection OID. Changing or clearing a value
 uses one required atomic Git push guarded by exact leases to advance that selection, create or
 retain the chosen reservation, and delete every obsolete reservation owned by the claim. Only
-the winning transaction updates local task metadata. A lost response is repaired from the
-selection chain; malformed history or a remote without atomic-push support fails closed.
+the winning transaction updates local task metadata. Within one clone, a secure claim-scoped
+process lock covers selection reconciliation, remote transition, local metadata publication,
+and a final authoritative selection check, so an older process cannot overwrite a newer local
+winner. Across clones, a lost response or interrupted local write is repaired from the
+selection chain. Any failed atomic push re-observes the requested reservation so a competing
+owner remains a duplicate-work failure even when this claim already had a prior selection.
+Malformed history or a remote without atomic-push support fails closed.
 
 A terminal task retains its selection and reservation until cleanup has removed the task
 workspace; cleanup then atomically releases the selection and every reservation bound to that
@@ -332,7 +337,10 @@ The exact event IDs are `task-claimed`, `task-claim-conflict`, `task-active`,
 A writer correlates them with `claim_id` and branch.
 After publishing `task-claimed`, start keeps a process-exit compensation guard until the task
 branch is durably pushed. Any worktree, scaffold, commit, or push failure publishes the matching
-`task-claim-conflict`, so a failed concurrent start cannot remain a second live claim.
+`task-claim-conflict`, so a failed concurrent start cannot remain a second live claim. The guard
+is installed before publication. If the host persists `task-claimed` but its response is lost,
+start reduces a fresh trusted lifecycle observation for that exact claim and publishes or
+confirms the matching conflict before returning failure.
 
 The canonical v2 marker is UTF-8 JSON inside a versioned HTML comment:
 

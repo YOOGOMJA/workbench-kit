@@ -166,7 +166,10 @@ context. Legacy `workbench-task/v1` start/resume keeps its existing auto-attach 
 does not emit this v2 contract.
 Once `task-claimed` is published, every failure before the task branch push is compensated by
 one matching `task-claim-conflict`, including concurrent local worktree creation and scaffold
-or commit failure. A successfully pushed branch retires that compensation guard.
+or commit failure. The guard is armed before publication. A failed publication response triggers
+a fresh trusted observation: an absent exact claim needs no marker, an already conflicted claim
+is complete, and a persisted live claim is retired with `task-claim-conflict`. A successfully
+pushed branch retires that compensation guard.
 
 ## Task references
 
@@ -216,10 +219,18 @@ the selection, creates or retains the selected per-value reservation, and delete
 same-claim reservations. A competing value reservation is the duplicate-work failure. A
 same-claim selection loser returns `work-ref-selection-conflict`; malformed, unreadable,
 unwritable, non-atomic, or unreconciled coordination returns
-`work-ref-reservation-unavailable`. Local `task/index.md` changes only after remote success. If
-the remote transaction succeeded but the response or local write was lost, repeating the same
-set/clear first repairs local metadata from the selection and then converges without another
-semantic transition.
+`work-ref-reservation-unavailable`. Every failed atomic push re-observes the requested
+reservation before classifying the failure, including when both claims already have selection
+history, so a differently bound reservation always reports duplicate active `work_ref`.
+
+Within one clone, a secure claim-scoped process lock covers the initial selection repair,
+inventory and reservation checks, atomic transition, local `task/index.md` update, and final
+authoritative selection repair/check. Local metadata changes only after remote success, and an
+older process cannot publish after a newer local winner. If a different clone advances the
+selection during the local interval, the final check repairs to that selection and reports
+`work-ref-selection-conflict`. If the remote transaction succeeded but the response or local
+write was lost, repeating the same set/clear first repairs local metadata from the selection and
+then converges without another semantic transition.
 
 Before a context-policy set is sealed, `context_ref` may be set or cleared. Changing it
 invalidates any unsealed registration, which cannot be reused for the new ref. After seal,

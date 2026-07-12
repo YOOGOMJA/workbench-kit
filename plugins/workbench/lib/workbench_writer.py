@@ -1360,6 +1360,62 @@ def open_anchor_lock(directory: int) -> int:
     return lock
 
 
+def open_work_ref_local_lock(directory: int, claim_id: str) -> int:
+    require_text(claim_id, "work-ref local lock claim_id")
+    name = "work-ref-local-{}.lock".format(
+        hashlib.sha256(claim_id.encode("utf-8")).hexdigest()
+    )
+    flags = secure_file_flags(os.O_RDWR)
+    lock = -1
+    for _ in range(8):
+        try:
+            lock = os.open(
+                name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory
+            )
+            break
+        except FileExistsError:
+            try:
+                lock = os.open(name, flags, dir_fd=directory)
+                break
+            except FileNotFoundError:
+                continue
+    if lock < 0:
+        raise OSError("work-ref local lock could not be opened")
+    try:
+        validate_anchor_inode(os.fstat(lock), "work-ref local lock")
+        os.fchmod(lock, 0o600)
+    except Exception:
+        os.close(lock)
+        raise
+    return lock
+
+
+def cmd_work_ref_local_lock_run(args: argparse.Namespace) -> int:
+    command = list(args.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise ValueError("work-ref local lock command is required")
+    directory = -1
+    lock = -1
+    try:
+        opened = open_anchor_directory(args.common_dir, True)
+        if opened is None:
+            raise OSError("work-ref local lock parent is unavailable")
+        directory = opened
+        lock = open_work_ref_local_lock(directory, args.claim_id)
+        acquire_anchor_lock(lock, True, timeout=30.0)
+        return subprocess.call(command)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print("error: work-ref local lock unavailable: {}".format(exc), file=sys.stderr)
+        return 1
+    finally:
+        if lock >= 0:
+            os.close(lock)
+        if directory >= 0:
+            os.close(directory)
+
+
 def acquire_anchor_lock(lock: int, exclusive: bool, timeout: float = 5.0) -> None:
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     deadline = time.monotonic() + timeout
@@ -2812,6 +2868,11 @@ def parser() -> argparse.ArgumentParser:
     selection_inspect.add_argument("--branch", required=True)
     selection_inspect.add_argument("--descriptor-digest")
     selection_inspect.set_defaults(func=cmd_work_ref_selection_inspect)
+    local_lock = commands.add_parser("work-ref-local-lock-run")
+    local_lock.add_argument("--common-dir", required=True)
+    local_lock.add_argument("--claim-id", required=True)
+    local_lock.add_argument("command", nargs=argparse.REMAINDER)
+    local_lock.set_defaults(func=cmd_work_ref_local_lock_run)
 
     matching = commands.add_parser("matching-active")
     matching.add_argument("file")
@@ -2825,11 +2886,11 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
-        args.func(args)
+        result = args.func(args)
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         print("error: {}".format(exc), file=sys.stderr)
         return 2
-    return 0
+    return 0 if result is None else int(result)
 
 
 if __name__ == "__main__":
