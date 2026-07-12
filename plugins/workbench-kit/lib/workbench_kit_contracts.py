@@ -1950,6 +1950,8 @@ def validate_journal(
     if normalized_plan is not None:
         if normalized_plan["plan_digest"] != journal["plan_digest"]:
             fail("journal.plan_digest")
+        if normalized_plan["workspace"] != workspace:
+            fail("journal.workspace")
         expected_effects: list[tuple[str, dict[str, Any]]] = []
         for parent in normalized_plan["parent_directories"]:
             if parent["before_type"] is None:

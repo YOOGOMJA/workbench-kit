@@ -1060,6 +1060,51 @@ fractional_journal = copy.deepcopy(journal)
 fractional_journal["created_at"] = "2024-02-29T00:00:00.123Z"
 fractional_journal["updated_at"] = "2024-02-29T00:00:00.456Z"
 assert validate_journal(fractional_journal, changed) == fractional_journal
+
+other_workspace = copy.deepcopy(changed["workspace"])
+other_workspace["root"] = "/tmp/other-workbench"
+other_workspace_id = "ws-" + hashlib.sha256(
+    b"workbench-kit-workspace-id/v1\nroot\t/tmp/other-workbench\n"
+).hexdigest()
+failed_validation = {
+    "status": "failed",
+    "classification_after": None,
+    "basis_kind": None,
+    "basis_digest": None,
+    "blockers": [{"code": "fixture-failed", "ref": "validation"}],
+    "digest": None,
+}
+failed_validation["digest"] = canonical_digest(
+    failed_validation, null_field="digest"
+)
+nonterminal_states = {
+    "prepared": ("forward", 0, [], pending_validation),
+    "applying": ("forward", 1, ["effect-0001"], pending_validation),
+    "validating": (
+        "forward", 2, ["effect-0001", "effect-0002"], pending_validation,
+    ),
+    "rolling-back": (
+        "reverse", 1, ["effect-0001"], failed_validation,
+    ),
+}
+for stage, (direction, cursor, applied, stage_validation) in (
+    nonterminal_states.items()
+):
+    bad = copy.deepcopy(journal)
+    bad["workspace"] = copy.deepcopy(other_workspace)
+    bad["workspace_id"] = other_workspace_id
+    bad["stage"] = stage
+    bad["direction"] = direction
+    bad["cursor"] = cursor
+    bad["applied"] = list(applied)
+    bad["validation"] = copy.deepcopy(stage_validation)
+    assert validate_journal(bad) == bad, stage
+    schema_accepts("upgrade-journal.schema.json", bad)
+    rejected(lambda bad=bad: validate_journal(bad, changed))
+    product_rejects(
+        "upgrade-journal.schema.json", bad, context={"plan": changed}
+    )
+
 for field, invalid_timestamp in (
     ("created_at", "2026-02-29T00:00:00Z"),
     ("created_at", "2026-02-31T00:00:00Z"),
@@ -1240,7 +1285,6 @@ completion_context_gaps = {
     "target_classification",
     "embedded_engine",
     "provenance_final",
-    "workspace",
     "preserved",
     "active_v1_tasks",
 }
