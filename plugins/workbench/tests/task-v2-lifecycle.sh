@@ -4068,7 +4068,8 @@ test_writer_anchor_rejects_symlinked_parent() {
     fail "writer accepted a symlinked anchor parent"
   else rc=$?; fi
   [ "$rc" = 1 ] || fail "symlinked writer anchor parent returned $rc"
-  assert_file_contains "$out" '"code":"writer-lock-unavailable"'
+  assert_file_contains "$out" '"operation":"task.add-repo"'
+  assert_file_contains "$out" '"code":"submission-recovery-unavailable"'
   [ ! -e "$saved/writer-coordination-anchor" ] \
     || fail "writer wrote its trusted anchor through a symlinked parent"
   [ ! -e "$task_dir/task/codebases/shared-api" ] \

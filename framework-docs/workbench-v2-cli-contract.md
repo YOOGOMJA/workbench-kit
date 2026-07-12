@@ -729,6 +729,14 @@ cannot be inspected, leaves other unavailable values null, and sets blocker
 `{"code":"writer-lock-unavailable","ref":"refs/heads/workbench-coordination/writer-claims"}`.
 Doctor never mutates the coordination ref.
 
+## Mutation activation safety
+
+Before any task mutation, the kernel reconciles authenticated submission-recovery state from
+the clone-private Git common directory. If that state cannot be inspected through the secure
+directory and file contract, the command returns a `workbench-error/v1` envelope at exit `1`
+with blocker `submission-recovery-unavailable` and ref `workbench:task/<claim_id>`. It performs
+no lifecycle transition, policy resolution, writer claim, or content mutation.
+
 ## Terminal content freeze
 
 After `task-completed` or `task-abandoned`, revision-affecting content is immutable. The

@@ -34,6 +34,8 @@ for current_arg in "$@"; do
   previous_arg="$current_arg"
 done
 unset current_arg previous_arg
+TASK_ACTIVATION_BLOCKER=""
+TASK_ACTIVATION_BLOCKER_REF=""
 
 die() { echo "error: $*" >&2; exit 1; }
 usage_error() { echo "error: $*" >&2; exit 2; }
@@ -5751,6 +5753,7 @@ current_task_identity() {
 
 activate_v2_task_once() {
   local operation="${1:-}" latest event recovered=false reactivation_revision
+  TASK_ACTIVATION_BLOCKER=""; TASK_ACTIVATION_BLOCKER_REF=""
   latest="$(lifecycle_latest_for_branch "$CURRENT_ROOT" "$CURRENT_HOME" \
     "$CURRENT_ISSUE" "$CURRENT_BRANCH" 2>/dev/null)" || return 1
   event="$(lifecycle_field "$latest" event)"
@@ -5760,8 +5763,12 @@ activate_v2_task_once() {
   fi
   case "$event" in
     task-active)
-      submission_recovery_reactivate "$TASK_DIR" "$CURRENT_BRANCH" "$CURRENT_CLAIM_ID" \
-        "$(git -C "$TASK_DIR" rev-parse HEAD)" || return 1
+      if ! submission_recovery_reactivate "$TASK_DIR" "$CURRENT_BRANCH" \
+        "$CURRENT_CLAIM_ID" "$(git -C "$TASK_DIR" rev-parse HEAD)" 2>/dev/null; then
+        TASK_ACTIVATION_BLOCKER=submission-recovery-unavailable
+        TASK_ACTIVATION_BLOCKER_REF="workbench:task/$CURRENT_CLAIM_ID"
+        return 1
+      fi
       return 0
       ;;
     task-claimed|task-verified|task-submitted) ;;
@@ -5782,8 +5789,12 @@ activate_v2_task_once() {
     return 1
   fi
   if [ "$recovered" = true ] || [ "$event" = task-submitted ]; then
-    submission_recovery_reactivate "$TASK_DIR" "$CURRENT_BRANCH" "$CURRENT_CLAIM_ID" \
-      "$reactivation_revision" || return 1
+    if ! submission_recovery_reactivate "$TASK_DIR" "$CURRENT_BRANCH" \
+      "$CURRENT_CLAIM_ID" "$reactivation_revision" 2>/dev/null; then
+      TASK_ACTIVATION_BLOCKER=submission-recovery-unavailable
+      TASK_ACTIVATION_BLOCKER_REF="workbench:task/$CURRENT_CLAIM_ID"
+      return 1
+    fi
     SUBMISSION_RECOVERY_ACTIVE=false
   fi
 }
@@ -5802,7 +5813,14 @@ require_mutable_task() {
       "$(json_escape "$operation")" "$(json_escape "$(record_get "$terminal" action_instance_id)")"
     return 1
   fi
-  activate_v2_task_once "$operation"
+  if ! activate_v2_task_once "$operation"; then
+    if [ -n "$TASK_ACTIVATION_BLOCKER" ]; then
+      printf '{"contract_version":"workbench-error/v1","operation":"%s","blockers":[{"code":"%s","ref":"%s"}]}\n' \
+        "$(json_escape "$operation")" "$(json_escape "$TASK_ACTIVATION_BLOCKER")" \
+        "$(json_escape "$TASK_ACTIVATION_BLOCKER_REF")"
+    fi
+    return 1
+  fi
 }
 
 validate_tracked_v2_records() {
