@@ -217,19 +217,121 @@ set -euo pipefail
 [ -n "${1:-}" ] || exit 2
 command="$1"
 shift
-authority="" revision="" issue="" repository="" head_branch="" head_revision=""
+authority="" revision="" default_ref="" issue="" repository="" head_branch="" head_revision="" legacy_inventory=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --authority-file) authority="$2"; shift 2 ;;
     --default-revision) revision="$2"; shift 2 ;;
+    --default-ref) default_ref="$2"; shift 2 ;;
     --issue) issue="$2"; shift 2 ;;
     --repository) repository="$2"; shift 2 ;;
     --head-branch) head_branch="$2"; shift 2 ;;
     --head-revision) head_revision="$2"; shift 2 ;;
+    --legacy-inventory-file) legacy_inventory="$2"; shift 2 ;;
     --format) [ "$2" = json ]; shift 2 ;;
     *) exit 2 ;;
   esac
 done
+if [ "$command" = active-tasks ]; then
+  if [ -n "${WORKBENCH_TEST_ACTIVE_TASK_OBSERVATION:-}" ]; then
+    cat "$WORKBENCH_TEST_ACTIVE_TASK_OBSERVATION"
+    exit
+  fi
+  python3 - "$repository" "$legacy_inventory" "${GH_COMMENTS_DIR:-}" "$default_ref" <<'PY'
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+repository = pathlib.Path(sys.argv[1])
+legacy = json.load(open(sys.argv[2], encoding="utf-8"))
+comments_dir = pathlib.Path(sys.argv[3])
+origin = subprocess.check_output(
+    ["git", "-C", str(repository), "remote", "get-url", "origin"], text=True
+).strip()
+pagination = {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None}
+homes = [
+    {
+        "home": item["home"],
+        "origin_url": item["origin_url"],
+        "membership": item["membership"],
+        "issue_pagination": pagination,
+        "issues": [],
+    }
+    for item in legacy["homes"]
+]
+by_home = {item["home"]: item for item in homes}
+workspace_home = next(
+    item["home"] for item in homes if item["origin_url"] == origin
+)
+comment_paths = [path for path in comments_dir.glob("*.comments") if path.stem.isdigit()]
+for path in sorted(comment_paths, key=lambda item: int(item.stem)):
+    body = path.read_text(encoding="utf-8")
+    marker_homes = {
+        json.loads(raw)["home"]
+        for raw in re.findall(
+            r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->", body
+        )
+    }
+    if not marker_homes:
+        continue
+    if len(marker_homes) != 1:
+        raise SystemExit("fixture issue spans multiple homes")
+    marker_home = marker_homes.pop()
+    home = workspace_home if marker_home is None else marker_home
+    fixture_comments = list(re.finditer(
+        r"<!-- fixture-comment-author:([^\r\n ]+) -->\n(.*?)<!-- fixture-comment-end -->\n?",
+        body,
+        re.DOTALL,
+    ))
+    trusted_body = re.sub(
+        r"<!-- fixture-comment-author:[^\r\n ]+ -->\n.*?<!-- fixture-comment-end -->\n?",
+        "",
+        body,
+        flags=re.DOTALL,
+    )
+    observed = []
+    if trusted_body:
+        observed.append({"author_identity": "test@example.invalid", "body": trusted_body})
+    observed.extend(
+        {"author_identity": match.group(1), "body": match.group(2)}
+        for match in fixture_comments
+    )
+    by_home[home]["issues"].append({
+        "number": int(path.stem),
+        "lifecycle_pagination": pagination,
+        "comments": observed,
+    })
+pull_requests = []
+stored = comments_dir / "pr-17.json"
+if stored.exists():
+    item = json.load(open(stored, encoding="utf-8"))
+    pull_requests.append({
+        "number": item["number"],
+        "url": item["url"],
+        "head_branch": item["headRefName"],
+        "head_revision": item["headRefOid"],
+        "head_repository_origin_url": origin,
+        "head_is_fork": False,
+        "base_ref": item["baseRefName"],
+        "state": "merged" if item["merged"] else "open",
+    })
+value = {
+    "contract_version": "workbench-hosting-active-task-observation/v1",
+    "workspace_origin_url": origin,
+    "workspace_home": workspace_home,
+    "default_ref": sys.argv[4],
+    "default_revision": legacy["source_revision"],
+    "home_pagination": pagination,
+    "pr_pagination": pagination,
+    "homes": homes,
+    "pull_requests": pull_requests,
+}
+print(json.dumps(value, separators=(",", ":")))
+PY
+  exit
+fi
 if [ "$command" = lifecycle ]; then
   python3 - "$repository" "$issue" "${GH_COMMENTS_DIR:-}/$issue.comments" <<'PY'
 import json
@@ -482,6 +584,7 @@ run_task_in_dir() {
   WORKBENCH_PLATFORM_POLICY_REF="${WORKBENCH_PLATFORM_POLICY_REF:-}" \
     WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/$case_name/bin/hosting-authority" \
     WORKBENCH_TRUSTED_LEGACY_ADAPTER="${WORKBENCH_TRUSTED_LEGACY_ADAPTER:-$TMPDIR/$case_name/bin/legacy-adapter}" \
+    WORKBENCH_TEST_ACTIVE_TASK_OBSERVATION="${WORKBENCH_TEST_ACTIVE_TASK_OBSERVATION:-}" \
     WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PRIMARY:-0}" \
     WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_ATTEMPT="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_ATTEMPT:-0}" \
     WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PROBE="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PROBE:-0}" \
@@ -1275,6 +1378,275 @@ test_refs_are_opaque_and_duplicate_active_work_is_rejected() {
   if run_task_in_dir refs "$second" refs set --work-ref 'scenario without namespace' --format json >"$out" 2>&1; then
     fail "invalid namespaced ref must be rejected"
   fi
+}
+
+test_work_ref_uniqueness_rejects_remote_only_task() {
+  local repo first second branch out
+  repo="$(setup_workbench remote_work_ref)"
+  first="$(start_task remote_work_ref "$repo" 29)"
+  run_task_in_dir remote_work_ref "$first" refs set \
+    --work-ref toolbox:scenario/SCN-REMOTE --format json >/dev/null
+  git -C "$first" add task/index.md
+  git -C "$first" commit -q -m "test: persist remote work reference"
+  git -C "$first" push -q
+  branch="$(git -C "$first" branch --show-current)"
+  git -C "$repo" worktree remove --force "$first"
+  git -C "$repo" branch -D "$branch" >/dev/null
+
+  second="$(start_task remote_work_ref "$repo" 31)"
+  out="$TMPDIR/remote_work_ref/duplicate.out"
+  if run_task_in_dir remote_work_ref "$second" refs set \
+    --work-ref toolbox:scenario/SCN-REMOTE --format json >"$out" 2>&1; then
+    fail "remote-only active work_ref must be rejected"
+  fi
+  assert_file_contains "$out" "duplicate active work_ref"
+}
+
+test_work_ref_uniqueness_retains_submitted_deleted_branch() {
+  local repo first second branch body out
+  repo="$(setup_workbench submitted_work_ref)"
+  first="$(start_task submitted_work_ref "$repo" 29)"
+  run_task_in_dir submitted_work_ref "$first" refs set \
+    --work-ref toolbox:scenario/SCN-SUBMITTED --format json >/dev/null
+  printf '%s\n' retained-increment > "$first/RETAINED.md"
+  printf '\n## [2026-07-12 00:00:00] code · create RETAINED.md | submitted work-ref fixture\n' \
+    >> "$first/task/log.md"
+  printf '%s\n' '# Status' '' '상태: submitted work-ref fixture ready' > "$first/task/status.md"
+  git -C "$first" add task RETAINED.md
+  git -C "$first" commit -q -m "test: prepare submitted work reference"
+  git -C "$first" push -q
+  body="$TMPDIR/submitted_work_ref/body.md"
+  printf '%s\n' 'submitted work-ref fixture' > "$body"
+  run_task_in_dir submitted_work_ref "$first" submit \
+    --title "test: submitted work ref" --body-file "$body" >/dev/null
+  branch="$(git -C "$first" branch --show-current)"
+  git -C "$first" push -q origin --delete "$branch"
+  git -C "$repo" worktree remove --force "$first"
+  git -C "$repo" branch -D "$branch" >/dev/null
+
+  second="$(start_task submitted_work_ref "$repo" 31)"
+  out="$TMPDIR/submitted_work_ref/duplicate.out"
+  if run_task_in_dir submitted_work_ref "$second" refs set \
+    --work-ref toolbox:scenario/SCN-SUBMITTED --format json >"$out" 2>&1; then
+    fail "submitted task with a deleted branch released its active work_ref"
+  fi
+  assert_file_contains "$out" "duplicate active work_ref"
+}
+
+test_work_ref_inventory_requires_complete_pagination() {
+  local repo task_dir observation origin revision mode out
+  repo="$(setup_workbench work_ref_pagination)"
+  task_dir="$(start_task work_ref_pagination "$repo" 29)"
+  observation="$TMPDIR/work_ref_pagination/active-observation.json"
+  origin="$(git -C "$repo" remote get-url origin)"
+  revision="$(git -C "$repo" rev-parse origin/main)"
+  for mode in home issue pr; do
+    python3 - "$observation" "$origin" "$revision" "$mode" <<'PY'
+import json
+import sys
+
+path, origin, revision, mode = sys.argv[1:]
+complete = {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None}
+incomplete = {
+    "complete": False,
+    "pages_fetched": 1,
+    "end_cursor": "cursor:2",
+    "failure": {"code": "page-unavailable", "ref": "cursor:2"},
+}
+value = {
+    "contract_version": "workbench-hosting-active-task-observation/v1",
+    "workspace_origin_url": origin,
+    "workspace_home": "workbench",
+    "default_ref": "main",
+    "default_revision": revision,
+    "home_pagination": incomplete if mode == "home" else complete,
+    "pr_pagination": incomplete if mode == "pr" else complete,
+    "homes": [{
+        "home": "workbench",
+        "origin_url": origin,
+        "membership": "current",
+        "issue_pagination": incomplete if mode == "issue" else complete,
+        "issues": [],
+    }],
+    "pull_requests": [],
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+    out="$TMPDIR/work_ref_pagination/$mode.out"
+    if WORKBENCH_TEST_ACTIVE_TASK_OBSERVATION="$observation" \
+      run_task_in_dir work_ref_pagination "$task_dir" refs set \
+        --work-ref toolbox:scenario/SCN-PAGE --format json >"$out" 2>&1; then
+      fail "work_ref inventory accepted incomplete $mode pagination"
+    fi
+    assert_file_contains "$out" 'active-task-inventory-unavailable'
+    [ -z "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" ] \
+      || fail "incomplete $mode pagination changed work_ref"
+  done
+}
+
+test_work_ref_inventory_covers_removed_codebase_home() {
+  local repo first second branch workspace_origin home_origin revision observation adapter out
+  setup_writer_workbench removed_home_work_ref shared-api
+  repo="$WRITER_REPO"
+  run_task removed_home_work_ref "$repo" start shared-api#29 closed-home --format json >/dev/null
+  first="$repo/.worktrees/task__shared-api__29-closed-home"
+  run_task_in_dir removed_home_work_ref "$first" refs set \
+    --work-ref toolbox:scenario/SCN-CLOSED --format json >/dev/null
+  git -C "$first" add task/index.md
+  git -C "$first" commit -q -m "test: persist removed-home work reference"
+  git -C "$first" push -q
+  branch="$(git -C "$first" branch --show-current)"
+  git -C "$repo" worktree remove --force "$first"
+  git -C "$repo" branch -D "$branch" >/dev/null
+
+  workspace_origin="$(git -C "$repo" remote get-url origin)"
+  home_origin="$TMPDIR/removed_home_work_ref/shared-api.git"
+  printf '%s\n' '# no registered codebases' > "$repo/codebases.yaml"
+  git -C "$repo" add codebases.yaml
+  git -C "$repo" commit -q -m "test: remove codebase home"
+  git -C "$repo" push -q
+  revision="$(git -C "$repo" rev-parse origin/main)"
+  observation="$TMPDIR/removed_home_work_ref/legacy-observation.json"
+  python3 - "$observation" "$revision" "$workspace_origin" "$home_origin" <<'PY'
+import json
+import sys
+
+path, revision, workspace_origin, home_origin = sys.argv[1:]
+pagination = {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None}
+value = {
+    "contract_version": "workbench-legacy-observation/v1",
+    "source_revision": revision,
+    "homes": [
+        {
+            "home": "shared-api",
+            "origin_url": home_origin,
+            "membership": "removed",
+            "pagination": pagination,
+            "claims": [],
+        },
+        {
+            "home": "workbench",
+            "origin_url": workspace_origin,
+            "membership": "current",
+            "pagination": pagination,
+            "claims": [],
+        },
+    ],
+    "origin_replacements": [{
+        "home": "shared-api",
+        "previous_origin_url": home_origin,
+        "current_origin_url": None,
+        "status": "removed-in-use",
+    }],
+    "blockers": [],
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  adapter="$TMPDIR/removed_home_work_ref/bin/removed-home-legacy"
+  write_fake_legacy_adapter "$adapter" "$observation"
+
+  second="$(start_task removed_home_work_ref "$repo" 31)"
+  out="$TMPDIR/removed_home_work_ref/duplicate.out"
+  if WORKBENCH_TRUSTED_LEGACY_ADAPTER="$adapter" \
+    run_task_in_dir removed_home_work_ref "$second" refs set \
+      --work-ref toolbox:scenario/SCN-CLOSED --format json >"$out" 2>&1; then
+    fail "removed codebase home released its active work_ref"
+  fi
+  assert_file_contains "$out" "duplicate active work_ref"
+}
+
+test_work_ref_inventory_is_cross_clone() {
+  local repo first clone second out
+  repo="$(setup_workbench cross_clone_work_ref)"
+  first="$(start_task cross_clone_work_ref "$repo" 29)"
+  run_task_in_dir cross_clone_work_ref "$first" refs set \
+    --work-ref toolbox:scenario/SCN-CROSS --format json >/dev/null
+  git -C "$first" add task/index.md
+  git -C "$first" commit -q -m "test: persist cross-clone work reference"
+  git -C "$first" push -q
+
+  clone="$TMPDIR/cross_clone_work_ref/device-two"
+  git clone -q "$TMPDIR/cross_clone_work_ref/origin.git" "$clone"
+  git -C "$clone" config user.name "Test User"
+  git -C "$clone" config user.email "test@example.invalid"
+  run_task cross_clone_work_ref "$clone" start 31 cross-clone --format json >/dev/null
+  second="$clone/.worktrees/task__31-cross-clone"
+  out="$TMPDIR/cross_clone_work_ref/duplicate.out"
+  if run_task_in_dir cross_clone_work_ref "$second" refs set \
+    --work-ref toolbox:scenario/SCN-CROSS --format json >"$out" 2>&1; then
+    fail "second clone accepted a duplicate active work_ref"
+  fi
+  assert_file_contains "$out" "duplicate active work_ref"
+}
+
+test_work_ref_inventory_uses_authority_default_ref() {
+  local repo task_dir actual
+  repo="$(setup_workbench work_ref_trunk)"
+  git -C "$repo" branch -m trunk
+  python3 - "$repo/.workbench/authority.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["default_ref"] = "refs/heads/trunk"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  git -C "$repo" add .workbench/authority.json
+  git -C "$repo" commit -q -m "test: protect trunk by authority"
+  git -C "$repo" push -q -u origin trunk
+  git -C "$TMPDIR/work_ref_trunk/origin.git" symbolic-ref HEAD refs/heads/trunk
+  git -C "$repo" remote set-head origin trunk
+
+  run_task work_ref_trunk "$repo" start 29 trunk-ref --format json >/dev/null
+  task_dir="$repo/.worktrees/task__29-trunk-ref"
+  actual="$(run_task_in_dir work_ref_trunk "$task_dir" refs set \
+    --work-ref toolbox:scenario/SCN-TRUNK --format json)"
+  assert_contains "$actual" '"work_ref":"toolbox:scenario/SCN-TRUNK"'
+}
+
+test_work_ref_inventory_fails_closed_on_identity_mismatch() {
+  local repo first second branch out
+  repo="$(setup_workbench work_ref_identity)"
+  first="$(start_task work_ref_identity "$repo" 29)"
+  run_task_in_dir work_ref_identity "$first" refs set \
+    --work-ref toolbox:scenario/SCN-IDENTITY --format json >/dev/null
+  python3 - "$first/task/index.md" <<'PY'
+import sys
+
+path = sys.argv[1]
+rows = open(path, encoding="utf-8").read().splitlines()
+for index, row in enumerate(rows):
+    if row.startswith("claim_id:"):
+        rows[index] = "claim_id: forged-remote-claim"
+        break
+else:
+    raise AssertionError("missing claim_id")
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(rows) + "\n")
+PY
+  git -C "$first" add task/index.md
+  git -C "$first" commit -q -m "test: corrupt remote task identity"
+  git -C "$first" push -q
+  branch="$(git -C "$first" branch --show-current)"
+  git -C "$repo" worktree remove --force "$first"
+  git -C "$repo" branch -D "$branch" >/dev/null
+
+  second="$(start_task work_ref_identity "$repo" 31)"
+  out="$TMPDIR/work_ref_identity/rejected.out"
+  if run_task_in_dir work_ref_identity "$second" refs set \
+    --work-ref toolbox:scenario/SCN-OTHER --format json >"$out" 2>&1; then
+    fail "work_ref inventory ignored a remote claim/index mismatch"
+  fi
+  assert_file_contains "$out" 'active-task-inventory-unavailable'
+  [ -z "$(sed -n 's/^work_ref: *//p' "$second/task/index.md")" ] \
+    || fail "identity-mismatched inventory changed the current work_ref"
 }
 
 test_policy_context_is_owner_authorized_sealed_and_manifest_bound() {
@@ -4836,6 +5208,13 @@ run_case test_v1_rejects_v2_mutation_but_keeps_legacy_start
 run_case test_start_rejects_noncanonical_schema_slug_and_home
 run_case test_v2_start_and_resume_are_authority_bound_skeletons
 run_case test_refs_are_opaque_and_duplicate_active_work_is_rejected
+run_case test_work_ref_uniqueness_rejects_remote_only_task
+run_case test_work_ref_uniqueness_retains_submitted_deleted_branch
+run_case test_work_ref_inventory_requires_complete_pagination
+run_case test_work_ref_inventory_covers_removed_codebase_home
+run_case test_work_ref_inventory_is_cross_clone
+run_case test_work_ref_inventory_uses_authority_default_ref
+run_case test_work_ref_inventory_fails_closed_on_identity_mismatch
 run_case test_deliverables_and_revision_bound_evidence
 run_case test_tracked_v2_records_cannot_forge_accepted_or_waived_state
 run_case test_evidence_time_is_kernel_owned_and_future_rows_fail_closed

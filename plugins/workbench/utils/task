@@ -162,7 +162,8 @@ observe_workspace_authority() {
   parsed="$(python3 "$(contract_helper)" authority-descriptor "$descriptor_file" 2>/dev/null)" \
     || { rm -f "$descriptor_file" "$policy_file" "$verification_file"; die "policy-authority-unavailable"; }
   AUTHORITY_DESCRIPTOR_DIGEST=""; AUTHORITY_IDENTITY=""; AUTHORITY_ORIGIN_URL=""
-  AUTHORITY_DEFAULT_REF=""; AUTHORITY_HOSTING_ADAPTER=""; AUTHORITY_HOSTING_REF=""
+  AUTHORITY_DEFAULT_REF=""; AUTHORITY_WORKSPACE_HOME=""
+  AUTHORITY_HOSTING_ADAPTER=""; AUTHORITY_HOSTING_REF=""
   while IFS= read -r line; do
     key="${line%%=*}"; value="${line#*=}"
     case "$key" in
@@ -170,6 +171,7 @@ observe_workspace_authority() {
       authority_identity) AUTHORITY_IDENTITY="$value" ;;
       origin_url) AUTHORITY_ORIGIN_URL="$value" ;;
       default_ref) AUTHORITY_DEFAULT_REF="$value" ;;
+      workspace_home) AUTHORITY_WORKSPACE_HOME="$value" ;;
       hosting_adapter) AUTHORITY_HOSTING_ADAPTER="$value" ;;
       hosting_ref) AUTHORITY_HOSTING_REF="$value" ;;
     esac
@@ -2865,15 +2867,17 @@ task_terminal_outcome() {
   esac
 }
 
-duplicate_active_work_ref() {
-  local value="$1" root other other_value parsed home parent issue branch outcome
+local_duplicate_active_work_ref() {
+  local value="$1" root other other_value home issue branch outcome
   root="$(wb_root)"
   for other in "$root"/.worktrees/task__*/task/index.md; do
     [ -f "$other" ] || continue
     [ "$other" = "$TASK_DIR/task/index.md" ] && continue
+    branch="$(sed -n '/^---$/,/^---$/p' "$other" | sed -n 's/^branch: *//p' | head -1)"
+    python3 "$(lifecycle_helper)" task-index --file "$other" --branch "$branch" \
+      --format json >/dev/null 2>&1 || return 2
     other_value="$(sed -n '/^---$/,/^---$/p' "$other" | sed -n 's/^work_ref: *//p' | head -1)"
     [ "$other_value" = "$value" ] || continue
-    branch="$(sed -n '/^---$/,/^---$/p' "$other" | sed -n 's/^branch: *//p' | head -1)"
     home="$(sed -n '/^---$/,/^---$/p' "$other" | sed -n 's/^home: *//p' | head -1)"
     issue="$(sed -n '/^---$/,/^---$/p' "$other" | sed -n 's/^issue: *//p' | head -1)"
     if ! outcome="$(task_terminal_outcome "$root" "$home" "$issue" "$branch" "${other%/task/index.md}")"; then
@@ -2882,6 +2886,53 @@ duplicate_active_work_ref() {
     fi
   done
   return 1
+}
+
+authoritative_active_task_inventory() {
+  local output="$1" root legacy observation adapter legacy_util default_branch
+  root="$(wb_root)"
+  observe_workspace_authority "$root" "$(index_get workspace_authority_descriptor_digest)"
+  legacy="$(mktemp "${TMPDIR:-/tmp}/workbench-active-legacy.XXXXXX")"
+  observation="$(mktemp "${TMPDIR:-/tmp}/workbench-active-observation.XXXXXX")"
+  legacy_util="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/legacy-inventory"
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  default_branch="${AUTHORITY_DEFAULT_REF#refs/heads/}"
+  [ "refs/heads/$default_branch" = "$AUTHORITY_DEFAULT_REF" ] \
+    || { rm -f "$legacy" "$observation"; return 1; }
+  if [ -z "$adapter" ] || [ ! -x "$adapter" ] \
+    || ! "$legacy_util" show --format json > "$legacy" 2>/dev/null \
+    || ! "$adapter" active-tasks --repository "$root" \
+      --legacy-inventory-file "$legacy" --default-revision "$AUTHORITY_REVISION" \
+      --default-ref "$default_branch" \
+      --format json > "$observation" 2>/dev/null \
+    || ! python3 "$(lifecycle_helper)" active-inventory \
+      --observation-file "$observation" --legacy-inventory-file "$legacy" \
+      --repository "$root" --workspace-origin-url "$AUTHORITY_ORIGIN_URL" \
+      --workspace-home "$AUTHORITY_WORKSPACE_HOME" \
+      --default-ref "$AUTHORITY_DEFAULT_REF" \
+      --default-revision "$AUTHORITY_REVISION" \
+      --descriptor-digest "$AUTHORITY_DESCRIPTOR_DIGEST" > "$output" 2>/dev/null; then
+    rm -f "$legacy" "$observation"; return 1
+  fi
+  rm -f "$legacy" "$observation"
+}
+
+authoritative_duplicate_active_work_ref() {
+  local value="$1" inventory projection count branch
+  inventory="$(mktemp "${TMPDIR:-/tmp}/workbench-active-inventory.XXXXXX")"
+  authoritative_active_task_inventory "$inventory" \
+    || { rm -f "$inventory"; return 2; }
+  projection="$(python3 "$(writer_helper)" work-ref-conflict \
+    --inventory-file "$inventory" --work-ref "$value" \
+    --current-claim-id "$(index_get claim_id)" 2>/dev/null)" \
+    || { rm -f "$inventory"; return 2; }
+  rm -f "$inventory"
+  count="$(printf '%s\n' "$projection" | python3 -c \
+    'import json,sys; print(len(json.load(sys.stdin)["conflicts"]))')" || return 2
+  [ "$count" -gt 0 ] || return 1
+  branch="$(printf '%s\n' "$projection" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["conflicts"][0]["branch"])')" || return 2
+  printf '%s\n' "$branch"
 }
 
 cmd_refs() {
@@ -2898,7 +2949,8 @@ cmd_refs() {
       print_refs_json false
       ;;
     set)
-      local context_ref="" work_ref="" set_context="" set_work="" clear_context="" clear_work="" duplicate format="" changed=false
+      local context_ref="" work_ref="" set_context="" set_work="" clear_context="" clear_work=""
+      local duplicate format="" changed=false duplicate_rc
       while [ $# -gt 0 ]; do
         case "$1" in
           --context-ref) context_ref="$2"; set_context=1; shift 2 ;;
@@ -2923,8 +2975,17 @@ cmd_refs() {
       if [ -n "$set_context" ]; then validate_namespaced_ref "$context_ref"; fi
       if [ -n "$set_work" ]; then
         validate_namespaced_ref "$work_ref"
-        if duplicate="$(duplicate_active_work_ref "$work_ref")"; then
+        if duplicate="$(authoritative_duplicate_active_work_ref "$work_ref")"; then
           die "duplicate active work_ref: $work_ref ($duplicate)"
+        else
+          duplicate_rc=$?
+          [ "$duplicate_rc" -eq 1 ] || die "active-task-inventory-unavailable"
+        fi
+        if duplicate="$(local_duplicate_active_work_ref "$work_ref")"; then
+          die "duplicate active work_ref: $work_ref ($duplicate)"
+        else
+          duplicate_rc=$?
+          [ "$duplicate_rc" -eq 1 ] || die "active-task-local-identity-unreconciled"
         fi
       fi
       if [ -n "$set_context" ] && [ "$(index_get context_ref)" != "$context_ref" ]; then

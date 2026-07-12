@@ -22,10 +22,34 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Se
 
 LEDGER_HEADER = "workbench-writer-claims/v1"
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+OID = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?\Z")
+NAMESPACED_REF = re.compile(r"[a-z][a-z0-9-]*:[a-z][a-z0-9-]*/[A-Za-z0-9._-]+\Z")
 UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
 OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+ACTIVE_TASK_INVENTORY_FIELDS = {
+    "contract_version",
+    "source_revision",
+    "descriptor_digest",
+    "workspace_origin_url",
+    "tasks",
+    "complete",
+    "blockers",
+}
+ACTIVE_TASK_FIELDS = {
+    "home",
+    "issue",
+    "branch",
+    "claim_id",
+    "workspace_authority_descriptor_digest",
+    "work_ref",
+    "source_kind",
+    "source_revision",
+    "index_revision",
+    "pull_request",
+}
 
 CLAIM_FIELDS = (
     "kind",
@@ -137,16 +161,16 @@ def load_json(file: str) -> Any:
         return json.load(handle, object_pairs_hook=unique_object)
 
 
-def require_text(value: str, field: str) -> str:
-    if not value or "\t" in value or "\n" in value or "\r" in value:
+def require_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value or "\t" in value or "\n" in value or "\r" in value:
         raise ValueError("{} must be a non-empty single-line value".format(field))
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise ValueError("{} must not contain control characters".format(field))
     return value
 
 
-def require_digest(value: str, field: str) -> str:
-    if DIGEST.fullmatch(value) is None:
+def require_digest(value: Any, field: str) -> str:
+    if not isinstance(value, str) or DIGEST.fullmatch(value) is None:
         raise ValueError("{} must be a canonical SHA-256 digest".format(field))
     return value
 
@@ -773,6 +797,85 @@ def cmd_conflict(args: argparse.Namespace) -> None:
         "conflicts": conflicts,
     }
     write_json(value)
+
+
+def cmd_work_ref_conflict(args: argparse.Namespace) -> None:
+    inventory = load_json(args.inventory_file)
+    if not isinstance(inventory, dict) or set(inventory) != ACTIVE_TASK_INVENTORY_FIELDS:
+        raise ValueError("active task inventory fields do not match the contract")
+    if (
+        inventory["contract_version"] != "workbench-active-task-inventory/v1"
+        or inventory["complete"] is not True
+        or inventory["blockers"] != []
+    ):
+        raise ValueError("active task inventory is incomplete")
+    if not isinstance(inventory["source_revision"], str) or OID.fullmatch(inventory["source_revision"]) is None:
+        raise ValueError("active task inventory revision is invalid")
+    require_digest(inventory["descriptor_digest"], "descriptor_digest")
+    require_text(inventory["workspace_origin_url"], "workspace_origin_url")
+    if NAMESPACED_REF.fullmatch(args.work_ref) is None:
+        raise ValueError("work_ref is invalid")
+    if not isinstance(inventory["tasks"], list):
+        raise ValueError("active task inventory tasks must be an array")
+    validated = []
+    for task in inventory["tasks"]:
+        if not isinstance(task, dict) or set(task) != ACTIVE_TASK_FIELDS:
+            raise ValueError("active task fields do not match the contract")
+        if task["home"] is not None:
+            require_text(task["home"], "task.home")
+        if (
+            not isinstance(task["issue"], int)
+            or isinstance(task["issue"], bool)
+            or task["issue"] <= 0
+        ):
+            raise ValueError("active task issue is invalid")
+        for field in ("branch", "claim_id"):
+            require_text(task[field], "task." + field)
+        require_digest(
+            task["workspace_authority_descriptor_digest"],
+            "task.workspace_authority_descriptor_digest",
+        )
+        if task["work_ref"] is not None and (
+            not isinstance(task["work_ref"], str)
+            or NAMESPACED_REF.fullmatch(task["work_ref"]) is None
+        ):
+            raise ValueError("active task work_ref is invalid")
+        if task["source_kind"] not in ("branch", "submitted-pr"):
+            raise ValueError("active task source kind is invalid")
+        for field in ("source_revision", "index_revision"):
+            if not isinstance(task[field], str) or OID.fullmatch(task[field]) is None:
+                raise ValueError("active task {} is invalid".format(field))
+        if task["source_kind"] == "branch":
+            if task["pull_request"] is not None:
+                raise ValueError("branch-backed active task carries a pull request")
+        elif (
+            not isinstance(task["pull_request"], int)
+            or isinstance(task["pull_request"], bool)
+            or task["pull_request"] <= 0
+        ):
+            raise ValueError("submitted active task pull request is invalid")
+        validated.append(task)
+    if validated != sorted(validated, key=lambda item: (item["branch"], item["claim_id"])):
+        raise ValueError("active tasks are not canonically sorted")
+    if len(validated) != len({item["claim_id"] for item in validated}):
+        raise ValueError("active task claim identity is duplicated")
+    conflicts = [
+        {
+            "claim_id": task["claim_id"],
+            "branch": task["branch"],
+            "home": task["home"],
+            "issue": task["issue"],
+        }
+        for task in validated
+        if task["work_ref"] == args.work_ref and task["claim_id"] != args.current_claim_id
+    ]
+    write_json(
+        {
+            "contract_version": "workbench-work-ref-conflict/v1",
+            "work_ref": args.work_ref,
+            "conflicts": conflicts,
+        }
+    )
 
 
 def cmd_matching_active(args: argparse.Namespace) -> None:
@@ -2208,6 +2311,11 @@ def parser() -> argparse.ArgumentParser:
     conflict.add_argument("--operation-file", required=True)
     conflict.add_argument("--legacy-inventory-file", required=True)
     conflict.set_defaults(func=cmd_conflict)
+    work_ref = commands.add_parser("work-ref-conflict")
+    work_ref.add_argument("--inventory-file", required=True)
+    work_ref.add_argument("--work-ref", required=True)
+    work_ref.add_argument("--current-claim-id", required=True)
+    work_ref.set_defaults(func=cmd_work_ref_conflict)
 
     matching = commands.add_parser("matching-active")
     matching.add_argument("file")
