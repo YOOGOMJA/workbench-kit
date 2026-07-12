@@ -9,6 +9,7 @@ import hashlib
 import multiprocessing
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -925,7 +926,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
         try:
             dry_run_upgrade(cli_request, cli_bundle)
         except CliError as error:
-            assert error.code == "public-adapter-mutated", error.code
+            assert error.code == "public-adapter-restore-failed", error.code
         else:
             raise AssertionError("mutating public adapter was accepted")
     finally:
@@ -938,6 +939,17 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
         check=False,
     )
     assert race_config.returncode == 1
+    residues = []
+    for current, directories, _ in os.walk(cli_root, topdown=True):
+        for name in list(directories):
+            if name.startswith(".workbench-kit-private-"):
+                directories.remove(name)
+                residues.append(pathlib.Path(current) / name)
+    assert residues
+    for residue in residues:
+        shutil.rmtree(residue)
+    assert workspace_digest(cli_root) == cli_before
+    assert git_observable_state(cli_root) == git_state_before
 
     try:
         applied = apply_upgrade(apply_request, cli_bundle)

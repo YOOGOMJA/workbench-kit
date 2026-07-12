@@ -56,6 +56,18 @@ if [ "$mode" = mutate-mode-admin ] && [ "$*" = "contract show --format json" ]; 
   chmod 000 "$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
 fi
 
+if [ "$mode" = mutate-delete-worktree ] && [ "$*" = "contract show --format json" ]; then
+  rm -rf sealed
+fi
+
+if [ "$mode" = mutate-delete-nested ] && [ "$*" = "contract show --format json" ]; then
+  rm -rf nested/parent
+fi
+
+if [ "$mode" = mutate-delete-admin ] && [ "$*" = "contract show --format json" ]; then
+  rm -rf "$(git rev-parse --path-format=absolute --git-common-dir)/adapter-owned"
+fi
+
 case "$*" in
   "contract show --format json")
     root="$PWD"

@@ -593,7 +593,7 @@ def _remove_state_node_at(
     name: str,
     expected: tuple[str, int | None, bytes | str | None],
     ref: str,
-) -> None:
+) -> tuple[str, int]:
     try:
         observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as error:
@@ -646,31 +646,11 @@ def _remove_state_node_at(
                 opened.st_dev,
                 opened.st_ino,
             ):
-                try:
-                    _rename_noreplace(
-                        private_fd, "node", parent_fd, name, ref
-                    )
-                    moved = False
-                except AdapterError:
-                    pass
                 raise AdapterError("public-adapter-restore-failed", ref)
-            if expected[0] == "directory":
-                os.rmdir("node", dir_fd=private_fd)
-            else:
-                os.unlink("node", dir_fd=private_fd)
-            moved = False
+            private = os.fstat(private_fd)
+            return private_name, stat.S_IMODE(private.st_mode)
         except OSError as error:
             raise AdapterError("public-adapter-restore-failed", ref) from error
-    except BaseException:
-        if moved:
-            try:
-                _rename_noreplace(
-                    private_fd, "node", parent_fd, name, ref
-                )
-                moved = False
-            except AdapterError:
-                pass
-        raise
     finally:
         os.close(handle)
         os.close(private_fd)
@@ -681,6 +661,36 @@ def _remove_state_node_at(
                 raise AdapterError(
                     "public-adapter-restore-failed", ref
                 ) from error
+
+
+def _record_private_residue(
+    manifest: dict[str, tuple[str, int | None, bytes | str | None]],
+    relative: str,
+    residue: tuple[str, int],
+) -> None:
+    source = pathlib.PurePosixPath(relative)
+    source_prefix = relative + "/"
+    moved = {
+        path: image
+        for path, image in manifest.items()
+        if path == relative or path.startswith(source_prefix)
+    }
+    for path in moved:
+        manifest.pop(path)
+    private_name, private_mode = residue
+    private_root = (
+        pathlib.PurePosixPath(private_name)
+        if source.parent == pathlib.PurePosixPath(".")
+        else source.parent / private_name
+    )
+    private_relative = private_root.as_posix()
+    manifest[private_relative] = ("directory", private_mode, None)
+    for path, image in moved.items():
+        suffix = pathlib.PurePosixPath(path).relative_to(source)
+        destination = private_root / "node"
+        if suffix.parts:
+            destination /= suffix
+        manifest[destination.as_posix()] = image
 
 
 def _open_state_handle_at(
@@ -699,6 +709,8 @@ def _open_state_handle_at(
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     elif hasattr(os, "O_SYMLINK"):
         flags = os.O_RDONLY | os.O_SYMLINK
+    elif sys.platform == "darwin":
+        flags = os.O_RDONLY | 0x00200000
     elif hasattr(os, "O_PATH"):
         flags = os.O_PATH | getattr(os, "O_NOFOLLOW", 0)
     else:
@@ -800,6 +812,7 @@ def _create_state_node_at(
             raise AdapterError("public-adapter-restore-failed", ref) from error
         return
     private_fd, private_name = _open_private_namespace(parent_fd, ref)
+    staged = False
     installed = False
     try:
         if kind == "file":
@@ -810,6 +823,7 @@ def _create_state_node_at(
                 | getattr(os, "O_NOFOLLOW", 0)
             )
             descriptor = os.open("node", flags, mode, dir_fd=private_fd)
+            staged = True
             try:
                 view = memoryview(payload)
                 while view:
@@ -822,6 +836,7 @@ def _create_state_node_at(
                 os.close(descriptor)
         elif kind == "symlink":
             os.symlink(payload, "node", dir_fd=private_fd)
+            staged = True
         else:
             raise AdapterError("public-adapter-restore-failed", ref)
         if _state_node_at(parent_fd, name, ref) != ABSENT_STATE:
@@ -833,16 +848,12 @@ def _create_state_node_at(
     except OSError as error:
         raise AdapterError("public-adapter-restore-failed", ref) from error
     finally:
-        if not installed:
-            try:
-                os.unlink("node", dir_fd=private_fd)
-            except FileNotFoundError:
-                pass
         os.close(private_fd)
-        try:
-            os.rmdir(private_name, dir_fd=parent_fd)
-        except OSError as error:
-            raise AdapterError("public-adapter-restore-failed", ref) from error
+        if installed or not staged:
+            try:
+                os.rmdir(private_name, dir_fd=parent_fd)
+            except OSError as error:
+                raise AdapterError("public-adapter-restore-failed", ref) from error
 
 
 def _chmod_directory_at(
@@ -1311,10 +1322,17 @@ def _restore_directory_access(
     repaired = False
     _require_workspace_root(workspace, root_fd, restore=True)
     for group in groups:
+        detached: list[str] = []
         for record in group["records"]:
+            relative = record["relative"]
+            if any(
+                relative.startswith(prefix + "/")
+                for prefix in detached
+            ):
+                continue
+            root_record = record["parent_fd"] is None
             try:
-                opened = os.fstat(record["fd"])
-                if record["parent_fd"] is None:
+                if root_record:
                     current = os.lstat(record["path"])
                 else:
                     current = os.stat(
@@ -1322,15 +1340,36 @@ def _restore_directory_access(
                         dir_fd=record["parent_fd"],
                         follow_symlinks=False,
                     )
+            except FileNotFoundError as error:
+                if not root_record:
+                    detached.append(relative)
+                    continue
+                raise AdapterError(
+                    "public-adapter-restore-failed", record["path"]
+                ) from error
+            except OSError as error:
+                raise AdapterError(
+                    "public-adapter-restore-failed", record["path"]
+                ) from error
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != record["binding"]
+            ):
+                if not root_record:
+                    detached.append(relative)
+                    continue
+                raise AdapterError(
+                    "public-adapter-restore-failed", record["path"]
+                )
+            try:
+                opened = os.fstat(record["fd"])
             except OSError as error:
                 raise AdapterError(
                     "public-adapter-restore-failed", record["path"]
                 ) from error
             if (
                 not stat.S_ISDIR(opened.st_mode)
-                or not stat.S_ISDIR(current.st_mode)
                 or (opened.st_dev, opened.st_ino) != record["binding"]
-                or (current.st_dev, current.st_ino) != record["binding"]
             ):
                 raise AdapterError(
                     "public-adapter-restore-failed", record["path"]
@@ -1405,15 +1444,25 @@ def _restore_worktree(
     state: dict[str, Any],
     after: dict[str, Any],
     root_fd: int,
-) -> None:
+) -> dict[str, tuple[str, int | None, bytes | str | None]]:
     before_manifest = state["worktree"]
     expected = dict(after["worktree"])
     expected_root_mode = after["root_mode"]
-    removals = [
+    removal_candidates = [
         relative
         for relative, image in expected.items()
         if relative not in before_manifest
         or before_manifest[relative][0] != image[0]
+    ]
+    removal_set = set(removal_candidates)
+    removals = [
+        relative
+        for relative in removal_candidates
+        if not any(
+            pathlib.PurePosixPath(*pathlib.PurePosixPath(relative).parts[:depth]).as_posix()
+            in removal_set
+            for depth in range(1, len(pathlib.PurePosixPath(relative).parts))
+        )
     ]
     directories = [
         relative
@@ -1480,10 +1529,12 @@ def _restore_worktree(
         )
         parent_fd, name = _worktree_parent(workspace, root_fd, relative)
         try:
-            _remove_state_node_at(parent_fd, name, expected[relative], relative)
+            residue = _remove_state_node_at(
+                parent_fd, name, expected[relative], relative
+            )
         finally:
             os.close(parent_fd)
-        expected.pop(relative, None)
+        _record_private_residue(expected, relative, residue)
         _require_workspace_root(workspace, root_fd, restore=True)
         _require_worktree_cas(
             workspace, root_fd, expected, expected_root_mode
@@ -1516,10 +1567,12 @@ def _restore_worktree(
             )
             parent_fd, name = _worktree_parent(workspace, root_fd, relative)
             try:
-                _remove_state_node_at(parent_fd, name, current, relative)
+                residue = _remove_state_node_at(
+                    parent_fd, name, current, relative
+                )
             finally:
                 os.close(parent_fd)
-            expected.pop(relative, None)
+            _record_private_residue(expected, relative, residue)
             _require_workspace_root(workspace, root_fd, restore=True)
             _require_worktree_cas(
                 workspace, root_fd, expected, expected_root_mode
@@ -1582,9 +1635,8 @@ def _restore_worktree(
             ) from error
         expected_root_mode = state["root_mode"]
         _require_workspace_root(workspace, root_fd, restore=True)
-    _require_worktree_cas(
-        workspace, root_fd, before_manifest, state["root_mode"]
-    )
+    _require_worktree_cas(workspace, root_fd, expected, state["root_mode"])
+    return expected
 
 
 def _path_for_manifest(root: pathlib.Path, relative: str) -> pathlib.Path:
@@ -1645,7 +1697,7 @@ def _restore_admin_manifest(
     object_relative: str | None,
     before: dict[str, tuple[str, int | None, bytes | str | None]],
     after: dict[str, tuple[str, int | None, bytes | str | None]],
-) -> None:
+) -> dict[str, tuple[str, int | None, bytes | str | None]]:
     try:
         root_fd = os.open(
             root,
@@ -1656,7 +1708,7 @@ def _restore_admin_manifest(
     except OSError as error:
         raise AdapterError("public-adapter-restore-failed", str(root)) from error
     try:
-        _restore_admin_manifest_open(
+        return _restore_admin_manifest_open(
             workspace,
             workspace_fd,
             root,
@@ -1679,18 +1731,28 @@ def _restore_admin_manifest_open(
     object_relative: str | None,
     before: dict[str, tuple[str, int | None, bytes | str | None]],
     after: dict[str, tuple[str, int | None, bytes | str | None]],
-) -> None:
+) -> dict[str, tuple[str, int | None, bytes | str | None]]:
     expected = dict(after)
     if before.get(".", ABSENT_STATE)[0] != after.get(".", ABSENT_STATE)[0]:
         raise AdapterError("public-adapter-restore-failed", str(root))
 
-    removals = [
+    removal_candidates = [
         relative
         for relative, image in after.items()
         if relative != "."
         and (
             relative not in before
             or before[relative][0] != image[0]
+        )
+    ]
+    removal_set = set(removal_candidates)
+    removals = [
+        relative
+        for relative in removal_candidates
+        if not any(
+            pathlib.PurePosixPath(*pathlib.PurePosixPath(relative).parts[:depth]).as_posix()
+            in removal_set
+            for depth in range(1, len(pathlib.PurePosixPath(relative).parts))
         )
     ]
     directories = [
@@ -1789,12 +1851,12 @@ def _restore_admin_manifest_open(
         path = _path_for_manifest(root, relative)
         parent_fd, name = _open_relative_parent(root_fd, relative, str(path))
         try:
-            _remove_state_node_at(
+            residue = _remove_state_node_at(
                 parent_fd, name, expected[relative], str(path)
             )
         finally:
             os.close(parent_fd)
-        expected.pop(relative, None)
+        _record_private_residue(expected, relative, residue)
         _require_admin_cas(
             workspace,
             workspace_fd,
@@ -1849,10 +1911,12 @@ def _restore_admin_manifest_open(
             )
             parent_fd, name = _open_relative_parent(root_fd, relative, str(path))
             try:
-                _remove_state_node_at(parent_fd, name, current, str(path))
+                residue = _remove_state_node_at(
+                    parent_fd, name, current, str(path)
+                )
             finally:
                 os.close(parent_fd)
-            expected.pop(relative, None)
+            _record_private_residue(expected, relative, residue)
             _require_admin_cas(
                 workspace,
                 workspace_fd,
@@ -1953,8 +2017,9 @@ def _restore_admin_manifest_open(
         root_fd,
         binding,
         object_relative,
-        before,
+        expected,
     )
+    return expected
 
 
 def _restore_git_pointer(
@@ -1962,15 +2027,19 @@ def _restore_git_pointer(
     root_fd: int,
     before: tuple[str, int | None, bytes | str | None],
     after: tuple[str, int | None, bytes | str | None],
-) -> None:
+) -> dict[str, tuple[str, int | None, bytes | str | None]]:
     path = workspace / ".git"
     if before == after or before[0] == "directory":
-        return
+        return {}
+    residue_manifest = {".git": after}
     _require_workspace_root(workspace, root_fd, restore=True)
     if _state_node_at(root_fd, ".git", str(path)) != after:
         raise AdapterError("public-adapter-restore-failed", str(path))
     if after[0] != "absent":
-        _remove_state_node_at(root_fd, ".git", after, str(path))
+        residue = _remove_state_node_at(
+            root_fd, ".git", after, str(path)
+        )
+        _record_private_residue(residue_manifest, ".git", residue)
         _require_workspace_root(workspace, root_fd, restore=True)
         if _state_node_at(root_fd, ".git", str(path)) != ABSENT_STATE:
             raise AdapterError("public-adapter-restore-failed", str(path))
@@ -1981,6 +2050,7 @@ def _restore_git_pointer(
         _require_workspace_root(workspace, root_fd, restore=True)
         if _state_node_at(root_fd, ".git", str(path)) != before:
             raise AdapterError("public-adapter-restore-failed", str(path))
+    return residue_manifest if after[0] != "absent" else {}
 
 
 def _restore_caller_state(
@@ -1998,12 +2068,18 @@ def _restore_caller_state(
             raise AdapterError(
                 "public-adapter-restore-failed", str(workspace)
             )
-        _restore_worktree(workspace, state, after, root_fd)
-        _restore_git_pointer(
+        expected_worktree = _restore_worktree(
+            workspace, state, after, root_fd
+        )
+        pointer_residue = _restore_git_pointer(
             workspace,
             root_fd,
             state["git_pointer"],
             after["git_pointer"],
+        )
+        expected_worktree.update(pointer_residue)
+        _require_worktree_cas(
+            workspace, root_fd, expected_worktree, state["root_mode"]
         )
         if state["git_nodes"] != after["git_nodes"]:
             raise AdapterError(
@@ -2011,6 +2087,7 @@ def _restore_caller_state(
             )
         before_admin = {item["path"]: item for item in state["git_admin"]}
         after_admin = {item["path"]: item for item in after["git_admin"]}
+        expected_admin = []
         for path in sorted(before_admin):
             expected_binding = before_admin[path]["binding"]
             observed_binding = after_admin[path]["binding"]
@@ -2020,7 +2097,7 @@ def _restore_caller_state(
                 )
             root = pathlib.Path(path)
             _require_nofollow_directory(root)
-            _restore_admin_manifest(
+            expected_manifest = _restore_admin_manifest(
                 workspace,
                 root_fd,
                 root,
@@ -2029,11 +2106,19 @@ def _restore_caller_state(
                 before_admin[path]["manifest"],
                 after_admin[path]["manifest"],
             )
+            expected_item = dict(before_admin[path])
+            expected_item["manifest"] = expected_manifest
+            expected_admin.append(expected_item)
+        expected_state = dict(state)
+        expected_state["worktree"] = expected_worktree
+        expected_state["git_admin"] = expected_admin
         if _capture_caller_state(
             workspace, root_fd, state["git_specs"], state["git_binding"]
-        ) != state:
+        ) != expected_state:
             raise AdapterError("public-adapter-restore-failed", str(workspace))
         if _raw_git_binding(workspace, strict=True) != state["git_binding"]:
+            raise AdapterError("public-adapter-restore-failed", str(workspace))
+        if expected_state != state:
             raise AdapterError("public-adapter-restore-failed", str(workspace))
     except AdapterError:
         raise

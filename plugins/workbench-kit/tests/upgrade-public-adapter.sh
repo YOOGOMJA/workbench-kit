@@ -12,6 +12,8 @@ mkdir -p "$legacy_workspace" "$current_workspace/.workbench" "$linked_source"
 printf 'workbench/v2\n' > "$current_workspace/.workbench/schema"
 mkdir -p "$current_workspace/sealed"
 printf 'sealed\n' > "$current_workspace/sealed/owned"
+mkdir -p "$current_workspace/nested/parent/child"
+printf 'nested\n' > "$current_workspace/nested/parent/child/owned"
 git -C "$legacy_workspace" init -q
 git -C "$current_workspace" init -q
 for repo in "$legacy_workspace" "$current_workspace"; do
@@ -20,6 +22,8 @@ for repo in "$legacy_workspace" "$current_workspace"; do
   git -C "$repo" add -A
   git -C "$repo" commit --allow-empty -qm "fixture: public adapter"
 done
+mkdir -p "$current_workspace/.git/adapter-owned/child"
+printf 'admin\n' > "$current_workspace/.git/adapter-owned/child/owned"
 git -C "$linked_source" init -q
 git -C "$linked_source" config user.name Fixture
 git -C "$linked_source" config user.email fixture@example.invalid
@@ -72,7 +76,10 @@ for admin_root in sorted({git_dir, common_dir}, key=str):
         if admin_root == common_dir and relative_root == pathlib.Path("objects"):
             directories[:] = []
             files[:] = []
-        directories[:] = sorted(directories)
+        directories[:] = sorted(
+            item for item in directories
+            if not item.startswith(".workbench-kit-private-")
+        )
         for name in sorted(directories + files):
             path = current_path / name
             relative = (relative_root / name).as_posix().encode()
@@ -86,7 +93,10 @@ for admin_root in sorted({git_dir, common_dir}, key=str):
                 payload = b"F\0" + path.read_bytes()
             parts.append(b"G\0" + label + b"\0" + relative + b"\0" + mode + b"\0" + payload)
 for current, directories, files in os.walk(root, topdown=True, followlinks=False):
-    directories[:] = sorted(item for item in directories if item != ".git")
+    directories[:] = sorted(
+        item for item in directories
+        if item != ".git" and not item.startswith(".workbench-kit-private-")
+    )
     for name in sorted(files):
         path = pathlib.Path(current) / name
         relative = path.relative_to(root).as_posix().encode()
@@ -143,6 +153,10 @@ set -e
 [ "$status" -eq 0 ] || { echo "$ok" >&2; exit 1; }
 [ "$legacy_git_before" = "$(git_state_digest "$legacy_workspace")" ] \
   || { echo "legacy public calls mutated caller Git state" >&2; exit 1; }
+if find "$legacy_workspace" -name '.workbench-kit-private-*' -print -quit | grep -q .; then
+  echo "read-only public adapter left a private residue" >&2
+  exit 1
+fi
 python3 - "$ok" <<'PY'
 import hashlib
 import json
@@ -452,14 +466,20 @@ expect_failure task-status-duplicate public-task-status-invalid "$current_worksp
 expect_failure task-status-blocker public-adapter-exit "$current_workspace" - show
 
 mutating_before="$(git_state_digest "$current_workspace")"
-expect_failure mutate-state public-adapter-mutated "$current_workspace" - show
+expect_failure mutate-state public-adapter-restore-failed "$current_workspace" - show
 [ "$mutating_before" = "$(git_state_digest "$current_workspace")" ] || {
   echo "mutating public adapter was not fully restored" >&2
   exit 1
 }
+find "$current_workspace" -path '*/.workbench-kit-private-*/node' \
+  -type f -exec grep -Fq 'public adapter mutation' {} \; -print -quit \
+  | grep -q . || {
+  echo "worktree mutation was not preserved as a private residue" >&2
+  exit 1
+}
 
 admin_before="$(git_state_digest "$current_workspace")"
-expect_failure mutate-git-admin public-adapter-mutated "$current_workspace" - show
+expect_failure mutate-git-admin public-adapter-restore-failed "$current_workspace" - show
 [ "$admin_before" = "$(git_state_digest "$current_workspace")" ] || {
   echo "Git control state was not restored exactly" >&2
   exit 1
@@ -469,11 +489,23 @@ common_dir="$(git -C "$current_workspace" rev-parse --path-format=absolute --git
   echo "newly fetched object cache data was removed" >&2
   exit 1
 }
+find "$common_dir" -path '*/.workbench-kit-private-*/node' \
+  -type f -exec grep -Fq 'admin = mutated' {} \; -print -quit \
+  | grep -q . || {
+  echo "Git admin mutation was not preserved as a private residue" >&2
+  exit 1
+}
 
 pointer_before="$(git_state_digest "$linked_workspace")"
-expect_failure mutate-git-pointer public-adapter-mutated "$linked_workspace" "$approval"
+expect_failure mutate-git-pointer public-adapter-restore-failed "$linked_workspace" "$approval"
 [ "$pointer_before" = "$(git_state_digest "$linked_workspace")" ] || {
   echo "linked-worktree .git pointer was not restored exactly" >&2
+  exit 1
+}
+find "$linked_workspace" -path '*/.workbench-kit-private-*/node' \
+  -type f -exec grep -Fq 'workbench-kit-mutated' {} \; -print -quit \
+  | grep -q . || {
+  echo "linked-worktree pointer mutation was not preserved as a private residue" >&2
   exit 1
 }
 git -C "$linked_workspace" status --porcelain=v2 >/dev/null
@@ -495,6 +527,25 @@ admin_mode_before="$(mode_of "$common_dir/hooks")"
 expect_failure mutate-mode-admin public-adapter-mutated "$current_workspace" - show
 [ "$(mode_of "$common_dir/hooks")" = "$admin_mode_before" ] || {
   echo "Git admin directory access mode was not restored" >&2
+  exit 1
+}
+
+deleted_worktree_before="$(git_state_digest "$current_workspace")"
+expect_failure mutate-delete-worktree public-adapter-mutated "$current_workspace" - show
+[ "$deleted_worktree_before" = "$(git_state_digest "$current_workspace")" ] || {
+  echo "deleted tracked worktree directory was not restored" >&2
+  exit 1
+}
+deleted_nested_before="$(git_state_digest "$current_workspace")"
+expect_failure mutate-delete-nested public-adapter-mutated "$current_workspace" - show
+[ "$deleted_nested_before" = "$(git_state_digest "$current_workspace")" ] || {
+  echo "deleted nested worktree directory was not restored" >&2
+  exit 1
+}
+deleted_admin_before="$(git_state_digest "$current_workspace")"
+expect_failure mutate-delete-admin public-adapter-mutated "$current_workspace" - show
+[ "$deleted_admin_before" = "$(git_state_digest "$current_workspace")" ] || {
+  echo "deleted Git admin child directory was not restored" >&2
   exit 1
 }
 
@@ -666,24 +717,32 @@ def removal_race(kind):
         except adapter.AdapterError as error:
             assert error.code == "public-adapter-restore-failed", error.code
         else:
-            raise AssertionError("replacement node was removed")
+            raise AssertionError("replacement node race was accepted")
     finally:
         adapter._rename_noreplace = original
         os.close(descriptor)
+    assert not target.exists() and not target.is_symlink()
+    assert (root / "adapter-before-race").exists() or (
+        root / "adapter-before-race"
+    ).is_symlink()
+    residues = list(root.glob(".workbench-kit-private-*"))
+    assert len(residues) == 1
     if kind == "file":
-        assert target.read_bytes() == b"concurrent file\n"
+        assert (residues[0] / "node").read_bytes() == b"concurrent file\n"
+        assert (root / "adapter-before-race").read_bytes() == b"adapter mutation\n"
     elif kind == "directory":
-        assert (target / "child").read_bytes() == b"concurrent directory\n"
+        assert (residues[0] / "node/child").read_bytes() == b"concurrent directory\n"
     else:
-        assert os.readlink(target) == "concurrent-target"
+        assert os.readlink(residues[0] / "node") == "concurrent-target"
+        assert os.readlink(root / "adapter-before-race") == "adapter-target"
 
 
 for node_kind in ("file", "directory", "symlink"):
     removal_race(node_kind)
 
 
-def private_discard_failure(kind, occupy_original=False):
-    root = pathlib.Path(tempfile.mkdtemp(prefix=f"discard-{kind}-", dir=base))
+def private_quarantine_residue(kind):
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"quarantine-{kind}-", dir=base))
     target = root / "owned"
     if kind == "file":
         target.write_bytes(b"adapter file\n")
@@ -693,67 +752,159 @@ def private_discard_failure(kind, occupy_original=False):
         target.symlink_to("adapter-target")
     parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     expected = adapter._state_node_at(parent_fd, "owned", "owned")
-    original_unlink = adapter.os.unlink
-    original_rmdir = adapter.os.rmdir
+    try:
+        residue_name, _ = adapter._remove_state_node_at(
+            parent_fd, "owned", expected, "owned"
+        )
+    finally:
+        os.close(parent_fd)
+    assert not target.exists() and not target.is_symlink()
+    residue = root / residue_name / "node"
+    if kind == "file":
+        assert residue.read_bytes() == b"adapter file\n"
+    elif kind == "directory":
+        assert residue.is_dir()
+    else:
+        assert os.readlink(residue) == "adapter-target"
 
-    def fail_unlink(path, *args, dir_fd=None, **kwargs):
-        if path == "node" and dir_fd != parent_fd:
-            if occupy_original:
+
+for node_kind in ("file", "directory", "symlink"):
+    private_quarantine_residue(node_kind)
+
+
+def private_node_swap_after_stat(kind):
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"private-swap-{kind}-", dir=base))
+    target = root / "owned"
+    if kind == "file":
+        target.write_bytes(b"adapter file\n")
+    else:
+        target.symlink_to("adapter-target")
+    parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    expected = adapter._state_node_at(parent_fd, "owned", "owned")
+    original_stat = adapter.os.stat
+    injected = False
+
+    def raced_stat(path, *args, dir_fd=None, follow_symlinks=True, **kwargs):
+        nonlocal injected
+        node = original_stat(
+            path,
+            *args,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+            **kwargs,
+        )
+        if path == "node" and dir_fd != parent_fd and not injected:
+            injected = True
+            os.rename(
+                "node", "adapter-node",
+                src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
+            )
+            if kind == "file":
                 replacement = os.open(
-                    "owned", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o644, dir_fd=parent_fd,
+                    "node", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644, dir_fd=dir_fd,
                 )
-                os.write(replacement, b"concurrent original\n")
+                os.write(replacement, b"concurrent private file\n")
                 os.close(replacement)
-            raise OSError(16, "fixture private unlink failure")
-        return original_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+            else:
+                os.symlink("concurrent-private-target", "node", dir_fd=dir_fd)
+        return node
 
-    def fail_rmdir(path, *args, dir_fd=None, **kwargs):
-        if path == "node" and dir_fd != parent_fd:
-            node_fd = os.open(
-                "node", os.O_RDONLY | os.O_DIRECTORY, dir_fd=dir_fd
-            )
-            child = os.open(
-                "concurrent-child",
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o644,
-                dir_fd=node_fd,
-            )
-            os.write(child, b"concurrent child\n")
-            os.close(child)
-            os.close(node_fd)
-            raise OSError(66, "fixture private directory not empty")
-        return original_rmdir(path, *args, dir_fd=dir_fd, **kwargs)
-
-    adapter.os.unlink = fail_unlink
-    adapter.os.rmdir = fail_rmdir
+    adapter.os.stat = raced_stat
     try:
         try:
             adapter._remove_state_node_at(parent_fd, "owned", expected, "owned")
         except adapter.AdapterError as error:
             assert error.code == "public-adapter-restore-failed", error.code
-        else:
-            raise AssertionError("private discard failure was accepted")
     finally:
-        adapter.os.unlink = original_unlink
-        adapter.os.rmdir = original_rmdir
+        adapter.os.stat = original_stat
         os.close(parent_fd)
-    if occupy_original:
-        assert target.read_bytes() == b"concurrent original\n"
-        residues = list(root.glob(".workbench-kit-private-*"))
-        assert len(residues) == 1
-        assert (residues[0] / "node").read_bytes() == b"adapter file\n"
-    elif kind == "file":
-        assert target.read_bytes() == b"adapter file\n"
-    elif kind == "directory":
-        assert (target / "concurrent-child").read_bytes() == b"concurrent child\n"
+    assert injected
+    residues = list(root.glob(".workbench-kit-private-*"))
+    assert len(residues) == 1
+    if kind == "file":
+        assert (residues[0] / "node").read_bytes() == b"concurrent private file\n"
+        assert (residues[0] / "adapter-node").read_bytes() == b"adapter file\n"
     else:
-        assert os.readlink(target) == "adapter-target"
+        assert os.readlink(residues[0] / "node") == "concurrent-private-target"
+        assert os.readlink(residues[0] / "adapter-node") == "adapter-target"
 
 
-for node_kind in ("file", "directory", "symlink"):
-    private_discard_failure(node_kind)
-private_discard_failure("file", occupy_original=True)
+for node_kind in ("file", "symlink"):
+    private_node_swap_after_stat(node_kind)
+
+
+def private_temp_swap_before_failure_cleanup(kind):
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"private-temp-{kind}-", dir=base))
+    parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    image = (
+        ("file", 0o644, b"restored file\n")
+        if kind == "file"
+        else ("symlink", 0o777, "restored-target")
+    )
+    original_state = adapter._state_node_at
+    calls = 0
+
+    def raced_state(descriptor, name, ref):
+        nonlocal calls
+        image_at_target = original_state(descriptor, name, ref)
+        if descriptor == parent_fd and name == "installed":
+            calls += 1
+            if calls == 2:
+                private = next(root.glob(".workbench-kit-private-*"))
+                private_fd = os.open(private, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.stat("node", dir_fd=private_fd, follow_symlinks=False)
+                    os.rename(
+                        "node", "adapter-node",
+                        src_dir_fd=private_fd, dst_dir_fd=private_fd,
+                    )
+                    if kind == "file":
+                        replacement = os.open(
+                            "node", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o644, dir_fd=private_fd,
+                        )
+                        os.write(replacement, b"concurrent temp file\n")
+                        os.close(replacement)
+                    else:
+                        os.symlink(
+                            "concurrent-temp-target", "node", dir_fd=private_fd
+                        )
+                finally:
+                    os.close(private_fd)
+                concurrent = os.open(
+                    "installed", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644, dir_fd=parent_fd,
+                )
+                os.write(concurrent, b"concurrent destination\n")
+                os.close(concurrent)
+                return original_state(descriptor, name, ref)
+        return image_at_target
+
+    adapter._state_node_at = raced_state
+    try:
+        try:
+            adapter._create_state_node_at(parent_fd, "installed", image, "installed")
+        except adapter.AdapterError as error:
+            assert error.code == "public-adapter-restore-failed", error.code
+        else:
+            raise AssertionError("occupied restore destination was accepted")
+    finally:
+        adapter._state_node_at = original_state
+        os.close(parent_fd)
+    residues = list(root.glob(".workbench-kit-private-*"))
+    assert len(residues) == 1
+    assert (root / "installed").read_bytes() == b"concurrent destination\n"
+    if kind == "file":
+        assert (residues[0] / "node").read_bytes() == b"concurrent temp file\n"
+        assert (residues[0] / "adapter-node").read_bytes() == b"restored file\n"
+    else:
+        assert os.readlink(residues[0] / "node") == "concurrent-temp-target"
+        assert os.readlink(residues[0] / "adapter-node") == "restored-target"
+
+
+for node_kind in ("file", "symlink"):
+    private_temp_swap_before_failure_cleanup(node_kind)
 
 
 def shared_quarantine_cleanup(kind):
@@ -906,6 +1057,26 @@ finally:
     os.close(chmod_fd)
 assert os.stat(chmod_root / "owned").st_mode & 0o777 == 0o711
 
+detached_root = repository("detached-access").resolve()
+(detached_root / "parent/child").mkdir(parents=True)
+detached_root_fd = adapter._open_workspace_root(detached_root)
+detached_state = adapter._capture_caller_state(detached_root, detached_root_fd)
+detached_groups = adapter._capture_directory_access(
+    detached_root, detached_root_fd, detached_state
+)
+os.rename(detached_root / "parent", detached_root / "detached-parent")
+(detached_root / "parent/child").mkdir(parents=True)
+os.chmod(detached_root / "detached-parent/child", 0o000)
+try:
+    repaired = adapter._restore_directory_access(
+        detached_root, detached_root_fd, detached_groups
+    )
+    assert not repaired
+    assert os.stat(detached_root / "detached-parent/child").st_mode & 0o777 == 0
+finally:
+    adapter._close_directory_access(detached_groups)
+    os.close(detached_root_fd)
+
 exhaustion_root = repository("descriptor-exhaustion").resolve()
 (exhaustion_root / "level-one/level-two").mkdir(parents=True)
 exhaustion_fd = adapter._open_workspace_root(exhaustion_root)
@@ -947,6 +1118,32 @@ finally:
     os.environ["UPGRADE_STUB_MODE"] = mode_before
 assert capacity_snapshot["contract"]["workspace"]["schema"] == "workbench/v1"
 assert resource.getrlimit(resource.RLIMIT_NOFILE) == limit_before
+
+if sys.platform == "darwin":
+    symlink_root = pathlib.Path(tempfile.mkdtemp(prefix="darwin-symlink-", dir=base))
+    (symlink_root / "owned").symlink_to("target")
+    symlink_parent_fd = os.open(symlink_root, os.O_RDONLY | os.O_DIRECTORY)
+    saved_flags = {
+        name: getattr(adapter.os, name)
+        for name in ("O_SYMLINK", "O_PATH")
+        if hasattr(adapter.os, name)
+    }
+    try:
+        for name in saved_flags:
+            delattr(adapter.os, name)
+        handle = adapter._open_state_handle_at(
+            symlink_parent_fd, "owned", "symlink", "owned"
+        )
+        try:
+            assert os.path.samestat(
+                os.fstat(handle), os.stat("owned", dir_fd=symlink_parent_fd, follow_symlinks=False)
+            )
+        finally:
+            os.close(handle)
+    finally:
+        for name, value in saved_flags.items():
+            setattr(adapter.os, name, value)
+        os.close(symlink_parent_fd)
 PY
 
 if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' \
