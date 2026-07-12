@@ -3,13 +3,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/workbench-upgrade-adapter.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 legacy_workspace="$tmp/legacy-workspace"
 current_workspace="$tmp/current-workspace"
 linked_source="$tmp/linked-source"
 linked_workspace="$tmp/linked-workspace"
 mkdir -p "$legacy_workspace" "$current_workspace/.workbench" "$linked_source"
 printf 'workbench/v2\n' > "$current_workspace/.workbench/schema"
+mkdir -p "$current_workspace/sealed"
+printf 'sealed\n' > "$current_workspace/sealed/owned"
 git -C "$legacy_workspace" init -q
 git -C "$current_workspace" init -q
 for repo in "$legacy_workspace" "$current_workspace"; do
@@ -93,6 +95,14 @@ for current, directories, files in os.walk(root, topdown=True, followlinks=False
         else:
             parts.append(b"F\0" + relative + b"\0" + path.read_bytes())
 print(hashlib.sha256(b"\0".join(parts)).hexdigest())
+PY
+}
+
+mode_of() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+print(oct(os.stat(sys.argv[1]).st_mode & 0o7777))
 PY
 }
 
@@ -468,6 +478,26 @@ expect_failure mutate-git-pointer public-adapter-mutated "$linked_workspace" "$a
 }
 git -C "$linked_workspace" status --porcelain=v2 >/dev/null
 
+root_mode_before="$(mode_of "$current_workspace")"
+expect_failure mutate-mode-root public-adapter-mutated "$current_workspace" - show
+[ "$(mode_of "$current_workspace")" = "$root_mode_before" ] || {
+  echo "workspace root access mode was not restored" >&2
+  exit 1
+}
+worktree_mode_before="$(mode_of "$current_workspace/sealed")"
+expect_failure mutate-mode-worktree public-adapter-mutated "$current_workspace" - show
+[ "$(mode_of "$current_workspace/sealed")" = "$worktree_mode_before" ] || {
+  echo "worktree directory access mode was not restored" >&2
+  exit 1
+}
+common_dir="$(git -C "$current_workspace" rev-parse --path-format=absolute --git-common-dir)"
+admin_mode_before="$(mode_of "$common_dir/hooks")"
+expect_failure mutate-mode-admin public-adapter-mutated "$current_workspace" - show
+[ "$(mode_of "$common_dir/hooks")" = "$admin_mode_before" ] || {
+  echo "Git admin directory access mode was not restored" >&2
+  exit 1
+}
+
 UPGRADE_STUB_MODE=mutate-state \
 UPGRADE_STUB_APPROVAL_FILE="$approval" \
 WORKBENCH_KIT_WORKBENCH_BIN="$ROOT/tests/upgrade-public-stub.sh" \
@@ -610,19 +640,21 @@ def removal_race(kind):
     original = adapter._rename_noreplace
     injected = False
 
-    def raced(parent_fd, source, destination, ref):
+    def raced(source_fd, source, destination_fd, destination, ref):
         nonlocal injected
         if source == "owned" and not injected:
             injected = True
             os.rename(
                 "owned", "adapter-before-race",
-                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                src_dir_fd=source_fd, dst_dir_fd=source_fd,
             )
             os.rename(
                 "replacement", "owned",
-                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                src_dir_fd=source_fd, dst_dir_fd=source_fd,
             )
-        return original(parent_fd, source, destination, ref)
+        return original(
+            source_fd, source, destination_fd, destination, ref
+        )
 
     adapter._rename_noreplace = raced
     try:
@@ -647,6 +679,119 @@ def removal_race(kind):
 
 for node_kind in ("file", "directory", "symlink"):
     removal_race(node_kind)
+
+
+def shared_quarantine_cleanup(kind):
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"cleanup-{kind}-", dir=base))
+    target = root / "owned"
+    if kind == "file":
+        target.write_bytes(b"adapter mutation\n")
+    else:
+        target.symlink_to("adapter-target")
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    expected = adapter._state_node_at(descriptor, "owned", "owned")
+    original_state = adapter._state_node_at
+    exposed = False
+
+    def raced_state(parent_fd, name, ref):
+        nonlocal exposed
+        image = original_state(parent_fd, name, ref)
+        if parent_fd == descriptor and name != "owned" and image == expected:
+            exposed = True
+            os.rename(
+                name, name + "-adapter",
+                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+            )
+            if kind == "file":
+                replacement_fd = os.open(
+                    name, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644, dir_fd=parent_fd,
+                )
+                os.write(replacement_fd, b"concurrent quarantine bytes\n")
+                os.close(replacement_fd)
+            else:
+                os.symlink("concurrent-quarantine", name, dir_fd=parent_fd)
+        return image
+
+    adapter._state_node_at = raced_state
+    try:
+        try:
+            adapter._remove_state_node_at(
+                descriptor, "owned", expected, "owned"
+            )
+        except adapter.AdapterError:
+            pass
+    finally:
+        adapter._state_node_at = original_state
+        os.close(descriptor)
+    assert not exposed, f"{kind} cleanup used a shared verified name before unlink"
+
+
+def shared_temp_cleanup(kind):
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"temp-{kind}-", dir=base))
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    image = (
+        ("file", 0o644, b"restored file\n")
+        if kind == "file"
+        else ("symlink", 0o777, "restored-target")
+    )
+    original_stat = adapter.os.stat
+    exposed = False
+
+    def raced_stat(path, *args, dir_fd=None, follow_symlinks=True, **kwargs):
+        nonlocal exposed
+        node = original_stat(
+            path,
+            *args,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+            **kwargs,
+        )
+        if (
+            isinstance(path, str)
+            and path != "installed"
+            and dir_fd == descriptor
+            and not exposed
+        ):
+            try:
+                target = original_stat(
+                    "installed", dir_fd=descriptor, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                target = None
+            if target is not None and (node.st_dev, node.st_ino) == (
+                target.st_dev, target.st_ino
+            ):
+                exposed = True
+                os.rename(
+                    path, path + "-adapter",
+                    src_dir_fd=descriptor, dst_dir_fd=descriptor,
+                )
+                if kind == "file":
+                    replacement = os.open(
+                        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o644, dir_fd=descriptor,
+                    )
+                    os.write(replacement, b"concurrent temp bytes\n")
+                    os.close(replacement)
+                else:
+                    os.symlink("concurrent-temp", path, dir_fd=descriptor)
+        return node
+
+    adapter.os.stat = raced_stat
+    try:
+        adapter._create_state_node_at(
+            descriptor, "installed", image, "installed"
+        )
+    finally:
+        adapter.os.stat = original_stat
+        os.close(descriptor)
+    assert not exposed, f"{kind} install cleaned a shared temporary name"
+
+
+for node_kind in ("file", "symlink"):
+    shared_quarantine_cleanup(node_kind)
+    shared_temp_cleanup(node_kind)
 
 chmod_root = pathlib.Path(tempfile.mkdtemp(prefix="chmod-race-", dir=base))
 (chmod_root / "owned").mkdir(mode=0o755)
@@ -685,6 +830,35 @@ finally:
     adapter.os.open = original_open
     os.close(chmod_fd)
 assert os.stat(chmod_root / "owned").st_mode & 0o777 == 0o711
+
+exhaustion_root = repository("descriptor-exhaustion").resolve()
+(exhaustion_root / "level-one/level-two").mkdir(parents=True)
+exhaustion_fd = adapter._open_workspace_root(exhaustion_root)
+exhaustion_state = adapter._capture_caller_state(exhaustion_root, exhaustion_fd)
+descriptor_count = len(os.listdir("/dev/fd"))
+original_open = adapter.os.open
+
+
+def exhausted_open(path, flags, *args, dir_fd=None, **kwargs):
+    if path == "level-two" and dir_fd is not None:
+        raise OSError(24, "fixture descriptor exhaustion")
+    return original_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+
+adapter.os.open = exhausted_open
+try:
+    try:
+        adapter._capture_directory_access(
+            exhaustion_root, exhaustion_fd, exhaustion_state
+        )
+    except adapter.AdapterError as error:
+        assert error.code == "public-state-unavailable", error.code
+    else:
+        raise AssertionError("descriptor exhaustion was accepted")
+finally:
+    adapter.os.open = original_open
+    os.close(exhaustion_fd)
+assert len(os.listdir("/dev/fd")) == descriptor_count - 1
 PY
 
 if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' \

@@ -44,6 +44,18 @@ if [ "$mode" = mutate-git-pointer ] && [ "$*" = "contract show --format json" ];
   printf 'gitdir: /nonexistent/workbench-kit-mutated\n' > .git
 fi
 
+if [ "$mode" = mutate-mode-root ] && [ "$*" = "contract show --format json" ]; then
+  chmod 000 .
+fi
+
+if [ "$mode" = mutate-mode-worktree ] && [ "$*" = "contract show --format json" ]; then
+  chmod 000 sealed
+fi
+
+if [ "$mode" = mutate-mode-admin ] && [ "$*" = "contract show --format json" ]; then
+  chmod 000 "$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
+fi
+
 case "$*" in
   "contract show --format json")
     root="$PWD"

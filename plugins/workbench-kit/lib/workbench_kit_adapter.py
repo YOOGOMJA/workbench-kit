@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from workbench_kit_json import (
@@ -344,49 +344,7 @@ def _worktree_manifest(
 ) -> dict[str, tuple[str, int, bytes | str | None]]:
     _require_workspace_root(root, root_fd, restore=False)
     manifest: dict[str, tuple[str, int, bytes | str | None]] = {}
-
-    def visit(directory: pathlib.Path, prefix: pathlib.PurePosixPath) -> None:
-        try:
-            entries = sorted(os.scandir(directory), key=lambda item: item.name)
-        except OSError as error:
-            raise AdapterError("public-state-unavailable", str(directory)) from error
-        for entry in entries:
-            if not prefix.parts and entry.name == ".git":
-                continue
-            relative_path = prefix / entry.name
-            relative = relative_path.as_posix()
-            path = pathlib.Path(entry.path)
-            try:
-                node = os.lstat(path)
-            except OSError as error:
-                raise AdapterError("public-state-unavailable", relative) from error
-            mode = stat.S_IMODE(node.st_mode)
-            if stat.S_ISLNK(node.st_mode):
-                try:
-                    target = os.readlink(path)
-                except OSError as error:
-                    raise AdapterError("public-state-unavailable", relative) from error
-                manifest[relative] = ("symlink", mode, target)
-            elif stat.S_ISREG(node.st_mode):
-                try:
-                    content = path.read_bytes()
-                    verified = os.lstat(path)
-                except OSError as error:
-                    raise AdapterError("public-state-unavailable", relative) from error
-                if (
-                    (node.st_dev, node.st_ino, node.st_size, node.st_mtime_ns)
-                    != (verified.st_dev, verified.st_ino, verified.st_size, verified.st_mtime_ns)
-                    or len(content) != node.st_size
-                ):
-                    raise AdapterError("public-state-unavailable", relative)
-                manifest[relative] = ("file", mode, content)
-            elif stat.S_ISDIR(node.st_mode):
-                manifest[relative] = ("directory", mode, None)
-                visit(path, relative_path)
-            else:
-                raise AdapterError("public-state-unavailable", relative)
-
-    visit(root, pathlib.PurePosixPath())
+    _manifest_visit(root_fd, pathlib.PurePosixPath(), manifest, skip_git=True)
     _require_workspace_root(root, root_fd, restore=False)
     return manifest
 
@@ -540,6 +498,71 @@ def _state_node_at(
     raise AdapterError("public-adapter-restore-failed", ref)
 
 
+def _manifest_node_at(
+    parent_fd: int,
+    name: str,
+    ref: str,
+) -> tuple[str, int | None, bytes | str | None]:
+    try:
+        image = _state_node_at(parent_fd, name, ref)
+    except AdapterError as error:
+        raise AdapterError("public-state-unavailable", ref) from error
+    if image[0] == "absent":
+        raise AdapterError("public-state-unavailable", ref)
+    return image
+
+
+def _manifest_visit(
+    directory_fd: int,
+    prefix: pathlib.PurePosixPath,
+    manifest: dict[str, tuple[str, int | None, bytes | str | None]],
+    *,
+    skip_git: bool = False,
+    stop_directory: str | None = None,
+) -> None:
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as error:
+        raise AdapterError("public-state-unavailable", prefix.as_posix()) from error
+    for name in names:
+        if not prefix.parts and skip_git and name == ".git":
+            continue
+        relative_path = prefix / name
+        relative = relative_path.as_posix()
+        image = _manifest_node_at(directory_fd, name, relative)
+        manifest[relative] = image
+        if image[0] != "directory" or relative == stop_directory:
+            continue
+        try:
+            node = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            child_fd = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            opened = os.fstat(child_fd)
+        except OSError as error:
+            raise AdapterError("public-state-unavailable", relative) from error
+        try:
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (node.st_dev, node.st_ino)
+                != (opened.st_dev, opened.st_ino)
+                or stat.S_IMODE(opened.st_mode) != image[1]
+            ):
+                raise AdapterError("public-state-unavailable", relative)
+            _manifest_visit(
+                child_fd,
+                relative_path,
+                manifest,
+                stop_directory=stop_directory,
+            )
+        finally:
+            os.close(child_fd)
+
+
 def _open_relative_parent(root_fd: int, relative: str, ref: str) -> tuple[int, str]:
     path = pathlib.PurePosixPath(relative)
     if path.is_absolute() or not path.parts or any(
@@ -596,47 +619,124 @@ def _remove_state_node_at(
         verified.st_ctime_ns,
     ):
         raise AdapterError("public-adapter-restore-failed", ref)
-    quarantine = _temporary_state_name(parent_fd, ref)
-    _rename_noreplace(parent_fd, name, quarantine, ref)
+    handle = _open_state_handle_at(parent_fd, name, expected[0], ref)
+    try:
+        private_fd, private_name = _open_private_namespace(parent_fd, ref)
+    except BaseException:
+        os.close(handle)
+        raise
+    moved = False
     try:
         try:
-            moved = os.stat(
-                quarantine, dir_fd=parent_fd, follow_symlinks=False
+            opened = os.fstat(handle)
+            if (opened.st_dev, opened.st_ino) != (
+                observed.st_dev,
+                observed.st_ino,
+            ):
+                raise AdapterError("public-adapter-restore-failed", ref)
+            _rename_noreplace(
+                parent_fd, name, private_fd, "node", ref
             )
+            moved = True
+            quarantined = os.stat(
+                "node", dir_fd=private_fd, follow_symlinks=False
+            )
+            if (quarantined.st_dev, quarantined.st_ino) != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                try:
+                    _rename_noreplace(
+                        private_fd, "node", parent_fd, name, ref
+                    )
+                    moved = False
+                except AdapterError:
+                    pass
+                raise AdapterError("public-adapter-restore-failed", ref)
+            if expected[0] == "directory":
+                os.rmdir("node", dir_fd=private_fd)
+            else:
+                os.unlink("node", dir_fd=private_fd)
+            moved = False
         except OSError as error:
             raise AdapterError("public-adapter-restore-failed", ref) from error
-        if (moved.st_dev, moved.st_ino) != (observed.st_dev, observed.st_ino):
-            raise AdapterError("public-adapter-restore-failed", ref)
-        if _state_node_at(parent_fd, quarantine, ref) != expected:
-            raise AdapterError("public-adapter-restore-failed", ref)
-        if expected[0] == "directory":
-            os.rmdir(quarantine, dir_fd=parent_fd)
-        else:
-            os.unlink(quarantine, dir_fd=parent_fd)
-    except AdapterError:
-        _restore_quarantine(parent_fd, quarantine, name, ref)
-        raise
+    finally:
+        os.close(handle)
+        os.close(private_fd)
+        if not moved:
+            try:
+                os.rmdir(private_name, dir_fd=parent_fd)
+            except OSError as error:
+                raise AdapterError(
+                    "public-adapter-restore-failed", ref
+                ) from error
+
+
+def _open_state_handle_at(
+    parent_fd: int,
+    name: str,
+    kind: str,
+    ref: str,
+) -> int:
+    if kind == "directory":
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+    elif kind == "file":
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    elif hasattr(os, "O_SYMLINK"):
+        flags = os.O_RDONLY | os.O_SYMLINK
+    elif hasattr(os, "O_PATH"):
+        flags = os.O_PATH | getattr(os, "O_NOFOLLOW", 0)
+    else:
+        raise AdapterError("public-adapter-restore-failed", ref)
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
     except OSError as error:
-        _restore_quarantine(parent_fd, quarantine, name, ref)
         raise AdapterError("public-adapter-restore-failed", ref) from error
 
 
-def _temporary_state_name(parent_fd: int, ref: str) -> str:
-    prefix = f".workbench-kit-restore-{os.getpid()}-"
+def _open_private_namespace(parent_fd: int, ref: str) -> tuple[int, str]:
+    prefix = f".workbench-kit-private-{os.getpid()}-"
     for _ in range(1024):
         name = prefix + os.urandom(16).hex()
         try:
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return name
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
         except OSError as error:
             raise AdapterError("public-adapter-restore-failed", ref) from error
+        descriptor = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            node = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            opened = os.fstat(descriptor)
+            if (node.st_dev, node.st_ino) != (opened.st_dev, opened.st_ino):
+                raise AdapterError("public-adapter-restore-failed", ref)
+            return descriptor, name
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise
     raise AdapterError("public-adapter-restore-failed", ref)
 
 
 def _rename_noreplace(
-    parent_fd: int,
+    source_fd: int,
     source: str,
+    destination_fd: int,
     destination: str,
     ref: str,
 ) -> None:
@@ -663,30 +763,14 @@ def _rename_noreplace(
     ]
     rename.restype = ctypes.c_int
     if rename(
-        parent_fd,
+        source_fd,
         source_raw,
-        parent_fd,
+        destination_fd,
         destination_raw,
         flag,
     ) != 0:
         error = OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
         raise AdapterError("public-adapter-restore-failed", ref) from error
-
-
-def _restore_quarantine(
-    parent_fd: int,
-    quarantine: str,
-    original: str,
-    ref: str,
-) -> None:
-    try:
-        if (
-            _state_node_at(parent_fd, original, ref) == ABSENT_STATE
-            and _state_node_at(parent_fd, quarantine, ref) != ABSENT_STATE
-        ):
-            _rename_noreplace(parent_fd, quarantine, original, ref)
-    except AdapterError:
-        pass
 
 
 def _create_state_node_at(
@@ -704,8 +788,8 @@ def _create_state_node_at(
         except OSError as error:
             raise AdapterError("public-adapter-restore-failed", ref) from error
         return
-    temporary = _temporary_state_name(parent_fd, ref)
-    created: tuple[int, int] | None = None
+    private_fd, private_name = _open_private_namespace(parent_fd, ref)
+    installed = False
     try:
         if kind == "file":
             flags = (
@@ -714,10 +798,8 @@ def _create_state_node_at(
                 | os.O_EXCL
                 | getattr(os, "O_NOFOLLOW", 0)
             )
-            descriptor = os.open(temporary, flags, mode, dir_fd=parent_fd)
+            descriptor = os.open("node", flags, mode, dir_fd=private_fd)
             try:
-                opened = os.fstat(descriptor)
-                created = (opened.st_dev, opened.st_ino)
                 view = memoryview(payload)
                 while view:
                     written = os.write(descriptor, view)
@@ -728,34 +810,28 @@ def _create_state_node_at(
             finally:
                 os.close(descriptor)
         elif kind == "symlink":
-            os.symlink(payload, temporary, dir_fd=parent_fd)
-            opened = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
-            created = (opened.st_dev, opened.st_ino)
+            os.symlink(payload, "node", dir_fd=private_fd)
         else:
             raise AdapterError("public-adapter-restore-failed", ref)
         if _state_node_at(parent_fd, name, ref) != ABSENT_STATE:
             raise AdapterError("public-adapter-restore-failed", ref)
-        os.link(
-            temporary,
-            name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
+        _rename_noreplace(private_fd, "node", parent_fd, name, ref)
+        installed = True
     except AdapterError:
         raise
     except OSError as error:
         raise AdapterError("public-adapter-restore-failed", ref) from error
     finally:
-        if created is not None:
+        if not installed:
             try:
-                node = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
-                if (node.st_dev, node.st_ino) == created:
-                    os.unlink(temporary, dir_fd=parent_fd)
+                os.unlink("node", dir_fd=private_fd)
             except FileNotFoundError:
                 pass
-            except OSError:
-                pass
+        os.close(private_fd)
+        try:
+            os.rmdir(private_name, dir_fd=parent_fd)
+        except OSError as error:
+            raise AdapterError("public-adapter-restore-failed", ref) from error
 
 
 def _chmod_directory_at(
@@ -939,28 +1015,45 @@ def _admin_specs(binding: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _admin_manifest(
-    root: pathlib.Path, object_relative: str | None
+    root: pathlib.Path,
+    object_relative: str | None,
+    root_fd: int | None = None,
 ) -> dict[str, tuple[str, int | None, bytes | str | None]]:
-    manifest = {".": _state_node(root)}
-    if manifest["."][0] != "directory" or object_relative == ".":
-        return manifest
-
-    def visit(directory: pathlib.Path, prefix: pathlib.PurePosixPath) -> None:
+    owned = root_fd is None
+    if root_fd is None:
         try:
-            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+            node = os.lstat(root)
+            root_fd = os.open(
+                root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(root_fd)
         except OSError as error:
-            raise AdapterError("public-state-unavailable", str(directory)) from error
-        for entry in entries:
-            relative_path = prefix / entry.name
-            relative = relative_path.as_posix()
-            path = pathlib.Path(entry.path)
-            image = _state_node(path)
-            manifest[relative] = image
-            if image[0] == "directory" and relative != object_relative:
-                visit(path, relative_path)
-
-    visit(root, pathlib.PurePosixPath())
-    return manifest
+            raise AdapterError("public-state-unavailable", str(root)) from error
+        if (
+            not stat.S_ISDIR(node.st_mode)
+            or (node.st_dev, node.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            os.close(root_fd)
+            raise AdapterError("public-state-unavailable", str(root))
+    try:
+        opened = os.fstat(root_fd)
+        manifest = {
+            ".": ("directory", stat.S_IMODE(opened.st_mode), None)
+        }
+        if object_relative != ".":
+            _manifest_visit(
+                root_fd,
+                pathlib.PurePosixPath(),
+                manifest,
+                stop_directory=object_relative,
+            )
+        return manifest
+    finally:
+        if owned:
+            os.close(root_fd)
 
 
 def _capture_caller_state(
@@ -1018,6 +1111,201 @@ def _capture_caller_state(
     }
     _require_workspace_root(workspace, root_fd, restore=False)
     return result
+
+
+def _directory_access_group(
+    root_fd: int,
+    root_path: pathlib.Path,
+    manifest: dict[str, tuple[str, int | None, bytes | str | None]],
+    root_mode: int,
+    ref: str,
+) -> dict[str, Any]:
+    descriptors: dict[str, int] = {".": os.dup(root_fd)}
+    records = []
+    try:
+        root_node = os.fstat(descriptors["."])
+        records.append({
+            "relative": ".",
+            "path": str(root_path),
+            "fd": descriptors["."],
+            "parent_fd": None,
+            "name": None,
+            "binding": (root_node.st_dev, root_node.st_ino),
+            "mode": root_mode,
+            "uid": root_node.st_uid,
+            "gid": root_node.st_gid,
+        })
+        directories = sorted(
+            (
+                relative
+                for relative, image in manifest.items()
+                if relative != "." and image[0] == "directory"
+            ),
+            key=lambda value: (value.count("/"), value),
+        )
+        for relative in directories:
+            pure = pathlib.PurePosixPath(relative)
+            parent = pure.parent.as_posix()
+            if parent == ".":
+                parent = "."
+            parent_fd = descriptors[parent]
+            name = pure.name
+            node = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            descriptors[relative] = descriptor
+            opened = os.fstat(descriptor)
+            expected_mode = manifest[relative][1]
+            if (
+                not stat.S_ISDIR(node.st_mode)
+                or (node.st_dev, node.st_ino)
+                != (opened.st_dev, opened.st_ino)
+                or stat.S_IMODE(opened.st_mode) != expected_mode
+            ):
+                raise AdapterError("public-state-unavailable", ref)
+            records.append({
+                "relative": relative,
+                "path": str(root_path / pathlib.PurePosixPath(relative)),
+                "fd": descriptor,
+                "parent_fd": parent_fd,
+                "name": name,
+                "binding": (opened.st_dev, opened.st_ino),
+                "mode": expected_mode,
+                "uid": opened.st_uid,
+                "gid": opened.st_gid,
+            })
+        return {"root": str(root_path), "records": records}
+    except BaseException as error:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+        if isinstance(error, AdapterError):
+            raise
+        if isinstance(error, OSError):
+            raise AdapterError("public-state-unavailable", ref) from error
+        raise
+
+
+def _capture_directory_access(
+    workspace: pathlib.Path,
+    root_fd: int,
+    state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    groups = []
+    try:
+        groups.append(_directory_access_group(
+            root_fd,
+            workspace,
+            state["worktree"],
+            state["root_mode"],
+            str(workspace),
+        ))
+        for admin in state["git_admin"]:
+            root = pathlib.Path(admin["path"])
+            descriptor = os.open(
+                root,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if admin["binding"] != (opened.st_dev, opened.st_ino):
+                    raise AdapterError("public-state-unavailable", str(root))
+                groups.append(_directory_access_group(
+                    descriptor,
+                    root,
+                    admin["manifest"],
+                    admin["manifest"]["."][1],
+                    str(root),
+                ))
+            finally:
+                os.close(descriptor)
+        return groups
+    except BaseException as error:
+        _close_directory_access(groups)
+        if isinstance(error, AdapterError):
+            raise
+        if isinstance(error, OSError):
+            raise AdapterError(
+                "public-state-unavailable", str(workspace)
+            ) from error
+        raise
+
+
+def _directory_readable(node: os.stat_result) -> bool:
+    if os.geteuid() == 0:
+        return True
+    mode = stat.S_IMODE(node.st_mode)
+    if node.st_uid == os.geteuid():
+        required = 0o500
+    elif node.st_gid == os.getegid() or node.st_gid in os.getgroups():
+        required = 0o050
+    else:
+        required = 0o005
+    return mode & required == required
+
+
+def _restore_directory_access(
+    workspace: pathlib.Path,
+    root_fd: int,
+    groups: list[dict[str, Any]],
+) -> bool:
+    repaired = False
+    _require_workspace_root(workspace, root_fd, restore=True)
+    for group in groups:
+        for record in group["records"]:
+            try:
+                opened = os.fstat(record["fd"])
+                if record["parent_fd"] is None:
+                    current = os.lstat(record["path"])
+                else:
+                    current = os.stat(
+                        record["name"],
+                        dir_fd=record["parent_fd"],
+                        follow_symlinks=False,
+                    )
+            except OSError as error:
+                raise AdapterError(
+                    "public-adapter-restore-failed", record["path"]
+                ) from error
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(current.st_mode)
+                or (opened.st_dev, opened.st_ino) != record["binding"]
+                or (current.st_dev, current.st_ino) != record["binding"]
+            ):
+                raise AdapterError(
+                    "public-adapter-restore-failed", record["path"]
+                )
+            if not _directory_readable(current):
+                try:
+                    os.fchmod(record["fd"], record["mode"])
+                    verified = os.fstat(record["fd"])
+                except OSError as error:
+                    raise AdapterError(
+                        "public-adapter-restore-failed", record["path"]
+                    ) from error
+                if (
+                    (verified.st_dev, verified.st_ino) != record["binding"]
+                    or stat.S_IMODE(verified.st_mode) != record["mode"]
+                ):
+                    raise AdapterError(
+                        "public-adapter-restore-failed", record["path"]
+                    )
+                repaired = True
+            _require_workspace_root(workspace, root_fd, restore=True)
+    return repaired
+
+
+def _close_directory_access(groups: list[dict[str, Any]]) -> None:
+    for group in reversed(groups):
+        for record in reversed(group["records"]):
+            os.close(record["fd"])
 
 
 def _require_worktree_cas(
@@ -1267,7 +1555,7 @@ def _require_admin_cas(
     ):
         raise AdapterError("public-adapter-restore-failed", str(root))
     try:
-        observed = _admin_manifest(root, object_relative)
+        observed = _admin_manifest(root, object_relative, root_fd)
     except AdapterError as error:
         raise AdapterError(
             "public-adapter-restore-failed", str(root)
@@ -2336,6 +2624,7 @@ def _inspect_public_kernel(
     authority_approval_file: pathlib.Path | None = None,
     inventory_mode: str | None = None,
     include_engine_manifest: bool = False,
+    inventory_mode_resolver: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     workspace = workspace.resolve()
     if inventory_mode not in (
@@ -2359,15 +2648,32 @@ def _inspect_public_kernel(
         binary, ("doctor", "--format", "json"), workspace, {0, 1}
     )
     validate_doctor(doctor, doctor_status)
+    resolved_inventory_mode = inventory_mode
+    if schema == "workbench/v2" and doctor["ready"]:
+        resolved_inventory_mode = "show"
+    elif schema == "workbench/v2" and inventory_mode_resolver is not None:
+        resolved_inventory_mode = inventory_mode_resolver()
+        if resolved_inventory_mode not in (
+            None,
+            "show",
+            "bootstrap-show",
+            "bootstrap-if-not-ready",
+        ):
+            raise AdapterError(
+                "public-inventory-mode-invalid", str(resolved_inventory_mode)
+            )
     use_bootstrap = (
         schema == "workbench/v1"
-        or inventory_mode == "bootstrap-show"
-        or (inventory_mode == "bootstrap-if-not-ready" and not doctor["ready"])
+        or resolved_inventory_mode == "bootstrap-show"
+        or (
+            resolved_inventory_mode == "bootstrap-if-not-ready"
+            and not doctor["ready"]
+        )
     )
-    if schema == "workbench/v1" and inventory_mode == "show":
+    if schema == "workbench/v1" and resolved_inventory_mode == "show":
         raise AdapterError("public-inventory-mode-invalid", "show")
     if use_bootstrap:
-        if schema == "workbench/v2" and inventory_mode == "bootstrap-if-not-ready":
+        if schema == "workbench/v2":
             validate_contract(
                 contract,
                 workspace,
@@ -2464,11 +2770,14 @@ def inspect_public_kernel(
     authority_approval_file: pathlib.Path | None = None,
     inventory_mode: str | None = None,
     include_engine_manifest: bool = False,
+    inventory_mode_resolver: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     workspace = workspace.resolve()
     root_fd = _open_workspace_root(workspace)
+    access_groups: list[dict[str, Any]] = []
     try:
         before = _capture_caller_state(workspace, root_fd)
+        access_groups = _capture_directory_access(workspace, root_fd, before)
         result: dict[str, Any] | None = None
         failure: BaseException | None = None
         try:
@@ -2477,10 +2786,15 @@ def inspect_public_kernel(
                 authority_approval_file,
                 inventory_mode,
                 include_engine_manifest,
+                inventory_mode_resolver,
             )
         except BaseException as error:
             failure = error
+        access_repaired = False
         try:
+            access_repaired = _restore_directory_access(
+                workspace, root_fd, access_groups
+            )
             after = _capture_caller_state(
                 workspace,
                 root_fd,
@@ -2489,12 +2803,13 @@ def inspect_public_kernel(
             )
         except BaseException:
             after = None
-        if after != before:
+        if after != before or access_repaired:
             if after is None:
                 raise AdapterError(
                     "public-adapter-restore-failed", str(workspace)
                 ) from failure
-            _restore_caller_state(workspace, root_fd, before, after)
+            if after != before:
+                _restore_caller_state(workspace, root_fd, before, after)
             raise AdapterError(
                 "public-adapter-mutated", str(workspace)
             ) from failure
@@ -2503,4 +2818,5 @@ def inspect_public_kernel(
         assert result is not None
         return result
     finally:
+        _close_directory_access(access_groups)
         os.close(root_fd)
