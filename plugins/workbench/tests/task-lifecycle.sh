@@ -5,6 +5,7 @@ set -euo pipefail
 # scaffold/templates (profile defaults live there, not under the plugin).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIFECYCLE_HELPER="$ROOT/lib/workbench_lifecycle.py"
+TIME_HELPER="$ROOT/lib/workbench_time.py"
 SCAFFOLD_TEMPLATES="$(cd "$ROOT/../workbench-kit/scaffold/templates" && pwd)"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/workbench-task-lifecycle.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -150,11 +151,12 @@ setup_workbench() {
   mkdir -p "$repo/utils" "$repo/lib" "$repo/templates"
   cp "$ROOT/utils/task" "$repo/utils/task"
   cp "$LIFECYCLE_HELPER" "$repo/lib/workbench_lifecycle.py"
+  cp "$TIME_HELPER" "$repo/lib/workbench_time.py"
   chmod +x "$repo/utils/task"
   cp "$SCAFFOLD_TEMPLATES/task-AGENTS.md" "$repo/templates/task-AGENTS.md"
   git -C "$repo" config user.name "Test User"
   git -C "$repo" config user.email "test@example.invalid"
-  git -C "$repo" add utils/task lib/workbench_lifecycle.py templates/task-AGENTS.md
+  git -C "$repo" add utils/task lib/workbench_lifecycle.py lib/workbench_time.py templates/task-AGENTS.md
   git -C "$repo" commit -q -m "init"
   git -C "$repo" remote add origin "$origin"
   git -C "$repo" push -q -u origin main

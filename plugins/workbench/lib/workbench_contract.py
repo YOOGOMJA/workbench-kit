@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+from workbench_time import require_rfc3339_utc
+
 
 GRANDFATHERED = {
     "art-lojban",
@@ -160,7 +162,7 @@ def strict_json_object(file: str, expected_fields: Any) -> Dict[str, Any]:
         value = json.load(handle, object_pairs_hook=unique_object)
     if not isinstance(value, dict) or set(value) != set(expected_fields):
         raise ValueError("JSON object fields do not match the contract")
-    return value
+    return {field: value[field] for field in expected_fields}
 
 
 def require_contract_string(value: Dict[str, Any], key: str) -> str:
@@ -172,7 +174,7 @@ def require_contract_string(value: Dict[str, Any], key: str) -> str:
 
 def digest_json(value: Any) -> str:
     raw = (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
@@ -224,7 +226,7 @@ def load_authority_descriptor(file: str) -> Dict[str, Any]:
         r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git", value["origin_url"]
     ) is None:
         raise ValueError("GitHub origin_url must be canonical HTTPS with .git suffix")
-    return value
+    return {field: value[field] for field in fields}
 
 
 def cmd_authority_descriptor(args: argparse.Namespace) -> None:
@@ -331,8 +333,7 @@ def cmd_authorization(args: argparse.Namespace) -> None:
         raise ValueError("unsupported authorization contract")
     if value["decision"] not in ("allow", "deny"):
         raise ValueError("authorization decision must be allow or deny")
-    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value["authorized_at"]):
-        raise ValueError("authorized_at must be RFC 3339 UTC")
+    require_rfc3339_utc(value["authorized_at"], "authorized_at")
     for key in fields:
         sys.stdout.write("{}={}\n".format(key, value[key]))
 
@@ -366,9 +367,6 @@ REGISTRATION_FIELDS = (
     "actor",
     "registered_at",
 )
-RFC3339_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
-
-
 def sha256_bytes(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
@@ -407,9 +405,8 @@ def validate_authority_receipt(value: Any) -> Dict[str, Any]:
     ) is None:
         raise ValueError("invalid authority receipt revision")
     require_sha256(value["policy_digest"], "authority_receipt.policy_digest")
-    if not isinstance(value["issued_at"], str) or RFC3339_UTC.fullmatch(value["issued_at"]) is None:
-        raise ValueError("authority receipt issued_at must be RFC 3339 UTC")
-    return value
+    require_rfc3339_utc(value["issued_at"], "authority receipt issued_at")
+    return {field: value[field] for field in RECEIPT_FIELDS}
 
 
 def validate_policy_binding(
@@ -429,7 +426,9 @@ def validate_policy_binding(
     path = validate_policy_ref(workspace, value["policy_ref"], "policy_ref")
     if sha256_bytes(path.read_bytes()) != value["policy_digest"]:
         raise ValueError("policy-source-tampered")
-    return value
+    normalized = {field: value[field] for field in fields}
+    normalized["authority_receipt"] = receipt
+    return normalized
 
 
 def load_registration(file: str, workspace_root: str) -> Dict[str, Any]:
@@ -441,8 +440,7 @@ def load_registration(file: str, workspace_root: str) -> Dict[str, Any]:
         raise ValueError("unsupported context policy registration contract")
     for key in ("registration_id", "task_claim_id", "actor"):
         require_printable_ascii(value[key], key)
-    if not isinstance(value["registered_at"], str) or RFC3339_UTC.fullmatch(value["registered_at"]) is None:
-        raise ValueError("registered_at must be RFC 3339 UTC")
+    require_rfc3339_utc(value["registered_at"], "registered_at")
     context_ref = value["task_context_ref"]
     if context_ref is None:
         if (
@@ -599,9 +597,9 @@ def cmd_context_snapshot(args: argparse.Namespace) -> None:
         or state["digest"] != expected_digest
         or expected_digest != args.context_digest
         or state["registered_at"] != value["registered_at"]
-        or RFC3339_UTC.fullmatch(state["sealed_at"]) is None
     ):
         raise ValueError("context snapshot does not match its sealed registration")
+    require_rfc3339_utc(state["sealed_at"], "sealed_at")
     validate_context_action_tuple(state, "registration")
     validate_context_action_tuple(state, "seal")
     sys.stdout.write("digest={}\ntask_claim_id={}\n".format(expected_digest, args.task_claim_id))
@@ -664,13 +662,13 @@ def cmd_owner_acceptance(args: argparse.Namespace) -> None:
         raise ValueError("owner acceptance fields do not match the contract")
     if value["contract_version"] != "workbench-owner-acceptance/v1":
         raise ValueError("unsupported owner acceptance contract")
+    value = {field: value[field] for field in OWNER_ACCEPTANCE_FIELDS}
     for key in ("acceptance_id", "deliverable_id", "owner", "kind", "revision", "actor"):
         require_printable_ascii(value[key], key)
     for key in ("owner_context_ref", "acceptance_authority_ref"):
         if not isinstance(value[key], str) or not is_namespaced_ref(value[key]):
             raise ValueError("{} must be a namespaced reference".format(key))
-    if RFC3339_UTC.fullmatch(value["accepted_at"]) is None:
-        raise ValueError("accepted_at must be RFC 3339 UTC")
+    require_rfc3339_utc(value["accepted_at"], "accepted_at")
     sys.stdout.write("authority_digest={}\n".format(digest_json(value)))
     for key in OWNER_ACCEPTANCE_FIELDS[1:]:
         sys.stdout.write("{}={}\n".format(key, value[key]))
@@ -678,8 +676,7 @@ def cmd_owner_acceptance(args: argparse.Namespace) -> None:
 
 def auto_null_registration(claim_id: str, at: str) -> Dict[str, Any]:
     require_printable_ascii(claim_id, "task_claim_id")
-    if RFC3339_UTC.fullmatch(at) is None:
-        raise ValueError("auto-null timestamp must be RFC 3339 UTC")
+    require_rfc3339_utc(at, "auto-null timestamp")
     return {
         "contract_version": "workbench-context-policy-registration/v1",
         "registration_id": "auto-null",
@@ -744,6 +741,7 @@ def cmd_profile(args: argparse.Namespace) -> None:
 
 
 def cmd_github_probe(args: argparse.Namespace) -> None:
+    require_rfc3339_utc(args.observed_at, "observed_at")
     subject = {
         "contract_version": "workbench-probe/github-pr-subject/v1",
         "repository": args.repository,

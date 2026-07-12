@@ -458,10 +458,11 @@ cmd_resolve() {
   ACTION_ID=""; CLAIM_ID=""; TARGET_REF=""; REVISION=""; INTENT_DIGEST=""; REQUEST_FILE=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --request-file) request_file="$2"; shift 2 ;;
-      --intent-digest) asserted_intent="$2"; shift 2 ;;
-      --format) format="$2"; shift 2 ;; --action-instance-id) instance_id="$2"; shift 2 ;;
-      --authorization-file) authorization_file="$2"; shift 2 ;;
+      --request-file) [ $# -ge 2 ] || usage_error "--request-file requires a value"; request_file="$2"; shift 2 ;;
+      --intent-digest) [ $# -ge 2 ] || usage_error "--intent-digest requires a value"; asserted_intent="$2"; shift 2 ;;
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      --action-instance-id) [ $# -ge 2 ] || usage_error "--action-instance-id requires a value"; instance_id="$2"; shift 2 ;;
+      --authorization-file) [ $# -ge 2 ] || usage_error "--authorization-file requires a value"; authorization_file="$2"; shift 2 ;;
       *) usage_error "unknown option: $1" ;;
     esac
   done

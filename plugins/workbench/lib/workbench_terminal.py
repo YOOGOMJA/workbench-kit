@@ -22,12 +22,11 @@ from workbench_writer import (
     read_ledger,
 )
 from workbench_intent import load_request
+from workbench_time import parse_rfc3339_utc
 
 
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RECORD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-RFC3339_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
-
 ACTION_FIELDS = (
     "id",
     "action_id",
@@ -424,14 +423,7 @@ def require_optional_text(value: str, field: str) -> str:
 
 
 def parse_time(value: str, field: str) -> datetime.datetime:
-    if RFC3339_UTC.fullmatch(value) is None:
-        raise ValueError("{} must be RFC3339 UTC".format(field))
-    try:
-        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc
-        )
-    except ValueError as exc:
-        raise ValueError("{} must be RFC3339 UTC".format(field)) from exc
+    return parse_rfc3339_utc(value, field)
 
 
 def require_not_future(value: str, now: datetime.datetime, field: str) -> None:

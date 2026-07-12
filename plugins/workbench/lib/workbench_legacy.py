@@ -12,6 +12,8 @@ import sys
 import tempfile
 from typing import Any, Dict, Iterable, List, Tuple
 
+from workbench_time import require_rfc3339_utc
+
 
 AUTHORITY_FIELDS = (
     "contract_version",
@@ -53,8 +55,6 @@ HOME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 OID = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?\Z")
 DEFAULT_REF = re.compile(r"refs/heads/[A-Za-z0-9._/-]+\Z")
-RFC3339_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
-
 OBSERVATION_FIELDS = (
     "contract_version",
     "source_revision",
@@ -141,7 +141,7 @@ def require_home(value: Any, field: str) -> str:
 def require_fields(value: Any, fields: Tuple[str, ...], name: str) -> Dict[str, Any]:
     if not isinstance(value, dict) or set(value) != set(fields):
         raise ValueError("{} fields do not match the contract".format(name))
-    return value
+    return {field: value[field] for field in fields}
 
 
 def require_digest(value: Any, field: str) -> str:
@@ -157,7 +157,7 @@ def require_oid(value: Any, field: str) -> str:
 
 
 def validate_authority(value: Any, require_hosting: bool = False) -> Dict[str, Any]:
-    require_fields(value, AUTHORITY_FIELDS, "workspace authority")
+    value = require_fields(value, AUTHORITY_FIELDS, "workspace authority")
     if value["contract_version"] != "workbench-workspace-authority/v1":
         raise ValueError("unsupported workspace authority contract")
     require_printable_ascii(value["authority_identity"], "authority_identity")
@@ -190,7 +190,7 @@ def load_authority(file: str) -> Dict[str, Any]:
 
 def canonical_json(value: Any) -> bytes:
     return (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
     ).encode("utf-8")
 
 
@@ -203,7 +203,7 @@ def load_bootstrap_approval(file: str) -> Tuple[Dict[str, Any], bytes]:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
     except UnicodeDecodeError as exc:
         raise ValueError("bootstrap approval must be UTF-8") from exc
-    require_fields(value, BOOTSTRAP_APPROVAL_FIELDS, "bootstrap authority approval")
+    value = require_fields(value, BOOTSTRAP_APPROVAL_FIELDS, "bootstrap authority approval")
     if value["contract_version"] != "workbench-bootstrap-authority-approval/v1":
         raise ValueError("unsupported bootstrap authority approval contract")
     require_printable_ascii(value["approval_id"], "approval_id")
@@ -218,13 +218,12 @@ def load_bootstrap_approval(file: str) -> Tuple[Dict[str, Any], bytes]:
         raise ValueError("bootstrap protection must block direct task-actor writes")
     for key in ("ref", "evidence_ref"):
         require_printable_ascii(protection[key], "protection." + key)
-    for key in ("verified_at",):
-        if not isinstance(protection[key], str) or RFC3339_UTC.fullmatch(protection[key]) is None:
-            raise ValueError("protection.verified_at must be RFC 3339 UTC")
+    require_rfc3339_utc(protection["verified_at"], "protection.verified_at")
     for key in ("actor", "source_ref"):
         require_printable_ascii(value[key], key)
-    if not isinstance(value["approved_at"], str) or RFC3339_UTC.fullmatch(value["approved_at"]) is None:
-        raise ValueError("approved_at must be RFC 3339 UTC")
+    require_rfc3339_utc(value["approved_at"], "approved_at")
+    value["proposed_descriptor"] = descriptor
+    value["protection"] = protection
     return value, canonical_json(value)
 
 

@@ -562,12 +562,17 @@ import json
 import sys
 
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-raw = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+fields = (
+    "contract_version", "authority_identity", "origin_url", "default_ref",
+    "workspace_home", "hosting_adapter", "hosting_ref",
+)
+canonical = {field: value[field] for field in fields}
+raw = (json.dumps(canonical, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
 print("sha256:" + hashlib.sha256(raw).hexdigest())
 PY
 )"
   assert_eq "$expected_digest" "$(printf '%s\n' "$actual" | sed -n 's/^descriptor_digest=//p')" \
-    "authority descriptor digest must use sorted-key canonical JSON"
+    "authority descriptor digest must use frozen listed-field canonical JSON"
   assert_eq "$expected_digest" "$(printf '%s\n' "$reordered_actual" | sed -n 's/^descriptor_digest=//p')" \
     "authority descriptor member order must not change its digest"
 
@@ -646,21 +651,46 @@ PY
   expected_receipt="$(python3 - "$receipt" <<'PY'
 import hashlib, json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+fields = (
+    "contract_version", "authority_identity", "authority_ref", "authority_revision",
+    "policy_ref", "policy_digest", "actor", "issued_at", "source_ref",
+)
+canonical = {field: value[field] for field in fields}
+raw = (json.dumps(canonical, separators=(",", ":")) + "\n").encode()
 print("sha256:" + hashlib.sha256(raw).hexdigest())
 PY
 )"
   expected_registration="$(python3 - "$registration" <<'PY'
 import hashlib, json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+receipt_fields = (
+    "contract_version", "authority_identity", "authority_ref", "authority_revision",
+    "policy_ref", "policy_digest", "actor", "issued_at", "source_ref",
+)
+participant_fields = (
+    "context_ref", "policy_ref", "policy_digest", "authority_ref", "authority_receipt",
+)
+registration_fields = (
+    "contract_version", "registration_id", "task_claim_id", "task_context_ref",
+    "participants", "task_policy", "actor", "registered_at",
+)
+participants = []
+for item in value["participants"]:
+    normalized = {field: item[field] for field in participant_fields}
+    normalized["authority_receipt"] = {
+        field: item["authority_receipt"][field] for field in receipt_fields
+    }
+    participants.append(normalized)
+canonical = {field: value[field] for field in registration_fields}
+canonical["participants"] = participants
+raw = (json.dumps(canonical, separators=(",", ":")) + "\n").encode()
 print("sha256:" + hashlib.sha256(raw).hexdigest())
 PY
 )"
   assert_eq "$expected_registration" "$(printf '%s\n' "$parsed" | sed -n 's/^registration_digest=//p')" \
-    "context registration digest must match the shared sorted-key fixture"
+    "context registration digest must match the frozen listed-field fixture"
   assert_eq "$expected_receipt" "$(printf '%s\n' "$sources" | awk -F '\t' '{print $8}')" \
-    "nested authority receipt digest must match the shared sorted-key fixture"
+    "nested authority receipt digest must match the frozen listed-field fixture"
 }
 
 test_action_request_binds_the_exact_effect_intent() {
@@ -759,6 +789,7 @@ request_value = {
     "payload_contract": "workbench-deliverable-accept-intent/v1",
     "payload": payload,
 }
+
 with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(request_value, handle, separators=(",", ":"))
     handle.write("\n")
@@ -801,6 +832,42 @@ consumed = dict(action, status="consumed", consumed_provenance_digest=primary_di
 idempotent = reduce_applied_effect(consumed, request, [], "missing", mandatory_authorization=True)
 assert idempotent["decision"] == "idempotent"
 assert idempotent["consume_action"] is False
+PY
+}
+
+test_shared_rfc3339_utc_parser_is_calendar_aware() {
+  PYTHONPATH="$ROOT/lib" python3 - <<'PY'
+import datetime
+
+from workbench_time import parse_rfc3339_utc, require_rfc3339_utc
+
+valid = parse_rfc3339_utc("2024-02-29T23:59:59Z", "fixture.at")
+assert valid == datetime.datetime(2024, 2, 29, 23, 59, 59, tzinfo=datetime.timezone.utc)
+assert require_rfc3339_utc("2026-07-12T15:04:00Z", "fixture.at") == "2026-07-12T15:04:00Z"
+
+for value in (
+    "2026-02-30T12:00:00Z",
+    "2025-02-29T12:00:00Z",
+    "2026-01-01T24:00:00Z",
+    "2026-01-01T23:60:00Z",
+    "2026-01-01T23:59:60Z",
+    "2026-01-01T23:59:59+00:00",
+    "2026-01-01T23:59:59.000Z",
+):
+    try:
+        parse_rfc3339_utc(value, "fixture.at")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted invalid RFC3339 UTC timestamp: " + value)
+
+for value in (None, 1, {}, []):
+    try:
+        require_rfc3339_utc(value, "fixture.at")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted non-string timestamp")
 PY
 }
 
@@ -1226,7 +1293,25 @@ import json
 import sys
 
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+approval_fields = (
+    "contract_version", "approval_id", "proposed_descriptor", "default_revision",
+    "protection", "actor", "approved_at", "source_ref",
+)
+descriptor_fields = (
+    "contract_version", "authority_identity", "origin_url", "default_ref",
+    "workspace_home", "hosting_adapter", "hosting_ref",
+)
+protection_fields = (
+    "ref", "revision", "direct_task_actor_writes", "verified_at", "evidence_ref",
+)
+canonical_value = {field: value[field] for field in approval_fields}
+canonical_value["proposed_descriptor"] = {
+    field: value["proposed_descriptor"][field] for field in descriptor_fields
+}
+canonical_value["protection"] = {
+    field: value["protection"][field] for field in protection_fields
+}
+canonical = (json.dumps(canonical_value, separators=(",", ":")) + "\n").encode()
 descriptor = value["proposed_descriptor"]
 output = {
     "contract_version": "workbench-bootstrap-authority-verification/v1",
@@ -1322,9 +1407,14 @@ import sys
 
 approval = json.load(open(sys.argv[1], encoding="utf-8"))
 value = json.loads(os.environ["ACTUAL"])
-descriptor_raw = (json.dumps(
-    approval["proposed_descriptor"], sort_keys=True, separators=(",", ":")
-) + "\n").encode()
+descriptor_fields = (
+    "contract_version", "authority_identity", "origin_url", "default_ref",
+    "workspace_home", "hosting_adapter", "hosting_ref",
+)
+descriptor = {
+    field: approval["proposed_descriptor"][field] for field in descriptor_fields
+}
+descriptor_raw = (json.dumps(descriptor, separators=(",", ":")) + "\n").encode()
 assert value["contract_version"] == "workbench-legacy-inventory/v1"
 assert value["source_revision"] == value["authority"]["default_revision"]
 assert value["source_revision"] == value["home_set"]["source_revision"] == sys.argv[2]
@@ -1733,7 +1823,12 @@ import json
 import sys
 
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+fields = (
+    "contract_version", "authority_identity", "origin_url", "default_ref",
+    "workspace_home", "hosting_adapter", "hosting_ref",
+)
+canonical = {field: value[field] for field in fields}
+raw = (json.dumps(canonical, separators=(",", ":")) + "\n").encode()
 print(hashlib.sha256(raw).hexdigest())
 PY
 )"
@@ -1825,6 +1920,12 @@ test_policy_rejects_obsolete_scalar_public_bindings() {
   assert_eq 2 "$rc" "obsolete public policy bindings are malformed input"
   assert_file_contains "$err" "unknown option: --action-id"
   [ ! -s "$out" ] || fail "obsolete binding rejection must emit no JSON"
+
+  if run_workbench "$repo" policy resolve --format >"$out" 2>"$err"; then
+    fail "policy resolution accepted a missing --format value"
+  else rc=$?; fi
+  assert_eq 2 "$rc" "missing policy option value is malformed input"
+  [ ! -s "$out" ] || fail "missing policy option value emitted partial JSON"
 }
 
 test_policy_defaults_to_ask_and_applies_lattice() {
@@ -2101,6 +2202,148 @@ EOF
   [ ! -s "$out" ] || fail "missing Python must emit no partial JSON"
 }
 
+test_structured_validators_reject_impossible_timestamps() {
+  PYTHONPATH="$ROOT/lib" python3 - "$TMPDIR/calendar-aware" <<'PY'
+import contextlib
+import hashlib
+import io
+import json
+import pathlib
+import sys
+import types
+
+import workbench_cleanup
+import workbench_contract
+import workbench_intent
+import workbench_legacy
+import workbench_lifecycle
+import workbench_terminal
+
+root = pathlib.Path(sys.argv[1])
+root.mkdir()
+invalid = "2026-02-30T24:00:00Z"
+valid = "2026-07-12T15:05:00Z"
+
+
+def rejects(call, label):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            call()
+    except ValueError:
+        return
+    raise AssertionError(label + " accepted an impossible timestamp")
+
+
+rejects(
+    lambda: workbench_contract.auto_null_registration("claim-calendar", invalid),
+    "auto-null registration",
+)
+rejects(lambda: workbench_cleanup.require_time(invalid, "cleanup.at"), "cleanup journal")
+rejects(lambda: workbench_lifecycle.parse_time(invalid), "lifecycle marker")
+rejects(lambda: workbench_terminal.parse_time(invalid, "terminal.at"), "terminal record")
+
+receipt = {
+    "contract_version": "workbench-policy-authority-receipt/v1",
+    "authority_identity": "toolbox:authority/product-owner",
+    "authority_ref": "toolbox:policy/acme",
+    "authority_revision": "sha256:" + "1" * 64,
+    "policy_ref": "contexts/acme.policy",
+    "policy_digest": "sha256:" + "2" * 64,
+    "actor": "owner@example.com",
+    "issued_at": invalid,
+    "source_ref": "toolbox:approval/acme",
+}
+rejects(
+    lambda: workbench_contract.validate_authority_receipt(receipt),
+    "policy authority receipt",
+)
+
+acceptance_file = root / "owner-acceptance.json"
+acceptance_file.write_text(json.dumps({
+    "contract_version": "workbench-owner-acceptance/v1",
+    "acceptance_id": "acc-calendar",
+    "deliverable_id": "pack",
+    "owner": "kit",
+    "kind": "workbench-increment",
+    "owner_context_ref": "toolbox:product/acme",
+    "acceptance_authority_ref": "toolbox:policy/acme",
+    "revision": "sha256:" + "3" * 64,
+    "actor": "owner@example.com",
+    "accepted_at": invalid,
+}, separators=(",", ":")) + "\n", encoding="utf-8")
+rejects(
+    lambda: workbench_contract.cmd_owner_acceptance(types.SimpleNamespace(file=str(acceptance_file))),
+    "owner acceptance",
+)
+
+authorization_file = root / "authorization.json"
+authorization_file.write_text(json.dumps({
+    "contract_version": "workbench-authorization/v1",
+    "authorization_id": "auth_calendar",
+    "action_instance_id": "act_calendar",
+    "action_id": "task.complete",
+    "task_claim_id": "claim-calendar",
+    "target_ref": "workbench:task/claim-calendar",
+    "revision": "sha256:" + "4" * 64,
+    "intent_digest": "sha256:" + "5" * 64,
+    "policy_manifest_digest": "sha256:" + "6" * 64,
+    "decision": "allow",
+    "actor": "owner@example.com",
+    "authorized_at": invalid,
+    "source_ref": "conversation:message/calendar",
+}, separators=(",", ":")) + "\n", encoding="utf-8")
+rejects(
+    lambda: workbench_intent.load_authorization(str(authorization_file)),
+    "authorization",
+)
+
+approval_file = root / "bootstrap-approval.json"
+descriptor = {
+    "contract_version": "workbench-workspace-authority/v1",
+    "authority_identity": "github:repository/example/workbench",
+    "origin_url": "https://github.com/example/workbench.git",
+    "default_ref": "refs/heads/main",
+    "workspace_home": "workbench",
+    "hosting_adapter": "github",
+    "hosting_ref": "github:repository/example/workbench",
+}
+approval_file.write_text(json.dumps({
+    "contract_version": "workbench-bootstrap-authority-approval/v1",
+    "approval_id": "approval-calendar",
+    "proposed_descriptor": descriptor,
+    "default_revision": "1" * 40,
+    "protection": {
+        "ref": "refs/heads/main",
+        "revision": "1" * 40,
+        "direct_task_actor_writes": "blocked",
+        "verified_at": valid,
+        "evidence_ref": "github:ruleset/example",
+    },
+    "actor": "owner@example.com",
+    "approved_at": invalid,
+    "source_ref": "conversation:message/bootstrap",
+}, separators=(",", ":")) + "\n", encoding="utf-8")
+rejects(
+    lambda: workbench_legacy.load_bootstrap_approval(str(approval_file)),
+    "bootstrap approval",
+)
+
+rejects(
+    lambda: workbench_contract.cmd_github_probe(types.SimpleNamespace(
+        repository="example/web",
+        pull_request=1,
+        external_ref="https://github.com/example/web/pull/1",
+        state="merged",
+        head_revision="1" * 40,
+        merge_revision="2" * 40,
+        observed_at=invalid,
+        format="json",
+    )),
+    "GitHub probe",
+)
+PY
+}
+
 run_case() {
   local name="$1"
   [ -z "${WORKBENCH_TEST_FILTER:-}" ] || [ "$WORKBENCH_TEST_FILTER" = "$name" ] || return 0
@@ -2117,6 +2360,8 @@ run_case test_workspace_authority_descriptor_binds_workspace_home
 run_case test_context_registration_accepts_reordered_nested_receipts
 run_case test_action_request_binds_the_exact_effect_intent
 run_case test_applied_effect_reducer_recovers_without_reauthorization
+run_case test_shared_rfc3339_utc_parser_is_calendar_aware
+run_case test_structured_validators_reject_impossible_timestamps
 run_case test_github_probe_separates_stable_subject_from_observation
 run_case test_writer_ledger_reduces_effect_owner_before_claim_release
 run_case test_writer_operation_uses_the_exact_recovery_cursor_schema

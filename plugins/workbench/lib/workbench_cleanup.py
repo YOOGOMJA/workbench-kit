@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime
 import hashlib
 import json
 import os
@@ -34,6 +33,7 @@ from workbench_terminal import (
     read_exact_record,
     validate_terminal_record,
 )
+from workbench_time import parse_rfc3339_utc, require_rfc3339_utc
 from workbench_writer import current_claim_state, latest_effect, read_ledger
 
 
@@ -81,7 +81,6 @@ DISPOSITIONS = {
 }
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 ACTION_ID = re.compile(r"act_[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-RFC3339_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z"
 )
@@ -156,9 +155,7 @@ def require_digest(value: Any, field: str) -> str:
 
 
 def require_time(value: Any, field: str) -> str:
-    if not isinstance(value, str) or RFC3339_UTC.fullmatch(value) is None:
-        raise ValueError("{} must be an RFC3339 UTC timestamp".format(field))
-    return value
+    return require_rfc3339_utc(value, field)
 
 
 def require_relative_path(value: Any, field: str) -> str:
@@ -458,6 +455,9 @@ def validate_terminal_checkpoint(value: Any) -> Mapping[str, Any]:
         action["authorization_at"],
     )
     if terminal["authorization_ref"]:
+        require_rfc3339_utc(
+            action["authorization_at"], "terminal action authorization_at"
+        )
         if (
             not all(authorization)
             or re.fullmatch(
@@ -465,7 +465,6 @@ def validate_terminal_checkpoint(value: Any) -> Mapping[str, Any]:
             )
             is None
             or action["authorization_ref"] != terminal["authorization_ref"]
-            or RFC3339_UTC.fullmatch(action["authorization_at"]) is None
         ):
             raise ValueError("terminal checkpoint authorization is not exact")
         for field in (
@@ -888,9 +887,7 @@ def cmd_validate_snapshot(args: argparse.Namespace) -> None:
         raise ValueError("cleanup journal does not join the task index")
     target_ref = "workbench:task/" + journal["claim_id"]
     if checkpoint is None:
-        now = datetime.datetime.strptime(args.now, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc
-        )
+        now = parse_rfc3339_utc(args.now, "now")
         terminal = validate_terminal_record(
             task_dir,
             task_dir / "task/.workbench/terminal",

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import datetime
 import errno
 import fcntl
 import hashlib
@@ -20,6 +19,8 @@ import sys
 import tempfile
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from workbench_time import require_rfc3339_utc
 
 
 OBSERVATION_FIELDS = {
@@ -228,7 +229,6 @@ ACTION_ID = re.compile(r"act_[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 HOME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+){0,3}\Z")
 NAMESPACED_REF = re.compile(r"[a-z][a-z0-9-]*:[a-z][a-z0-9-]*/[A-Za-z0-9._-]+\Z")
-RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 V2_MARKER = re.compile(r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->")
 V1_MARKER = re.compile(r"<!-- workbench-task-lifecycle:v1 ([^\r\n]+) -->")
 
@@ -262,10 +262,7 @@ def require_optional_text(value: Any, field: str) -> None:
 
 
 def parse_time(value: Any) -> str:
-    if not isinstance(value, str) or RFC3339.fullmatch(value) is None:
-        raise ValueError("lifecycle at must be RFC 3339 UTC")
-    datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
-    return value
+    return require_rfc3339_utc(value, "lifecycle at")
 
 
 def canonical_marker(value: Dict[str, Any]) -> Dict[str, Any]:
@@ -2065,16 +2062,17 @@ def validate_restored_acceptance_files(
         }
         if any(attempt[field] != item for field, item in expected.items()):
             raise ValueError("restored acceptance attempt is not submission-bound")
+        require_rfc3339_utc(attempt["created_at"], "acceptance attempt created_at")
+        if attempt["probed_at"]:
+            require_rfc3339_utc(attempt["probed_at"], "acceptance attempt probed_at")
         if (
             re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", attempt["acceptance_id"])
             is None
-            or RFC3339.fullmatch(attempt["created_at"]) is None
             or bool(attempt["subject_authority_digest"]) != bool(attempt["probed_at"])
             or (
                 attempt["subject_authority_digest"]
                 and DIGEST.fullmatch(attempt["subject_authority_digest"]) is None
             )
-            or (attempt["probed_at"] and RFC3339.fullmatch(attempt["probed_at"]) is None)
         ):
             raise ValueError("restored acceptance attempt contract is invalid")
     receipt = None
@@ -2088,6 +2086,7 @@ def validate_restored_acceptance_files(
         expected_path = ".workbench/acceptances/{}.record".format(
             receipt["acceptance_id"]
         )
+        require_rfc3339_utc(receipt["accepted_at"], "acceptance receipt accepted_at")
         empty = (
             "owner_context_ref",
             "acceptance_authority_ref",
@@ -2112,7 +2111,6 @@ def validate_restored_acceptance_files(
             or any(receipt[field] for field in empty)
             or DIGEST.fullmatch(receipt["authority_digest"]) is None
             or DIGEST.fullmatch(receipt["subject_authority_digest"]) is None
-            or RFC3339.fullmatch(receipt["accepted_at"]) is None
             or attempt is None
             or receipt["acceptance_id"] != attempt["acceptance_id"]
             or receipt["subject_authority_digest"]
@@ -2202,6 +2200,8 @@ def validate_restored_terminal_files(
         action["authorization_actor"],
         action["authorization_at"],
     )
+    if all(authorization):
+        require_rfc3339_utc(action["authorization_at"], "action authorization_at")
     if (
         (any(authorization) and not all(authorization))
         or (
@@ -2212,7 +2212,6 @@ def validate_restored_terminal_files(
                     action["authorization_id"],
                 )
                 is None
-                or RFC3339.fullmatch(action["authorization_at"]) is None
             )
         )
         or (
@@ -2253,6 +2252,7 @@ def validate_restored_terminal_files(
     terminal = parse_submission_record(
         terminal_raw, TERMINAL_RECORD_FIELDS, "terminal record"
     )
+    require_rfc3339_utc(terminal["at"], "terminal at")
     expected_action = {
         "completed": "task.complete",
         "abandoned": "task.abandon",
@@ -2264,7 +2264,6 @@ def validate_restored_terminal_files(
         or terminal["intent_digest"] != action["intent_digest"]
         or terminal["policy_manifest_digest"] != action["policy_manifest_digest"]
         or terminal["authorization_ref"] != action["authorization_ref"]
-        or RFC3339.fullmatch(terminal["at"]) is None
     ):
         raise ValueError("restored terminal record is not action-bound")
 

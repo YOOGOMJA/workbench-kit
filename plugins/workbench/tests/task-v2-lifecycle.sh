@@ -15,6 +15,7 @@ TERMINAL_HELPER="$PLUGIN_ROOT/lib/workbench_terminal.py"
 CLEANUP_HELPER="$PLUGIN_ROOT/lib/workbench_cleanup.py"
 LEGACY_HELPER="$PLUGIN_ROOT/lib/workbench_legacy.py"
 LIFECYCLE_HELPER="$PLUGIN_ROOT/lib/workbench_lifecycle.py"
+TIME_HELPER="$PLUGIN_ROOT/lib/workbench_time.py"
 LEGACY_UTIL="$PLUGIN_ROOT/utils/legacy-inventory"
 SCAFFOLD_TEMPLATES="$(cd "$PLUGIN_ROOT/../workbench-kit/scaffold/templates" && pwd)"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/workbench-task-v2.XXXXXX")"
@@ -546,6 +547,7 @@ setup_workbench() {
   cp "$CLEANUP_HELPER" "$repo/lib/workbench_cleanup.py"
   cp "$LEGACY_HELPER" "$repo/lib/workbench_legacy.py"
   cp "$LIFECYCLE_HELPER" "$repo/lib/workbench_lifecycle.py"
+  cp "$TIME_HELPER" "$repo/lib/workbench_time.py"
   cp "$LEGACY_UTIL" "$repo/utils/legacy-inventory"
   chmod +x "$repo/utils/legacy-inventory"
   cp "$SCAFFOLD_TEMPLATES/task-AGENTS.md" "$repo/templates/task-AGENTS.md"
@@ -1377,31 +1379,41 @@ test_v1_rejects_v2_mutation_but_keeps_legacy_start() {
 }
 
 test_start_rejects_noncanonical_schema_slug_and_home() {
-  local repo out
+  local repo out rc
   repo="$(setup_workbench start_validation)"
   out="$TMPDIR/start_validation/invalid.out"
   for slug in '../escape' 'Upper-Case' 'trailing-' 'too-many-slug-words-here'; do
     if run_task start_validation "$repo" start 29 "$slug" --format json >"$out" 2>&1; then
       fail "v2 start accepted noncanonical slug: $slug"
-    fi
+    else rc=$?; fi
+    [ "$rc" = 2 ] || fail "invalid v2 slug returned $rc instead of usage exit 2"
   done
   if run_task start_validation "$repo" start '../shared-api#29' safe-slug \
     --format json >"$out" 2>&1; then
     fail "v2 start accepted a noncanonical reference home"
-  fi
+  else rc=$?; fi
+  [ "$rc" = 2 ] || fail "invalid v2 home returned $rc instead of usage exit 2"
+  if run_task start_validation "$repo" start 29 safe-slug --parent >"$out" 2>&1; then
+    fail "v2 start accepted a missing --parent value"
+  else rc=$?; fi
+  [ "$rc" = 2 ] || fail "missing v2 option value returned $rc instead of usage exit 2"
   printf 'workbench/v2\n\n' > "$repo/.workbench/schema"
   if run_task start_validation "$repo" start 29 safe-slug --format json >"$out" 2>&1; then
     fail "task entrypoint accepted a schema marker with a trailing blank line"
-  fi
+  else rc=$?; fi
+  [ "$rc" = 2 ] || fail "malformed schema returned $rc instead of usage exit 2"
   [ ! -e "$repo/.worktrees/task__29-safe-slug" ] || fail "invalid start created a task workspace"
 }
 
 test_v2_start_and_resume_are_authority_bound_skeletons() {
   local repo task_dir started resumed status digest lifecycle observation revision origin legacy_adapter
+  local err mutation active_count
   setup_writer_workbench start_skeleton shared-api
   repo="$WRITER_REPO"
 
-  started="$(run_task start_skeleton "$repo" start shared-api#29 skeleton --format json)"
+  err="$TMPDIR/start_skeleton/start.err"
+  started="$(run_task start_skeleton "$repo" start shared-api#29 skeleton --format json 2>"$err")"
+  [ ! -s "$err" ] || fail "successful JSON start wrote progress to stderr: $(cat "$err")"
   task_dir="$repo/.worktrees/task__shared-api__29-skeleton"
   digest="$(python3 - "$repo/.workbench/authority.json" <<'PY'
 import hashlib
@@ -1409,7 +1421,12 @@ import json
 import sys
 
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+fields = (
+    "contract_version", "authority_identity", "origin_url", "default_ref",
+    "workspace_home", "hosting_adapter", "hosting_ref",
+)
+canonical = {field: value[field] for field in fields}
+raw = (json.dumps(canonical, separators=(",", ":")) + "\n").encode()
 print("sha256:" + hashlib.sha256(raw).hexdigest())
 PY
 )"
@@ -1430,8 +1447,23 @@ PY
   lifecycle="$TMPDIR/start_skeleton/comments/29.comments"
   assert_file_contains "$lifecycle" 'workbench-task-lifecycle:v2'
   assert_file_contains "$lifecycle" "\"workspace_authority_descriptor_digest\":\"$digest\""
+  active_count="$(grep -Fc '"event":"task-active"' "$lifecycle" || true)"
+  [ "$active_count" = 0 ] || fail "v2 skeleton start emitted task-active"
 
-  resumed="$(run_task start_skeleton "$repo" resume shared-api#29 --format json)"
+  mutation="$(run_task_in_dir start_skeleton "$task_dir" refs set \
+    --context-ref toolbox:product/acme --format json)"
+  [ "$(json_get "$mutation" changed)" = true ] || fail "first configured mutation was unchanged"
+  active_count="$(grep -Fc '"event":"task-active"' "$lifecycle" || true)"
+  [ "$active_count" = 1 ] || fail "first configured mutation did not emit task-active once"
+  mutation="$(run_task_in_dir start_skeleton "$task_dir" refs set \
+    --context-ref toolbox:product/acme --format json)"
+  [ "$(json_get "$mutation" changed)" = false ] || fail "repeated configured mutation changed state"
+  active_count="$(grep -Fc '"event":"task-active"' "$lifecycle" || true)"
+  [ "$active_count" = 1 ] || fail "configured mutation retry duplicated task-active"
+
+  err="$TMPDIR/start_skeleton/resume.err"
+  resumed="$(run_task start_skeleton "$repo" resume shared-api#29 --format json 2>"$err")"
+  [ ! -s "$err" ] || fail "successful JSON resume wrote progress to stderr: $(cat "$err")"
   [ "$(json_get "$resumed" contract_version)" = workbench-task-start/v2 ] || fail "wrong resume contract"
   [ "$(json_get "$resumed" workspace_authority_descriptor_digest)" = "$digest" ] \
     || fail "resume lost authority binding"
@@ -1451,7 +1483,7 @@ PY
 }
 
 test_refs_are_opaque_and_duplicate_active_work_is_rejected() {
-  local repo first second actual out
+  local repo first second actual out rc
   repo="$(setup_workbench refs)"
   first="$(start_task refs "$repo" 29)"
   second="$(start_task refs "$repo" 31)"
@@ -1474,7 +1506,13 @@ test_refs_are_opaque_and_duplicate_active_work_is_rejected() {
 
   if run_task_in_dir refs "$second" refs set --work-ref 'scenario without namespace' --format json >"$out" 2>&1; then
     fail "invalid namespaced ref must be rejected"
-  fi
+  else rc=$?; fi
+  [ "$rc" = 2 ] || fail "invalid namespaced ref returned $rc instead of usage exit 2"
+
+  if run_task_in_dir refs "$second" refs set --context-ref --format json >"$out" 2>&1; then
+    fail "refs set accepted a missing option value"
+  else rc=$?; fi
+  [ "$rc" = 2 ] || fail "missing refs option value returned $rc instead of usage exit 2"
 }
 
 test_work_ref_uniqueness_rejects_remote_only_task() {

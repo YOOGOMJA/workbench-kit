@@ -10,6 +10,8 @@ import re
 import sys
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
+from workbench_time import require_rfc3339_utc
+
 
 REQUEST_FIELDS = (
     "contract_version",
@@ -119,9 +121,6 @@ PAYLOAD_FIELDS = {
 }
 
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-RFC3339_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
-
-
 def unique_object(pairs: Iterable[Tuple[str, Any]]) -> Dict[str, Any]:
     value: Dict[str, Any] = {}
     for key, item in pairs:
@@ -242,6 +241,8 @@ def validate_line_binding(request: Mapping[str, Any], fields: Mapping[str, str])
             "accepted_at",
         ):
             require_nullable(fields[key], key)
+        if fields["accepted_at"] != "null":
+            require_rfc3339_utc(fields["accepted_at"], "accepted_at")
         if request["target_ref"] != "workbench:deliverable/" + fields["deliverable_id"]:
             raise ValueError("deliverable target binding mismatch")
     elif contract == "workbench-required-check-waive-intent/v1":
@@ -333,8 +334,7 @@ def load_authorization(file: str) -> Dict[str, Any]:
         require_digest(value[key], key)
     if value["decision"] not in ("allow", "deny"):
         raise ValueError("authorization decision must be allow or deny")
-    if not isinstance(value["authorized_at"], str) or RFC3339_UTC.fullmatch(value["authorized_at"]) is None:
-        raise ValueError("authorized_at must be RFC 3339 UTC")
+    require_rfc3339_utc(value["authorized_at"], "authorized_at")
     return value
 
 

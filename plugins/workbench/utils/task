@@ -24,8 +24,20 @@ set -euo pipefail
 export LC_ALL=C
 export PYTHONDONTWRITEBYTECODE=1
 
+WORKBENCH_MACHINE_JSON=0
+previous_arg=""
+for current_arg in "$@"; do
+  if [ "$previous_arg" = --format ] && [ "$current_arg" = json ]; then
+    WORKBENCH_MACHINE_JSON=1
+    break
+  fi
+  previous_arg="$current_arg"
+done
+unset current_arg previous_arg
+
 die() { echo "error: $*" >&2; exit 1; }
-info() { echo "==> $*"; }
+usage_error() { echo "error: $*" >&2; exit 2; }
+info() { [ "$WORKBENCH_MACHINE_JSON" = 1 ] || echo "==> $*"; }
 
 # ── 공통 ──────────────────────────────────────────────────────────────
 
@@ -62,9 +74,9 @@ parse_id() {
     *'#'*) HOME_REPO="${id%%#*}"; ISSUE="${id##*#}" ;;
     *)     HOME_REPO="";          ISSUE="$id" ;;
   esac
-  echo "$ISSUE" | grep -Eq '^[0-9]+$' || die "잘못된 ID: $id (이슈 번호가 숫자가 아님)"
+  echo "$ISSUE" | grep -Eq '^[0-9]+$' || usage_error "잘못된 ID: $id (이슈 번호가 숫자가 아님)"
   if [ -n "$HOME_REPO" ]; then
-    validate_home_name "$HOME_REPO" || die "잘못된 ID: $id (repo 이름이 비정규)"
+    validate_home_name "$HOME_REPO" || usage_error "잘못된 ID: $id (repo 이름이 비정규)"
   fi
 }
 
@@ -105,10 +117,10 @@ workspace_schema() {
   local root="$1" marker helper
   marker="$root/.workbench/schema"
   if [ ! -e "$marker" ]; then printf '%s\n' workbench/v1; return 0; fi
-  [ -f "$marker" ] || die "invalid workspace schema marker: $marker"
+  [ -f "$marker" ] || usage_error "invalid workspace schema marker: $marker"
   helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
   python3 "$helper" schema "$marker" \
-    || die "workspace schema marker must contain exactly one supported schema ID"
+    || usage_error "workspace schema marker must contain exactly one supported schema ID"
 }
 
 contract_helper() {
@@ -653,23 +665,29 @@ cmd_start() {
   local id="" slug="" parent="" format=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --parent) parent="$2"; shift 2 ;;
-      --format) format="$2"; shift 2 ;;
-      --*) die "unknown option: $1" ;;
-      *) if [ -z "$id" ]; then id="$1"; else slug="$1"; fi; shift ;;
+      --parent) [ $# -ge 2 ] || usage_error "--parent requires a value"; parent="$2"; shift 2 ;;
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      --*) usage_error "unknown option: $1" ;;
+      *)
+        if [ -z "$id" ]; then id="$1"
+        elif [ -z "$slug" ]; then slug="$1"
+        else usage_error "too many positional arguments for task start"
+        fi
+        shift
+        ;;
     esac
   done
-  [ -n "$id" ] || die "usage: workbench task start <ID> [slug] [--parent N] [--format json]"
+  [ -n "$id" ] || usage_error "usage: workbench task start <ID> [slug] [--parent N] [--format json]"
   parse_id "$id"
 
   local root new_task_contract="" authority_descriptor_digest=""; root="$(wb_root)"
   if [ "$(workspace_schema "$root")" = workbench/v2 ]; then
     new_task_contract=workbench-task/v2
-    [ "$format" = json ] || die "v2 task start requires --format json"
+    [ "$format" = json ] || usage_error "v2 task start requires --format json"
     observe_workspace_authority "$root"
     authority_descriptor_digest="$AUTHORITY_DESCRIPTOR_DIGEST"
   else
-    [ -z "$format" ] || die "v1 task start does not support --format"
+    [ -z "$format" ] || usage_error "v1 task start does not support --format"
   fi
   if find_branches "$HOME_REPO" "$ISSUE" "$parent" >/dev/null 2>&1; then
     die "이미 존재하는 task: $(find_branches "$HOME_REPO" "$ISSUE" "$parent" | head -1) — task resume $id 를 쓸 것"
@@ -689,7 +707,7 @@ cmd_start() {
     [ -n "$title" ] || die "이슈 제목 조회 실패 — slug를 직접 지정할 것: task start $id <slug>"
     slug="$(slugify "$title")"
   fi
-  validate_slug "$slug" || die "invalid task slug: $slug"
+  validate_slug "$slug" || usage_error "invalid task slug: $slug"
 
   local branch="task/${HOME_REPO:+$HOME_REPO/}${parent:+$parent/}${ISSUE}-${slug}"
   local dir="$root/.worktrees/$(branch_to_dir "$branch")"
@@ -700,10 +718,10 @@ cmd_start() {
 
   # 최신 원격 main 기준으로 분기 — 로컬 main은 다른 task 머지 뒤 낡아 있을 수
   # 있어, 그대로 쓰면 새 워크트리에 직전 증분이 빠지고 수동 rebase를 부른다.
-  git -C "$root" fetch origin --quiet 2>/dev/null || info "fetch 실패(오프라인?) — 로컬 main 기준으로 분기"
+  git -C "$root" fetch origin --quiet 2>/dev/null \
+    || { [ -n "$new_task_contract" ] || info "fetch 실패(오프라인?) — 로컬 main 기준으로 분기"; }
   local base; base="$(main_ref "$root")"
   if [ -n "$new_task_contract" ]; then
-    info "브랜치 $branch → $dir (base: $base)" >&2
     git -C "$root" worktree add -q -b "$branch" "$dir" "$base"
   else
     info "브랜치 $branch → $dir (base: $base)"
@@ -827,17 +845,18 @@ EOF
     (cd "$dir" && cmd_add_repo "$HOME_REPO")
   fi
 
-  if [ -n "$new_task_contract" ]; then info "push: $branch" >&2; else info "push: $branch"; fi
+  if [ -z "$new_task_contract" ]; then info "push: $branch"; fi
   if { [ -n "$new_task_contract" ] && git -C "$dir" push -q -u origin "$branch"; } \
     || { [ -z "$new_task_contract" ] && git -C "$dir" push -u origin "$branch"; }; then
-    lifecycle_emit_optional "$root" "$HOME_REPO" "$ISSUE" task-active "$claim_id" "$branch"
+    if [ -z "$new_task_contract" ]; then
+      lifecycle_emit_optional "$root" "$HOME_REPO" "$ISSUE" task-active "$claim_id" "$branch"
+    fi
   else
     lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-claim-conflict "$claim_id" "$branch"
     die "task branch push 실패: $branch"
   fi
 
   if [ -n "$new_task_contract" ]; then
-    info "완료. cd $dir" >&2
     print_task_start_json "$dir" true
   else
     info "완료. cd $dir"
@@ -2799,13 +2818,13 @@ record_get() {
 validate_record_id() {
   local label="$1" value="$2"
   printf '%s' "$value" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
-    || die "invalid $label: $value"
+    || usage_error "invalid $label: $value"
 }
 
 validate_namespaced_ref() {
   local value="$1"
   printf '%s' "$value" | grep -Eq '^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*/[A-Za-z0-9._-]+$' \
-    || die "invalid namespaced reference: $value"
+    || usage_error "invalid namespaced reference: $value"
 }
 
 frontmatter_set() {
@@ -2982,9 +3001,12 @@ cmd_refs() {
     show)
       local format=""
       while [ $# -gt 0 ]; do
-        case "$1" in --format) format="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac
+        case "$1" in
+          --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+          *) usage_error "unknown option: $1" ;;
+        esac
       done
-      [ "$format" = json ] || die "unsupported format: ${format:-none}"
+      [ "$format" = json ] || usage_error "unsupported format: ${format:-none}"
       require_task_worktree
       [ -f "$TASK_DIR/task/index.md" ] || die "task/index.md not found"
       print_refs_json false
@@ -2994,18 +3016,24 @@ cmd_refs() {
       local duplicate format="" changed=false duplicate_rc
       while [ $# -gt 0 ]; do
         case "$1" in
-          --context-ref) context_ref="$2"; set_context=1; shift 2 ;;
-          --work-ref) work_ref="$2"; set_work=1; shift 2 ;;
+          --context-ref)
+            [ $# -ge 2 ] && [ "${2#--}" = "$2" ] || usage_error "--context-ref requires a value"
+            context_ref="$2"; set_context=1; shift 2
+            ;;
+          --work-ref)
+            [ $# -ge 2 ] && [ "${2#--}" = "$2" ] || usage_error "--work-ref requires a value"
+            work_ref="$2"; set_work=1; shift 2
+            ;;
           --clear-context-ref) clear_context=1; shift ;;
           --clear-work-ref) clear_work=1; shift ;;
-          --format) format="$2"; shift 2 ;;
-          *) die "unknown option: $1" ;;
+          --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+          *) usage_error "unknown option: $1" ;;
         esac
       done
-      [ "$format" = json ] || die "unsupported format: ${format:-none}"
-      [ -n "$set_context$set_work$clear_context$clear_work" ] || die "refs set requires a set or clear option"
-      [ -z "$set_context$clear_context" ] || [ -z "$set_context" ] || [ -z "$clear_context" ] || die "context set and clear are mutually exclusive"
-      [ -z "$set_work$clear_work" ] || [ -z "$set_work" ] || [ -z "$clear_work" ] || die "work set and clear are mutually exclusive"
+      [ "$format" = json ] || usage_error "unsupported format: ${format:-none}"
+      [ -n "$set_context$set_work$clear_context$clear_work" ] || usage_error "refs set requires a set or clear option"
+      [ -z "$set_context$clear_context" ] || [ -z "$set_context" ] || [ -z "$clear_context" ] || usage_error "context set and clear are mutually exclusive"
+      [ -z "$set_work$clear_work" ] || [ -z "$set_work" ] || [ -z "$clear_work" ] || usage_error "work set and clear are mutually exclusive"
       require_v2_task
       require_mutable_task task.refs.set || return 1
       if [ -n "$set_context$clear_context" ] \
@@ -3046,7 +3074,7 @@ cmd_refs() {
       fi
       print_refs_json "$changed"
       ;;
-    *) die "usage: workbench task refs show|set ..." ;;
+    *) usage_error "usage: workbench task refs show|set ..." ;;
   esac
 }
 
@@ -4795,13 +4823,13 @@ cmd_resume() {
   local id="" parent="" format=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --parent) parent="$2"; shift 2 ;;
-      --format) format="$2"; shift 2 ;;
-      --*) die "unknown option: $1" ;;
-      *) [ -n "$id" ] || id="$1"; shift ;;
+      --parent) [ $# -ge 2 ] || usage_error "--parent requires a value"; parent="$2"; shift 2 ;;
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      --*) usage_error "unknown option: $1" ;;
+      *) [ -z "$id" ] || usage_error "too many positional arguments for task resume"; id="$1"; shift ;;
     esac
   done
-  [ -n "$id" ] || die "usage: workbench task resume <ID> [--parent N] [--format json]"
+  [ -n "$id" ] || usage_error "usage: workbench task resume <ID> [--parent N] [--format json]"
   parse_id "$id"
   local root branch dir changed=false task_contract descriptor_digest
   root="$(wb_root)"
@@ -4813,14 +4841,13 @@ cmd_resume() {
   if [ ! -d "$dir" ]; then
     changed=true
     if [ "$format" = json ]; then
-      info "워크트리 복원: $branch → $dir" >&2
       git -C "$root" worktree add -q "$dir" "$branch"
     else
       info "워크트리 복원: $branch → $dir"
       git -C "$root" worktree add "$dir" "$branch"
     fi
-  else
-    if [ "$format" = json ]; then info "워크트리 이미 존재: $dir" >&2; else info "워크트리 이미 존재: $dir"; fi
+  elif [ "$format" != json ]; then
+    info "워크트리 이미 존재: $dir"
   fi
 
   # index.md 기록 기반으로 codebase 작업 사본 재구성
@@ -4832,14 +4859,13 @@ cmd_resume() {
   fi
   task_contract="$(index_get task_contract)"; [ -n "$task_contract" ] || task_contract=workbench-task/v1
   if [ "$task_contract" = workbench-task/v2 ]; then
-    [ "$format" = json ] || die "v2 task resume requires --format json"
+    [ "$format" = json ] || usage_error "v2 task resume requires --format json"
     descriptor_digest="$(index_get workspace_authority_descriptor_digest)"
     observe_workspace_authority "$root" "$descriptor_digest"
-    info "완료. cd $dir" >&2
     print_task_start_json "$dir" "$changed"
     return 0
   fi
-  [ -z "$format" ] || die "v1 task resume does not support --format"
+  [ -z "$format" ] || usage_error "v1 task resume does not support --format"
   local name cb_branch role clone wt
   while IFS='|' read -r name cb_branch role; do
     name="$(echo "$name" | sed -E 's/^- *| *$//g')"
@@ -5578,6 +5604,16 @@ current_task_identity() {
   [ -n "$CURRENT_CLAIM_ID" ] || CURRENT_CLAIM_ID="$CURRENT_BRANCH"
 }
 
+activate_v2_task_once() {
+  local latest event
+  latest="$(lifecycle_latest_for_branch "$CURRENT_ROOT" "$CURRENT_HOME" \
+    "$CURRENT_ISSUE" "$CURRENT_BRANCH" 2>/dev/null)" || return 0
+  event="$(lifecycle_field "$latest" event)"
+  [ "$event" = task-claimed ] || return 0
+  lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-active \
+    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" >/dev/null 2>&1 || true
+}
+
 require_mutable_task() {
   local operation="$1" outcome terminal
   current_task_identity
@@ -5592,6 +5628,7 @@ require_mutable_task() {
       "$(json_escape "$operation")" "$(json_escape "$(record_get "$terminal" action_instance_id)")"
     return 1
   fi
+  activate_v2_task_once
 }
 
 validate_tracked_v2_records() {
@@ -7813,5 +7850,5 @@ case "${1:-}" in
   check)    shift; cmd_check "$@" ;;
   status)   shift; cmd_status "$@" ;;
   tickets)  shift; cmd_tickets "$@" ;;
-  *) sed -n '6,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '6,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
