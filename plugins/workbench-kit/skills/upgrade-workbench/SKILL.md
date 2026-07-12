@@ -61,5 +61,8 @@ interpreting exit status, or preparing external evidence and journal paths.
 
 - A stale plan, source, or input requires a new dry-run and human review.
 - A `rolled-back` result is terminal evidence: report blockers and retain it.
+- A `public-adapter-restore-failed` ref under `.workbench-kit-quarantine-*`
+  is retained external evidence. Report its canonical path and never delete it
+  automatically, even when it appears empty.
 - Preserve unsafe, corrupt, aliased, or foreign journal/temp state. Never delete or
   rewrite transaction evidence manually.

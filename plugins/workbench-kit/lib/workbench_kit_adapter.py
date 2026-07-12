@@ -892,10 +892,9 @@ def _ensure_quarantine_root(
         except BaseException:
             if descriptor is not None:
                 os.close(descriptor)
-            try:
-                os.rmdir(name, dir_fd=quarantine["parent_fd"])
-            except OSError:
-                pass
+            quarantine["root_name"] = name
+            quarantine["root_fd"] = None
+            quarantine["root_binding"] = None
             raise
     raise AdapterError("public-adapter-restore-failed", ref)
 
@@ -944,10 +943,6 @@ def _open_quarantine_entry(
         except BaseException:
             if descriptor is not None:
                 os.close(descriptor)
-            try:
-                os.rmdir(name, dir_fd=quarantine["root_fd"])
-            except OSError:
-                pass
             raise
     raise AdapterError("public-adapter-restore-failed", ref)
 
@@ -1059,28 +1054,22 @@ def _close_quarantine_entry(
                 quarantine, entry_fd, entry_name, ref
             )
         else:
-            try:
-                os.rmdir(entry_name, dir_fd=quarantine["root_fd"])
-                _fsync_directory(quarantine["root_fd"], ref)
-                _fsync_directory(quarantine["parent_fd"], ref)
-            except OSError as error:
-                try:
-                    quarantine["residues"][entry_name] = (
-                        _quarantine_entry_snapshot(
-                            quarantine,
-                            entry_fd,
-                            entry_name,
-                            ref,
-                            require_node=False,
-                        )
-                    )
-                except BaseException:
-                    pass
-                failure = AdapterError(
+            snapshot = _quarantine_entry_snapshot(
+                quarantine,
+                entry_fd,
+                entry_name,
+                ref,
+                require_node=False,
+            )
+            if snapshot["node_binding"] is not None or snapshot["manifest"]:
+                raise AdapterError(
                     "public-adapter-restore-failed",
                     _external_quarantine_ref(quarantine),
                 )
-                failure.__cause__ = error
+            quarantine["residues"][entry_name] = snapshot
+            _fsync_directory(entry_fd, ref)
+            _fsync_directory(quarantine["root_fd"], ref)
+            _fsync_directory(quarantine["parent_fd"], ref)
     except BaseException as error:
         failure = error
     try:
@@ -1152,22 +1141,16 @@ def _close_external_quarantine(quarantine: dict[str, Any]) -> None:
                 )
                 failure.__cause__ = error
         quarantine["root_fd"] = None
-        if not quarantine["residues"] and failure is None:
-            try:
-                os.rmdir(
-                    quarantine["root_name"],
-                    dir_fd=quarantine["parent_fd"],
-                )
-                _fsync_directory(
-                    quarantine["parent_fd"],
-                    _external_quarantine_ref(quarantine),
-                )
-            except OSError as error:
-                failure = AdapterError(
-                    "public-adapter-restore-failed",
-                    _external_quarantine_ref(quarantine),
-                )
-                failure.__cause__ = error
+        if failure is None:
+            failure = AdapterError(
+                "public-adapter-restore-failed",
+                _external_quarantine_ref(quarantine),
+            )
+    elif quarantine["root_name"] is not None:
+        failure = AdapterError(
+            "public-adapter-restore-failed",
+            _external_quarantine_ref(quarantine),
+        )
     try:
         os.close(quarantine["parent_fd"])
     except OSError as error:

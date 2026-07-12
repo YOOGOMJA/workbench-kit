@@ -263,6 +263,11 @@ expected_v2+="$current_workspace"$'\t'"legacy-inventory show --format json"
 expected_v2+=$'\n'"$current_workspace"$'\t'"task status --format json"
 [ "$(cat "$tmp/v2-ok.log")" = "$expected_v2" ] || fail=1
 [ "${fail:-0}" -eq 0 ] || { cat "$tmp/v2-ok.log" >&2; exit 1; }
+if find "$tmp" -maxdepth 1 -name '.workbench-kit-quarantine-*' \
+  -print -quit | grep -q .; then
+  echo "successful read-only public calls created external quarantine" >&2
+  exit 1
+fi
 
 staged="$(probe staged-v2 "$current_workspace" "$approval" bootstrap-show)" \
   || { echo "$staged" >&2; exit 1; }
@@ -629,19 +634,19 @@ expect_failure mutate-mode-admin public-adapter-mutated "$current_workspace" - s
 }
 
 deleted_worktree_before="$(git_state_digest "$current_workspace")"
-expect_failure mutate-delete-worktree public-adapter-mutated "$current_workspace" - show
+expect_failure mutate-delete-worktree public-adapter-restore-failed "$current_workspace" - show
 [ "$deleted_worktree_before" = "$(git_state_digest "$current_workspace")" ] || {
   echo "deleted tracked worktree directory was not restored" >&2
   exit 1
 }
 deleted_nested_before="$(git_state_digest "$current_workspace")"
-expect_failure mutate-delete-nested public-adapter-mutated "$current_workspace" - show
+expect_failure mutate-delete-nested public-adapter-restore-failed "$current_workspace" - show
 [ "$deleted_nested_before" = "$(git_state_digest "$current_workspace")" ] || {
   echo "deleted nested worktree directory was not restored" >&2
   exit 1
 }
 deleted_admin_before="$(git_state_digest "$current_workspace")"
-expect_failure mutate-delete-admin public-adapter-mutated "$current_workspace" - show
+expect_failure mutate-delete-admin public-adapter-restore-failed "$current_workspace" - show
 [ "$deleted_admin_before" = "$(git_state_digest "$current_workspace")" ] || {
   echo "deleted Git admin child directory was not restored" >&2
   exit 1
@@ -845,7 +850,7 @@ def removal_race(kind):
     finally:
         adapter._rename_noreplace = original
         residue_root = quarantine_path(quarantine)
-        adapter._close_external_quarantine(quarantine)
+        close_quarantine_failure(quarantine)
         os.close(descriptor)
     assert not target.exists() and not target.is_symlink()
     assert (root / "adapter-before-race").exists() or (
@@ -885,7 +890,7 @@ def private_quarantine_residue(kind):
         )
     finally:
         residue_root = quarantine_path(quarantine)
-        adapter._close_external_quarantine(quarantine)
+        close_quarantine_failure(quarantine)
         os.close(parent_fd)
     assert not target.exists() and not target.is_symlink()
     residues = quarantine_nodes(residue_root)
@@ -941,7 +946,7 @@ try:
 finally:
     adapter.os.fsync = original_fsync
     durable_residue_root = quarantine_path(durable_quarantine)
-    adapter._close_external_quarantine(durable_quarantine)
+    close_quarantine_failure(durable_quarantine)
     os.close(durable_fd)
 durable_nodes = quarantine_nodes(durable_residue_root)
 assert len(durable_nodes) == 1
@@ -1220,7 +1225,7 @@ def shared_quarantine_cleanup(kind):
             pass
     finally:
         adapter._state_node_at = original_state
-        adapter._close_external_quarantine(quarantine)
+        close_quarantine_failure(quarantine)
         os.close(descriptor)
     assert not exposed, f"{kind} cleanup used a shared verified name before unlink"
 
@@ -1284,7 +1289,7 @@ def shared_temp_cleanup(kind):
         )
     finally:
         adapter.os.stat = original_stat
-        adapter._close_external_quarantine(quarantine)
+        close_quarantine_failure(quarantine)
         os.close(descriptor)
     assert not exposed, f"{kind} install cleaned a shared temporary name"
 
@@ -1549,6 +1554,54 @@ assert rename_calls == 0
 assert (cross_device_root / "owned").read_bytes() == b"preserve before fallback\n"
 assert not list(cross_device_root.glob(".workbench-kit-private-*"))
 
+empty_preserve_root = repository("empty-quarantine-preserve").resolve()
+empty_preserve_fd = adapter._open_workspace_root(empty_preserve_root)
+empty_preserve_quarantine = quarantine_for(empty_preserve_root, empty_preserve_fd)
+adapter._ensure_quarantine_root(empty_preserve_quarantine, "empty-preserve")
+empty_preserve_path = quarantine_path(empty_preserve_quarantine)
+try:
+    close_quarantine_failure(empty_preserve_quarantine)
+finally:
+    os.close(empty_preserve_fd)
+assert empty_preserve_path.is_dir()
+assert list(empty_preserve_path.iterdir()) == []
+
+empty_race_root = repository("empty-quarantine-race").resolve()
+empty_race_fd = adapter._open_workspace_root(empty_race_root)
+empty_race_quarantine = quarantine_for(empty_race_root, empty_race_fd)
+adapter._ensure_quarantine_root(empty_race_quarantine, "empty-race")
+empty_race_path = quarantine_path(empty_race_quarantine)
+empty_race_orphan = empty_race_path.with_name(empty_race_path.name + "-owned")
+empty_race_root_fd = empty_race_quarantine["root_fd"]
+original_close = adapter.os.close
+empty_race_injected = False
+
+
+def replace_empty_root_after_close(descriptor):
+    global empty_race_injected
+    original_close(descriptor)
+    if descriptor == empty_race_root_fd and not empty_race_injected:
+        empty_race_injected = True
+        os.rename(empty_race_path, empty_race_orphan)
+        empty_race_path.mkdir(mode=0o700)
+
+
+adapter.os.close = replace_empty_root_after_close
+try:
+    try:
+        adapter._close_external_quarantine(empty_race_quarantine)
+    except adapter.AdapterError as error:
+        assert error.code == "public-adapter-restore-failed", error.code
+        assert pathlib.Path(error.ref) == empty_race_path
+    else:
+        raise AssertionError("replaced empty quarantine was deleted")
+finally:
+    adapter.os.close = original_close
+    os.close(empty_race_fd)
+assert empty_race_injected
+assert empty_race_path.is_dir()
+assert empty_race_orphan.is_dir()
+
 collision_root = repository("quarantine-collision").resolve()
 collision_fd = adapter._open_workspace_root(collision_root)
 collision_quarantine = quarantine_for(collision_root, collision_fd)
@@ -1581,14 +1634,16 @@ try:
 finally:
     adapter.os.urandom = original_urandom
     empty_quarantine = quarantine_path(collision_quarantine)
-    adapter._close_external_quarantine(collision_quarantine)
+    close_quarantine_failure(collision_quarantine)
     os.close(collision_fd)
 assert collision_path.is_symlink()
 assert os.readlink(collision_path) == collision_target.name
 assert (collision_root / "installed").read_bytes() == (
     b"installed without following collision\n"
 )
-assert not empty_quarantine.exists()
+assert empty_quarantine.is_dir()
+assert len(list(empty_quarantine.glob("entry-*"))) == 1
+assert not quarantine_nodes(empty_quarantine)
 
 nonempty_root = repository("nonempty-quarantine").resolve()
 nonempty_fd = adapter._open_workspace_root(nonempty_root)
