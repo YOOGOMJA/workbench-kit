@@ -174,6 +174,18 @@
   47. Run deterministic kernel PR acceptance through `task.deliverable.accept` policy. The
       owner probe is not a judgment gate and would create false action provenance; kernel kinds
       branch before policy with null action fields, while pack owner assertions remain governed.
+  48. Use only per-value leases for `work_ref` changes. Two values selected concurrently by one
+      claim could delete each other's reservation; a claim-scoped append-only selection CAS and
+      one atomic multi-ref push now choose one transition before local metadata changes.
+  49. Require a terminal authorization actor to equal the task claimant. Approval is often
+      intentionally third-party; the authenticated winning claimant instead attests the exact
+      consumed action while its independently authenticated authorization provenance is kept.
+  50. Retire a start claim only when branch push fails. Worktree or scaffold failure occurs
+      earlier and could leave two live claims; an exit compensation guard covers the complete
+      post-claim, pre-publication interval.
+  51. Return a plain diagnostic when submitted private-state inspection is unsafe. Mutation
+      callers need a stable machine decision; every such path now returns the operation-bound
+      `submission-recovery-unavailable` blocker envelope before any effect.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing

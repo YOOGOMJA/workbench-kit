@@ -706,12 +706,7 @@ def cmd_terminal_checkpoint_find_observation(args: argparse.Namespace) -> None:
             trusted_actor = claim_actors.get(key)
             if trusted_actor is None or comment["author_identity"] != trusted_actor:
                 raise ValueError("terminal checkpoint actor does not own the winning claim")
-            action = value["terminal_action"]
-            if (
-                action["authorization_ref"]
-                and action["authorization_actor"] != trusted_actor
-            ):
-                raise ValueError("terminal checkpoint authorization actor is untrusted")
+            # The claimant attests the consumed action; its approving actor is independent.
             values.append(value)
     if not values:
         raise LookupError("terminal checkpoint not found")

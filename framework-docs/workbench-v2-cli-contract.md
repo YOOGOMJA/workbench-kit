@@ -164,6 +164,9 @@ context or canonical lazy empty seal at the first explicit governed mutation whi
 null, then explicit `add-repo --role work`. `add-repo --role reference` does not seal the
 context. Legacy `workbench-task/v1` start/resume keeps its existing auto-attach behavior and
 does not emit this v2 contract.
+Once `task-claimed` is published, every failure before the task branch push is compensated by
+one matching `task-claim-conflict`, including concurrent local worktree creation and scaffold
+or commit failure. A successfully pushed branch retires that compensation guard.
 
 ## Task references
 
@@ -199,13 +202,24 @@ mutually exclusive. The output shape for both commands is:
 duplicate active `work_ref` is an integrity failure at exit `1`. Reference grammar and the
 kernel/domain interpretation boundary are defined in [[workbench-v2-governance]].
 
-`work_ref` mutation keeps the authoritative active-task inventory check and then acquires a
-per-value remote Git reservation as the final compare-and-set. A competing valid reservation
-is reported as the same duplicate-work failure. An unreadable, malformed, or unwritable
-reservation reports `work-ref-reservation-unavailable`; a value already written locally but
-whose stale reservation could not be lease-released reports
-`work-ref-reservation-release-unreconciled`. Repeating the same set/clear operation is the
-recovery path and converges all reservations owned by that task claim.
+`work_ref` mutation keeps the authoritative active-task inventory check and per-value remote
+Git reservation. It additionally reads the claim-scoped ref
+`refs/heads/workbench-coordination/work-ref-selections/<sha256(claim_id)>`. Each selection is
+an exact single-parent `workbench-work-ref-selection/v1` commit with ordered fields
+`contract_version`, `claim_id`, `branch`, `workspace_authority_descriptor_digest`, `work_ref`,
+`reservation_ref`, `reservation_oid`, and `previous_selection_oid`. The first commit is a root;
+every later commit and payload name the exact previous OID. A clear is a tombstone selection
+whose three work/reservation fields are null.
+
+One required `git push --atomic` guarded by exact selection and reservation leases advances
+the selection, creates or retains the selected per-value reservation, and deletes all obsolete
+same-claim reservations. A competing value reservation is the duplicate-work failure. A
+same-claim selection loser returns `work-ref-selection-conflict`; malformed, unreadable,
+unwritable, non-atomic, or unreconciled coordination returns
+`work-ref-reservation-unavailable`. Local `task/index.md` changes only after remote success. If
+the remote transaction succeeded but the response or local write was lost, repeating the same
+set/clear first repairs local metadata from the selection and then converges without another
+semantic transition.
 
 Before a context-policy set is sealed, `context_ref` may be set or cleared. Changing it
 invalidates any unsealed registration, which cannot be reused for the new ref. After seal,
@@ -2287,6 +2301,13 @@ terminal outcome is idempotent with `changed: false`. A conflicting terminal out
 
 Completion emits `task-completed`; abandonment emits `task-abandoned`. Either event activates
 the terminal content freeze before the command returns success.
+
+For a submitted task whose private task state may disappear, the terminal outcome and its
+consumed action/request are repeated in one terminal-checkpoint marker paired with that
+terminal lifecycle marker. The trusted hosting adapter authenticates the comment author, and
+the author must equal the unique winning `task-claimed` actor. That actor attests the already
+consumed action; the action's `authorization_actor` remains the independent approving identity
+authenticated by the authorization source and is never required to equal the claimant.
 
 ## Governed cleanup
 

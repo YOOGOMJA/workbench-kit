@@ -57,6 +57,16 @@ WORK_REF_RESERVATION_FIELDS = (
     "branch",
     "workspace_authority_descriptor_digest",
 )
+WORK_REF_SELECTION_FIELDS = (
+    "contract_version",
+    "claim_id",
+    "branch",
+    "workspace_authority_descriptor_digest",
+    "work_ref",
+    "reservation_ref",
+    "reservation_oid",
+    "previous_selection_oid",
+)
 
 CLAIM_FIELDS = (
     "kind",
@@ -892,6 +902,12 @@ def work_ref_reservation_ref(work_ref: str) -> str:
     return "refs/heads/workbench-coordination/work-refs/" + suffix
 
 
+def work_ref_selection_ref(claim_id: str) -> str:
+    require_text(claim_id, "work-ref selection claim_id")
+    suffix = hashlib.sha256(claim_id.encode("utf-8")).hexdigest()
+    return "refs/heads/workbench-coordination/work-ref-selections/" + suffix
+
+
 def validate_work_ref_reservation(value: Any) -> Mapping[str, str]:
     if not isinstance(value, dict) or tuple(value) != WORK_REF_RESERVATION_FIELDS:
         raise ValueError("work-ref reservation fields are not canonical")
@@ -1007,6 +1023,182 @@ def cmd_work_ref_reservation_inspect(args: argparse.Namespace) -> None:
     if args.work_ref is not None and value["work_ref"] != args.work_ref:
         raise ValueError("work-ref reservation does not bind its ref")
     print_work_ref_reservation_shell(value, args.revision)
+
+
+def validate_work_ref_selection(value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, dict) or tuple(value) != WORK_REF_SELECTION_FIELDS:
+        raise ValueError("work-ref selection fields are not canonical")
+    if value["contract_version"] != "workbench-work-ref-selection/v1":
+        raise ValueError("unsupported work-ref selection contract")
+    require_text(value["claim_id"], "work-ref selection claim_id")
+    branch = require_text(value["branch"], "work-ref selection branch")
+    if subprocess.call(
+        ["git", "check-ref-format", "refs/heads/" + branch],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ) != 0:
+        raise ValueError("work-ref selection branch is invalid")
+    require_digest(
+        value["workspace_authority_descriptor_digest"],
+        "work-ref selection descriptor",
+    )
+    previous = value["previous_selection_oid"]
+    if previous is not None and (
+        not isinstance(previous, str) or OID.fullmatch(previous) is None
+    ):
+        raise ValueError("work-ref selection previous revision is invalid")
+    work_ref = value["work_ref"]
+    if work_ref is None:
+        if value["reservation_ref"] is not None or value["reservation_oid"] is not None:
+            raise ValueError("cleared work-ref selection carries a reservation")
+    else:
+        if not isinstance(work_ref, str) or NAMESPACED_REF.fullmatch(work_ref) is None:
+            raise ValueError("work-ref selection work_ref is invalid")
+        if value["reservation_ref"] != work_ref_reservation_ref(work_ref):
+            raise ValueError("work-ref selection reservation ref is invalid")
+        if not isinstance(value["reservation_oid"], str) or OID.fullmatch(
+            value["reservation_oid"]
+        ) is None:
+            raise ValueError("work-ref selection reservation revision is invalid")
+    return value
+
+
+def work_ref_selection_commit(
+    repository: str, revision: str
+) -> Tuple[Mapping[str, Any], Optional[str]]:
+    if OID.fullmatch(revision) is None:
+        raise ValueError("work-ref selection revision is invalid")
+    tree, parents = coordination_commit(repository, revision)
+    rows = [row for row in git_bytes(repository, "ls-tree", "-z", tree).split(b"\0") if row]
+    if len(rows) != 1:
+        raise ValueError("work-ref selection tree is not exact")
+    metadata, path = rows[0].split(b"\t", 1)
+    mode, kind, blob = metadata.split(b" ", 2)
+    if mode != b"100644" or kind != b"blob" or path != b"work-ref-selection.json":
+        raise ValueError("work-ref selection tree entry is invalid")
+    raw = git_bytes(repository, "cat-file", "blob", blob.decode("ascii"))
+    if not raw.endswith(b"\n") or b"\r" in raw:
+        raise ValueError("work-ref selection payload is not canonical")
+    value = validate_work_ref_selection(
+        json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    )
+    parent = parents[0] if parents else None
+    if value["previous_selection_oid"] != parent:
+        raise ValueError("work-ref selection parent binding is invalid")
+    return value, parent
+
+
+def inspect_work_ref_selection_chain(
+    repository: str, revision: str
+) -> Mapping[str, Any]:
+    seen = set()
+    current = revision
+    latest: Optional[Mapping[str, Any]] = None
+    identity: Optional[Tuple[str, str, str]] = None
+    while current is not None:
+        if current in seen:
+            raise ValueError("work-ref selection history contains a cycle")
+        seen.add(current)
+        value, parent = work_ref_selection_commit(repository, current)
+        selected_identity = (
+            str(value["claim_id"]),
+            str(value["branch"]),
+            str(value["workspace_authority_descriptor_digest"]),
+        )
+        if identity is None:
+            identity = selected_identity
+            latest = value
+        elif selected_identity != identity:
+            raise ValueError("work-ref selection identity changed")
+        current = parent
+    if latest is None:
+        raise ValueError("work-ref selection history is empty")
+    return latest
+
+
+def print_work_ref_selection_shell(value: Mapping[str, Any], revision: str) -> None:
+    sys.stdout.write(
+        "selection_ref={}\nselection_oid={}\nclaim_id={}\nbranch={}\n"
+        "descriptor_digest={}\nwork_ref={}\nreservation_ref={}\nreservation_oid={}\n"
+        "previous_selection_oid={}\n".format(
+            work_ref_selection_ref(str(value["claim_id"])),
+            revision,
+            value["claim_id"],
+            value["branch"],
+            value["workspace_authority_descriptor_digest"],
+            value["work_ref"] or "",
+            value["reservation_ref"] or "",
+            value["reservation_oid"] or "",
+            value["previous_selection_oid"] or "",
+        )
+    )
+
+
+def cmd_work_ref_selection_build(args: argparse.Namespace) -> None:
+    previous = args.previous_selection_oid
+    if previous is not None:
+        prior = inspect_work_ref_selection_chain(args.repository, previous)
+        if (
+            prior["claim_id"] != args.claim_id
+            or prior["branch"] != args.branch
+            or prior["workspace_authority_descriptor_digest"] != args.descriptor_digest
+        ):
+            raise ValueError("work-ref selection predecessor identity mismatch")
+    if args.work_ref is None:
+        if args.reservation_oid is not None:
+            raise ValueError("cleared work-ref selection carries a reservation revision")
+        reservation_ref = None
+    else:
+        if args.reservation_oid is None:
+            raise ValueError("work-ref selection reservation revision is required")
+        reservation_ref = work_ref_reservation_ref(args.work_ref)
+    value = validate_work_ref_selection(
+        {
+            "contract_version": "workbench-work-ref-selection/v1",
+            "claim_id": args.claim_id,
+            "branch": args.branch,
+            "workspace_authority_descriptor_digest": args.descriptor_digest,
+            "work_ref": args.work_ref,
+            "reservation_ref": reservation_ref,
+            "reservation_oid": args.reservation_oid,
+            "previous_selection_oid": previous,
+        }
+    )
+    raw = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    blob = reservation_git_input(args.repository, ("hash-object", "-w", "--stdin"), raw)
+    tree = reservation_git_input(
+        args.repository,
+        ("mktree",),
+        "100644 blob {}\twork-ref-selection.json\n".format(blob).encode("ascii"),
+    )
+    commit_args = ["commit-tree", tree]
+    if previous is not None:
+        commit_args.extend(("-p", previous))
+    revision = reservation_git_input(
+        args.repository,
+        tuple(commit_args),
+        b"workbench: select work reference\n",
+        True,
+    )
+    if OID.fullmatch(revision) is None:
+        raise ValueError("work-ref selection revision is invalid")
+    print_work_ref_selection_shell(value, revision)
+
+
+def cmd_work_ref_selection_inspect(args: argparse.Namespace) -> None:
+    value = inspect_work_ref_selection_chain(args.repository, args.revision)
+    if value["claim_id"] != args.claim_id:
+        raise ValueError("work-ref selection claim identity mismatch")
+    if value["branch"] != args.branch:
+        raise ValueError("work-ref selection branch mismatch")
+    if (
+        args.descriptor_digest is not None
+        and value["workspace_authority_descriptor_digest"] != args.descriptor_digest
+    ):
+        raise ValueError("work-ref selection descriptor mismatch")
+    print_work_ref_selection_shell(value, args.revision)
 
 
 def cmd_matching_active(args: argparse.Namespace) -> None:
@@ -2604,6 +2796,22 @@ def parser() -> argparse.ArgumentParser:
     reservation_inspect.add_argument("--revision", required=True)
     reservation_inspect.add_argument("--work-ref")
     reservation_inspect.set_defaults(func=cmd_work_ref_reservation_inspect)
+    selection_build = commands.add_parser("work-ref-selection-build")
+    selection_build.add_argument("--repository", required=True)
+    selection_build.add_argument("--claim-id", required=True)
+    selection_build.add_argument("--branch", required=True)
+    selection_build.add_argument("--descriptor-digest", required=True)
+    selection_build.add_argument("--work-ref")
+    selection_build.add_argument("--reservation-oid")
+    selection_build.add_argument("--previous-selection-oid")
+    selection_build.set_defaults(func=cmd_work_ref_selection_build)
+    selection_inspect = commands.add_parser("work-ref-selection-inspect")
+    selection_inspect.add_argument("--repository", required=True)
+    selection_inspect.add_argument("--revision", required=True)
+    selection_inspect.add_argument("--claim-id", required=True)
+    selection_inspect.add_argument("--branch", required=True)
+    selection_inspect.add_argument("--descriptor-digest")
+    selection_inspect.set_defaults(func=cmd_work_ref_selection_inspect)
 
     matching = commands.add_parser("matching-active")
     matching.add_argument("file")

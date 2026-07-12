@@ -668,6 +668,16 @@ print("refs/heads/workbench-coordination/work-refs/" + hashlib.sha256(value).hex
 '
 }
 
+work_ref_selection_remote_ref() {
+  printf '%s' "$1" | python3 -c '
+import hashlib
+import sys
+
+value = sys.stdin.buffer.read()
+print("refs/heads/workbench-coordination/work-ref-selections/" + hashlib.sha256(value).hexdigest())
+'
+}
+
 start_task() {
   local case_name="$1" repo="$2" issue="${3:-29}" schema output
   schema="$(cat "$repo/.workbench/schema" 2>/dev/null || true)"
@@ -1510,6 +1520,80 @@ PY
     || fail "status lost the task authority descriptor binding"
 }
 
+test_concurrent_start_retires_the_losing_claim() {
+  local repo barrier git_wrapper real_git first_out second_out first_rc second_rc comments
+  repo="$(setup_workbench concurrent_start_claim)"
+  barrier="$TMPDIR/concurrent_start_claim/barrier"; mkdir -p "$barrier"
+  real_git="$(command -v git)"
+  git_wrapper="$TMPDIR/concurrent_start_claim/bin/git"
+  cat > "$git_wrapper" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " == *" worktree add "* ]]; then
+  : "${WORKBENCH_TEST_START_BARRIER_DIR:?}"
+  : "${WORKBENCH_TEST_START_BARRIER_ID:?}"
+  touch "$WORKBENCH_TEST_START_BARRIER_DIR/$WORKBENCH_TEST_START_BARRIER_ID.ready"
+  for _ in $(seq 1 200); do
+    [ "$(find "$WORKBENCH_TEST_START_BARRIER_DIR" -name '*.ready' | wc -l | tr -d ' ')" -ge 2 ] \
+      && break
+    sleep 0.05
+  done
+  [ "$(find "$WORKBENCH_TEST_START_BARRIER_DIR" -name '*.ready' | wc -l | tr -d ' ')" -ge 2 ] \
+    || exit 1
+fi
+exec "$WORKBENCH_TEST_REAL_GIT" "$@"
+SH
+  chmod +x "$git_wrapper"
+  first_out="$TMPDIR/concurrent_start_claim/first.out"
+  second_out="$TMPDIR/concurrent_start_claim/second.out"
+  (
+    set +e
+    WORKBENCH_TEST_REAL_GIT="$real_git" \
+    WORKBENCH_TEST_START_BARRIER_DIR="$barrier" \
+    WORKBENCH_TEST_START_BARRIER_ID=first \
+      run_task concurrent_start_claim "$repo" start 29 concurrent-start --format json \
+        >"$first_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/concurrent_start_claim/first.rc"
+  ) &
+  local first_pid=$!
+  (
+    set +e
+    WORKBENCH_TEST_REAL_GIT="$real_git" \
+    WORKBENCH_TEST_START_BARRIER_DIR="$barrier" \
+    WORKBENCH_TEST_START_BARRIER_ID=second \
+      run_task concurrent_start_claim "$repo" start 29 concurrent-start --format json \
+        >"$second_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/concurrent_start_claim/second.rc"
+  ) &
+  local second_pid=$!
+  wait "$first_pid"; wait "$second_pid"
+  first_rc="$(cat "$TMPDIR/concurrent_start_claim/first.rc")"
+  second_rc="$(cat "$TMPDIR/concurrent_start_claim/second.rc")"
+  { [ "$first_rc" = 0 ] && [ "$second_rc" != 0 ]; } \
+    || { [ "$first_rc" != 0 ] && [ "$second_rc" = 0 ]; } \
+    || fail "concurrent start did not choose one local creator: first=$first_rc second=$second_rc"
+  comments="$TMPDIR/concurrent_start_claim/comments/29.comments"
+  python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+markers = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+]
+claims = [item for item in markers if item["event"] == "task-claimed"]
+conflicts = [item for item in markers if item["event"] == "task-claim-conflict"]
+assert len(claims) == 2, markers
+assert len(conflicts) == 1, markers
+assert conflicts[0]["claim_id"] in {item["claim_id"] for item in claims}, markers
+assert len({item["claim_id"] for item in claims} - {conflicts[0]["claim_id"]}) == 1, markers
+PY
+}
+
 test_verified_result_change_reactivates_before_primary() {
   local repo task_dir comments out rc actual
   repo="$(setup_workbench lifecycle_reactivation)"
@@ -1643,6 +1727,154 @@ SH
   fi
 }
 
+test_work_ref_selection_serializes_same_claim_changes() {
+  local repo task_dir claim old first second barrier hook first_out second_out
+  local first_rc second_rc winner loser winner_ref loser_ref selection_ref actual
+  repo="$(setup_workbench work_ref_selection_cas)"
+  task_dir="$(start_task work_ref_selection_cas "$repo" 29)"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  old=toolbox:scenario/SCN-OLD
+  first=toolbox:scenario/SCN-FIRST
+  second=toolbox:scenario/SCN-SECOND
+  run_task_in_dir work_ref_selection_cas "$task_dir" refs set \
+    --work-ref "$old" --format json >/dev/null
+
+  barrier="$TMPDIR/work_ref_selection_cas/barrier"; mkdir -p "$barrier"
+  hook="$TMPDIR/work_ref_selection_cas/work-ref-barrier"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${WORKBENCH_TEST_WORK_REF_BARRIER_DIR:?}"
+: "${WORKBENCH_TEST_WORK_REF_BARRIER_ID:?}"
+touch "$WORKBENCH_TEST_WORK_REF_BARRIER_DIR/$WORKBENCH_TEST_WORK_REF_BARRIER_ID.ready"
+for _ in $(seq 1 200); do
+  [ "$(find "$WORKBENCH_TEST_WORK_REF_BARRIER_DIR" -name '*.ready' | wc -l | tr -d ' ')" -ge 2 ] \
+    && exit 0
+  sleep 0.05
+done
+exit 1
+SH
+  chmod +x "$hook"
+  first_out="$TMPDIR/work_ref_selection_cas/first.out"
+  second_out="$TMPDIR/work_ref_selection_cas/second.out"
+  (
+    set +e
+    WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="$hook" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_DIR="$barrier" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_ID=first \
+      run_task_in_dir work_ref_selection_cas "$task_dir" refs set \
+        --work-ref "$first" --format json >"$first_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/work_ref_selection_cas/first.rc"
+  ) &
+  local first_pid=$!
+  (
+    set +e
+    WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="$hook" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_DIR="$barrier" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_ID=second \
+      run_task_in_dir work_ref_selection_cas "$task_dir" refs set \
+        --work-ref "$second" --format json >"$second_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/work_ref_selection_cas/second.rc"
+  ) &
+  local second_pid=$!
+  wait "$first_pid"; wait "$second_pid"
+  first_rc="$(cat "$TMPDIR/work_ref_selection_cas/first.rc")"
+  second_rc="$(cat "$TMPDIR/work_ref_selection_cas/second.rc")"
+  [ "$first_rc$second_rc" = 01 ] || [ "$first_rc$second_rc" = 10 ] \
+    || fail "same-claim selection CAS did not choose one winner: first=$first_rc second=$second_rc"
+  if [ "$first_rc" = 0 ]; then winner="$first"; loser="$second"; else winner="$second"; loser="$first"; fi
+  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$winner" ] \
+    || fail "same-claim selection winner did not own the local primary"
+  winner_ref="$(work_ref_remote_ref "$winner")"
+  loser_ref="$(work_ref_remote_ref "$loser")"
+  [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_selection_cas/origin.git" "$winner_ref")" ] \
+    && [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_selection_cas/origin.git" "$loser_ref")" ] \
+    || fail "same-claim selection did not retain exactly the winner reservation"
+  selection_ref="$(work_ref_selection_remote_ref "$claim")"
+  [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_selection_cas/origin.git" "$selection_ref")" ] \
+    || fail "same-claim selection CAS did not publish its serialization ref"
+
+  actual="$(run_task_in_dir work_ref_selection_cas "$task_dir" refs set \
+    --work-ref "$loser" --format json)"
+  assert_contains "$actual" '"changed":true'
+  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$loser" ] \
+    || fail "selection retry did not transition to the requested work_ref"
+  [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_selection_cas/origin.git" "$winner_ref")" ] \
+    && [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_selection_cas/origin.git" "$loser_ref")" ] \
+    || fail "selection retry did not atomically replace the winner reservation"
+}
+
+test_work_ref_selection_repairs_local_state_after_remote_success() {
+  local repo task_dir old new old_ref new_ref out rc actual
+  repo="$(setup_workbench work_ref_selection_recovery)"
+  task_dir="$(start_task work_ref_selection_recovery "$repo" 29)"
+  old=toolbox:scenario/SCN-RECOVERY-OLD
+  new=toolbox:scenario/SCN-RECOVERY-NEW
+  old_ref="$(work_ref_remote_ref "$old")"
+  new_ref="$(work_ref_remote_ref "$new")"
+  run_task_in_dir work_ref_selection_recovery "$task_dir" refs set \
+    --work-ref "$old" --format json >/dev/null
+
+  out="$TMPDIR/work_ref_selection_recovery/interrupted.out"
+  if WORKBENCH_TEST_WORK_REF_POSTWRITE_FAIL=1 \
+    run_task_in_dir work_ref_selection_recovery "$task_dir" refs set \
+      --work-ref "$new" --format json >"$out" 2>&1; then
+    fail "work-ref transition ignored its post-remote crash injection"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "post-remote work-ref interruption returned $rc"
+  assert_file_contains "$out" 'work-ref-local-reconciliation-required'
+  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$old" ] \
+    || fail "post-remote interruption changed the local work_ref"
+  [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_selection_recovery/origin.git" "$old_ref")" ] \
+    && [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_selection_recovery/origin.git" "$new_ref")" ] \
+    || fail "post-remote interruption did not leave one durable selected reservation"
+
+  actual="$(run_task_in_dir work_ref_selection_recovery "$task_dir" refs set \
+    --work-ref "$new" --format json)"
+  assert_contains "$actual" '"changed":true'
+  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$new" ] \
+    || fail "selection retry did not repair the local work_ref"
+  [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_selection_recovery/origin.git" "$old_ref")" ] \
+    && [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_selection_recovery/origin.git" "$new_ref")" ] \
+    || fail "selection retry changed the recovered reservation set"
+}
+
+test_work_ref_selection_rejects_non_append_only_history() {
+  local repo task_dir claim old new old_ref new_ref selection tip payload blob tree forged out rc
+  repo="$(setup_workbench work_ref_selection_history)"
+  task_dir="$(start_task work_ref_selection_history "$repo" 29)"
+  claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
+  old=toolbox:scenario/SCN-HISTORY-OLD
+  new=toolbox:scenario/SCN-HISTORY-NEW
+  old_ref="$(work_ref_remote_ref "$old")"
+  new_ref="$(work_ref_remote_ref "$new")"
+  selection="$(work_ref_selection_remote_ref "$claim")"
+  run_task_in_dir work_ref_selection_history "$task_dir" refs set \
+    --work-ref "$old" --format json >/dev/null
+  tip="$(git ls-remote --heads "$TMPDIR/work_ref_selection_history/origin.git" "$selection" \
+    | awk '{print $1}')"
+  payload="$TMPDIR/work_ref_selection_history/selection.json"
+  git -C "$repo" show "$tip:work-ref-selection.json" > "$payload"
+  blob="$(git -C "$repo" hash-object -w "$payload")"
+  tree="$(printf '100644 blob %s\twork-ref-selection.json\n' "$blob" | git -C "$repo" mktree)"
+  forged="$(printf '%s\n' 'test: forge selection parent binding' \
+    | git -C "$repo" commit-tree "$tree" -p "$tip")"
+  git -C "$repo" push -q --force origin "$forged:$selection"
+
+  out="$TMPDIR/work_ref_selection_history/rejected.out"
+  if run_task_in_dir work_ref_selection_history "$task_dir" refs set \
+    --work-ref "$new" --format json >"$out" 2>&1; then
+    fail "work-ref mutation accepted a non-append-only selection"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "non-append-only work-ref selection returned $rc"
+  assert_file_contains "$out" 'work-ref-selection-unavailable'
+  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$old" ] \
+    || fail "non-append-only selection changed the local primary"
+  [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_selection_history/origin.git" "$old_ref")" ] \
+    && [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_selection_history/origin.git" "$new_ref")" ] \
+    || fail "non-append-only selection changed remote reservations"
+}
+
 test_work_ref_reservation_rejects_malformed_remote_owner() {
   local repo task_dir work_ref reservation payload blob tree commit out rc before after
   repo="$(setup_workbench work_ref_malformed)"
@@ -1688,16 +1920,16 @@ test_work_ref_reservation_tracks_change_and_clear() {
     fail "work-ref change ignored a stale reservation release failure"
   else rc=$?; fi
   [ "$rc" = 1 ] || fail "failed work-ref change release returned $rc"
-  assert_file_contains "$out" 'work-ref-reservation-release-unreconciled'
-  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$new" ] \
-    || fail "failed release did not retain its new local primary"
+  assert_file_contains "$out" 'work-ref-reservation-unavailable'
+  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$old" ] \
+    || fail "failed atomic transition changed its local primary"
   [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$old_ref")" ] \
-    && [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$new_ref")" ] \
-    || fail "failed release did not retain both retry reservations"
+    && [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$new_ref")" ] \
+    || fail "failed atomic transition changed its remote reservations"
 
   actual="$(run_task_in_dir work_ref_transition "$task_dir" refs set \
     --work-ref "$new" --format json)"
-  assert_contains "$actual" '"changed":false'
+  assert_contains "$actual" '"changed":true'
   [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$old_ref")" ] \
     || fail "changed work-ref retained its old reservation"
   [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$new_ref")" ] \
@@ -3807,12 +4039,15 @@ PY
 }
 
 test_cleanup_releases_work_ref_reservation_after_workspace_removal() {
-  local work_ref reservation actual out rc branch
+  local work_ref reservation selection actual out rc branch
   work_ref=toolbox:scenario/SCN-CLEANUP-RELEASE
   prepare_cleanup_fixture cleanup_work_ref_release "$work_ref"
   reservation="$(work_ref_remote_ref "$work_ref")"
+  selection="$(work_ref_selection_remote_ref "$CLEANUP_CLAIM")"
   [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
     "$reservation")" ] || fail "cleanup fixture did not retain its work-ref reservation"
+  [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
+    "$selection")" ] || fail "cleanup fixture did not retain its work-ref selection"
   branch="task/29-v2-lifecycle-fixture-29"
   out="$TMPDIR/cleanup_work_ref_release/release-failure.out"
   if WORKBENCH_TEST_WORK_REF_RELEASE_FAIL=1 \
@@ -3829,11 +4064,15 @@ test_cleanup_releases_work_ref_reservation_after_workspace_removal() {
     || fail "failed reservation release removed the retry branch"
   [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
     "$reservation")" ] || fail "failed cleanup release dropped its reservation"
+  [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
+    "$selection")" ] || fail "failed cleanup release dropped its selection"
 
   actual="$(run_task cleanup_work_ref_release "$CLEANUP_REPO" done 29 --format json)"
   assert_contains "$actual" '"outcome":"cleaned"'
   [ -z "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
     "$reservation")" ] || fail "cleanup retained its work-ref reservation"
+  [ -z "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
+    "$selection")" ] || fail "cleanup retained its work-ref selection"
 }
 
 test_cleanup_deleted_retry_rejects_tampered_immutable_intent() {
@@ -5842,6 +6081,39 @@ assert [item["event"] for item in markers][-2:] == ["task-submitted", "task-acti
 PY
 }
 
+test_submitted_mutation_reports_unsafe_recovery_state_as_blocker() {
+  local common saved out rc reservation comments_before comments_after
+  prepare_submission_fixture submit_recovery_blocker
+  run_task_in_dir submit_recovery_blocker "$SUBMISSION_TASK_DIR" submit \
+    --title "fix: reject unsafe submitted recovery" --body-file "$SUBMISSION_BODY" >/dev/null
+  ! git -C "$SUBMISSION_TASK_DIR" ls-files --error-unmatch task/index.md >/dev/null 2>&1 \
+    || fail "unsafe recovery fixture unexpectedly retained tracked task state"
+  common="$(git -C "$SUBMISSION_TASK_DIR" rev-parse --path-format=absolute --git-common-dir)"
+  saved="$TMPDIR/submit_recovery_blocker/saved-workbench-v2"
+  mv "$common/workbench-v2" "$saved"
+  ln -s "$saved" "$common/workbench-v2"
+  comments_before="$(grep -Fc '"event":"task-active"' \
+    "$TMPDIR/submit_recovery_blocker/comments/29.comments" || true)"
+  out="$TMPDIR/submit_recovery_blocker/rejected.out"
+  if run_task_in_dir submit_recovery_blocker "$SUBMISSION_TASK_DIR" refs set \
+    --work-ref toolbox:scenario/SCN-UNSAFE-RECOVERY --format json >"$out" 2>&1; then
+    fail "submitted mutation accepted an unsafe recovery directory"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "unsafe submitted recovery returned $rc"
+  assert_file_contains "$out" '"contract_version":"workbench-error/v1"'
+  assert_file_contains "$out" '"operation":"task.refs.set"'
+  assert_file_contains "$out" '"code":"submission-recovery-unavailable"'
+  [ -z "$(sed -n 's/^work_ref: *//p' "$SUBMISSION_TASK_DIR/task/index.md")" ] \
+    || fail "unsafe submitted recovery changed the local work_ref"
+  reservation="$(work_ref_remote_ref toolbox:scenario/SCN-UNSAFE-RECOVERY)"
+  [ -z "$(git ls-remote --heads "$TMPDIR/submit_recovery_blocker/origin.git" "$reservation")" ] \
+    || fail "unsafe submitted recovery created a remote reservation"
+  comments_after="$(grep -Fc '"event":"task-active"' \
+    "$TMPDIR/submit_recovery_blocker/comments/29.comments" || true)"
+  [ "$comments_before" = "$comments_after" ] \
+    || fail "unsafe submitted recovery emitted a lifecycle transition"
+}
+
 test_v1_submission_without_origin_head_uses_main_fallback() {
   local repo task_dir body actual
   repo="$(setup_workbench v1_submit_no_head workbench/v1)"
@@ -6443,6 +6715,56 @@ test_v2_submitted_completion_keeps_cleanup_authorization_separate() {
   assert_contains "$actual" '"outcome":"cleaned"'
 }
 
+test_v2_submitted_terminal_checkpoint_preserves_independent_authorizer() {
+  local head out rc pending instance claim target revision manifest intent auth actual comments
+  prepare_submission_fixture submit_terminal_authorizer
+  run_task_in_dir submit_terminal_authorizer "$SUBMISSION_TASK_DIR" submit \
+    --title "fix: preserve terminal authorizer" --body-file "$SUBMISSION_BODY" >/dev/null
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  mark_submission_pr_merged submit_terminal_authorizer
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_terminal_authorizer "$SUBMISSION_TASK_DIR" deliverable accept \
+      --id workbench-pr --format json >/dev/null
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_terminal_authorizer "$SUBMISSION_TASK_DIR" verify \
+      --format json >/dev/null
+  out="$TMPDIR/submit_terminal_authorizer/pending.out"
+  if GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_terminal_authorizer "$SUBMISSION_TASK_DIR" complete \
+      --format json >"$out"; then
+    fail "terminal authorizer fixture did not require explicit authorization"
+  else rc=$?; fi
+  [ "$rc" = 3 ] || fail "terminal authorization ask returned $rc"
+  pending="$(cat "$out")"
+  instance="$(json_get "$pending" action_instance.id)"
+  claim="$(json_get "$pending" action_instance.task_claim_id)"
+  target="$(json_get "$pending" action_instance.target_ref)"
+  revision="$(json_get "$pending" action_instance.revision)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  auth="$TMPDIR/submit_terminal_authorizer/authorization.json"
+  write_authorization "$auth" "$instance" task.complete "$claim" "$target" \
+    "$revision" "$manifest" allow reviewer@example.invalid 2026-07-12T13:04:00Z \
+    conversation:message/terminal-review "$intent"
+  actual="$(GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_terminal_authorizer "$SUBMISSION_TASK_DIR" complete \
+      --action-instance-id "$instance" --authorization-file "$auth" --format json)"
+  assert_contains "$actual" '"outcome":"completed"'
+  comments="$TMPDIR/submit_terminal_authorizer/comments/29.comments"
+  python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+raw = open(sys.argv[1], encoding="utf-8").read()
+checkpoint = json.loads(re.findall(
+    r"<!-- workbench-task-terminal-checkpoint:v1\n([^\r\n]+)\n-->", raw
+)[-1])
+assert checkpoint["terminal_action"]["authorization_actor"] == "reviewer@example.invalid"
+assert checkpoint["terminal_action"]["authorization_ref"] == "conversation:message/terminal-review"
+PY
+}
+
 test_v2_submitted_abandonment_publishes_one_terminal_checkpoint() {
   local branch clone task actual comments
   prepare_submission_fixture submit_abandon_checkpoint true allow abandon
@@ -6707,7 +7029,8 @@ PY
         verify --format json >"$out" 2>&1; then
       fail "submitted task accepted $mode PR observation"
     fi
-    assert_file_contains "$out" 'authenticated submitted task recovery is unavailable'
+    assert_file_contains "$out" '"operation":"task.verify"'
+    assert_file_contains "$out" '"code":"submission-recovery-unavailable"'
   done
 
   claim="$(sed -n 's/^claim_id: *//p' "$SUBMISSION_TASK_DIR/task/index.md")"
@@ -6746,7 +7069,8 @@ PY
     verify --format json >"$out" 2>&1; then
     fail "reactivation did not invalidate the submitted PR recovery"
   fi
-  assert_file_contains "$out" 'authenticated submitted task recovery is unavailable'
+  assert_file_contains "$out" '"operation":"task.verify"'
+  assert_file_contains "$out" '"code":"submission-recovery-unavailable"'
 }
 
 test_v2_submission_rejects_noncanonical_cleanup_history() {
@@ -7132,9 +7456,13 @@ run_case() {
 run_case test_v1_rejects_v2_mutation_but_keeps_legacy_start
 run_case test_start_rejects_noncanonical_schema_slug_and_home
 run_case test_v2_start_and_resume_are_authority_bound_skeletons
+run_case test_concurrent_start_retires_the_losing_claim
 run_case test_verified_result_change_reactivates_before_primary
 run_case test_refs_are_opaque_and_duplicate_active_work_is_rejected
 run_case test_work_ref_reservation_is_atomic_across_tasks
+run_case test_work_ref_selection_serializes_same_claim_changes
+run_case test_work_ref_selection_repairs_local_state_after_remote_success
+run_case test_work_ref_selection_rejects_non_append_only_history
 run_case test_work_ref_reservation_rejects_malformed_remote_owner
 run_case test_work_ref_reservation_tracks_change_and_clear
 run_case test_work_ref_uniqueness_rejects_remote_only_task
@@ -7214,6 +7542,7 @@ run_case test_cleanup_rejects_broken_symlink_worktree
 run_case test_status_reports_concurrent_writer_conflicts
 run_case test_v2_submit_reconciles_durable_submission_without_v1_fallback
 run_case test_submitted_result_change_reactivates_tracked_task
+run_case test_submitted_mutation_reports_unsafe_recovery_state_as_blocker
 run_case test_v1_submission_without_origin_head_uses_main_fallback
 run_case test_v2_submission_restores_authenticated_state_to_terminal_cleanup
 run_case test_v2_submission_crash_boundaries_are_idempotent
@@ -7224,6 +7553,7 @@ run_case test_v2_submission_rejects_deleted_restored_deliverable
 run_case test_v2_submission_rejects_deleted_restored_required_check
 run_case test_v2_submission_rejects_restored_acceptance_tampering
 run_case test_v2_submitted_completion_keeps_cleanup_authorization_separate
+run_case test_v2_submitted_terminal_checkpoint_preserves_independent_authorizer
 run_case test_v2_submitted_abandonment_publishes_one_terminal_checkpoint
 run_case test_v2_terminal_checkpoint_rejects_adversarial_observations
 run_case test_v2_submission_rejects_noncanonical_pr_and_lifecycle_state

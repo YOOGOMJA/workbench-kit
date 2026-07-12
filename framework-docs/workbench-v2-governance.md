@@ -117,21 +117,30 @@ duplicate active `work_ref` values, and reports the references. Only the namespa
 interprets the value. Missing references have no product meaning and remain valid.
 
 Active-task inventory is the semantic preflight for `work_ref` uniqueness, but it is not the
-serialization point. Every non-null value also owns one Git reservation at
+serialization point. Every non-null value owns one Git reservation at
 `refs/heads/workbench-coordination/work-refs/<sha256(work_ref)>`. The ref is created by a
 non-force push of a deterministic root commit whose exact `work-ref.json` binds the value,
 task claim, task branch, and workspace-authority descriptor. Concurrent setters may both
 pass inventory; the remote ref creation still selects exactly one winner. An existing
 malformed or differently bound reservation fails closed and is never overwritten.
 
-Changing or clearing a value uses exact-OID lease deletion, and a successful retry removes
-stale reservations owned by the same claim. A terminal task retains its reservation until
-cleanup has removed the task workspace; cleanup then releases every reservation bound to
-that claim and branch before deleting the local branch. This ordering lets a cleanup retry
-finish after the workspace is gone without making the work item concurrently reusable while
-user bytes still exist. Tasks created before this reservation contract remain readable;
-their current value is reserved lazily on the next matching `refs set`, while authoritative
-inventory continues to protect them during migration.
+The per-value ref does not serialize two different values selected concurrently by the same
+claim. Each claim therefore also owns an append-only selection chain at
+`refs/heads/workbench-coordination/work-ref-selections/<sha256(claim_id)>`. Its exact
+`workbench-work-ref-selection/v1` commit binds claim, branch, descriptor, nullable selected
+value, matching reservation ref/OID, and previous selection OID. Changing or clearing a value
+uses one required atomic Git push guarded by exact leases to advance that selection, create or
+retain the chosen reservation, and delete every obsolete reservation owned by the claim. Only
+the winning transaction updates local task metadata. A lost response is repaired from the
+selection chain; malformed history or a remote without atomic-push support fails closed.
+
+A terminal task retains its selection and reservation until cleanup has removed the task
+workspace; cleanup then atomically releases the selection and every reservation bound to that
+claim and branch before deleting the local branch. This ordering lets a cleanup retry finish
+after the workspace is gone without making the work item concurrently reusable while user
+bytes still exist. Tasks created before this coordination contract remain readable; their
+current value and first selection are materialized lazily on the next matching `refs set`,
+while authoritative inventory continues to protect them during migration.
 
 ### Work-item and multi-context boundary
 
@@ -321,6 +330,9 @@ stateDiagram-v2
 The exact event IDs are `task-claimed`, `task-claim-conflict`, `task-active`,
 `task-verified`, `task-submitted`, `task-completed`, `task-abandoned`, and `task-cleaned`.
 A writer correlates them with `claim_id` and branch.
+After publishing `task-claimed`, start keeps a process-exit compensation guard until the task
+branch is durably pushed. Any worktree, scaffold, commit, or push failure publishes the matching
+`task-claim-conflict`, so a failed concurrent start cannot remain a second live claim.
 
 The canonical v2 marker is UTF-8 JSON inside a versioned HTML comment:
 

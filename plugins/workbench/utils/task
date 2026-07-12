@@ -249,7 +249,7 @@ protected_registry_entry() {
 
 require_v2_task() {
   require_task_worktree
-  local root schema task_contract
+  local operation="${1:-}" root schema task_contract
   root="$(wb_root)"; schema="$(workspace_schema "$root")"
   [ "$schema" = workbench/v2 ] \
     || die "v2 task mutation requires workbench/v2 (caller is $schema; migrate first)"
@@ -259,8 +259,15 @@ require_v2_task() {
   [ "$task_contract" = workbench-task/v2 ] \
     || die "v2 task mutation requires workbench-task/v2 (task is $task_contract)"
   if ! git -C "$TASK_DIR" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
-    submission_recovery_guard \
-      || die "authenticated submitted task recovery is unavailable"
+    if ! submission_recovery_guard 2>/dev/null; then
+      if [ -n "$operation" ]; then
+        current_task_identity
+        printf '{"contract_version":"workbench-error/v1","operation":"%s","blockers":[{"code":"submission-recovery-unavailable","ref":"workbench:task/%s"}]}\n' \
+          "$(json_escape "$operation")" "$(json_escape "$CURRENT_CLAIM_ID")"
+        return 1
+      fi
+      die "authenticated submitted task recovery is unavailable"
+    fi
   fi
 }
 
@@ -640,6 +647,24 @@ $matches
 
 # ── start ─────────────────────────────────────────────────────────────
 
+start_claim_compensate() {
+  [ "${START_CLAIM_PENDING:-false}" = true ] || return 0
+  if lifecycle_emit "$START_CLAIM_ROOT" "$START_CLAIM_HOME" "$START_CLAIM_ISSUE" \
+    task-claim-conflict "$START_CLAIM_ID" "$START_CLAIM_BRANCH" - "" "" \
+    "$START_CLAIM_CONTRACT" "$START_CLAIM_DESCRIPTOR"; then
+    START_CLAIM_PENDING=false
+    return 0
+  fi
+  return 1
+}
+
+start_claim_exit() {
+  local rc=$?
+  trap - EXIT
+  start_claim_compensate || true
+  exit "$rc"
+}
+
 print_task_start_json() {
   local dir="$1" changed="$2" index="$dir/task/index.md" state context_ref work_ref sealed=false
   local claim_id branch descriptor_digest owners owner first=1
@@ -717,6 +742,11 @@ cmd_start() {
 
   lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-claimed "$claim_id" "$branch" - "" "" \
     "${new_task_contract:-workbench-task/v1}" "$authority_descriptor_digest"
+  START_CLAIM_ROOT="$root"; START_CLAIM_HOME="$HOME_REPO"; START_CLAIM_ISSUE="$ISSUE"
+  START_CLAIM_ID="$claim_id"; START_CLAIM_BRANCH="$branch"
+  START_CLAIM_CONTRACT="${new_task_contract:-workbench-task/v1}"
+  START_CLAIM_DESCRIPTOR="$authority_descriptor_digest"; START_CLAIM_PENDING=true
+  trap start_claim_exit EXIT
 
   # 최신 원격 main 기준으로 분기 — 로컬 main은 다른 task 머지 뒤 낡아 있을 수
   # 있어, 그대로 쓰면 새 워크트리에 직전 증분이 빠지고 수동 rebase를 부른다.
@@ -854,9 +884,12 @@ EOF
       lifecycle_emit_optional "$root" "$HOME_REPO" "$ISSUE" task-active "$claim_id" "$branch"
     fi
   else
-    lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-claim-conflict "$claim_id" "$branch"
+    start_claim_compensate || true
     die "task branch push 실패: $branch"
   fi
+
+  START_CLAIM_PENDING=false
+  trap - EXIT
 
   if [ -n "$new_task_contract" ]; then
     print_task_start_json "$dir" true
@@ -2545,7 +2578,7 @@ cmd_add_repo() {
     [ -z "$format$instance_id$authorization_file" ] || die "v1 task does not support v2 add-repo options"
     cmd_add_repo_v1 "${original[@]}"; return
   fi
-  require_v2_task; require_mutable_task task.add-repo || return 1
+  require_v2_task task.add-repo; require_mutable_task task.add-repo || return 1
   [ "$format" = json ] || die "v2 add-repo requires --format json"
   case "$role" in work|reference) ;; *) die "role must be work or reference" ;; esac
   if [ "$role" = work ]; then
@@ -2787,7 +2820,12 @@ cmd_writer_operation() {
     esac
   done
   [ -n "$operation_id" ] || die "writer-operation requires --operation-id"
-  require_task_worktree; require_v2_task
+  require_task_worktree
+  case "$subcommand" in
+    show) require_v2_task ;;
+    cancel|handoff) require_v2_task "task.writer-operation.$subcommand" ;;
+    *) require_v2_task ;;
+  esac
   case "$subcommand" in
     show) [ -z "$target_device$target_clone" ] || die "show does not accept a handoff target"
       cmd_writer_operation_show "$operation_id" "$format" ;;
@@ -3016,37 +3054,80 @@ EOF
     && [ -n "$WORK_REF_REMOTE_BRANCH" ] && [ -n "$WORK_REF_REMOTE_DESCRIPTOR" ]
 }
 
-work_ref_reservation_acquire() {
-  local root="$1" value="$2" origin observe_rc
-  work_ref_reservation_build "$root" "$value" || return 2
-  origin="$(canonical_workspace_origin_url "$root")" || return 2
-  if work_ref_reservation_observe "$root" "$origin" "$value" \
-    "$WORK_REF_RESERVATION_REF"; then
-    [ "$WORK_REF_REMOTE_OID" = "$WORK_REF_RESERVATION_OID" ] && return 0
-    return 3
+work_ref_selection_ref() {
+  local claim_id="$1" digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$claim_id" | sha256sum | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$claim_id" | shasum -a 256 | awk '{print $1}')"
   else
-    observe_rc=$?
-    [ "$observe_rc" -eq 1 ] || return 2
+    return 1
   fi
-  if [ -n "${WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK:-}" ]; then
-    "$WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK" "$value" "$(index_get claim_id)" \
-      || return 2
-  fi
-  git -C "$root" push --quiet "$origin" \
-    "$WORK_REF_RESERVATION_OID:$WORK_REF_RESERVATION_REF" >/dev/null 2>&1 || true
-  if work_ref_reservation_observe "$root" "$origin" "$value" \
-    "$WORK_REF_RESERVATION_REF"; then
-    [ "$WORK_REF_REMOTE_OID" = "$WORK_REF_RESERVATION_OID" ] && return 0
-    return 3
-  fi
-  return 2
+  printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  printf 'refs/heads/workbench-coordination/work-ref-selections/%s\n' "$digest"
 }
 
-work_ref_reservations_release_claim() {
-  local root="$1" claim_id="$2" branch="$3" keep_ref="${4:-}" origin rows oid ref
-  local output line key item
-  local reservation_ref reservation_claim reservation_branch matched=false
+work_ref_selection_observe() {
+  local root="$1" claim_id="$2" branch="$3" descriptor="${4:-}" origin rows count oid advertised
+  local output line key item inspect_args
+  origin="$(canonical_workspace_origin_url "$root")" || return 2
+  WORK_REF_SELECTION_REF="$(work_ref_selection_ref "$claim_id")" || return 2
+  WORK_REF_SELECTION_OID=""; WORK_REF_SELECTION_WORK_REF=""
+  WORK_REF_SELECTION_RESERVATION_REF=""; WORK_REF_SELECTION_RESERVATION_OID=""
+  WORK_REF_SELECTION_DESCRIPTOR=""
+  rows="$(git ls-remote --heads "$origin" "$WORK_REF_SELECTION_REF" 2>/dev/null)" \
+    || return 2
+  count="$(printf '%s\n' "$rows" | sed '/^$/d' | wc -l | tr -d ' ')"
+  [ "$count" -le 1 ] || return 2
+  [ "$count" -eq 1 ] || return 1
+  IFS=$'\t' read -r oid advertised <<EOF
+$rows
+EOF
+  [ "$advertised" = "$WORK_REF_SELECTION_REF" ] \
+    && printf '%s' "$oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+    || return 2
+  git -C "$root" fetch --quiet --no-tags --no-write-fetch-head "$origin" "$oid" \
+    >/dev/null 2>&1 || return 2
+  inspect_args=(work-ref-selection-inspect --repository "$root" --revision "$oid" \
+    --claim-id "$claim_id" --branch "$branch")
+  [ -z "$descriptor" ] || inspect_args+=(--descriptor-digest "$descriptor")
+  output="$(python3 "$(writer_helper)" "${inspect_args[@]}" 2>/dev/null)" || return 2
+  while IFS= read -r line; do
+    key="${line%%=*}"; item="${line#*=}"
+    case "$key" in
+      selection_ref) [ "$item" = "$WORK_REF_SELECTION_REF" ] || return 2 ;;
+      selection_oid) WORK_REF_SELECTION_OID="$item" ;;
+      descriptor_digest) WORK_REF_SELECTION_DESCRIPTOR="$item" ;;
+      work_ref) WORK_REF_SELECTION_WORK_REF="$item" ;;
+      reservation_ref) WORK_REF_SELECTION_RESERVATION_REF="$item" ;;
+      reservation_oid) WORK_REF_SELECTION_RESERVATION_OID="$item" ;;
+    esac
+  done <<< "$output"
+  [ "$WORK_REF_SELECTION_OID" = "$oid" ] \
+    && [ -n "$WORK_REF_SELECTION_DESCRIPTOR" ] || return 2
+  if [ -n "$WORK_REF_SELECTION_WORK_REF" ]; then
+    [ -n "$WORK_REF_SELECTION_RESERVATION_REF" ] \
+      && [ -n "$WORK_REF_SELECTION_RESERVATION_OID" ] || return 2
+    work_ref_reservation_observe "$root" "$origin" "$WORK_REF_SELECTION_WORK_REF" \
+      "$WORK_REF_SELECTION_RESERVATION_REF" || return 2
+    [ "$WORK_REF_REMOTE_OID" = "$WORK_REF_SELECTION_RESERVATION_OID" ] \
+      && [ "$WORK_REF_REMOTE_CLAIM" = "$claim_id" ] \
+      && [ "$WORK_REF_REMOTE_BRANCH" = "$branch" ] \
+      && [ "$WORK_REF_REMOTE_DESCRIPTOR" = "$WORK_REF_SELECTION_DESCRIPTOR" ] \
+      || return 2
+  else
+    [ -z "$WORK_REF_SELECTION_RESERVATION_REF$WORK_REF_SELECTION_RESERVATION_OID" ] \
+      || return 2
+  fi
+}
+
+work_ref_reservations_list_claim() {
+  local root="$1" claim_id="$2" branch="$3" expected_descriptor="${4:-}"
+  local origin rows oid ref output line key item reservation_ref reservation_claim
+  local reservation_branch reservation_descriptor reservation_value
   origin="$(canonical_workspace_origin_url "$root")" || return 1
+  WORK_REF_OWNED_COUNT=0; WORK_REF_OWNED_REFS=(); WORK_REF_OWNED_OIDS=()
+  WORK_REF_OWNED_VALUES=(); WORK_REF_OWNED_DESCRIPTOR="$expected_descriptor"
   rows="$(git ls-remote --heads "$origin" \
     'refs/heads/workbench-coordination/work-refs/*' 2>/dev/null)" || return 1
   while IFS=$'\t' read -r oid ref; do
@@ -3060,25 +3141,194 @@ work_ref_reservations_release_claim() {
     output="$(python3 "$(writer_helper)" work-ref-reservation-inspect \
       --repository "$root" --revision "$oid" 2>/dev/null)" || return 1
     reservation_ref=""; reservation_claim=""; reservation_branch=""
+    reservation_descriptor=""; reservation_value=""
     while IFS= read -r line; do
       key="${line%%=*}"; item="${line#*=}"
       case "$key" in
         reservation_ref) reservation_ref="$item" ;;
+        reservation_oid) [ "$item" = "$oid" ] || return 1 ;;
+        work_ref) reservation_value="$item" ;;
         claim_id) reservation_claim="$item" ;;
         branch) reservation_branch="$item" ;;
+        descriptor_digest) reservation_descriptor="$item" ;;
       esac
     done <<< "$output"
     [ "$reservation_ref" = "$ref" ] || return 1
     [ "$reservation_claim" = "$claim_id" ] \
       && [ "$reservation_branch" = "$branch" ] || continue
-    [ "$ref" != "$keep_ref" ] || continue
-    matched=true
-    [ "${WORKBENCH_TEST_WORK_REF_RELEASE_FAIL:-0}" != 1 ] || return 1
-    git -C "$root" push --quiet --force-with-lease="$ref:$oid" \
-      "$origin" ":$ref" >/dev/null 2>&1 || return 1
-    [ -z "$(git ls-remote --heads "$origin" "$ref" 2>/dev/null)" ] || return 1
+    if [ -z "$WORK_REF_OWNED_DESCRIPTOR" ]; then
+      WORK_REF_OWNED_DESCRIPTOR="$reservation_descriptor"
+    fi
+    [ "$reservation_descriptor" = "$WORK_REF_OWNED_DESCRIPTOR" ] || return 1
+    WORK_REF_OWNED_REFS[$WORK_REF_OWNED_COUNT]="$ref"
+    WORK_REF_OWNED_OIDS[$WORK_REF_OWNED_COUNT]="$oid"
+    WORK_REF_OWNED_VALUES[$WORK_REF_OWNED_COUNT]="$reservation_value"
+    WORK_REF_OWNED_COUNT=$((WORK_REF_OWNED_COUNT + 1))
   done <<< "$rows"
-  [ "$matched" = true ] || return 0
+}
+
+work_ref_reservation_prepare() {
+  local root="$1" value="$2" origin observe_rc
+  work_ref_reservation_build "$root" "$value" || return 2
+  origin="$(canonical_workspace_origin_url "$root")" || return 2
+  WORK_REF_RESERVATION_EXPECTED_OID=""
+  if work_ref_reservation_observe "$root" "$origin" "$value" \
+    "$WORK_REF_RESERVATION_REF"; then
+    [ "$WORK_REF_REMOTE_OID" = "$WORK_REF_RESERVATION_OID" ] || return 3
+    WORK_REF_RESERVATION_EXPECTED_OID="$WORK_REF_REMOTE_OID"
+    return 0
+  else
+    observe_rc=$?
+    [ "$observe_rc" -eq 1 ] || return 2
+  fi
+}
+
+work_ref_selection_build() {
+  local root="$1" value="$2" previous="$3" output line key item
+  local args=(work-ref-selection-build --repository "$root" \
+    --claim-id "$(index_get claim_id)" --branch "$(index_get branch)" \
+    --descriptor-digest "$(index_get workspace_authority_descriptor_digest)")
+  [ -z "$value" ] || args+=(--work-ref "$value" --reservation-oid "$WORK_REF_RESERVATION_OID")
+  [ -z "$previous" ] || args+=(--previous-selection-oid "$previous")
+  output="$(python3 "$(writer_helper)" "${args[@]}" 2>/dev/null)" || return 1
+  WORK_REF_NEXT_SELECTION_REF=""; WORK_REF_NEXT_SELECTION_OID=""
+  while IFS= read -r line; do
+    key="${line%%=*}"; item="${line#*=}"
+    case "$key" in
+      selection_ref) WORK_REF_NEXT_SELECTION_REF="$item" ;;
+      selection_oid) WORK_REF_NEXT_SELECTION_OID="$item" ;;
+    esac
+  done <<< "$output"
+  [ "$WORK_REF_NEXT_SELECTION_REF" = "$WORK_REF_SELECTION_REF" ] \
+    && [ -n "$WORK_REF_NEXT_SELECTION_OID" ]
+}
+
+work_ref_selection_reconcile_local() {
+  local root="$1" claim_id branch descriptor local_value observe_rc
+  claim_id="$(index_get claim_id)"; branch="$(index_get branch)"
+  descriptor="$(index_get workspace_authority_descriptor_digest)"
+  WORK_REF_LOCAL_RECONCILED=false
+  if work_ref_selection_observe "$root" "$claim_id" "$branch" "$descriptor"; then
+    local_value="$(index_get work_ref)"
+    if [ "$local_value" != "$WORK_REF_SELECTION_WORK_REF" ]; then
+      if [ -n "$WORK_REF_SELECTION_WORK_REF" ]; then
+        frontmatter_set "$TASK_DIR/task/index.md" work_ref "$WORK_REF_SELECTION_WORK_REF"
+      else
+        frontmatter_delete "$TASK_DIR/task/index.md" work_ref
+      fi
+      WORK_REF_LOCAL_RECONCILED=true
+    fi
+    return 0
+  else
+    observe_rc=$?
+    [ "$observe_rc" -eq 1 ] || return 2
+  fi
+  WORK_REF_SELECTION_OID=""; WORK_REF_SELECTION_WORK_REF=""
+  WORK_REF_SELECTION_RESERVATION_REF=""; WORK_REF_SELECTION_RESERVATION_OID=""
+  WORK_REF_SELECTION_DESCRIPTOR="$descriptor"
+}
+
+work_ref_selection_transition() {
+  local root="$1" value="$2" claim_id branch descriptor origin reservation_rc i stale=0
+  local push_ok=false observed_rc expected_selection="$WORK_REF_SELECTION_OID"
+  local -a push_args refspecs
+  claim_id="$(index_get claim_id)"; branch="$(index_get branch)"
+  descriptor="$(index_get workspace_authority_descriptor_digest)"
+  origin="$(canonical_workspace_origin_url "$root")" || return 2
+  if [ -n "$value" ]; then
+    if work_ref_reservation_prepare "$root" "$value"; then :; else
+      reservation_rc=$?; return "$reservation_rc"
+    fi
+  else
+    WORK_REF_RESERVATION_REF=""; WORK_REF_RESERVATION_OID=""
+    WORK_REF_RESERVATION_EXPECTED_OID=""
+  fi
+  work_ref_reservations_list_claim "$root" "$claim_id" "$branch" "$descriptor" || return 2
+  for ((i=0; i<WORK_REF_OWNED_COUNT; i++)); do
+    [ "${WORK_REF_OWNED_REFS[$i]}" = "$WORK_REF_RESERVATION_REF" ] || stale=$((stale + 1))
+  done
+  if [ -n "$WORK_REF_SELECTION_OID" ] \
+    && [ "$WORK_REF_SELECTION_WORK_REF" = "$value" ] \
+    && [ "$WORK_REF_SELECTION_RESERVATION_REF" = "$WORK_REF_RESERVATION_REF" ] \
+    && [ "$WORK_REF_SELECTION_RESERVATION_OID" = "$WORK_REF_RESERVATION_OID" ] \
+    && [ "$stale" -eq 0 ]; then
+    return 0
+  fi
+  work_ref_selection_build "$root" "$value" "$WORK_REF_SELECTION_OID" || return 2
+  push_args=(push --quiet --atomic \
+    --force-with-lease="$WORK_REF_SELECTION_REF:$WORK_REF_SELECTION_OID")
+  refspecs=("$WORK_REF_NEXT_SELECTION_OID:$WORK_REF_SELECTION_REF")
+  if [ -n "$value" ]; then
+    push_args+=(--force-with-lease="$WORK_REF_RESERVATION_REF:$WORK_REF_RESERVATION_EXPECTED_OID")
+    refspecs+=("$WORK_REF_RESERVATION_OID:$WORK_REF_RESERVATION_REF")
+  fi
+  for ((i=0; i<WORK_REF_OWNED_COUNT; i++)); do
+    [ "${WORK_REF_OWNED_REFS[$i]}" != "$WORK_REF_RESERVATION_REF" ] || continue
+    push_args+=(--force-with-lease="${WORK_REF_OWNED_REFS[$i]}:${WORK_REF_OWNED_OIDS[$i]}")
+    refspecs+=(":${WORK_REF_OWNED_REFS[$i]}")
+  done
+  [ "${WORKBENCH_TEST_WORK_REF_RELEASE_FAIL:-0}" != 1 ] || return 2
+  if [ -n "${WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK:-}" ]; then
+    "$WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK" "$value" "$claim_id" || return 2
+  fi
+  if git -C "$root" "${push_args[@]}" "$origin" "${refspecs[@]}" \
+    >/dev/null 2>&1; then push_ok=true; fi
+  if work_ref_selection_observe "$root" "$claim_id" "$branch" "$descriptor"; then
+    if [ "$WORK_REF_SELECTION_OID" != "$WORK_REF_NEXT_SELECTION_OID" ]; then
+      [ "$push_ok" = false ] && [ "$WORK_REF_SELECTION_OID" = "$expected_selection" ] \
+        && return 2
+      return 4
+    fi
+  else
+    observed_rc=$?
+    if [ "$observed_rc" -eq 1 ] && [ -n "$value" ] \
+      && work_ref_reservation_observe "$root" "$origin" "$value" "$WORK_REF_RESERVATION_REF" \
+      && [ "$WORK_REF_REMOTE_OID" != "$WORK_REF_RESERVATION_OID" ]; then
+      return 3
+    fi
+    [ "$observed_rc" -eq 1 ] && [ "$push_ok" = false ] || return 2
+    return 2
+  fi
+  work_ref_reservations_list_claim "$root" "$claim_id" "$branch" "$descriptor" || return 2
+  if [ -n "$value" ]; then
+    [ "$WORK_REF_OWNED_COUNT" -eq 1 ] \
+      && [ "${WORK_REF_OWNED_REFS[0]}" = "$WORK_REF_RESERVATION_REF" ] \
+      && [ "${WORK_REF_OWNED_OIDS[0]}" = "$WORK_REF_RESERVATION_OID" ] || return 2
+  else
+    [ "$WORK_REF_OWNED_COUNT" -eq 0 ] || return 2
+  fi
+}
+
+work_ref_reservations_release_claim() {
+  local root="$1" claim_id="$2" branch="$3" selection_rc origin descriptor i
+  local -a push_args refspecs
+  origin="$(canonical_workspace_origin_url "$root")" || return 1
+  if work_ref_selection_observe "$root" "$claim_id" "$branch"; then
+    descriptor="$WORK_REF_SELECTION_DESCRIPTOR"
+  else
+    selection_rc=$?
+    [ "$selection_rc" -eq 1 ] || return 1
+    descriptor=""
+  fi
+  work_ref_reservations_list_claim "$root" "$claim_id" "$branch" "$descriptor" || return 1
+  [ -n "$WORK_REF_SELECTION_OID" ] || [ "$WORK_REF_OWNED_COUNT" -gt 0 ] || return 0
+  [ "${WORKBENCH_TEST_WORK_REF_RELEASE_FAIL:-0}" != 1 ] || return 1
+  push_args=(push --quiet --atomic)
+  refspecs=()
+  if [ -n "$WORK_REF_SELECTION_OID" ]; then
+    push_args+=(--force-with-lease="$WORK_REF_SELECTION_REF:$WORK_REF_SELECTION_OID")
+    refspecs+=(":$WORK_REF_SELECTION_REF")
+  fi
+  for ((i=0; i<WORK_REF_OWNED_COUNT; i++)); do
+    push_args+=(--force-with-lease="${WORK_REF_OWNED_REFS[$i]}:${WORK_REF_OWNED_OIDS[$i]}")
+    refspecs+=(":${WORK_REF_OWNED_REFS[$i]}")
+  done
+  git -C "$root" "${push_args[@]}" "$origin" "${refspecs[@]}" \
+    >/dev/null 2>&1 || return 1
+  if work_ref_selection_observe "$root" "$claim_id" "$branch"; then return 1
+  else [ "$?" -eq 1 ] || return 1; fi
+  work_ref_reservations_list_claim "$root" "$claim_id" "$branch" "$descriptor" || return 1
+  [ "$WORK_REF_OWNED_COUNT" -eq 0 ]
 }
 
 invalidate_unsealed_policy_context() {
@@ -3131,7 +3381,7 @@ cmd_refs() {
       ;;
     set)
       local context_ref="" work_ref="" set_context="" set_work="" clear_context="" clear_work=""
-      local duplicate format="" changed=false duplicate_rc reservation_rc root reservation_ref=""
+      local duplicate format="" changed=false duplicate_rc reservation_rc root
       while [ $# -gt 0 ]; do
         case "$1" in
           --context-ref)
@@ -3152,7 +3402,7 @@ cmd_refs() {
       [ -n "$set_context$set_work$clear_context$clear_work" ] || usage_error "refs set requires a set or clear option"
       [ -z "$set_context$clear_context" ] || [ -z "$set_context" ] || [ -z "$clear_context" ] || usage_error "context set and clear are mutually exclusive"
       [ -z "$set_work$clear_work" ] || [ -z "$set_work" ] || [ -z "$clear_work" ] || usage_error "work set and clear are mutually exclusive"
-      require_v2_task
+      require_v2_task task.refs.set
       require_mutable_task task.refs.set || return 1
       root="$(wb_root)"
       if [ -n "$set_context$clear_context" ] \
@@ -3161,6 +3411,11 @@ cmd_refs() {
         die "policy-context-immutable"
       fi
       if [ -n "$set_context" ]; then validate_namespaced_ref "$context_ref"; fi
+      if [ -n "$set_work$clear_work" ]; then
+        work_ref_selection_reconcile_local "$root" \
+          || die "work-ref-selection-unavailable: $(index_get claim_id)"
+        [ "$WORK_REF_LOCAL_RECONCILED" = false ] || changed=true
+      fi
       if [ -n "$set_work" ]; then
         validate_namespaced_ref "$work_ref"
         if duplicate="$(authoritative_duplicate_active_work_ref "$work_ref")"; then
@@ -3175,22 +3430,30 @@ cmd_refs() {
           duplicate_rc=$?
           [ "$duplicate_rc" -eq 1 ] || die "active-task-local-identity-unreconciled"
         fi
-        if work_ref_reservation_acquire "$root" "$work_ref"; then
-          :
-        else
-          reservation_rc=$?
-          if [ "$reservation_rc" -eq 3 ]; then
-            die "duplicate active work_ref: $work_ref ($WORK_REF_REMOTE_BRANCH)"
-          fi
-          die "work-ref-reservation-unavailable: $work_ref"
-        fi
-        reservation_ref="$WORK_REF_RESERVATION_REF"
       fi
       if { [ -n "$set_context" ] && [ "$(index_get context_ref)" != "$context_ref" ]; } \
         || { [ -n "$clear_context" ] && [ -n "$(index_get context_ref)" ]; }; then
         current_task_identity
         invalidate_unsealed_policy_context || return 1
       fi
+      if [ -n "$set_work" ]; then
+        if work_ref_selection_transition "$root" "$work_ref"; then :; else
+          reservation_rc=$?
+          case "$reservation_rc" in
+            3) die "duplicate active work_ref: $work_ref ($WORK_REF_REMOTE_BRANCH)" ;;
+            4) die "work-ref-selection-conflict: $work_ref" ;;
+            *) die "work-ref-reservation-unavailable: $work_ref" ;;
+          esac
+        fi
+      elif [ -n "$clear_work" ]; then
+        if work_ref_selection_transition "$root" ""; then :; else
+          reservation_rc=$?
+          [ "$reservation_rc" -ne 4 ] || die "work-ref-selection-conflict"
+          die "work-ref-reservation-unavailable"
+        fi
+      fi
+      [ "${WORKBENCH_TEST_WORK_REF_POSTWRITE_FAIL:-0}" != 1 ] \
+        || die "work-ref-local-reconciliation-required"
       if [ -n "$set_context" ] && [ "$(index_get context_ref)" != "$context_ref" ]; then
         frontmatter_set "$TASK_DIR/task/index.md" context_ref "$context_ref"; changed=true
       elif [ -n "$clear_context" ] && [ -n "$(index_get context_ref)" ]; then
@@ -3202,15 +3465,6 @@ cmd_refs() {
       elif [ -n "$clear_work" ] && [ -n "$(index_get work_ref)" ]; then
         frontmatter_delete "$TASK_DIR/task/index.md" work_ref
         changed=true
-      fi
-      if [ -n "$set_work" ]; then
-        work_ref_reservations_release_claim "$root" "$(index_get claim_id)" \
-          "$(index_get branch)" "$reservation_ref" \
-          || die "work-ref-reservation-release-unreconciled: $work_ref"
-      elif [ -n "$clear_work" ]; then
-        work_ref_reservations_release_claim "$root" "$(index_get claim_id)" \
-          "$(index_get branch)" \
-          || die "work-ref-reservation-release-unreconciled"
       fi
       print_refs_json "$changed"
       ;;
@@ -3379,7 +3633,7 @@ cmd_policy_context() {
     esac
   done
   [ "$format" = json ] || die "policy-context requires --format json"
-  require_v2_task; require_mutable_task "task.policy-context.$sub" || return 1
+  require_v2_task "task.policy-context.$sub"; require_mutable_task "task.policy-context.$sub" || return 1
   current_task_identity
   local dir state stored_registration context_ref parsed line key value
   local registration_id="" registration_digest="" registration_json="" actor="" registered_at=""
@@ -4039,7 +4293,7 @@ cmd_deliverable() {
           *) die "unknown option: $1" ;;
         esac
       done
-      require_v2_task
+      require_v2_task task.deliverable.declare
       require_mutable_task task.deliverable.declare || return 1
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
       validate_record_id deliverable_id "$id"
@@ -4098,7 +4352,7 @@ cmd_deliverable() {
           --format) format="$2"; shift 2 ;; *) die "unknown option: $1" ;;
         esac
       done
-      require_v2_task
+      require_v2_task task.deliverable.accept
       require_mutable_task task.deliverable.accept || return 1
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
       validate_record_id deliverable_id "$id"
@@ -4319,7 +4573,7 @@ cmd_deliverable() {
           *) die "unknown option: $1" ;;
         esac
       done
-      require_v2_task
+      require_v2_task task.deliverable.update
       require_mutable_task task.deliverable.update || return 1
       validate_record_id deliverable_id "$id"
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
@@ -4561,7 +4815,7 @@ cmd_required_check() {
           --deliverable-id) deliverable_id="$2"; shift 2 ;; --format) format="$2"; shift 2 ;;
           *) die "unknown option: $1" ;; esac
       done
-      require_v2_task
+      require_v2_task task.required-check.declare
       require_mutable_task task.required-check.declare || return 1
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
       validate_record_id check_id "$id"; require_single_line owner "$owner"
@@ -4608,7 +4862,7 @@ cmd_required_check() {
           *) die "unknown option: $1" ;;
         esac
       done
-      require_v2_task
+      require_v2_task task.required-check.waive
       require_mutable_task task.required-check.waive || return 1
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
       validate_record_id check_id "$id"
@@ -4743,7 +4997,7 @@ cmd_harvest() {
       ;;
     seal)
       [ "$#" -eq 2 ] && [ "$1" = --format ] && [ "$2" = json ] || die "usage: workbench task harvest seal --format json"
-      require_v2_task
+      require_v2_task task.harvest.seal
       require_mutable_task task.harvest.seal || return 1
       local dir changed=false; dir="$(harvest_dir)"; mkdir -p "$dir"
       if ! harvest_is_sealed; then printf 'true\n' > "$dir/sealed"; changed=true; fi
@@ -4756,7 +5010,7 @@ cmd_harvest() {
       while [ $# -gt 0 ]; do case "$1" in --id) id="$2"; shift 2 ;; --kind) kind="$2"; shift 2 ;;
         --source-ref) source_ref="$2"; shift 2 ;; --format) format="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
-      require_v2_task
+      require_v2_task task.harvest.candidate.declare
       require_mutable_task task.harvest.candidate.declare || return 1
       validate_record_id candidate_id "$id"; case "$kind" in decision|lesson|runbook|framework-change) ;; *) die "invalid harvest kind: $kind" ;; esac
       require_single_line source_ref "$source_ref"; dir="$(harvest_dir)/candidates"; mkdir -p "$dir"; file="$dir/$id.record"
@@ -4777,7 +5031,7 @@ cmd_harvest() {
         --authorization-file) authorization_file="$2"; shift 2 ;; --format) format="$2"; shift 2 ;;
         *) die "unknown option: $1" ;; esac; done
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
-      require_v2_task
+      require_v2_task task.harvest.dispose
       require_mutable_task task.harvest.dispose || return 1
       current_task_identity; validate_record_id candidate_id "$id"
       local file kind source_ref state old_decision old_target old_reason old_reason_ref
@@ -4894,7 +5148,7 @@ cmd_evidence() {
           *) die "unknown option: $1" ;;
         esac
       done
-      require_v2_task
+      require_v2_task task.evidence.record
       require_mutable_task task.evidence.record || return 1
       [ "$format" = json ] || die "unsupported format: ${format:-none}"
       validate_record_id evidence_id "$id"
@@ -6313,7 +6567,7 @@ cmd_verify() {
   local format="" terminal=false outcome
   while [ $# -gt 0 ]; do case "$1" in --format) format="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac; done
   [ "$format" = json ] || die "unsupported format: ${format:-none}"
-  require_v2_task; current_task_identity
+  require_v2_task task.verify; current_task_identity
   if outcome="$(task_terminal_outcome "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$CURRENT_BRANCH" "$TASK_DIR")"; then
     terminal=true
   fi
@@ -6710,7 +6964,7 @@ cmd_complete() {
       --format) format="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac
   done
   [ "$format" = json ] || die "unsupported format: ${format:-none}"
-  require_v2_task; current_task_identity
+  require_v2_task task.complete; current_task_identity
   if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ] \
     && [ -f "$(task_state_dir)/terminal" ] \
     && [ "$(record_get "$(task_state_dir)/terminal" outcome)" = completed ] \
@@ -6799,7 +7053,7 @@ cmd_abandon() {
   done
   [ "$format" = json ] || die "unsupported format: ${format:-none}"; require_single_line reason_code "$reason_code"
   [ -z "$reason_ref" ] || require_single_line reason_ref "$reason_ref"
-  require_v2_task; current_task_identity
+  require_v2_task task.abandon; current_task_identity
   if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ] \
     && [ -f "$(task_state_dir)/terminal" ] \
     && [ "$(record_get "$(task_state_dir)/terminal" outcome)" = abandoned ] \
