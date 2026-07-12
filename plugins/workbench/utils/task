@@ -2963,6 +2963,122 @@ authoritative_duplicate_active_work_ref() {
   printf '%s\n' "$branch"
 }
 
+work_ref_reservation_build() {
+  local root="$1" value="$2" output line key item
+  output="$(python3 "$(writer_helper)" work-ref-reservation-build \
+    --repository "$root" --work-ref "$value" --claim-id "$(index_get claim_id)" \
+    --branch "$(index_get branch)" \
+    --descriptor-digest "$(index_get workspace_authority_descriptor_digest)")" \
+    || return 1
+  WORK_REF_RESERVATION_REF=""; WORK_REF_RESERVATION_OID=""
+  while IFS= read -r line; do
+    key="${line%%=*}"; item="${line#*=}"
+    case "$key" in
+      reservation_ref) WORK_REF_RESERVATION_REF="$item" ;;
+      reservation_oid) WORK_REF_RESERVATION_OID="$item" ;;
+    esac
+  done <<< "$output"
+  [ -n "$WORK_REF_RESERVATION_REF" ] && [ -n "$WORK_REF_RESERVATION_OID" ]
+}
+
+work_ref_reservation_observe() {
+  local root="$1" origin="$2" value="$3" ref="$4" rows count oid advertised
+  local output line key item
+  rows="$(git ls-remote --heads "$origin" "$ref" 2>/dev/null)" || return 2
+  count="$(printf '%s\n' "$rows" | sed '/^$/d' | wc -l | tr -d ' ')"
+  [ "$count" -le 1 ] || return 2
+  if [ "$count" -eq 0 ]; then return 1; fi
+  IFS=$'\t' read -r oid advertised <<EOF
+$rows
+EOF
+  [ "$advertised" = "$ref" ] \
+    && printf '%s' "$oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+    || return 2
+  git -C "$root" fetch --quiet --no-tags --no-write-fetch-head "$origin" "$oid" \
+    >/dev/null 2>&1 || return 2
+  output="$(python3 "$(writer_helper)" work-ref-reservation-inspect \
+    --repository "$root" --revision "$oid" --work-ref "$value" 2>/dev/null)" \
+    || return 2
+  WORK_REF_REMOTE_OID=""; WORK_REF_REMOTE_CLAIM=""; WORK_REF_REMOTE_BRANCH=""
+  WORK_REF_REMOTE_DESCRIPTOR=""
+  while IFS= read -r line; do
+    key="${line%%=*}"; item="${line#*=}"
+    case "$key" in
+      reservation_oid) WORK_REF_REMOTE_OID="$item" ;;
+      claim_id) WORK_REF_REMOTE_CLAIM="$item" ;;
+      branch) WORK_REF_REMOTE_BRANCH="$item" ;;
+      descriptor_digest) WORK_REF_REMOTE_DESCRIPTOR="$item" ;;
+    esac
+  done <<< "$output"
+  [ "$WORK_REF_REMOTE_OID" = "$oid" ] && [ -n "$WORK_REF_REMOTE_CLAIM" ] \
+    && [ -n "$WORK_REF_REMOTE_BRANCH" ] && [ -n "$WORK_REF_REMOTE_DESCRIPTOR" ]
+}
+
+work_ref_reservation_acquire() {
+  local root="$1" value="$2" origin observe_rc
+  work_ref_reservation_build "$root" "$value" || return 2
+  origin="$(canonical_workspace_origin_url "$root")" || return 2
+  if work_ref_reservation_observe "$root" "$origin" "$value" \
+    "$WORK_REF_RESERVATION_REF"; then
+    [ "$WORK_REF_REMOTE_OID" = "$WORK_REF_RESERVATION_OID" ] && return 0
+    return 3
+  else
+    observe_rc=$?
+    [ "$observe_rc" -eq 1 ] || return 2
+  fi
+  if [ -n "${WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK:-}" ]; then
+    "$WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK" "$value" "$(index_get claim_id)" \
+      || return 2
+  fi
+  git -C "$root" push --quiet "$origin" \
+    "$WORK_REF_RESERVATION_OID:$WORK_REF_RESERVATION_REF" >/dev/null 2>&1 || true
+  if work_ref_reservation_observe "$root" "$origin" "$value" \
+    "$WORK_REF_RESERVATION_REF"; then
+    [ "$WORK_REF_REMOTE_OID" = "$WORK_REF_RESERVATION_OID" ] && return 0
+    return 3
+  fi
+  return 2
+}
+
+work_ref_reservations_release_claim() {
+  local root="$1" claim_id="$2" branch="$3" keep_ref="${4:-}" origin rows oid ref
+  local output line key item
+  local reservation_ref reservation_claim reservation_branch matched=false
+  origin="$(canonical_workspace_origin_url "$root")" || return 1
+  rows="$(git ls-remote --heads "$origin" \
+    'refs/heads/workbench-coordination/work-refs/*' 2>/dev/null)" || return 1
+  while IFS=$'\t' read -r oid ref; do
+    [ -n "$oid$ref" ] || continue
+    printf '%s' "$oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+      && printf '%s' "$ref" | grep -Eq \
+        '^refs/heads/workbench-coordination/work-refs/[0-9a-f]{64}$' \
+      || return 1
+    git -C "$root" fetch --quiet --no-tags --no-write-fetch-head "$origin" "$oid" \
+      >/dev/null 2>&1 || return 1
+    output="$(python3 "$(writer_helper)" work-ref-reservation-inspect \
+      --repository "$root" --revision "$oid" 2>/dev/null)" || return 1
+    reservation_ref=""; reservation_claim=""; reservation_branch=""
+    while IFS= read -r line; do
+      key="${line%%=*}"; item="${line#*=}"
+      case "$key" in
+        reservation_ref) reservation_ref="$item" ;;
+        claim_id) reservation_claim="$item" ;;
+        branch) reservation_branch="$item" ;;
+      esac
+    done <<< "$output"
+    [ "$reservation_ref" = "$ref" ] || return 1
+    [ "$reservation_claim" = "$claim_id" ] \
+      && [ "$reservation_branch" = "$branch" ] || continue
+    [ "$ref" != "$keep_ref" ] || continue
+    matched=true
+    [ "${WORKBENCH_TEST_WORK_REF_RELEASE_FAIL:-0}" != 1 ] || return 1
+    git -C "$root" push --quiet --force-with-lease="$ref:$oid" \
+      "$origin" ":$ref" >/dev/null 2>&1 || return 1
+    [ -z "$(git ls-remote --heads "$origin" "$ref" 2>/dev/null)" ] || return 1
+  done <<< "$rows"
+  [ "$matched" = true ] || return 0
+}
+
 invalidate_unsealed_policy_context() {
   local dir state registration target action_id action_file policy_util entry count=0
   dir="$(task_state_dir)/policy-context"; state="$dir/state.record"
@@ -3013,7 +3129,7 @@ cmd_refs() {
       ;;
     set)
       local context_ref="" work_ref="" set_context="" set_work="" clear_context="" clear_work=""
-      local duplicate format="" changed=false duplicate_rc
+      local duplicate format="" changed=false duplicate_rc reservation_rc root reservation_ref=""
       while [ $# -gt 0 ]; do
         case "$1" in
           --context-ref)
@@ -3036,6 +3152,7 @@ cmd_refs() {
       [ -z "$set_work$clear_work" ] || [ -z "$set_work" ] || [ -z "$clear_work" ] || usage_error "work set and clear are mutually exclusive"
       require_v2_task
       require_mutable_task task.refs.set || return 1
+      root="$(wb_root)"
       if [ -n "$set_context$clear_context" ] \
         && [ -f "$(task_state_dir)/policy-context/state.record" ] \
         && [ "$(record_get "$(task_state_dir)/policy-context/state.record" sealed)" = true ]; then
@@ -3056,6 +3173,16 @@ cmd_refs() {
           duplicate_rc=$?
           [ "$duplicate_rc" -eq 1 ] || die "active-task-local-identity-unreconciled"
         fi
+        if work_ref_reservation_acquire "$root" "$work_ref"; then
+          :
+        else
+          reservation_rc=$?
+          if [ "$reservation_rc" -eq 3 ]; then
+            die "duplicate active work_ref: $work_ref ($WORK_REF_REMOTE_BRANCH)"
+          fi
+          die "work-ref-reservation-unavailable: $work_ref"
+        fi
+        reservation_ref="$WORK_REF_RESERVATION_REF"
       fi
       if { [ -n "$set_context" ] && [ "$(index_get context_ref)" != "$context_ref" ]; } \
         || { [ -n "$clear_context" ] && [ -n "$(index_get context_ref)" ]; }; then
@@ -3068,9 +3195,20 @@ cmd_refs() {
         frontmatter_delete "$TASK_DIR/task/index.md" context_ref; changed=true
       fi
       if [ -n "$set_work" ] && [ "$(index_get work_ref)" != "$work_ref" ]; then
-        frontmatter_set "$TASK_DIR/task/index.md" work_ref "$work_ref"; changed=true
+        frontmatter_set "$TASK_DIR/task/index.md" work_ref "$work_ref"
+        changed=true
       elif [ -n "$clear_work" ] && [ -n "$(index_get work_ref)" ]; then
-        frontmatter_delete "$TASK_DIR/task/index.md" work_ref; changed=true
+        frontmatter_delete "$TASK_DIR/task/index.md" work_ref
+        changed=true
+      fi
+      if [ -n "$set_work" ]; then
+        work_ref_reservations_release_claim "$root" "$(index_get claim_id)" \
+          "$(index_get branch)" "$reservation_ref" \
+          || die "work-ref-reservation-release-unreconciled: $work_ref"
+      elif [ -n "$clear_work" ]; then
+        work_ref_reservations_release_claim "$root" "$(index_get claim_id)" \
+          "$(index_get branch)" \
+          || die "work-ref-reservation-release-unreconciled"
       fi
       print_refs_json "$changed"
       ;;
@@ -7335,6 +7473,10 @@ cleanup_apply_removal_plan() {
   fi
   [ ! -d "$dir" ] || return 1
   CLEANUP_TASK_WORKSPACE_REMOVED=true
+  if ! work_ref_reservations_release_claim "$root" "$CLEANUP_CLAIM_ID" "$branch"; then
+    cleanup_add_blocker work-ref-reservation-release-unreconciled "$branch"
+    return 1
+  fi
   if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
     git -C "$root" branch -D "$branch" >/dev/null || return 1
   fi

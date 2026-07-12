@@ -116,6 +116,23 @@ digits, dots, underscores, or hyphens. Examples are `toolbox:product/acme` and
 duplicate active `work_ref` values, and reports the references. Only the namespace owner
 interprets the value. Missing references have no product meaning and remain valid.
 
+Active-task inventory is the semantic preflight for `work_ref` uniqueness, but it is not the
+serialization point. Every non-null value also owns one Git reservation at
+`refs/heads/workbench-coordination/work-refs/<sha256(work_ref)>`. The ref is created by a
+non-force push of a deterministic root commit whose exact `work-ref.json` binds the value,
+task claim, task branch, and workspace-authority descriptor. Concurrent setters may both
+pass inventory; the remote ref creation still selects exactly one winner. An existing
+malformed or differently bound reservation fails closed and is never overwritten.
+
+Changing or clearing a value uses exact-OID lease deletion, and a successful retry removes
+stale reservations owned by the same claim. A terminal task retains its reservation until
+cleanup has removed the task workspace; cleanup then releases every reservation bound to
+that claim and branch before deleting the local branch. This ordering lets a cleanup retry
+finish after the workspace is gone without making the work item concurrently reusable while
+user bytes still exist. Tasks created before this reservation contract remain readable;
+their current value is reserved lazily on the next matching `refs set`, while authoritative
+inventory continues to protect them during migration.
+
 ### Work-item and multi-context boundary
 
 One task has one primary work item, represented by at most one `work_ref`, and zero or more

@@ -50,6 +50,13 @@ ACTIVE_TASK_FIELDS = {
     "index_revision",
     "pull_request",
 }
+WORK_REF_RESERVATION_FIELDS = (
+    "contract_version",
+    "work_ref",
+    "claim_id",
+    "branch",
+    "workspace_authority_descriptor_digest",
+)
 
 CLAIM_FIELDS = (
     "kind",
@@ -876,6 +883,130 @@ def cmd_work_ref_conflict(args: argparse.Namespace) -> None:
             "conflicts": conflicts,
         }
     )
+
+
+def work_ref_reservation_ref(work_ref: str) -> str:
+    if NAMESPACED_REF.fullmatch(work_ref) is None:
+        raise ValueError("work_ref is invalid")
+    suffix = hashlib.sha256(work_ref.encode("utf-8")).hexdigest()
+    return "refs/heads/workbench-coordination/work-refs/" + suffix
+
+
+def validate_work_ref_reservation(value: Any) -> Mapping[str, str]:
+    if not isinstance(value, dict) or tuple(value) != WORK_REF_RESERVATION_FIELDS:
+        raise ValueError("work-ref reservation fields are not canonical")
+    if value["contract_version"] != "workbench-work-ref-reservation/v1":
+        raise ValueError("unsupported work-ref reservation contract")
+    if NAMESPACED_REF.fullmatch(value["work_ref"] if isinstance(value["work_ref"], str) else "") is None:
+        raise ValueError("work-ref reservation work_ref is invalid")
+    require_text(value["claim_id"], "work-ref reservation claim_id")
+    branch = require_text(value["branch"], "work-ref reservation branch")
+    if subprocess.call(
+        ["git", "check-ref-format", "refs/heads/" + branch],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ) != 0:
+        raise ValueError("work-ref reservation branch is invalid")
+    require_digest(
+        value["workspace_authority_descriptor_digest"],
+        "work-ref reservation descriptor",
+    )
+    return value
+
+
+def reservation_git_input(
+    repository: str, arguments: Sequence[str], raw: bytes, identity: bool = False
+) -> str:
+    environment = dict(os.environ)
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    if identity:
+        environment.update(
+            {
+                "GIT_AUTHOR_NAME": "workbench",
+                "GIT_AUTHOR_EMAIL": "workbench@invalid.local",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+                "GIT_COMMITTER_NAME": "workbench",
+                "GIT_COMMITTER_EMAIL": "workbench@invalid.local",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+            }
+        )
+    return subprocess.check_output(
+        ["git", "-C", repository, *arguments],
+        input=raw,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+    ).decode("ascii").strip()
+
+
+def print_work_ref_reservation_shell(
+    value: Mapping[str, str], revision: str
+) -> None:
+    sys.stdout.write(
+        "reservation_ref={}\nreservation_oid={}\nwork_ref={}\nclaim_id={}\n"
+        "branch={}\ndescriptor_digest={}\n".format(
+            work_ref_reservation_ref(value["work_ref"]),
+            revision,
+            value["work_ref"],
+            value["claim_id"],
+            value["branch"],
+            value["workspace_authority_descriptor_digest"],
+        )
+    )
+
+
+def cmd_work_ref_reservation_build(args: argparse.Namespace) -> None:
+    value = validate_work_ref_reservation(
+        {
+            "contract_version": "workbench-work-ref-reservation/v1",
+            "work_ref": args.work_ref,
+            "claim_id": args.claim_id,
+            "branch": args.branch,
+            "workspace_authority_descriptor_digest": args.descriptor_digest,
+        }
+    )
+    raw = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    blob = reservation_git_input(args.repository, ("hash-object", "-w", "--stdin"), raw)
+    tree = reservation_git_input(
+        args.repository,
+        ("mktree",),
+        "100644 blob {}\twork-ref.json\n".format(blob).encode("ascii"),
+    )
+    revision = reservation_git_input(
+        args.repository,
+        ("commit-tree", tree),
+        b"workbench: reserve work reference\n",
+        True,
+    )
+    if OID.fullmatch(revision) is None:
+        raise ValueError("work-ref reservation revision is invalid")
+    print_work_ref_reservation_shell(value, revision)
+
+
+def cmd_work_ref_reservation_inspect(args: argparse.Namespace) -> None:
+    if OID.fullmatch(args.revision) is None:
+        raise ValueError("work-ref reservation revision is invalid")
+    tree, parents = coordination_commit(args.repository, args.revision)
+    if parents:
+        raise ValueError("work-ref reservation must be a root commit")
+    rows = git_bytes(args.repository, "ls-tree", "-z", tree).split(b"\0")
+    rows = [row for row in rows if row]
+    if len(rows) != 1:
+        raise ValueError("work-ref reservation tree is not exact")
+    metadata, path = rows[0].split(b"\t", 1)
+    mode, kind, blob = metadata.split(b" ", 2)
+    if mode != b"100644" or kind != b"blob" or path != b"work-ref.json":
+        raise ValueError("work-ref reservation tree entry is invalid")
+    raw = git_bytes(args.repository, "cat-file", "blob", blob.decode("ascii"))
+    if not raw.endswith(b"\n") or b"\r" in raw:
+        raise ValueError("work-ref reservation payload is not canonical")
+    value = validate_work_ref_reservation(
+        json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    )
+    if args.work_ref is not None and value["work_ref"] != args.work_ref:
+        raise ValueError("work-ref reservation does not bind its ref")
+    print_work_ref_reservation_shell(value, args.revision)
 
 
 def cmd_matching_active(args: argparse.Namespace) -> None:
@@ -2461,6 +2592,18 @@ def parser() -> argparse.ArgumentParser:
     work_ref.add_argument("--work-ref", required=True)
     work_ref.add_argument("--current-claim-id", required=True)
     work_ref.set_defaults(func=cmd_work_ref_conflict)
+    reservation_build = commands.add_parser("work-ref-reservation-build")
+    reservation_build.add_argument("--repository", required=True)
+    reservation_build.add_argument("--work-ref", required=True)
+    reservation_build.add_argument("--claim-id", required=True)
+    reservation_build.add_argument("--branch", required=True)
+    reservation_build.add_argument("--descriptor-digest", required=True)
+    reservation_build.set_defaults(func=cmd_work_ref_reservation_build)
+    reservation_inspect = commands.add_parser("work-ref-reservation-inspect")
+    reservation_inspect.add_argument("--repository", required=True)
+    reservation_inspect.add_argument("--revision", required=True)
+    reservation_inspect.add_argument("--work-ref")
+    reservation_inspect.set_defaults(func=cmd_work_ref_reservation_inspect)
 
     matching = commands.add_parser("matching-active")
     matching.add_argument("file")

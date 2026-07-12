@@ -199,6 +199,14 @@ mutually exclusive. The output shape for both commands is:
 duplicate active `work_ref` is an integrity failure at exit `1`. Reference grammar and the
 kernel/domain interpretation boundary are defined in [[workbench-v2-governance]].
 
+`work_ref` mutation keeps the authoritative active-task inventory check and then acquires a
+per-value remote Git reservation as the final compare-and-set. A competing valid reservation
+is reported as the same duplicate-work failure. An unreadable, malformed, or unwritable
+reservation reports `work-ref-reservation-unavailable`; a value already written locally but
+whose stale reservation could not be lease-released reports
+`work-ref-reservation-release-unreconciled`. Repeating the same set/clear operation is the
+recovery path and converges all reservations owned by that task claim.
+
 Before a context-policy set is sealed, `context_ref` may be set or cleared. Changing it
 invalidates any unsealed registration, which cannot be reused for the new ref. After seal,
 `context_ref` cannot change or clear; attempts fail with `policy-context-immutable` at exit

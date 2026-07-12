@@ -623,6 +623,10 @@ run_task_in_dir() {
     WORKBENCH_TEST_LIFECYCLE_OBSERVATION="${WORKBENCH_TEST_LIFECYCLE_OBSERVATION:-}" \
     WORKBENCH_TEST_GOVERNED_FINAL_HOOK="${WORKBENCH_TEST_GOVERNED_FINAL_HOOK:-}" \
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
+    WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="${WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK:-}" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_DIR="${WORKBENCH_TEST_WORK_REF_BARRIER_DIR:-}" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_ID="${WORKBENCH_TEST_WORK_REF_BARRIER_ID:-}" \
+    WORKBENCH_TEST_WORK_REF_RELEASE_FAIL="${WORKBENCH_TEST_WORK_REF_RELEASE_FAIL:-0}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
     GH_CLEANUP_RACE_COMMIT_WORKTREE="${GH_CLEANUP_RACE_COMMIT_WORKTREE:-}" \
@@ -652,6 +656,16 @@ run_task() {
 task_dir_for() {
   local repo="$1" issue="${2:-29}"
   printf '%s/.worktrees/task__%s-v2-lifecycle-fixture-%s\n' "$repo" "$issue" "$issue"
+}
+
+work_ref_remote_ref() {
+  printf '%s' "$1" | python3 -c '
+import hashlib
+import sys
+
+value = sys.stdin.buffer.read()
+print("refs/heads/workbench-coordination/work-refs/" + hashlib.sha256(value).hexdigest())
+'
 }
 
 start_task() {
@@ -710,7 +724,7 @@ append_repo_fact() {
 }
 
 prepare_cleanup_fixture() {
-  local case_name="$1" cleanup_payload cleanup_request parsed
+  local case_name="$1" work_ref="${2:-}" cleanup_payload cleanup_request parsed
   CLEANUP_REPO="$(setup_workbench "$case_name")"
   printf '%s\n' 'schema=workbench-policy/v1' 'action.task.abandon=allow' 'action.task.cleanup=allow' \
     > "$CLEANUP_REPO/.workbench/policy.conf"
@@ -718,6 +732,10 @@ prepare_cleanup_fixture() {
   git -C "$CLEANUP_REPO" commit -q -m "test: allow cleanup"
   git -C "$CLEANUP_REPO" push -q
   CLEANUP_TASK_DIR="$(start_task "$case_name" "$CLEANUP_REPO")"
+  if [ -n "$work_ref" ]; then
+    run_task_in_dir "$case_name" "$CLEANUP_TASK_DIR" refs set \
+      --work-ref "$work_ref" --format json >/dev/null
+  fi
   CLEANUP_CLAIM="$(sed -n 's/^claim_id: *//p' "$CLEANUP_TASK_DIR/task/index.md")"
   CLEANUP_PLATFORM_POLICY="$TMPDIR/$case_name/platform.policy"
   printf '%s\n' 'schema=workbench-policy/v1' 'action.task.abandon=allow' 'action.task.cleanup=allow' \
@@ -748,7 +766,7 @@ prepare_cleanup_fixture() {
       --request-file "$cleanup_request" --intent-digest "$CLEANUP_INTENT_DIGEST" \
       --format json > "$CLEANUP_POLICY_OUTPUT"
   CLEANUP_ACTION_INSTANCE="$(json_get "$(cat "$CLEANUP_POLICY_OUTPUT")" action_instance.id)"
-  git -C "$CLEANUP_TASK_DIR" add .workbench task/.workbench
+  git -C "$CLEANUP_TASK_DIR" add .workbench task/.workbench task/index.md
   git -C "$CLEANUP_TASK_DIR" commit -q -m "test: persist cleanup fixture"
   git -C "$CLEANUP_TASK_DIR" push -q
 }
@@ -1561,6 +1579,137 @@ test_refs_are_opaque_and_duplicate_active_work_is_rejected() {
     fail "refs set accepted a missing option value"
   else rc=$?; fi
   [ "$rc" = 2 ] || fail "missing refs option value returned $rc instead of usage exit 2"
+}
+
+test_work_ref_reservation_is_atomic_across_tasks() {
+  local repo first second barrier hook first_out second_out first_rc second_rc count reservation
+  repo="$(setup_workbench work_ref_cas)"
+  first="$(start_task work_ref_cas "$repo" 29)"
+  second="$(start_task work_ref_cas "$repo" 31)"
+  barrier="$TMPDIR/work_ref_cas/barrier"; mkdir -p "$barrier"
+  hook="$TMPDIR/work_ref_cas/work-ref-barrier"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${WORKBENCH_TEST_WORK_REF_BARRIER_DIR:?}"
+: "${WORKBENCH_TEST_WORK_REF_BARRIER_ID:?}"
+touch "$WORKBENCH_TEST_WORK_REF_BARRIER_DIR/$WORKBENCH_TEST_WORK_REF_BARRIER_ID.ready"
+for _ in $(seq 1 200); do
+  [ "$(find "$WORKBENCH_TEST_WORK_REF_BARRIER_DIR" -name '*.ready' | wc -l | tr -d ' ')" -ge 2 ] \
+    && exit 0
+  sleep 0.05
+done
+exit 1
+SH
+  chmod +x "$hook"
+  first_out="$TMPDIR/work_ref_cas/first.out"
+  second_out="$TMPDIR/work_ref_cas/second.out"
+  (
+    set +e
+    WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="$hook" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_DIR="$barrier" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_ID=first \
+      run_task_in_dir work_ref_cas "$first" refs set \
+        --work-ref toolbox:scenario/SCN-CAS --format json >"$first_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/work_ref_cas/first.rc"
+  ) &
+  local first_pid=$!
+  (
+    set +e
+    WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="$hook" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_DIR="$barrier" \
+    WORKBENCH_TEST_WORK_REF_BARRIER_ID=second \
+      run_task_in_dir work_ref_cas "$second" refs set \
+        --work-ref toolbox:scenario/SCN-CAS --format json >"$second_out" 2>&1
+    printf '%s\n' "$?" > "$TMPDIR/work_ref_cas/second.rc"
+  ) &
+  local second_pid=$!
+  wait "$first_pid"; wait "$second_pid"
+  first_rc="$(cat "$TMPDIR/work_ref_cas/first.rc")"
+  second_rc="$(cat "$TMPDIR/work_ref_cas/second.rc")"
+  [ "$first_rc$second_rc" = 01 ] || [ "$first_rc$second_rc" = 10 ] \
+    || fail "work-ref CAS did not select one winner: first=$first_rc second=$second_rc"
+  count="$(grep -l '^work_ref: toolbox:scenario/SCN-CAS$' \
+    "$first/task/index.md" "$second/task/index.md" | wc -l | tr -d ' ')"
+  [ "$count" = 1 ] || fail "work-ref CAS wrote $count local winners"
+  reservation="$(work_ref_remote_ref toolbox:scenario/SCN-CAS)"
+  [ "$(git ls-remote --heads "$TMPDIR/work_ref_cas/origin.git" "$reservation" \
+    | sed '/^$/d' | wc -l | tr -d ' ')" = 1 ] \
+    || fail "work-ref CAS did not publish exactly one central reservation"
+  if [ "$first_rc" = 1 ]; then
+    assert_file_contains "$first_out" 'duplicate active work_ref'
+  else
+    assert_file_contains "$second_out" 'duplicate active work_ref'
+  fi
+}
+
+test_work_ref_reservation_rejects_malformed_remote_owner() {
+  local repo task_dir work_ref reservation payload blob tree commit out rc before after
+  repo="$(setup_workbench work_ref_malformed)"
+  task_dir="$(start_task work_ref_malformed "$repo" 29)"
+  work_ref=toolbox:scenario/SCN-MALFORMED
+  reservation="$(work_ref_remote_ref "$work_ref")"
+  payload="$TMPDIR/work_ref_malformed/malformed.json"
+  printf '%s\n' '{"contract_version":"forged"}' > "$payload"
+  blob="$(git -C "$repo" hash-object -w "$payload")"
+  tree="$(printf '100644 blob %s\twork-ref.json\n' "$blob" | git -C "$repo" mktree)"
+  commit="$(printf '%s\n' 'test: malformed work-ref reservation' \
+    | git -C "$repo" commit-tree "$tree")"
+  git -C "$repo" push -q origin "$commit:$reservation"
+  before="$(git ls-remote --heads "$TMPDIR/work_ref_malformed/origin.git" "$reservation")"
+  out="$TMPDIR/work_ref_malformed/rejected.out"
+  if run_task_in_dir work_ref_malformed "$task_dir" refs set \
+    --work-ref "$work_ref" --format json >"$out" 2>&1; then
+    fail "malformed central work-ref reservation was overwritten"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "malformed work-ref reservation returned $rc"
+  assert_file_contains "$out" 'work-ref-reservation-unavailable'
+  [ -z "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" ] \
+    || fail "malformed reservation changed the local work_ref"
+  after="$(git ls-remote --heads "$TMPDIR/work_ref_malformed/origin.git" "$reservation")"
+  [ "$after" = "$before" ] || fail "malformed reservation changed remotely"
+}
+
+test_work_ref_reservation_tracks_change_and_clear() {
+  local repo task_dir old new old_ref new_ref actual out rc
+  repo="$(setup_workbench work_ref_transition)"
+  task_dir="$(start_task work_ref_transition "$repo" 29)"
+  old=toolbox:scenario/SCN-OLD; new=toolbox:scenario/SCN-NEW
+  old_ref="$(work_ref_remote_ref "$old")"; new_ref="$(work_ref_remote_ref "$new")"
+  run_task_in_dir work_ref_transition "$task_dir" refs set \
+    --work-ref "$old" --format json >/dev/null
+  [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$old_ref")" ] \
+    || fail "initial work-ref reservation was not published"
+
+  out="$TMPDIR/work_ref_transition/release-failure.out"
+  if WORKBENCH_TEST_WORK_REF_RELEASE_FAIL=1 \
+    run_task_in_dir work_ref_transition "$task_dir" refs set \
+      --work-ref "$new" --format json >"$out" 2>&1; then
+    fail "work-ref change ignored a stale reservation release failure"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "failed work-ref change release returned $rc"
+  assert_file_contains "$out" 'work-ref-reservation-release-unreconciled'
+  [ "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" = "$new" ] \
+    || fail "failed release did not retain its new local primary"
+  [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$old_ref")" ] \
+    && [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$new_ref")" ] \
+    || fail "failed release did not retain both retry reservations"
+
+  actual="$(run_task_in_dir work_ref_transition "$task_dir" refs set \
+    --work-ref "$new" --format json)"
+  assert_contains "$actual" '"changed":false'
+  [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$old_ref")" ] \
+    || fail "changed work-ref retained its old reservation"
+  [ -n "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$new_ref")" ] \
+    || fail "changed work-ref did not publish its new reservation"
+
+  actual="$(run_task_in_dir work_ref_transition "$task_dir" refs set \
+    --clear-work-ref --format json)"
+  assert_contains "$actual" '"changed":true'
+  [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_transition/origin.git" "$new_ref")" ] \
+    || fail "cleared work-ref retained its reservation"
+  [ -z "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" ] \
+    || fail "clear retained the task work_ref"
 }
 
 test_work_ref_uniqueness_rejects_remote_only_task() {
@@ -3655,6 +3804,36 @@ assert text.index('"stage":"completed"') < text.index('"event":"task-cleaned"')
 for key in ("journal_id", "task_id", "claim_id", "branch", "revision", "action_instance_id", "intent_digest", "policy_manifest", "authorization_ref", "removal_plan_digest", "removal_plan", "effect_owner_events"):
     assert journals[0][key] == journals[1][key]
 PY
+}
+
+test_cleanup_releases_work_ref_reservation_after_workspace_removal() {
+  local work_ref reservation actual out rc branch
+  work_ref=toolbox:scenario/SCN-CLEANUP-RELEASE
+  prepare_cleanup_fixture cleanup_work_ref_release "$work_ref"
+  reservation="$(work_ref_remote_ref "$work_ref")"
+  [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
+    "$reservation")" ] || fail "cleanup fixture did not retain its work-ref reservation"
+  branch="task/29-v2-lifecycle-fixture-29"
+  out="$TMPDIR/cleanup_work_ref_release/release-failure.out"
+  if WORKBENCH_TEST_WORK_REF_RELEASE_FAIL=1 \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_work_ref_release "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup ignored a failed work-ref reservation release"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "failed work-ref release returned $rc"
+  assert_file_contains "$out" '"code":"work-ref-reservation-release-unreconciled"'
+  [ ! -d "$CLEANUP_TASK_DIR" ] || fail "failed reservation release retained removed workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "failed reservation release removed the retry branch"
+  [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
+    "$reservation")" ] || fail "failed cleanup release dropped its reservation"
+
+  actual="$(run_task cleanup_work_ref_release "$CLEANUP_REPO" done 29 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+  [ -z "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
+    "$reservation")" ] || fail "cleanup retained its work-ref reservation"
 }
 
 test_cleanup_deleted_retry_rejects_tampered_immutable_intent() {
@@ -6920,6 +7099,9 @@ run_case test_start_rejects_noncanonical_schema_slug_and_home
 run_case test_v2_start_and_resume_are_authority_bound_skeletons
 run_case test_verified_result_change_reactivates_before_primary
 run_case test_refs_are_opaque_and_duplicate_active_work_is_rejected
+run_case test_work_ref_reservation_is_atomic_across_tasks
+run_case test_work_ref_reservation_rejects_malformed_remote_owner
+run_case test_work_ref_reservation_tracks_change_and_clear
 run_case test_work_ref_uniqueness_rejects_remote_only_task
 run_case test_work_ref_uniqueness_retains_submitted_deleted_branch
 run_case test_work_ref_inventory_requires_complete_pagination
@@ -6959,6 +7141,7 @@ run_case test_cleanup_revalidates_clean_head_after_prepared_journal
 run_case test_cleanup_rejects_untrusted_prepared_journal
 run_case test_cleanup_rejects_prepared_journal_without_terminal_action_join
 run_case test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion
+run_case test_cleanup_releases_work_ref_reservation_after_workspace_removal
 run_case test_cleanup_deleted_retry_rejects_tampered_immutable_intent
 run_case test_v2_cleanup_requires_terminal_outcome_even_with_force
 run_case test_writer_claim_cas_retry_rechecks_conflict_before_local_creation
