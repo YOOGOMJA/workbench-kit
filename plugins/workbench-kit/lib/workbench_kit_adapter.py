@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import re
+import resource
 import shutil
 import stat
 import subprocess
@@ -660,6 +661,16 @@ def _remove_state_node_at(
             moved = False
         except OSError as error:
             raise AdapterError("public-adapter-restore-failed", ref) from error
+    except BaseException:
+        if moved:
+            try:
+                _rename_noreplace(
+                    private_fd, "node", parent_fd, name, ref
+                )
+                moved = False
+            except AdapterError:
+                pass
+        raise
     finally:
         os.close(handle)
         os.close(private_fd)
@@ -1237,6 +1248,48 @@ def _capture_directory_access(
         raise
 
 
+def _raise_access_descriptor_limit(
+    state: dict[str, Any],
+) -> tuple[int, int] | None:
+    required = 1 + sum(
+        image[0] == "directory" for image in state["worktree"].values()
+    )
+    required += sum(
+        1 + sum(
+            relative != "." and image[0] == "directory"
+            for relative, image in admin["manifest"].items()
+        )
+        for admin in state["git_admin"]
+    )
+    previous = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft, hard = previous
+    if soft == resource.RLIM_INFINITY:
+        return None
+    target = soft + required + 32
+    if hard != resource.RLIM_INFINITY:
+        target = min(target, hard)
+    if target < soft + required:
+        raise AdapterError("public-state-unavailable", "RLIMIT_NOFILE")
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (OSError, ValueError) as error:
+        raise AdapterError(
+            "public-state-unavailable", "RLIMIT_NOFILE"
+        ) from error
+    return previous
+
+
+def _restore_access_descriptor_limit(previous: tuple[int, int] | None) -> None:
+    if previous is None:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, previous)
+    except (OSError, ValueError) as error:
+        raise AdapterError(
+            "public-state-unavailable", "RLIMIT_NOFILE"
+        ) from error
+
+
 def _directory_readable(node: os.stat_result) -> bool:
     if os.geteuid() == 0:
         return True
@@ -1303,9 +1356,18 @@ def _restore_directory_access(
 
 
 def _close_directory_access(groups: list[dict[str, Any]]) -> None:
+    failure = None
     for group in reversed(groups):
         for record in reversed(group["records"]):
-            os.close(record["fd"])
+            try:
+                os.close(record["fd"])
+            except OSError as error:
+                if failure is None:
+                    failure = error
+    if failure is not None:
+        raise AdapterError(
+            "public-state-unavailable", "directory-access-fd"
+        ) from failure
 
 
 def _require_worktree_cas(
@@ -2775,8 +2837,10 @@ def inspect_public_kernel(
     workspace = workspace.resolve()
     root_fd = _open_workspace_root(workspace)
     access_groups: list[dict[str, Any]] = []
+    descriptor_limit: tuple[int, int] | None = None
     try:
         before = _capture_caller_state(workspace, root_fd)
+        descriptor_limit = _raise_access_descriptor_limit(before)
         access_groups = _capture_directory_access(workspace, root_fd, before)
         result: dict[str, Any] | None = None
         failure: BaseException | None = None
@@ -2818,5 +2882,10 @@ def inspect_public_kernel(
         assert result is not None
         return result
     finally:
-        _close_directory_access(access_groups)
-        os.close(root_fd)
+        try:
+            _close_directory_access(access_groups)
+        finally:
+            try:
+                os.close(root_fd)
+            finally:
+                _restore_access_descriptor_limit(descriptor_limit)

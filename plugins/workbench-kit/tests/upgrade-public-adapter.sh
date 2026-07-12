@@ -540,6 +540,7 @@ WORKBENCH_KIT_WORKBENCH_BIN="$ROOT/tests/upgrade-public-stub.sh" \
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" "$tmp" "$approval" <<'PY'
 import os
 import pathlib
+import resource
 import subprocess
 import sys
 import tempfile
@@ -679,6 +680,80 @@ def removal_race(kind):
 
 for node_kind in ("file", "directory", "symlink"):
     removal_race(node_kind)
+
+
+def private_discard_failure(kind, occupy_original=False):
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"discard-{kind}-", dir=base))
+    target = root / "owned"
+    if kind == "file":
+        target.write_bytes(b"adapter file\n")
+    elif kind == "directory":
+        target.mkdir()
+    else:
+        target.symlink_to("adapter-target")
+    parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    expected = adapter._state_node_at(parent_fd, "owned", "owned")
+    original_unlink = adapter.os.unlink
+    original_rmdir = adapter.os.rmdir
+
+    def fail_unlink(path, *args, dir_fd=None, **kwargs):
+        if path == "node" and dir_fd != parent_fd:
+            if occupy_original:
+                replacement = os.open(
+                    "owned", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644, dir_fd=parent_fd,
+                )
+                os.write(replacement, b"concurrent original\n")
+                os.close(replacement)
+            raise OSError(16, "fixture private unlink failure")
+        return original_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+    def fail_rmdir(path, *args, dir_fd=None, **kwargs):
+        if path == "node" and dir_fd != parent_fd:
+            node_fd = os.open(
+                "node", os.O_RDONLY | os.O_DIRECTORY, dir_fd=dir_fd
+            )
+            child = os.open(
+                "concurrent-child",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+                dir_fd=node_fd,
+            )
+            os.write(child, b"concurrent child\n")
+            os.close(child)
+            os.close(node_fd)
+            raise OSError(66, "fixture private directory not empty")
+        return original_rmdir(path, *args, dir_fd=dir_fd, **kwargs)
+
+    adapter.os.unlink = fail_unlink
+    adapter.os.rmdir = fail_rmdir
+    try:
+        try:
+            adapter._remove_state_node_at(parent_fd, "owned", expected, "owned")
+        except adapter.AdapterError as error:
+            assert error.code == "public-adapter-restore-failed", error.code
+        else:
+            raise AssertionError("private discard failure was accepted")
+    finally:
+        adapter.os.unlink = original_unlink
+        adapter.os.rmdir = original_rmdir
+        os.close(parent_fd)
+    if occupy_original:
+        assert target.read_bytes() == b"concurrent original\n"
+        residues = list(root.glob(".workbench-kit-private-*"))
+        assert len(residues) == 1
+        assert (residues[0] / "node").read_bytes() == b"adapter file\n"
+    elif kind == "file":
+        assert target.read_bytes() == b"adapter file\n"
+    elif kind == "directory":
+        assert (target / "concurrent-child").read_bytes() == b"concurrent child\n"
+    else:
+        assert os.readlink(target) == "adapter-target"
+
+
+for node_kind in ("file", "directory", "symlink"):
+    private_discard_failure(node_kind)
+private_discard_failure("file", occupy_original=True)
 
 
 def shared_quarantine_cleanup(kind):
@@ -859,6 +934,19 @@ finally:
     adapter.os.open = original_open
     os.close(exhaustion_fd)
 assert len(os.listdir("/dev/fd")) == descriptor_count - 1
+
+capacity_root = repository("descriptor-capacity").resolve()
+for index in range(320):
+    (capacity_root / f"directory-{index:03d}").mkdir()
+limit_before = resource.getrlimit(resource.RLIMIT_NOFILE)
+mode_before = os.environ["UPGRADE_STUB_MODE"]
+os.environ["UPGRADE_STUB_MODE"] = "ok"
+try:
+    capacity_snapshot = adapter.inspect_public_kernel(capacity_root, approval)
+finally:
+    os.environ["UPGRADE_STUB_MODE"] = mode_before
+assert capacity_snapshot["contract"]["workspace"]["schema"] == "workbench/v1"
+assert resource.getrlimit(resource.RLIMIT_NOFILE) == limit_before
 PY
 
 if rg -n '\.worktrees|plugins/workbench/utils|task/codebases' \
