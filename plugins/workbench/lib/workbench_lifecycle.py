@@ -4,13 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime
+import errno
+import fcntl
+import hashlib
 import json
 import os
+import posixpath
 import re
+import secrets
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
@@ -64,6 +72,32 @@ ACTIVE_ISSUE_FIELDS = {
     "lifecycle_pagination",
     "comments",
 }
+SUBMISSION_RECOVERY_FIELDS = (
+    "contract_version",
+    "repository_origin_url",
+    "default_ref",
+    "branch",
+    "task_id",
+    "issue",
+    "home",
+    "parent",
+    "claim_id",
+    "workspace_authority_descriptor_digest",
+    "snapshot_revision",
+    "snapshot_index_digest",
+    "cleanup_revision",
+    "pull_request",
+    "pull_request_url",
+    "head_revision",
+    "stage",
+)
+SUBMISSION_RECOVERY_STAGES = (
+    "prepared",
+    "cleanup-committed",
+    "pr-observed",
+    "submitted",
+    "restored",
+)
 MARKER_FIELDS = {
     "task_contract",
     "event",
@@ -585,6 +619,100 @@ def validate_active_pull_requests(value: Any) -> List[Dict[str, Any]]:
     return result
 
 
+def reduce_lifecycle_marker(
+    groups: Dict[str, Dict[str, Any]], marker: Dict[str, Any]
+) -> None:
+    if marker["event"] == "task-claim-conflict":
+        return
+    branch = marker["branch"]
+    identity = (
+        marker["claim_id"],
+        marker["workspace_authority_descriptor_digest"],
+        marker["issue"],
+        marker["home"],
+    )
+    group = groups.get(branch)
+    if group is None:
+        if marker["event"] != "task-claimed":
+            raise ValueError("active task lifecycle does not begin with task-claimed")
+        groups[branch] = {
+            "branch": branch,
+            "claim_id": identity[0],
+            "workspace_authority_descriptor_digest": identity[1],
+            "issue": identity[2],
+            "home": identity[3],
+            "active": True,
+            "terminal": False,
+            "cleaned": False,
+            "submission": None,
+            "phase": "claimed",
+        }
+        return
+    if identity != (
+        group["claim_id"],
+        group["workspace_authority_descriptor_digest"],
+        group["issue"],
+        group["home"],
+    ):
+        raise ValueError("active task lifecycle identity is ambiguous")
+    event = marker["event"]
+    if event == "task-claimed":
+        raise ValueError("active task lifecycle claim is duplicated")
+    if event == "task-cleaned":
+        if not group["terminal"] or group["cleaned"]:
+            raise ValueError("active task cleanup transition is invalid")
+        group["cleaned"] = True
+        group["active"] = False
+        group["phase"] = "cleaned"
+        return
+    if group["terminal"]:
+        raise ValueError("active task lifecycle resumed after a terminal event")
+    if event == "task-active":
+        group["active"] = True
+        group["submission"] = None
+        group["phase"] = "active"
+    elif event == "task-verified":
+        if group["phase"] not in (
+            "active",
+            "verified",
+            "submitted",
+            "submitted-verified",
+        ):
+            raise ValueError("active task verification transition is invalid")
+        group["active"] = True
+        group["phase"] = (
+            "submitted-verified" if group["submission"] is not None else "verified"
+        )
+    elif event == "task-submitted":
+        if group["phase"] not in ("active", "verified"):
+            raise ValueError("active task submission transition is invalid")
+        group["active"] = True
+        group["submission"] = {
+            "number": marker["pr"],
+            "revision": marker["revision"],
+        }
+        group["phase"] = "submitted"
+    elif event in ("task-completed", "task-abandoned"):
+        if group["phase"] not in (
+            "active",
+            "verified",
+            "submitted",
+            "submitted-verified",
+        ):
+            raise ValueError("active task terminal transition is invalid")
+        if group["submission"] is None and marker["pr"] is not None:
+            raise ValueError("terminal task references an absent submission")
+        if group["submission"] is not None and (
+            marker["pr"] != group["submission"]["number"]
+        ):
+            raise ValueError("terminal task does not join its current submission")
+        group["terminal"] = True
+        group["active"] = False
+        group["terminal_event"] = event
+        group["terminal_revision"] = marker["revision"]
+        group["phase"] = "terminal"
+
+
 def active_lifecycle_groups(
     issues: Any, marker_home: Optional[str]
 ) -> List[Dict[str, Any]]:
@@ -618,65 +746,9 @@ def active_lifecycle_groups(
                 continue
             if marker["home"] != marker_home:
                 raise ValueError("active task lifecycle home does not match its issue home")
-            if marker["event"] == "task-claim-conflict":
-                continue
-            branch = marker["branch"]
-            identity = (
-                marker["claim_id"],
-                marker["workspace_authority_descriptor_digest"],
-                number,
-            )
-            group = groups.get(branch)
-            if group is None:
-                group = {
-                    "branch": branch,
-                    "claim_id": identity[0],
-                    "workspace_authority_descriptor_digest": identity[1],
-                    "issue": number,
-                    "active": False,
-                    "terminal": False,
-                    "cleaned": False,
-                    "submission": None,
-                }
-                groups[branch] = group
-            elif identity != (
-                group["claim_id"],
-                group["workspace_authority_descriptor_digest"],
-                group["issue"],
-            ):
-                raise ValueError("active task lifecycle identity is ambiguous")
-            event = marker["event"]
-            if event == "task-cleaned":
-                if not group["terminal"] or group["cleaned"]:
-                    raise ValueError("active task cleanup transition is invalid")
-                group["cleaned"] = True
-                group["active"] = False
-                group["submission"] = None
-                continue
-            if group["terminal"]:
-                raise ValueError("active task lifecycle resumed after a terminal event")
-            if event in ("task-claimed", "task-active", "task-verified"):
-                group["active"] = True
-                if event == "task-active":
-                    group["submission"] = None
-            elif event == "task-submitted":
-                submitted = {
-                    "number": marker["pr"],
-                    "revision": marker["revision"],
-                }
-                if group["submission"] is not None and group["submission"] != submitted:
-                    raise ValueError("active task submission identity changed without reactivation")
-                group["active"] = True
-                group["submission"] = submitted
-            elif event in ("task-completed", "task-abandoned"):
-                if marker["pr"] is not None and (
-                    group["submission"] is None
-                    or marker["pr"] != group["submission"]["number"]
-                ):
-                    raise ValueError("terminal task does not join its current submission")
-                group["terminal"] = True
-                group["active"] = False
-                group["submission"] = None
+            if marker["issue"] != number:
+                raise ValueError("active task lifecycle issue does not match its issue")
+            reduce_lifecycle_marker(groups, marker)
     return [group for group in groups.values() if group["active"]]
 
 
@@ -871,9 +943,1233 @@ def cmd_active_inventory(args: argparse.Namespace) -> None:
     sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def submission_recovery_name(branch: str) -> str:
+    require_text(branch, "submission recovery branch")
+    return "submission-recovery-{}.json".format(
+        hashlib.sha256(branch.encode("utf-8")).hexdigest()
+    )
+
+
+def submission_common_dir(repository: str) -> str:
+    return git_bytes(
+        repository, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    ).decode("utf-8").strip()
+
+
+def secure_directory_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    except AttributeError as exc:
+        raise ValueError("secure submission recovery directories are unavailable") from exc
+
+
+def secure_file_flags(access: int) -> int:
+    try:
+        return access | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    except AttributeError as exc:
+        raise ValueError("secure submission recovery files are unavailable") from exc
+
+
+def validate_recovery_inode(value: os.stat_result, kind: str) -> None:
+    if not stat.S_ISREG(value.st_mode):
+        raise ValueError("submission recovery {} is not a regular file".format(kind))
+    if value.st_nlink != 1:
+        raise ValueError("submission recovery {} must have exactly one link".format(kind))
+    if value.st_uid != os.geteuid() or value.st_mode & 0o022:
+        raise ValueError("submission recovery {} ownership or mode is unsafe".format(kind))
+
+
+def open_submission_directory(repository: str, create: bool) -> Optional[int]:
+    common_path = submission_common_dir(repository)
+    common = os.open(common_path, secure_directory_flags())
+    created = False
+    try:
+        if create:
+            try:
+                os.mkdir("workbench-v2", 0o700, dir_fd=common)
+                created = True
+                os.fsync(common)
+            except FileExistsError:
+                pass
+        try:
+            directory = os.open(
+                "workbench-v2", secure_directory_flags(), dir_fd=common
+            )
+        except FileNotFoundError:
+            if create:
+                raise
+            return None
+    finally:
+        os.close(common)
+    value = os.fstat(directory)
+    if not stat.S_ISDIR(value.st_mode):
+        os.close(directory)
+        raise ValueError("submission recovery parent is not a directory")
+    if value.st_uid != os.geteuid() or value.st_mode & 0o022:
+        os.close(directory)
+        raise ValueError("submission recovery parent ownership or mode is unsafe")
+    if created:
+        os.fchmod(directory, 0o700)
+        os.fsync(directory)
+    return directory
+
+
+def open_submission_lock(directory: int, branch: str) -> int:
+    name = submission_recovery_name(branch) + ".lock"
+    flags = secure_file_flags(os.O_RDWR)
+    descriptor = -1
+    for _ in range(8):
+        try:
+            descriptor = os.open(
+                name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory
+            )
+            break
+        except FileExistsError:
+            try:
+                descriptor = os.open(name, flags, dir_fd=directory)
+                break
+            except FileNotFoundError:
+                continue
+    if descriptor < 0:
+        raise OSError("submission recovery lock could not be opened")
+    try:
+        validate_recovery_inode(os.fstat(descriptor), "lock")
+        os.fchmod(descriptor, 0o600)
+    except Exception:
+        os.close(descriptor)
+        raise
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(descriptor)
+                raise TimeoutError("submission recovery lock timed out")
+            time.sleep(0.01)
+
+
+def validate_submission_recovery(value: Any) -> Dict[str, Any]:
+    require_fields(value, set(SUBMISSION_RECOVERY_FIELDS), "submission recovery")
+    if list(value) != list(SUBMISSION_RECOVERY_FIELDS):
+        raise ValueError("submission recovery members are not canonically ordered")
+    if value["contract_version"] != "workbench-submission-recovery/v1":
+        raise ValueError("unsupported submission recovery contract")
+    for field in ("repository_origin_url", "branch", "task_id", "claim_id"):
+        require_text(value[field], "submission recovery " + field)
+    if re.fullmatch(r"refs/heads/[A-Za-z0-9._/-]+", value["default_ref"]) is None:
+        raise ValueError("submission recovery default ref is invalid")
+    if not value["branch"].startswith("task/"):
+        raise ValueError("submission recovery branch is invalid")
+    if (
+        not isinstance(value["issue"], int)
+        or isinstance(value["issue"], bool)
+        or value["issue"] <= 0
+    ):
+        raise ValueError("submission recovery issue is invalid")
+    if value["home"] is not None:
+        require_text(value["home"], "submission recovery home")
+    if value["parent"] is not None and (
+        not isinstance(value["parent"], int)
+        or isinstance(value["parent"], bool)
+        or value["parent"] <= 0
+    ):
+        raise ValueError("submission recovery parent is invalid")
+    if DIGEST.fullmatch(value["workspace_authority_descriptor_digest"]) is None:
+        raise ValueError("submission recovery descriptor digest is invalid")
+    if OID.fullmatch(value["snapshot_revision"]) is None:
+        raise ValueError("submission recovery snapshot revision is invalid")
+    if DIGEST.fullmatch(value["snapshot_index_digest"]) is None:
+        raise ValueError("submission recovery index digest is invalid")
+    if value["stage"] not in SUBMISSION_RECOVERY_STAGES:
+        raise ValueError("submission recovery stage is invalid")
+    stage = SUBMISSION_RECOVERY_STAGES.index(value["stage"])
+    if stage == 0:
+        if any(
+            value[field] is not None
+            for field in (
+                "cleanup_revision",
+                "pull_request",
+                "pull_request_url",
+                "head_revision",
+            )
+        ):
+            raise ValueError("prepared submission recovery carries later state")
+        return value
+    if OID.fullmatch(value["cleanup_revision"] or "") is None:
+        raise ValueError("submission recovery cleanup revision is invalid")
+    if stage == 1:
+        if any(
+            value[field] is not None
+            for field in ("pull_request", "pull_request_url", "head_revision")
+        ):
+            raise ValueError("cleanup submission recovery carries PR state")
+        return value
+    if (
+        not isinstance(value["pull_request"], int)
+        or isinstance(value["pull_request"], bool)
+        or value["pull_request"] <= 0
+    ):
+        raise ValueError("submission recovery pull request is invalid")
+    require_text(value["pull_request_url"], "submission recovery pull request URL")
+    if OID.fullmatch(value["head_revision"] or "") is None:
+        raise ValueError("submission recovery head revision is invalid")
+    if value["head_revision"] != value["cleanup_revision"]:
+        raise ValueError("submission recovery PR head does not join cleanup")
+    return value
+
+
+def read_submission_recovery_at(
+    directory: int, branch: str
+) -> Optional[Dict[str, Any]]:
+    name = submission_recovery_name(branch)
+    try:
+        before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    validate_recovery_inode(before, "record")
+    descriptor = os.open(name, secure_file_flags(os.O_RDONLY), dir_fd=directory)
+    try:
+        after = os.fstat(descriptor)
+        validate_recovery_inode(after, "record")
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("submission recovery record changed while opening")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read(65537)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 65536:
+        raise ValueError("submission recovery record is too large")
+    value = json.loads(raw, object_pairs_hook=unique_object)
+    validate_submission_recovery(value)
+    canonical = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if raw != canonical:
+        raise ValueError("submission recovery record is not canonical")
+    return value
+
+
+def write_submission_recovery_at(
+    directory: int, branch: str, value: Dict[str, Any]
+) -> None:
+    validate_submission_recovery(value)
+    payload = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    temporary = ".submission-recovery-tmp-{}".format(secrets.token_hex(16))
+    descriptor = os.open(
+        temporary,
+        secure_file_flags(os.O_WRONLY) | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=directory,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("short submission recovery write")
+            offset += written
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        validate_recovery_inode(opened, "temporary file")
+        named = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
+        validate_recovery_inode(named, "temporary file")
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise ValueError("submission recovery temporary path changed")
+        os.replace(
+            temporary,
+            submission_recovery_name(branch),
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        installed = os.stat(
+            submission_recovery_name(branch),
+            dir_fd=directory,
+            follow_symlinks=False,
+        )
+        validate_recovery_inode(installed, "record")
+        if (opened.st_dev, opened.st_ino) != (installed.st_dev, installed.st_ino):
+            raise ValueError("submission recovery replacement was not exact")
+        os.fsync(directory)
+    finally:
+        os.close(descriptor)
+
+
+def submission_snapshot_index(
+    repository: str, revision: str, branch: str
+) -> Tuple[bytes, Dict[str, Any], str]:
+    if OID.fullmatch(revision) is None:
+        raise ValueError("submission snapshot revision is invalid")
+    if git_bytes(repository, "cat-file", "-t", revision).strip() != b"commit":
+        raise ValueError("submission snapshot is not a commit")
+    raw = git_bytes(repository, "show", revision + ":task/index.md")
+    index = parse_index_bytes(raw, branch)
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    return raw, index, digest
+
+
+def validate_recovery_snapshot(repository: str, value: Dict[str, Any]) -> bytes:
+    raw, index, digest = submission_snapshot_index(
+        repository, value["snapshot_revision"], value["branch"]
+    )
+    expected = {
+        "id": value["task_id"],
+        "issue": value["issue"],
+        "home": value["home"],
+        "parent": value["parent"],
+        "branch": value["branch"],
+        "claim_id": value["claim_id"],
+        "task_contract": "workbench-task/v2",
+        "workspace_authority_descriptor_digest": value[
+            "workspace_authority_descriptor_digest"
+        ],
+    }
+    for field, expected_value in expected.items():
+        if index[field] != expected_value:
+            raise ValueError("submission snapshot index identity mismatch")
+    if digest != value["snapshot_index_digest"]:
+        raise ValueError("submission snapshot index digest mismatch")
+    return raw
+
+
+def validate_cleanup_revision(
+    repository: str, value: Dict[str, Any], cleanup_revision: str
+) -> None:
+    if OID.fullmatch(cleanup_revision) is None:
+        raise ValueError("submission cleanup revision is invalid")
+    if commit_parents(repository, cleanup_revision) != [value["snapshot_revision"]]:
+        raise ValueError("submission cleanup is not the exact snapshot child")
+    raw_paths = git_bytes(
+        repository,
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        value["snapshot_revision"],
+        cleanup_revision,
+        "--",
+    )
+    paths = [path for path in raw_paths.split(b"\0") if path]
+    if not paths or any(not path.startswith(b"task/") for path in paths):
+        raise ValueError("submission cleanup changed non-task content")
+    if git_bytes(
+        repository, "ls-tree", "-r", "--name-only", cleanup_revision, "--", "task"
+    ).strip():
+        raise ValueError("submission cleanup retains tracked task state")
+
+
+def validate_recovery_authority(repository: str, value: Dict[str, Any]) -> None:
+    origin = git_bytes(repository, "remote", "get-url", "origin").decode("utf-8").strip()
+    if origin != value["repository_origin_url"]:
+        raise ValueError("submission recovery origin mismatch")
+    remote = git_bytes(repository, "ls-remote", "--symref", origin, "HEAD").splitlines()
+    refs = [
+        row.split()[1].decode("ascii")
+        for row in remote
+        if len(row.split()) == 3 and row.split()[0] == b"ref:" and row.split()[2] == b"HEAD"
+    ]
+    revisions = [
+        row.split()[0].decode("ascii")
+        for row in remote
+        if len(row.split()) == 2 and row.split()[1] == b"HEAD"
+    ]
+    if refs != [value["default_ref"]] or len(revisions) != 1 or OID.fullmatch(revisions[0]) is None:
+        raise ValueError("submission recovery default authority mismatch")
+    fetch_exact_revision(repository, origin, revisions[0])
+    raw = git_bytes(
+        repository, "show", revisions[0] + ":.workbench/authority.json"
+    )
+    descriptor = json.loads(raw, object_pairs_hook=unique_object)
+    expected_fields = {
+        "contract_version",
+        "authority_identity",
+        "origin_url",
+        "default_ref",
+        "workspace_home",
+        "hosting_adapter",
+        "hosting_ref",
+    }
+    require_fields(descriptor, expected_fields, "submission recovery authority")
+    if (
+        descriptor["contract_version"] != "workbench-workspace-authority/v1"
+        or descriptor["origin_url"] != origin
+        or descriptor["default_ref"] != value["default_ref"]
+    ):
+        raise ValueError("submission recovery authority descriptor mismatch")
+    canonical = (
+        json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    if digest != value["workspace_authority_descriptor_digest"]:
+        raise ValueError("submission recovery authority digest mismatch")
+
+
+def validate_recovery_worktree(
+    repository: str, value: Dict[str, Any], allow_snapshot_head: bool = False
+) -> None:
+    branch = git_bytes(repository, "symbolic-ref", "--quiet", "--short", "HEAD").decode(
+        "utf-8"
+    ).strip()
+    if branch != value["branch"]:
+        raise ValueError("submission recovery is bound to another worktree branch")
+    head = git_bytes(repository, "rev-parse", "HEAD").decode("ascii").strip()
+    allowed_heads = set()
+    if value["cleanup_revision"] is not None:
+        allowed_heads.add(value["cleanup_revision"])
+    if allow_snapshot_head:
+        allowed_heads.add(value["snapshot_revision"])
+    if head not in allowed_heads:
+        raise ValueError("submission recovery worktree head mismatch")
+    validate_recovery_authority(repository, value)
+
+
+def print_submission_recovery_shell(value: Dict[str, Any]) -> None:
+    for field in SUBMISSION_RECOVERY_FIELDS:
+        item = value[field]
+        sys.stdout.write("{}={}\n".format(field, "" if item is None else item))
+
+
+def cmd_submission_recovery_prepare(args: argparse.Namespace) -> None:
+    origin = require_text(args.repository_origin_url, "submission repository origin")
+    if re.fullmatch(r"refs/heads/[A-Za-z0-9._/-]+", args.default_ref) is None:
+        raise ValueError("submission default ref is invalid")
+    raw, index, digest = submission_snapshot_index(
+        args.repository, args.snapshot_revision, args.branch
+    )
+    del raw
+    if index["task_contract"] != "workbench-task/v2":
+        raise ValueError("submission recovery requires a v2 task snapshot")
+    value = dict(
+        zip(
+            SUBMISSION_RECOVERY_FIELDS,
+            (
+                "workbench-submission-recovery/v1",
+                origin,
+                args.default_ref,
+                args.branch,
+                index["id"],
+                index["issue"],
+                index["home"],
+                index["parent"],
+                index["claim_id"],
+                index["workspace_authority_descriptor_digest"],
+                args.snapshot_revision,
+                digest,
+                None,
+                None,
+                None,
+                None,
+                "prepared",
+            ),
+        )
+    )
+    directory = open_submission_directory(args.repository, True)
+    if directory is None:
+        raise ValueError("submission recovery directory is unavailable")
+    lock = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        current = read_submission_recovery_at(directory, args.branch)
+        if current is None:
+            validate_recovery_worktree(args.repository, value, True)
+            write_submission_recovery_at(directory, args.branch, value)
+            current = value
+        else:
+            for field in SUBMISSION_RECOVERY_FIELDS[:12]:
+                if current[field] != value[field]:
+                    raise ValueError("submission recovery identity is immutable")
+            validate_recovery_snapshot(args.repository, current)
+        validate_recovery_worktree(args.repository, current, True)
+        print_submission_recovery_shell(current)
+    finally:
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def cmd_submission_recovery_advance(args: argparse.Namespace) -> None:
+    if args.stage == "prepared":
+        raise ValueError("submission recovery cannot advance to prepared")
+    directory = open_submission_directory(args.repository, False)
+    if directory is None:
+        raise ValueError("submission recovery record is unavailable")
+    lock = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        value = read_submission_recovery_at(directory, args.branch)
+        if value is None:
+            raise ValueError("submission recovery record is unavailable")
+        validate_recovery_snapshot(args.repository, value)
+        current_stage = SUBMISSION_RECOVERY_STAGES.index(value["stage"])
+        requested_stage = SUBMISSION_RECOVERY_STAGES.index(args.stage)
+        supplied = {
+            "cleanup_revision": args.cleanup_revision,
+            "pull_request": args.pull_request,
+            "pull_request_url": args.pull_request_url,
+            "head_revision": args.head_revision,
+        }
+        if requested_stage <= current_stage:
+            for field, item in supplied.items():
+                if item is not None and value[field] != item:
+                    raise ValueError("submission recovery retry identity mismatch")
+            validate_recovery_worktree(args.repository, value, True)
+            print_submission_recovery_shell(value)
+            return
+        if requested_stage != current_stage + 1:
+            raise ValueError("submission recovery stage transition is invalid")
+        if args.stage == "cleanup-committed":
+            if any(
+                item is not None
+                for field, item in supplied.items()
+                if field != "cleanup_revision"
+            ):
+                raise ValueError("cleanup recovery transition carries PR state")
+            if args.cleanup_revision is None:
+                raise ValueError("cleanup recovery transition lacks a revision")
+            validate_cleanup_revision(args.repository, value, args.cleanup_revision)
+            value["cleanup_revision"] = args.cleanup_revision
+        elif args.stage == "pr-observed":
+            if (
+                args.cleanup_revision is not None
+                and args.cleanup_revision != value["cleanup_revision"]
+            ):
+                raise ValueError("submission recovery cleanup identity changed")
+            if (
+                args.pull_request is None
+                or args.pull_request_url is None
+                or args.head_revision is None
+            ):
+                raise ValueError("submission recovery PR transition is incomplete")
+            if args.head_revision != value["cleanup_revision"]:
+                raise ValueError("submission recovery PR head mismatch")
+            value["pull_request"] = args.pull_request
+            value["pull_request_url"] = args.pull_request_url
+            value["head_revision"] = args.head_revision
+        elif any(item is not None for item in supplied.values()):
+            raise ValueError("submission recovery state transition carries identity fields")
+        value["stage"] = args.stage
+        validate_recovery_worktree(args.repository, value, True)
+        write_submission_recovery_at(directory, args.branch, value)
+        print_submission_recovery_shell(value)
+    finally:
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def cmd_submission_recovery_validate(args: argparse.Namespace) -> None:
+    directory = open_submission_directory(args.repository, False)
+    if directory is None:
+        raise ValueError("submission recovery record is unavailable")
+    lock = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        value = read_submission_recovery_at(directory, args.branch)
+        if value is None or value["stage"] == "prepared":
+            raise ValueError("submission recovery is not cleanup-bound")
+        if (
+            value["repository_origin_url"] != args.repository_origin_url
+            or value["default_ref"] != args.default_ref
+            or value["branch"] != args.branch
+            or value["cleanup_revision"] != args.current_head
+        ):
+            raise ValueError("submission recovery authority identity mismatch")
+        raw = validate_recovery_snapshot(args.repository, value)
+        validate_cleanup_revision(
+            args.repository, value, value["cleanup_revision"]
+        )
+        validate_recovery_worktree(args.repository, value)
+        current = git_bytes(args.repository, "rev-parse", "HEAD").decode("ascii").strip()
+        if current != args.current_head:
+            raise ValueError("submission recovery current head changed")
+        if args.index_file is not None:
+            with open(args.index_file, "rb") as handle:
+                if handle.read() != raw:
+                    raise ValueError("restored task index does not match its snapshot")
+        print_submission_recovery_shell(value)
+    finally:
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def rename_noreplace(
+    source_directory: int,
+    source: str,
+    target_directory: int,
+    target: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_raw = os.fsencode(source)
+    target_raw = os.fsencode(target)
+    if hasattr(libc, "renameatx_np"):
+        operation = libc.renameatx_np
+        operation.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        operation.restype = ctypes.c_int
+        result = operation(
+            source_directory,
+            source_raw,
+            target_directory,
+            target_raw,
+            0x00000004,
+        )
+    elif hasattr(libc, "renameat2"):
+        operation = libc.renameat2
+        operation.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        operation.restype = ctypes.c_int
+        result = operation(
+            source_directory,
+            source_raw,
+            target_directory,
+            target_raw,
+            1,
+        )
+    else:
+        raise ValueError("atomic no-replace rename is unavailable")
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in (errno.EEXIST, errno.ENOTEMPTY):
+            raise FileExistsError(error, os.strerror(error), target)
+        raise OSError(error, os.strerror(error), target)
+
+
+def validate_owned_directory(descriptor: int, kind: str) -> None:
+    value = os.fstat(descriptor)
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError("submission recovery {} is not a directory".format(kind))
+    if value.st_uid != os.geteuid() or value.st_mode & 0o022:
+        raise ValueError(
+            "submission recovery {} ownership or mode is unsafe".format(kind)
+        )
+
+
+def validate_exact_task_directory(descriptor: int, kind: str) -> None:
+    validate_owned_directory(descriptor, kind)
+    if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+        raise ValueError("submission recovery {} mode is not 0700".format(kind))
+
+
+def open_child_directory(parent: int, name: str, create: bool) -> int:
+    if not name or name in (".", "..") or "/" in name or "\0" in name:
+        raise ValueError("submission recovery directory component is invalid")
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+            os.fsync(parent)
+        except FileExistsError:
+            pass
+    descriptor = os.open(name, secure_directory_flags(), dir_fd=parent)
+    validate_exact_task_directory(descriptor, "snapshot directory")
+    return descriptor
+
+
+def snapshot_task_entries(
+    repository: str, revision: str
+) -> Dict[str, Tuple[str, bytes]]:
+    raw = git_bytes(
+        repository,
+        "ls-tree",
+        "-rz",
+        "--full-tree",
+        revision,
+        "--",
+        "task",
+    )
+    result: Dict[str, Tuple[str, bytes]] = {}
+    for row in raw.split(b"\0"):
+        if not row:
+            continue
+        metadata, path_raw = row.split(b"\t", 1)
+        mode_raw, kind, oid_raw = metadata.split(b" ", 2)
+        mode = mode_raw.decode("ascii")
+        oid = oid_raw.decode("ascii")
+        path = path_raw.decode("utf-8")
+        if (
+            kind != b"blob"
+            or mode not in ("100644", "100755", "120000")
+            or not path.startswith("task/")
+        ):
+            raise ValueError("submission snapshot task tree is unsupported")
+        relative = path[len("task/") :]
+        parts = relative.split("/")
+        if (
+            not relative
+            or any(part in ("", ".", "..") for part in parts)
+            or any(
+                any(ord(character) < 32 or ord(character) == 127 for character in part)
+                for part in parts
+            )
+            or relative in result
+        ):
+            raise ValueError("submission snapshot task path is invalid")
+        blob = git_bytes(repository, "cat-file", "blob", oid)
+        if mode == "120000":
+            if b"\0" in blob or b"\n" in blob or not blob:
+                raise ValueError("submission snapshot symlink target is invalid")
+            target = blob.decode("utf-8")
+            if posixpath.isabs(target):
+                raise ValueError("submission snapshot symlink target is absolute")
+            resolved = posixpath.normpath(
+                posixpath.join(posixpath.dirname(relative), target)
+            )
+            if resolved == ".." or resolved.startswith("../"):
+                raise ValueError("submission snapshot symlink escapes task state")
+        result[relative] = (mode, blob)
+    if "index.md" not in result:
+        raise ValueError("submission snapshot task tree lacks index.md")
+    return result
+
+
+def ensure_relative_parent(root: int, parts: List[str]) -> int:
+    current = os.dup(root)
+    try:
+        for part in parts:
+            following = open_child_directory(current, part, True)
+            os.close(current)
+            current = following
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def materialize_task_tree(
+    root: int, temporary: str, entries: Dict[str, Tuple[str, bytes]]
+) -> None:
+    os.mkdir(temporary, 0o700, dir_fd=root)
+    os.fsync(root)
+    task = os.open(temporary, secure_directory_flags(), dir_fd=root)
+    validate_exact_task_directory(task, "temporary task tree")
+    try:
+        for relative in sorted(entries):
+            mode, blob = entries[relative]
+            parts = relative.split("/")
+            parent = ensure_relative_parent(task, parts[:-1])
+            try:
+                name = parts[-1]
+                if mode == "120000":
+                    os.symlink(blob.decode("utf-8"), name, dir_fd=parent)
+                else:
+                    descriptor = os.open(
+                        name,
+                        secure_file_flags(os.O_WRONLY) | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=parent,
+                    )
+                    try:
+                        offset = 0
+                        while offset < len(blob):
+                            written = os.write(descriptor, blob[offset:])
+                            if written <= 0:
+                                raise OSError("short submission snapshot write")
+                            offset += written
+                        os.fchmod(descriptor, 0o755 if mode == "100755" else 0o644)
+                        os.fsync(descriptor)
+                        validate_recovery_inode(
+                            os.fstat(descriptor), "restored task file"
+                        )
+                    finally:
+                        os.close(descriptor)
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+        os.fsync(task)
+    finally:
+        os.close(task)
+
+
+def validate_materialized_task(
+    root: int, name: str, entries: Dict[str, Tuple[str, bytes]]
+) -> None:
+    task = os.open(name, secure_directory_flags(), dir_fd=root)
+    validate_exact_task_directory(task, "restored task tree")
+    observed_files = set()
+    observed_directories = set()
+
+    def walk(directory: int, prefix: str) -> None:
+        for child in os.listdir(directory):
+            if child in (".", ".."):
+                raise ValueError("restored task tree contains an invalid entry")
+            relative = child if not prefix else prefix + "/" + child
+            value = os.stat(child, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(value.st_mode):
+                observed_directories.add(relative)
+                nested = os.open(child, secure_directory_flags(), dir_fd=directory)
+                validate_exact_task_directory(nested, "restored task directory")
+                try:
+                    walk(nested, relative)
+                finally:
+                    os.close(nested)
+                continue
+            if relative not in entries:
+                raise ValueError("restored task tree contains foreign content")
+            mode, blob = entries[relative]
+            if mode == "120000":
+                if not stat.S_ISLNK(value.st_mode):
+                    raise ValueError("restored task symlink type mismatch")
+                if os.fsencode(os.readlink(child, dir_fd=directory)) != blob:
+                    raise ValueError("restored task symlink target mismatch")
+            else:
+                validate_recovery_inode(value, "restored task file")
+                expected_mode = 0o755 if mode == "100755" else 0o644
+                if stat.S_IMODE(value.st_mode) != expected_mode:
+                    raise ValueError("restored task file mode mismatch")
+                descriptor = os.open(
+                    child, secure_file_flags(os.O_RDONLY), dir_fd=directory
+                )
+                try:
+                    with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                        if handle.read(len(blob) + 1) != blob:
+                            raise ValueError("restored task file content mismatch")
+                finally:
+                    os.close(descriptor)
+            observed_files.add(relative)
+
+    try:
+        walk(task, "")
+    finally:
+        os.close(task)
+    expected_directories = {
+        "/".join(relative.split("/")[:index])
+        for relative in entries
+        for index in range(1, len(relative.split("/")))
+    }
+    if observed_files != set(entries) or observed_directories != expected_directories:
+        raise ValueError("restored task tree is not the exact snapshot")
+
+
+def submission_task_staging_name(value: Dict[str, Any]) -> str:
+    identity = (value["branch"] + "\0" + value["snapshot_revision"]).encode("utf-8")
+    return ".submission-task-stage-{}".format(hashlib.sha256(identity).hexdigest())
+
+
+def cmd_submission_recovery_restore(args: argparse.Namespace) -> None:
+    directory = open_submission_directory(args.repository, False)
+    if directory is None:
+        raise ValueError("submission recovery record is unavailable")
+    lock = -1
+    root = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        value = read_submission_recovery_at(directory, args.branch)
+        if value is None or value["stage"] not in ("submitted", "restored"):
+            raise ValueError("submission recovery is not ready to restore")
+        validate_recovery_snapshot(args.repository, value)
+        validate_cleanup_revision(args.repository, value, value["cleanup_revision"])
+        validate_recovery_worktree(args.repository, value)
+        entries = snapshot_task_entries(args.repository, value["snapshot_revision"])
+        root = os.open(os.path.abspath(args.repository), secure_directory_flags())
+        validate_owned_directory(root, "worktree root")
+        try:
+            os.stat("task", dir_fd=root, follow_symlinks=False)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+        if exists:
+            validate_materialized_task(root, "task", entries)
+            sys.stdout.write("changed=false\n")
+            return
+        temporary = submission_task_staging_name(value)
+        try:
+            os.stat(temporary, dir_fd=directory, follow_symlinks=False)
+            staged = True
+        except FileNotFoundError:
+            staged = False
+        if not staged:
+            materialize_task_tree(directory, temporary, entries)
+        validate_materialized_task(directory, temporary, entries)
+        if os.environ.get("WORKBENCH_TEST_FAIL_SUBMISSION_STAGE") == "restore-materialized":
+            raise OSError("simulated failure after submission restore materialization")
+        rename_noreplace(directory, temporary, root, "task")
+        os.fsync(directory); os.fsync(root)
+        validate_materialized_task(root, "task", entries)
+        if os.environ.get("WORKBENCH_TEST_FAIL_SUBMISSION_STAGE") == "restore-installed":
+            raise OSError("simulated failure after submission restore installation")
+        sys.stdout.write("changed=true\n")
+    finally:
+        if root >= 0:
+            os.close(root)
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def codebases_parking_name(branch: str) -> str:
+    return "submission-codebases-{}".format(
+        hashlib.sha256(branch.encode("utf-8")).hexdigest()
+    )
+
+
+CODEBASES_MARKER_FIELDS = (
+    "contract_version",
+    "branch",
+    "claim_id",
+    "snapshot_revision",
+    "device",
+    "inode",
+)
+
+
+def codebases_marker_name(branch: str) -> str:
+    return codebases_parking_name(branch) + ".json"
+
+
+def validate_parked_directory(value: os.stat_result) -> None:
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError("parked task codebases is not a directory")
+    if value.st_uid != os.geteuid() or value.st_mode & 0o022:
+        raise ValueError("parked task codebases ownership or mode is unsafe")
+
+
+def codebases_marker_value(
+    recovery: Dict[str, Any], value: os.stat_result
+) -> Dict[str, Any]:
+    return dict(
+        zip(
+            CODEBASES_MARKER_FIELDS,
+            (
+                "workbench-submission-codebases/v1",
+                recovery["branch"],
+                recovery["claim_id"],
+                recovery["snapshot_revision"],
+                value.st_dev,
+                value.st_ino,
+            ),
+        )
+    )
+
+
+def validate_codebases_marker(value: Any) -> Dict[str, Any]:
+    require_fields(value, set(CODEBASES_MARKER_FIELDS), "submission codebases marker")
+    if list(value) != list(CODEBASES_MARKER_FIELDS):
+        raise ValueError("submission codebases marker is not canonically ordered")
+    if value["contract_version"] != "workbench-submission-codebases/v1":
+        raise ValueError("unsupported submission codebases marker")
+    for field in ("branch", "claim_id"):
+        require_text(value[field], "submission codebases " + field)
+    if OID.fullmatch(value["snapshot_revision"]) is None:
+        raise ValueError("submission codebases snapshot is invalid")
+    for field in ("device", "inode"):
+        if (
+            not isinstance(value[field], int)
+            or isinstance(value[field], bool)
+            or value[field] <= 0
+        ):
+            raise ValueError("submission codebases inode identity is invalid")
+    return value
+
+
+def read_codebases_marker(directory: int, branch: str) -> Optional[Dict[str, Any]]:
+    name = codebases_marker_name(branch)
+    try:
+        before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    validate_recovery_inode(before, "codebases marker")
+    descriptor = os.open(name, secure_file_flags(os.O_RDONLY), dir_fd=directory)
+    try:
+        after = os.fstat(descriptor)
+        validate_recovery_inode(after, "codebases marker")
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("submission codebases marker changed while opening")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read(8193)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 8192:
+        raise ValueError("submission codebases marker is too large")
+    value = json.loads(raw, object_pairs_hook=unique_object)
+    validate_codebases_marker(value)
+    canonical = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if raw != canonical:
+        raise ValueError("submission codebases marker is not canonical")
+    return value
+
+
+def write_codebases_marker(
+    directory: int, branch: str, value: Dict[str, Any]
+) -> None:
+    validate_codebases_marker(value)
+    payload = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    temporary = ".submission-codebases-marker-{}".format(secrets.token_hex(16))
+    descriptor = os.open(
+        temporary,
+        secure_file_flags(os.O_WRONLY) | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=directory,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("short submission codebases marker write")
+            offset += written
+        os.fsync(descriptor)
+        validate_recovery_inode(os.fstat(descriptor), "codebases marker temporary")
+        rename_noreplace(
+            directory, temporary, directory, codebases_marker_name(branch)
+        )
+        os.fsync(directory)
+    finally:
+        os.close(descriptor)
+
+
+def cmd_submission_recovery_codebases(args: argparse.Namespace) -> None:
+    directory = open_submission_directory(args.repository, True)
+    if directory is None:
+        raise ValueError("submission recovery directory is unavailable")
+    lock = -1
+    root = -1
+    task = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        recovery = read_submission_recovery_at(directory, args.branch)
+        if recovery is None or recovery["branch"] != args.branch:
+            raise ValueError("submission codebases recovery identity is unavailable")
+        validate_recovery_snapshot(args.repository, recovery)
+        validate_recovery_worktree(args.repository, recovery, True)
+        root = os.open(os.path.abspath(args.repository), secure_directory_flags())
+        validate_owned_directory(root, "worktree root")
+        parking = codebases_parking_name(args.branch)
+        marker = read_codebases_marker(directory, args.branch)
+        parked = True
+        try:
+            parked_status = os.stat(parking, dir_fd=directory, follow_symlinks=False)
+            validate_parked_directory(parked_status)
+        except FileNotFoundError:
+            parked = False
+        if args.direction == "park":
+            try:
+                task = os.open("task", secure_directory_flags(), dir_fd=root)
+                validate_owned_directory(task, "task directory")
+                source = os.stat("codebases", dir_fd=task, follow_symlinks=False)
+                validate_parked_directory(source)
+                present = True
+            except FileNotFoundError:
+                present = False
+            if present and parked:
+                raise ValueError("task codebases parking is ambiguous")
+            if present:
+                expected = codebases_marker_value(recovery, source)
+                if marker is None:
+                    write_codebases_marker(directory, args.branch, expected)
+                elif marker != expected:
+                    raise ValueError("task codebases parking marker mismatch")
+                rename_noreplace(task, "codebases", directory, parking)
+                os.fsync(task); os.fsync(directory)
+                installed = os.stat(parking, dir_fd=directory, follow_symlinks=False)
+                validate_parked_directory(installed)
+                if (installed.st_dev, installed.st_ino) != (source.st_dev, source.st_ino):
+                    raise ValueError("task codebases parking changed inode")
+                sys.stdout.write("changed=true\n")
+            elif parked:
+                expected = codebases_marker_value(recovery, parked_status)
+                if marker != expected:
+                    raise ValueError("parked task codebases marker mismatch")
+                sys.stdout.write("changed=false\n")
+            else:
+                if marker is not None:
+                    raise ValueError("task codebases marker has no directory")
+                sys.stdout.write("changed=false\n")
+            return
+        task = os.open("task", secure_directory_flags(), dir_fd=root)
+        validate_owned_directory(task, "task directory")
+        try:
+            target_status = os.stat("codebases", dir_fd=task, follow_symlinks=False)
+            validate_parked_directory(target_status)
+            target_present = True
+        except FileNotFoundError:
+            target_present = False
+        if parked and target_present:
+            raise ValueError("restored task codebases path is occupied")
+        if not parked:
+            if target_present:
+                expected = codebases_marker_value(recovery, target_status)
+                if marker != expected:
+                    raise ValueError("restored task codebases marker mismatch")
+            elif marker is not None:
+                raise ValueError("submission codebases marker has no directory")
+            sys.stdout.write("changed=false\n")
+            return
+        expected = codebases_marker_value(recovery, parked_status)
+        if marker != expected:
+            raise ValueError("parked task codebases marker mismatch")
+        rename_noreplace(directory, parking, task, "codebases")
+        os.fsync(directory); os.fsync(task)
+        installed = os.stat("codebases", dir_fd=task, follow_symlinks=False)
+        validate_parked_directory(installed)
+        if (installed.st_dev, installed.st_ino) != (
+            parked_status.st_dev,
+            parked_status.st_ino,
+        ):
+            raise ValueError("restored task codebases changed inode")
+        sys.stdout.write("changed=true\n")
+    finally:
+        if task >= 0:
+            os.close(task)
+        if root >= 0:
+            os.close(root)
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def unlink_regular_at(directory: int, name: str, kind: str) -> None:
+    before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    validate_recovery_inode(before, kind)
+    os.unlink(name, dir_fd=directory)
+    os.fsync(directory)
+
+
+def cmd_submission_recovery_retire(args: argparse.Namespace) -> None:
+    directory = open_submission_directory(args.repository, False)
+    if directory is None:
+        return
+    lock = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        value = read_submission_recovery_at(directory, args.branch)
+        if value is None:
+            lock_status = os.fstat(lock)
+            lock_name = submission_recovery_name(args.branch) + ".lock"
+            named = os.stat(lock_name, dir_fd=directory, follow_symlinks=False)
+            validate_recovery_inode(named, "lock")
+            if (lock_status.st_dev, lock_status.st_ino) != (named.st_dev, named.st_ino):
+                raise ValueError("submission recovery lock changed before retirement")
+            os.unlink(lock_name, dir_fd=directory)
+            os.fsync(directory)
+            return
+        if (
+            value["branch"] != args.branch
+            or value["claim_id"] != args.claim_id
+            or value["stage"] != "restored"
+        ):
+            raise ValueError("submission recovery retirement identity mismatch")
+        validate_recovery_snapshot(args.repository, value)
+        validate_cleanup_revision(
+            args.repository, value, value["cleanup_revision"]
+        )
+        validate_recovery_authority(args.repository, value)
+        local_ref = "refs/heads/" + args.branch
+        if subprocess.call(
+            ["git", "-C", args.repository, "show-ref", "--verify", "--quiet", local_ref],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ) == 0:
+            raise ValueError("submission recovery branch still exists during retirement")
+        worktrees = git_bytes(args.repository, "worktree", "list", "--porcelain").decode(
+            "utf-8"
+        )
+        if "branch {}\n".format(local_ref) in worktrees:
+            raise ValueError("submission recovery worktree still exists during retirement")
+        staging = submission_task_staging_name(value)
+        try:
+            os.stat(staging, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("submission recovery staging remains during retirement")
+        parking = codebases_parking_name(args.branch)
+        try:
+            os.stat(parking, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("submission codebases remain parked during retirement")
+        marker = read_codebases_marker(directory, args.branch)
+        if marker is not None:
+            if (
+                marker["branch"] != value["branch"]
+                or marker["claim_id"] != value["claim_id"]
+                or marker["snapshot_revision"] != value["snapshot_revision"]
+            ):
+                raise ValueError("submission codebases retirement marker mismatch")
+            unlink_regular_at(
+                directory, codebases_marker_name(args.branch), "codebases marker"
+            )
+        unlink_regular_at(
+            directory, submission_recovery_name(args.branch), "record"
+        )
+        lock_status = os.fstat(lock)
+        lock_name = submission_recovery_name(args.branch) + ".lock"
+        named = os.stat(lock_name, dir_fd=directory, follow_symlinks=False)
+        validate_recovery_inode(named, "lock")
+        if (lock_status.st_dev, lock_status.st_ino) != (named.st_dev, named.st_ino):
+            raise ValueError("submission recovery lock changed before retirement")
+        os.unlink(lock_name, dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def cmd_lifecycle_reduce(args: argparse.Namespace) -> None:
+    groups: Dict[str, Dict[str, Any]] = {}
+    with open(args.markers_file, encoding="utf-8") as handle:
+        for raw in handle:
+            if not raw.endswith("\n"):
+                raise ValueError("lifecycle marker stream is not LF-terminated")
+            marker = json.loads(raw, object_pairs_hook=unique_object)
+            require_fields(marker, MARKER_FIELDS, "lifecycle marker stream row")
+            if marker["task_contract"] != "workbench-task/v2":
+                continue
+            reduce_lifecycle_marker(groups, marker)
+    group = groups.get(args.branch)
+    expected_home = None if args.home == "-" else args.home
+    if group is None:
+        raise ValueError("submission lifecycle identity is absent")
+    if (
+        group["claim_id"] != args.claim_id
+        or group["issue"] != args.issue
+        or group["home"] != expected_home
+        or group["workspace_authority_descriptor_digest"] != args.descriptor_digest
+    ):
+        raise ValueError("submission lifecycle identity mismatch")
+    sys.stdout.write("phase={}\n".format(group["phase"]))
+    submission = group["submission"]
+    sys.stdout.write(
+        "pull_request={}\nhead_revision={}\n".format(
+            "" if submission is None else submission["number"],
+            "" if submission is None else submission["revision"],
+        )
+    )
+    sys.stdout.write("terminal_event={}\n".format(group.get("terminal_event", "")))
+    sys.stdout.write(
+        "terminal_revision={}\n".format(group.get("terminal_revision", ""))
+    )
+
+
 def load_submission_observation(
-    path: str, repository_origin: str, branch: str, expected_head: str
+    path: str,
+    repository_origin: str,
+    branch: str,
+    expected_head: str,
+    expected_base_ref: str,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
+    require_text(expected_base_ref, "submission expected base ref")
     with open(path, encoding="utf-8") as handle:
         value = json.load(handle, object_pairs_hook=unique_object)
     require_fields(value, SUBMISSION_OBSERVATION_FIELDS, "submission observation")
@@ -882,7 +2178,7 @@ def load_submission_observation(
     if (
         value["repository_origin_url"] != repository_origin
         or value["head_branch"] != branch
-        or value["base_ref"] != "main"
+        or value["base_ref"] != expected_base_ref
     ):
         raise ValueError("submission observation identity mismatch")
     pagination = require_fields(value["pagination"], PAGINATION_FIELDS, "submission pagination")
@@ -912,7 +2208,7 @@ def load_submission_observation(
             item["head_branch"] == branch
             and item["head_revision"] == expected_head
             and item["head_repository_origin_url"] == repository_origin
-            and item["base_ref"] == "main"
+            and item["base_ref"] == expected_base_ref
         ):
             matches.append(item)
     if len(matches) != 1 or len(value["pull_requests"]) != 1:
@@ -926,6 +2222,7 @@ def cmd_submission(args: argparse.Namespace) -> None:
         args.repository_origin_url,
         args.head_branch,
         args.head_revision,
+        args.base_ref,
     )
     sys.stdout.write("state={}\n".format(state))
     if item is not None:
@@ -963,7 +2260,58 @@ def parser() -> argparse.ArgumentParser:
     submission.add_argument("--repository-origin-url", required=True)
     submission.add_argument("--head-branch", required=True)
     submission.add_argument("--head-revision", required=True)
+    submission.add_argument("--base-ref", required=True)
     submission.set_defaults(func=cmd_submission)
+    recovery_prepare = commands.add_parser("submission-recovery-prepare")
+    recovery_prepare.add_argument("--repository", required=True)
+    recovery_prepare.add_argument("--repository-origin-url", required=True)
+    recovery_prepare.add_argument("--default-ref", required=True)
+    recovery_prepare.add_argument("--branch", required=True)
+    recovery_prepare.add_argument("--snapshot-revision", required=True)
+    recovery_prepare.set_defaults(func=cmd_submission_recovery_prepare)
+    recovery_advance = commands.add_parser("submission-recovery-advance")
+    recovery_advance.add_argument("--repository", required=True)
+    recovery_advance.add_argument("--branch", required=True)
+    recovery_advance.add_argument(
+        "--stage", choices=SUBMISSION_RECOVERY_STAGES[1:], required=True
+    )
+    recovery_advance.add_argument("--cleanup-revision")
+    recovery_advance.add_argument("--pull-request", type=int)
+    recovery_advance.add_argument("--pull-request-url")
+    recovery_advance.add_argument("--head-revision")
+    recovery_advance.set_defaults(func=cmd_submission_recovery_advance)
+    recovery_validate = commands.add_parser("submission-recovery-validate")
+    recovery_validate.add_argument("--repository", required=True)
+    recovery_validate.add_argument("--repository-origin-url", required=True)
+    recovery_validate.add_argument("--default-ref", required=True)
+    recovery_validate.add_argument("--branch", required=True)
+    recovery_validate.add_argument("--current-head", required=True)
+    recovery_validate.add_argument("--index-file")
+    recovery_validate.set_defaults(func=cmd_submission_recovery_validate)
+    recovery_restore = commands.add_parser("submission-recovery-restore")
+    recovery_restore.add_argument("--repository", required=True)
+    recovery_restore.add_argument("--branch", required=True)
+    recovery_restore.set_defaults(func=cmd_submission_recovery_restore)
+    recovery_codebases = commands.add_parser("submission-recovery-codebases")
+    recovery_codebases.add_argument("--repository", required=True)
+    recovery_codebases.add_argument("--branch", required=True)
+    recovery_codebases.add_argument(
+        "--direction", choices=("park", "restore"), required=True
+    )
+    recovery_codebases.set_defaults(func=cmd_submission_recovery_codebases)
+    recovery_retire = commands.add_parser("submission-recovery-retire")
+    recovery_retire.add_argument("--repository", required=True)
+    recovery_retire.add_argument("--branch", required=True)
+    recovery_retire.add_argument("--claim-id", required=True)
+    recovery_retire.set_defaults(func=cmd_submission_recovery_retire)
+    lifecycle_reduce = commands.add_parser("lifecycle-reduce")
+    lifecycle_reduce.add_argument("--markers-file", required=True)
+    lifecycle_reduce.add_argument("--branch", required=True)
+    lifecycle_reduce.add_argument("--claim-id", required=True)
+    lifecycle_reduce.add_argument("--issue", type=int, required=True)
+    lifecycle_reduce.add_argument("--home", required=True)
+    lifecycle_reduce.add_argument("--descriptor-digest", required=True)
+    lifecycle_reduce.set_defaults(func=cmd_lifecycle_reduce)
     return value
 
 

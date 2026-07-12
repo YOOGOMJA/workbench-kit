@@ -172,10 +172,10 @@ case "${1:-} ${2:-}" in
         *) shift ;;
       esac
     done
-    [ -n "$head" ] && [ "$base" = main ] || exit 9
+    [ -n "$head" ] && [ -n "$base" ] || exit 9
     head_oid="$(git rev-parse HEAD)"
     mkdir -p "$GH_COMMENTS_DIR"
-    python3 - "$GH_COMMENTS_DIR/pr-17.json" "$head" "$head_oid" <<'PY'
+    python3 - "$GH_COMMENTS_DIR/pr-17.json" "$head" "$head_oid" "$base" <<'PY'
 import json
 import sys
 
@@ -184,7 +184,7 @@ value = {
     "url": "https://github.com/example/workbench/pull/17",
     "headRefName": sys.argv[2],
     "headRefOid": sys.argv[3],
-    "baseRefName": "main",
+    "baseRefName": sys.argv[4],
     "state": "OPEN",
     "merged": False,
 }
@@ -376,7 +376,11 @@ PY
   exit
 fi
 if [ "$command" = submission ]; then
-  python3 - "$repository" "$head_branch" "$head_revision" "${GH_COMMENTS_DIR:-}/pr-17.json" <<'PY'
+  if [ -n "${WORKBENCH_TEST_SUBMISSION_OBSERVATION:-}" ]; then
+    cat "$WORKBENCH_TEST_SUBMISSION_OBSERVATION"
+    exit
+  fi
+  python3 - "$repository" "$head_branch" "$head_revision" "${GH_COMMENTS_DIR:-}/pr-17.json" "$default_ref" <<'PY'
 import json
 import pathlib
 import subprocess
@@ -404,7 +408,7 @@ value = {
     "contract_version": "workbench-hosting-submission-observation/v1",
     "repository_origin_url": origin,
     "head_branch": sys.argv[2],
-    "base_ref": "main",
+    "base_ref": sys.argv[5],
     "pagination": {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None},
     "pull_requests": pull_requests,
 }
@@ -592,6 +596,8 @@ run_task_in_dir() {
     WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM="${WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM:-0}" \
     WORKBENCH_TEST_FAIL_WRITER_STAGE="${WORKBENCH_TEST_FAIL_WRITER_STAGE:-}" \
     WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT="${WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT:-0}" \
+    WORKBENCH_TEST_FAIL_SUBMISSION_STAGE="${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" \
+    WORKBENCH_TEST_SUBMISSION_OBSERVATION="${WORKBENCH_TEST_SUBMISSION_OBSERVATION:-}" \
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
@@ -634,6 +640,34 @@ start_task() {
     run_task "$case_name" "$repo" start "$issue" "v2-lifecycle-fixture-$issue" >&2
   fi
   printf '%s/.worktrees/task__%s-v2-lifecycle-fixture-%s\n' "$repo" "$issue" "$issue"
+}
+
+prepare_submission_fixture() {
+  local case_name="$1"
+  SUBMISSION_REPO="$(setup_workbench "$case_name")"
+  printf '%s\n' 'kit: https://github.com/example/workbench.git' \
+    > "$SUBMISSION_REPO/codebases.yaml"
+  git -C "$SUBMISSION_REPO" add codebases.yaml
+  git -C "$SUBMISSION_REPO" commit -q -m "test: register submission owner"
+  git -C "$SUBMISSION_REPO" push -q
+  SUBMISSION_TASK_DIR="$(start_task "$case_name" "$SUBMISSION_REPO")"
+  run_task_in_dir "$case_name" "$SUBMISSION_TASK_DIR" policy-context seal \
+    --format json >/dev/null
+  run_task_in_dir "$case_name" "$SUBMISSION_TASK_DIR" deliverable declare \
+    --id workbench-pr --owner kit --kind workbench-increment --format json >/dev/null
+  run_task_in_dir "$case_name" "$SUBMISSION_TASK_DIR" harvest seal --format json >/dev/null
+  mkdir -p "$SUBMISSION_TASK_DIR/docs"
+  printf '%s\n' "# $case_name increment" > "$SUBMISSION_TASK_DIR/docs/increment.md"
+  printf '\n## [2026-07-12 13:00:00] code · create docs/increment.md | %s\n' "$case_name" \
+    >> "$SUBMISSION_TASK_DIR/task/log.md"
+  printf '%s\n' '# Status' '' "상태: $case_name ready" \
+    > "$SUBMISSION_TASK_DIR/task/status.md"
+  git -C "$SUBMISSION_TASK_DIR" add docs/increment.md task
+  git -C "$SUBMISSION_TASK_DIR" commit -q -m "feat: add $case_name increment"
+  git -C "$SUBMISSION_TASK_DIR" push -q
+  SUBMISSION_SNAPSHOT="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  SUBMISSION_BODY="$TMPDIR/$case_name/pr-body.md"
+  printf '%s\n' "$case_name fixture PR" > "$SUBMISSION_BODY"
 }
 
 append_repo_fact() {
@@ -1584,9 +1618,10 @@ test_work_ref_inventory_is_cross_clone() {
 }
 
 test_work_ref_inventory_uses_authority_default_ref() {
-  local repo task_dir actual
+  local repo task_dir actual body
   repo="$(setup_workbench work_ref_trunk)"
   git -C "$repo" branch -m trunk
+  printf '%s\n' 'kit: https://github.com/example/workbench.git' > "$repo/codebases.yaml"
   python3 - "$repo/.workbench/authority.json" <<'PY'
 import json
 import sys
@@ -1598,7 +1633,7 @@ with open(path, "w", encoding="utf-8") as handle:
     json.dump(value, handle, separators=(",", ":"))
     handle.write("\n")
 PY
-  git -C "$repo" add .workbench/authority.json
+  git -C "$repo" add .workbench/authority.json codebases.yaml
   git -C "$repo" commit -q -m "test: protect trunk by authority"
   git -C "$repo" push -q -u origin trunk
   git -C "$TMPDIR/work_ref_trunk/origin.git" symbolic-ref HEAD refs/heads/trunk
@@ -1609,6 +1644,21 @@ PY
   actual="$(run_task_in_dir work_ref_trunk "$task_dir" refs set \
     --work-ref toolbox:scenario/SCN-TRUNK --format json)"
   assert_contains "$actual" '"work_ref":"toolbox:scenario/SCN-TRUNK"'
+  run_task_in_dir work_ref_trunk "$task_dir" deliverable declare --id workbench-pr \
+    --owner kit --kind workbench-increment --format json >/dev/null
+  printf '%s\n' trunk-increment > "$task_dir/TRUNK.md"
+  printf '\n## [2026-07-12 14:30:00] code · create TRUNK.md | trunk submission fixture\n' \
+    >> "$task_dir/task/log.md"
+  printf '%s\n' '# Status' '' '상태: trunk submit ready' > "$task_dir/task/status.md"
+  git -C "$task_dir" add task TRUNK.md
+  git -C "$task_dir" commit -q -m "test: prepare trunk submission"
+  git -C "$task_dir" push -q
+  body="$TMPDIR/work_ref_trunk/body.md"; printf '%s\n' trunk > "$body"
+  run_task_in_dir work_ref_trunk "$task_dir" submit \
+    --title "test: trunk submission" --body-file "$body" >/dev/null
+  assert_file_contains "$TMPDIR/work_ref_trunk/comments/pr-17.json" '"baseRefName":"trunk"'
+  [ -f "$task_dir/task/index.md" ] \
+    || fail "trunk submission did not restore its task state"
 }
 
 test_work_ref_inventory_fails_closed_on_identity_mismatch() {
@@ -1647,6 +1697,44 @@ PY
   assert_file_contains "$out" 'active-task-inventory-unavailable'
   [ -z "$(sed -n 's/^work_ref: *//p' "$second/task/index.md")" ] \
     || fail "identity-mismatched inventory changed the current work_ref"
+}
+
+test_work_ref_inventory_rejects_lifecycle_without_initial_claim() {
+  local repo first second comments out
+  repo="$(setup_workbench work_ref_sequence)"
+  first="$(start_task work_ref_sequence "$repo" 29)"
+  run_task_in_dir work_ref_sequence "$first" refs set \
+    --work-ref toolbox:scenario/SCN-SEQUENCE --format json >/dev/null
+  git -C "$first" add task/index.md
+  git -C "$first" commit -q -m "test: persist sequence work reference"
+  git -C "$first" push -q
+  second="$(start_task work_ref_sequence "$repo" 31)"
+  comments="$TMPDIR/work_ref_sequence/comments/29.comments"
+  python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+raw = open(path, encoding="utf-8").read()
+pattern = re.compile(
+    r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->\n"
+    r"workbench task lifecycle: task-claimed[^\r\n]*\n+"
+)
+matches = list(pattern.finditer(raw))
+assert len(matches) == 1
+marker = json.loads(matches[0].group(1))
+assert marker["event"] == "task-claimed"
+raw = raw[: matches[0].start()] + raw[matches[0].end() :]
+open(path, "w", encoding="utf-8").write(raw)
+PY
+
+  out="$TMPDIR/work_ref_sequence/rejected.out"
+  if run_task_in_dir work_ref_sequence "$second" refs set \
+    --work-ref toolbox:scenario/SCN-OTHER --format json >"$out" 2>&1; then
+    fail "active inventory accepted a lifecycle identity without task-claimed"
+  fi
+  assert_file_contains "$out" 'active-task-inventory-unavailable'
 }
 
 test_policy_context_is_owner_authorized_sealed_and_manifest_bound() {
@@ -4954,6 +5042,364 @@ PY
   [ "$(git -C "$task_dir" branch --show-current)" = "$branch" ] || fail "submit changed task branch"
 }
 
+test_v1_submission_without_origin_head_uses_main_fallback() {
+  local repo task_dir body actual
+  repo="$(setup_workbench v1_submit_no_head workbench/v1)"
+  task_dir="$(start_task v1_submit_no_head "$repo")"
+  printf '%s\n' v1-increment > "$task_dir/V1.md"
+  printf '\n## [2026-07-12 11:30:00] code · create V1.md | v1 no origin HEAD fixture\n' \
+    >> "$task_dir/task/log.md"
+  printf '%s\n' '# Status' '' '상태: v1 submit ready' > "$task_dir/task/status.md"
+  git -C "$task_dir" add V1.md task
+  git -C "$task_dir" commit -q -m "test: prepare v1 submission"
+  git -C "$task_dir" push -q
+  git -C "$repo" remote set-head origin -d
+  body="$TMPDIR/v1_submit_no_head/body.md"; printf '%s\n' v1 > "$body"
+  actual="$(run_task_in_dir v1_submit_no_head "$task_dir" submit \
+    --title "test: v1 no origin head" --body-file "$body")"
+  assert_contains "$actual" 'https://github.com/example/workbench/pull/17'
+  assert_file_contains "$TMPDIR/v1_submit_no_head/comments/pr-17.json" '"baseRefName":"main"'
+}
+
+test_v2_submission_restores_authenticated_state_to_terminal_cleanup() {
+  local repo task_dir body snapshot head actual branch common
+  repo="$(setup_workbench v2_submit_terminal)"
+  printf '%s\n' \
+    'schema=workbench-policy/v1' \
+    'action.task.complete=allow' \
+    'action.task.cleanup=allow' > "$repo/.workbench/policy.conf"
+  printf '%s\n' 'kit: https://github.com/example/workbench.git' > "$repo/codebases.yaml"
+  git -C "$repo" add .workbench/policy.conf codebases.yaml
+  git -C "$repo" commit -q -m "test: allow submitted increment completion"
+  git -C "$repo" push -q
+  task_dir="$(start_task v2_submit_terminal "$repo")"
+  run_task_in_dir v2_submit_terminal "$task_dir" policy-context seal --format json >/dev/null
+  run_task_in_dir v2_submit_terminal "$task_dir" deliverable declare \
+    --id workbench-pr --owner kit --kind workbench-increment --format json >/dev/null
+  run_task_in_dir v2_submit_terminal "$task_dir" harvest seal --format json >/dev/null
+  mkdir -p "$task_dir/docs"
+  printf '%s\n' '# Recoverable increment' > "$task_dir/docs/recoverable.md"
+  printf '\n## [2026-07-12 12:00:00] code · create docs/recoverable.md | recoverable submit fixture\n' \
+    >> "$task_dir/task/log.md"
+  printf '%s\n' '# Status' '' '상태: recoverable submit fixture ready' \
+    > "$task_dir/task/status.md"
+  git -C "$task_dir" add docs/recoverable.md task
+  git -C "$task_dir" commit -q -m "feat: add recoverable increment"
+  git -C "$task_dir" push -q
+  snapshot="$(git -C "$task_dir" rev-parse HEAD)"
+  body="$TMPDIR/v2_submit_terminal/pr-body.md"
+  printf '%s\n' 'recoverable fixture PR' > "$body"
+
+  actual="$(run_task_in_dir v2_submit_terminal "$task_dir" submit \
+    --title "feat: recoverable v2 submit" --body-file "$body")"
+  assert_contains "$actual" 'https://github.com/example/workbench/pull/17'
+  head="$(git -C "$task_dir" rev-parse HEAD)"
+  branch="$(git -C "$task_dir" branch --show-current)"
+  [ "$(git -C "$task_dir" rev-parse HEAD^)" = "$snapshot" ] \
+    || fail "submission cleanup does not directly descend from its persisted snapshot"
+  [ -f "$task_dir/task/index.md" ] \
+    || fail "authenticated submission did not restore its live v2 task state"
+  git -C "$task_dir" ls-files --error-unmatch task/index.md >/dev/null 2>&1 \
+    && fail "restored v2 task state became tracked in the submitted PR"
+  [ -z "$(git -C "$task_dir" diff origin/main...HEAD --name-only -- task)" ] \
+    || fail "submitted PR diff contains task state"
+  actual="$(run_task_in_dir v2_submit_terminal "$task_dir" deliverable list --format json)"
+  assert_contains "$actual" '"kind":"workbench-increment"'
+  assert_contains "$actual" '"external_ref":"https://github.com/example/workbench/pull/17"'
+  assert_contains "$actual" "\"revision\":\"$head\",\"state\":\"submitted\""
+
+  python3 - "$TMPDIR/v2_submit_terminal/comments/pr-17.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["state"] = "MERGED"
+value["merged"] = True
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  actual="$(GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir v2_submit_terminal "$task_dir" deliverable accept \
+      --id workbench-pr --format json)"
+  assert_contains "$actual" '"state":"accepted"'
+  actual="$(GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir v2_submit_terminal "$task_dir" verify --format json)"
+  assert_contains "$actual" '"verified":true'
+  actual="$(GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir v2_submit_terminal "$task_dir" complete --format json)"
+  assert_contains "$actual" '"outcome":"completed"'
+  [ -z "$(git -C "$task_dir" diff origin/main...HEAD --name-only -- task)" ] \
+    || fail "terminal operations changed the submitted PR diff"
+
+  common="$(git -C "$task_dir" rev-parse --path-format=absolute --git-common-dir)"
+  actual="$(run_task v2_submit_terminal "$repo" done 29 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+  [ ! -d "$task_dir" ] || fail "completed submitted task workspace was not removed"
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+    fail "completed submitted task branch was not removed locally"
+  fi
+  python3 - "$common/workbench-v2" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+residue = [
+    path.name
+    for path in root.iterdir()
+    if path.name.startswith("submission-")
+    or path.name.startswith(".submission-task-stage-")
+]
+assert residue == [], residue
+PY
+}
+
+test_v2_submission_crash_boundaries_are_idempotent() {
+  local stage case_name out rc actual pr_creates common
+  for stage in ${WORKBENCH_SUBMISSION_CRASH_STAGES:-cleanup-staged cleanup-committed pr-observed submitted restore-materialized restore-installed restored}; do
+    case_name="submit_crash_${stage//-/_}"
+    prepare_submission_fixture "$case_name"
+    out="$TMPDIR/$case_name/failed.out"
+    if WORKBENCH_TEST_FAIL_SUBMISSION_STAGE="$stage" \
+      run_task_in_dir "$case_name" "$SUBMISSION_TASK_DIR" submit \
+        --title "feat: $case_name" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+      fail "submission crash hook $stage did not interrupt"
+    else rc=$?; fi
+    [ "$rc" = 1 ] || fail "submission crash hook $stage returned $rc"
+    if [ "$stage" = restore-materialized ]; then
+      [ ! -e "$SUBMISSION_TASK_DIR/task" ] \
+        || fail "failed restore materialization exposed a partial task tree"
+    fi
+    actual="$(run_task_in_dir "$case_name" "$SUBMISSION_TASK_DIR" submit \
+      --title "feat: $case_name" --body-file "$SUBMISSION_BODY")"
+    assert_contains "$actual" 'https://github.com/example/workbench/pull/17'
+    [ -f "$SUBMISSION_TASK_DIR/task/index.md" ] \
+      || fail "submission retry after $stage did not restore task state"
+    [ -z "$(git -C "$SUBMISSION_TASK_DIR" diff origin/main...HEAD --name-only -- task)" ] \
+      || fail "submission retry after $stage added task state to the PR"
+    common="$(git -C "$SUBMISSION_TASK_DIR" rev-parse --path-format=absolute --git-common-dir)"
+    [ -z "$(find "$common/workbench-v2" -maxdepth 1 -name '.submission-task-stage-*' -print)" ] \
+      || fail "submission retry after $stage retained restore staging"
+    pr_creates="$(grep -c 'pr create' "$TMPDIR/$case_name/gh.log" || true)"
+    [ "$pr_creates" = 1 ] || fail "submission retry after $stage created $pr_creates PRs"
+  done
+}
+
+test_v2_submission_restore_never_overwrites_occupied_state() {
+  local out rc branch common before staging staging_inode installed_inode
+  prepare_submission_fixture submit_restore_safety
+  out="$TMPDIR/submit_restore_safety/submitted.out"
+  if WORKBENCH_TEST_FAIL_SUBMISSION_STAGE=submitted \
+    run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+      --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "submission fixture did not stop before restoration"
+  fi
+  [ ! -e "$SUBMISSION_TASK_DIR/task" ] || fail "pre-restore fixture retained task state"
+  branch="$(git -C "$SUBMISSION_TASK_DIR" branch --show-current)"
+
+  mkdir "$SUBMISSION_TASK_DIR/task"
+  printf '%s\n' foreign > "$SUBMISSION_TASK_DIR/task/FOREIGN"
+  before="$(cat "$SUBMISSION_TASK_DIR/task/FOREIGN")"
+  if run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "submission restoration overwrote an occupied task directory"
+  fi
+  [ "$(cat "$SUBMISSION_TASK_DIR/task/FOREIGN")" = "$before" ] \
+    || fail "occupied task bytes changed during rejected restoration"
+  rm "$SUBMISSION_TASK_DIR/task/FOREIGN"; rmdir "$SUBMISSION_TASK_DIR/task"
+
+  mkdir "$SUBMISSION_TASK_DIR/task"
+  git -C "$SUBMISSION_TASK_DIR" show "$SUBMISSION_SNAPSHOT:task/index.md" \
+    > "$SUBMISSION_TASK_DIR/task/index.md"
+  if run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "submission restoration adopted a partial task snapshot"
+  fi
+  [ ! -e "$SUBMISSION_TASK_DIR/task/status.md" ] \
+    || fail "partial task snapshot was populated in place"
+  rm "$SUBMISSION_TASK_DIR/task/index.md"; rmdir "$SUBMISSION_TASK_DIR/task"
+
+  mkdir "$TMPDIR/submit_restore_safety/foreign-task"
+  printf '%s\n' symlink-target > "$TMPDIR/submit_restore_safety/foreign-task/FOREIGN"
+  ln -s "$TMPDIR/submit_restore_safety/foreign-task" "$SUBMISSION_TASK_DIR/task"
+  if run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "submission restoration followed an occupied task symlink"
+  fi
+  [ "$(cat "$TMPDIR/submit_restore_safety/foreign-task/FOREIGN")" = symlink-target ] \
+    || fail "task symlink target changed during rejected restoration"
+  rm "$SUBMISSION_TASK_DIR/task"
+
+  if python3 "$SUBMISSION_REPO/lib/workbench_lifecycle.py" submission-recovery-restore \
+    --repository "$SUBMISSION_REPO" --branch "$branch" >"$out" 2>&1; then
+    fail "recovery helper restored into a different worktree"
+  fi
+  [ ! -e "$SUBMISSION_REPO/task" ] \
+    || fail "direct recovery helper misuse created task state in the root checkout"
+
+  if WORKBENCH_TEST_FAIL_SUBMISSION_STAGE=restore-materialized \
+    run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+      --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "mid-restore failure hook did not interrupt"
+  fi
+  [ ! -e "$SUBMISSION_TASK_DIR/task" ] \
+    || fail "mid-restore failure exposed partial task state"
+  common="$(git -C "$SUBMISSION_TASK_DIR" rev-parse --path-format=absolute --git-common-dir)"
+  staging="$(find "$common/workbench-v2" -maxdepth 1 -name '.submission-task-stage-*' -type d)"
+  [ -n "$staging" ] && [ "$(printf '%s\n' "$staging" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "mid-restore failure did not retain one deterministic private staging tree"
+  staging_inode="$(ls -di "$staging" | awk '{print $1}')"
+  printf '%s\n' foreign-stage > "$staging/FOREIGN"
+  if run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "submission restoration adopted a foreign deterministic staging collision"
+  fi
+  [ "$(cat "$staging/FOREIGN")" = foreign-stage ] \
+    || fail "foreign staging collision changed during rejected restoration"
+  rm "$staging/FOREIGN"
+  if WORKBENCH_TEST_FAIL_SUBMISSION_STAGE=restore-installed \
+    run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+      --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "post-install failure hook did not interrupt"
+  fi
+  [ -f "$SUBMISSION_TASK_DIR/task/index.md" ] \
+    || fail "post-install failure did not leave the exact atomic task tree"
+  [ ! -e "$staging" ] || fail "successful restore retained its owned staging tree"
+  installed_inode="$(ls -di "$SUBMISSION_TASK_DIR/task" | awk '{print $1}')"
+  [ "$installed_inode" = "$staging_inode" ] \
+    || fail "submission retry did not atomically reuse its deterministic staging tree"
+  chmod 4644 "$SUBMISSION_TASK_DIR/task/index.md"
+  if run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "submission restoration accepted special mode bits"
+  fi
+  chmod 0644 "$SUBMISSION_TASK_DIR/task/index.md"
+  chmod 0755 "$SUBMISSION_TASK_DIR/task"
+  if run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "submission restoration accepted a non-exact task directory mode"
+  fi
+  chmod 0700 "$SUBMISSION_TASK_DIR/task"
+  run_task_in_dir submit_restore_safety "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: restore safety" --body-file "$SUBMISSION_BODY" >/dev/null
+  [ -f "$SUBMISSION_TASK_DIR/task/index.md" ] \
+    || fail "safe restoration did not recover after isolated materialization failure"
+}
+
+test_v2_submission_rejects_noncanonical_pr_and_lifecycle_state() {
+  local mode observation origin branch head out claim descriptor comments
+  prepare_submission_fixture submit_invalid_current
+  run_task_in_dir submit_invalid_current "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: invalid current" --body-file "$SUBMISSION_BODY" >/dev/null
+  origin="$(git -C "$SUBMISSION_TASK_DIR" remote get-url origin)"
+  branch="$(git -C "$SUBMISSION_TASK_DIR" branch --show-current)"
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  for mode in fork multiple changed-head; do
+    observation="$TMPDIR/submit_invalid_current/$mode.json"
+    python3 - "$observation" "$origin" "$branch" "$head" "$mode" <<'PY'
+import copy
+import json
+import sys
+
+path, origin, branch, head, mode = sys.argv[1:]
+pagination = {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None}
+item = {
+    "number": 17,
+    "url": "https://github.com/example/workbench/pull/17",
+    "head_branch": branch,
+    "head_revision": "0" * 40 if mode == "changed-head" else head,
+    "head_repository_origin_url": origin,
+    "head_is_fork": mode == "fork",
+    "base_ref": "main",
+    "state": "open",
+}
+items = [item]
+if mode == "multiple":
+    duplicate = copy.deepcopy(item)
+    duplicate["number"] = 18
+    duplicate["url"] = "https://github.com/example/workbench/pull/18"
+    items.append(duplicate)
+value = {
+    "contract_version": "workbench-hosting-submission-observation/v1",
+    "repository_origin_url": origin,
+    "head_branch": branch,
+    "base_ref": "main",
+    "pagination": pagination,
+    "pull_requests": items,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+    out="$TMPDIR/submit_invalid_current/$mode.out"
+    if WORKBENCH_TEST_SUBMISSION_OBSERVATION="$observation" \
+      run_task_in_dir submit_invalid_current "$SUBMISSION_TASK_DIR" \
+        verify --format json >"$out" 2>&1; then
+      fail "submitted task accepted $mode PR observation"
+    fi
+    assert_file_contains "$out" 'authenticated submitted task recovery is unavailable'
+  done
+
+  claim="$(sed -n 's/^claim_id: *//p' "$SUBMISSION_TASK_DIR/task/index.md")"
+  descriptor="$(sed -n 's/^workspace_authority_descriptor_digest: *//p' \
+    "$SUBMISSION_TASK_DIR/task/index.md")"
+  comments="$TMPDIR/submit_invalid_current/comments/29.comments"
+  python3 - "$comments" "$claim" "$branch" "$descriptor" <<'PY'
+import json
+import sys
+
+value = {
+    "task_contract": "workbench-task/v2",
+    "event": "task-active",
+    "claim_id": sys.argv[2],
+    "issue": 29,
+    "home": None,
+    "branch": sys.argv[3],
+    "workspace_authority_descriptor_digest": sys.argv[4],
+    "pr": None,
+    "revision": None,
+    "action_instance_id": None,
+    "intent_digest": None,
+    "actor": "test@example.invalid",
+    "tool": "workbench",
+    "at": "2026-07-12T14:00:00Z",
+}
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write("<!-- workbench-task-lifecycle:v2\n")
+    handle.write(json.dumps(value, separators=(",", ":")) + "\n")
+    handle.write("-->\nworkbench task lifecycle: task-active\n\n")
+PY
+  out="$TMPDIR/submit_invalid_current/reactivated.out"
+  if run_task_in_dir submit_invalid_current "$SUBMISSION_TASK_DIR" \
+    verify --format json >"$out" 2>&1; then
+    fail "reactivation did not invalidate the submitted PR recovery"
+  fi
+  assert_file_contains "$out" 'authenticated submitted task recovery is unavailable'
+}
+
+test_v2_submission_rejects_noncanonical_cleanup_history() {
+  local out
+  prepare_submission_fixture submit_bad_cleanup
+  out="$TMPDIR/submit_bad_cleanup/prepared.out"
+  if WORKBENCH_TEST_FAIL_SUBMISSION_STAGE=prepared \
+    run_task_in_dir submit_bad_cleanup "$SUBMISSION_TASK_DIR" submit \
+      --title "feat: bad cleanup" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "bad cleanup fixture did not stop after preparation"
+  fi
+  git -C "$SUBMISSION_TASK_DIR" rm -r -q task
+  mkdir -p "$SUBMISSION_TASK_DIR/"$'FORGED\ntask'
+  printf '%s\n' forged > "$SUBMISSION_TASK_DIR/"$'FORGED\ntask/looks-safe'
+  git -C "$SUBMISSION_TASK_DIR" add -A
+  git -C "$SUBMISSION_TASK_DIR" commit -q -m "test: forge noncanonical cleanup"
+  if run_task_in_dir submit_bad_cleanup "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: bad cleanup" --body-file "$SUBMISSION_BODY" >"$out" 2>&1; then
+    fail "submission accepted cleanup history with non-task changes"
+  fi
+  [ ! -e "$TMPDIR/submit_bad_cleanup/comments/pr-17.json" ] \
+    || fail "noncanonical cleanup history created a PR"
+}
+
 test_lifecycle_parser_is_strict_trusted_and_key_order_independent() {
   local observation valid_snapshot valid out rc
   observation="$TMPDIR/lifecycle-observation.json"
@@ -5215,6 +5661,7 @@ run_case test_work_ref_inventory_covers_removed_codebase_home
 run_case test_work_ref_inventory_is_cross_clone
 run_case test_work_ref_inventory_uses_authority_default_ref
 run_case test_work_ref_inventory_fails_closed_on_identity_mismatch
+run_case test_work_ref_inventory_rejects_lifecycle_without_initial_claim
 run_case test_deliverables_and_revision_bound_evidence
 run_case test_tracked_v2_records_cannot_forge_accepted_or_waived_state
 run_case test_evidence_time_is_kernel_owned_and_future_rows_fail_closed
@@ -5272,6 +5719,12 @@ run_case test_cleanup_descriptor_pins_task_and_clone_common_dirs
 run_case test_cleanup_rejects_broken_symlink_worktree
 run_case test_status_reports_concurrent_writer_conflicts
 run_case test_v2_submit_reconciles_durable_submission_without_v1_fallback
+run_case test_v1_submission_without_origin_head_uses_main_fallback
+run_case test_v2_submission_restores_authenticated_state_to_terminal_cleanup
+run_case test_v2_submission_crash_boundaries_are_idempotent
+run_case test_v2_submission_restore_never_overwrites_occupied_state
+run_case test_v2_submission_rejects_noncanonical_pr_and_lifecycle_state
+run_case test_v2_submission_rejects_noncanonical_cleanup_history
 run_case test_lifecycle_parser_is_strict_trusted_and_key_order_independent
 run_case test_status_rejects_forged_current_v2_task_identity
 run_case test_kernel_acceptance_attempt_is_stable_and_crash_reducible

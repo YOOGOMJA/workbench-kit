@@ -37,16 +37,21 @@ wb_root() {
   dirname "$common"
 }
 
-# 분기·비교의 정본 base. 로컬 main은 다른 task 머지 뒤 자동 갱신되지 않아
-# 낡을 수 있으므로, 원격 추적 ref(origin/main)가 있으면 그걸 base로 쓴다.
-# origin/main은 task-start의 fetch로 갱신되어 로컬 main보다 신선하다.
-# 원격이 없으면(오프라인·fresh clone) 로컬 main으로 폴백한다.
+# 분기·비교의 정본 base. 원격 HEAD는 v2 authority의 default_ref와 검증되어
+# 있으므로 main이라는 이름을 가정하지 않는다. 원격이 없으면 현재 브랜치로
+# 폴백한다(권한이 필요한 v2 경로는 별도로 authority 검증을 수행한다).
 main_ref() {
-  local dir="$1"
+  local dir="$1" remote_head
+  remote_head="$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [ -n "$remote_head" ] \
+    && git -C "$dir" rev-parse --verify --quiet "$remote_head" >/dev/null 2>&1; then
+    printf '%s\n' "$remote_head"
+    return
+  fi
   if git -C "$dir" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
-    echo origin/main
+    printf '%s\n' origin/main
   else
-    echo main
+    printf '%s\n' main
   fi
 }
 
@@ -239,6 +244,10 @@ require_v2_task() {
   [ -n "$task_contract" ] || task_contract=workbench-task/v1
   [ "$task_contract" = workbench-task/v2 ] \
     || die "v2 task mutation requires workbench-task/v2 (task is $task_contract)"
+  if ! git -C "$TASK_DIR" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
+    submission_recovery_guard \
+      || die "authenticated submitted task recovery is unavailable"
+  fi
 }
 
 require_single_line() {
@@ -3717,7 +3726,7 @@ recover_harvest_disposition() {
 recover_terminal_effect() {
   local requested="$1" supplied_instance="$2" terminal action_id action_file request_file status
   local latest event expected_event secondary result decision primary_digest intent target revision
-  local manifest authorization_ref removal_plan reason_code reason_ref governed_action
+  local manifest authorization_ref removal_plan reason_code reason_ref governed_action terminal_pr="-"
   terminal="$(task_state_dir)/terminal"; [ -f "$terminal" ] || return 10
   [ "$(record_get "$terminal" outcome)" = "$requested" ] || return 10
   validate_local_terminal_record || return 10
@@ -3745,8 +3754,11 @@ recover_terminal_effect() {
   [ "$decision" = reconcile ] || return 10
   intent="$(record_get "$terminal" intent_digest)"; revision="$(record_get "$terminal" revision)"
   if printf '%s' "$result" | grep -Fq '"write_secondary":true'; then
+    [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" != true ] \
+      || terminal_pr="$SUBMISSION_RECOVERY_PR_NUMBER"
     lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$expected_event" \
-      "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" - "$revision" "$action_id" workbench-task/v2 "" "$intent" \
+      "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" "$terminal_pr" "$revision" "$action_id" \
+      workbench-task/v2 "" "$intent" \
       || return 1
   fi
   primary_digest="$(json_string_field "$result" primary_digest)"
@@ -4736,17 +4748,205 @@ EOF
 
 # ── submit ────────────────────────────────────────────────────────────
 
+submission_recovery_load() {
+  local parsed="$1" line key value
+  SUBMISSION_RECOVERY_CONTRACT=""; SUBMISSION_RECOVERY_ORIGIN=""
+  SUBMISSION_RECOVERY_DEFAULT_REF=""; SUBMISSION_RECOVERY_BRANCH=""
+  SUBMISSION_RECOVERY_TASK_ID=""; SUBMISSION_RECOVERY_ISSUE=""
+  SUBMISSION_RECOVERY_HOME=""; SUBMISSION_RECOVERY_PARENT=""
+  SUBMISSION_RECOVERY_CLAIM_ID=""; SUBMISSION_RECOVERY_DESCRIPTOR_DIGEST=""
+  SUBMISSION_RECOVERY_SNAPSHOT=""; SUBMISSION_RECOVERY_INDEX_DIGEST=""
+  SUBMISSION_RECOVERY_CLEANUP=""; SUBMISSION_RECOVERY_PR_NUMBER=""
+  SUBMISSION_RECOVERY_PR_URL=""; SUBMISSION_RECOVERY_HEAD=""
+  SUBMISSION_RECOVERY_STAGE=""
+  while IFS= read -r line; do
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      contract_version) SUBMISSION_RECOVERY_CONTRACT="$value" ;;
+      repository_origin_url) SUBMISSION_RECOVERY_ORIGIN="$value" ;;
+      default_ref) SUBMISSION_RECOVERY_DEFAULT_REF="$value" ;;
+      branch) SUBMISSION_RECOVERY_BRANCH="$value" ;;
+      task_id) SUBMISSION_RECOVERY_TASK_ID="$value" ;;
+      issue) SUBMISSION_RECOVERY_ISSUE="$value" ;;
+      home) SUBMISSION_RECOVERY_HOME="$value" ;;
+      parent) SUBMISSION_RECOVERY_PARENT="$value" ;;
+      claim_id) SUBMISSION_RECOVERY_CLAIM_ID="$value" ;;
+      workspace_authority_descriptor_digest) SUBMISSION_RECOVERY_DESCRIPTOR_DIGEST="$value" ;;
+      snapshot_revision) SUBMISSION_RECOVERY_SNAPSHOT="$value" ;;
+      snapshot_index_digest) SUBMISSION_RECOVERY_INDEX_DIGEST="$value" ;;
+      cleanup_revision) SUBMISSION_RECOVERY_CLEANUP="$value" ;;
+      pull_request) SUBMISSION_RECOVERY_PR_NUMBER="$value" ;;
+      pull_request_url) SUBMISSION_RECOVERY_PR_URL="$value" ;;
+      head_revision) SUBMISSION_RECOVERY_HEAD="$value" ;;
+      stage) SUBMISSION_RECOVERY_STAGE="$value" ;;
+    esac
+  done <<< "$parsed"
+  [ "$SUBMISSION_RECOVERY_CONTRACT" = workbench-submission-recovery/v1 ] \
+    && [ "$SUBMISSION_RECOVERY_BRANCH" != "" ] \
+    && [ "$SUBMISSION_RECOVERY_SNAPSHOT" != "" ]
+}
+
+submission_recovery_prepare() {
+  local origin="$1" default_ref="$2" branch="$3" snapshot="$4" parsed
+  parsed="$(python3 "$(lifecycle_helper)" submission-recovery-prepare \
+    --repository "$TASK_DIR" --repository-origin-url "$origin" \
+    --default-ref "$default_ref" --branch "$branch" \
+    --snapshot-revision "$snapshot")" || return 1
+  submission_recovery_load "$parsed"
+}
+
+submission_recovery_advance() {
+  local branch="$1" stage="$2"; shift 2
+  local parsed
+  parsed="$(python3 "$(lifecycle_helper)" submission-recovery-advance \
+    --repository "$TASK_DIR" --branch "$branch" --stage "$stage" "$@")" \
+    || return 1
+  submission_recovery_load "$parsed"
+}
+
+submission_recovery_validate() {
+  local origin="$1" default_ref="$2" branch="$3" head="$4" index_file="${5:-}"
+  local parsed args=(submission-recovery-validate --repository "$TASK_DIR" \
+    --repository-origin-url "$origin" --default-ref "$default_ref" \
+    --branch "$branch" --current-head "$head")
+  [ -z "$index_file" ] || args+=(--index-file "$index_file")
+  parsed="$(python3 "$(lifecycle_helper)" "${args[@]}")" || return 1
+  submission_recovery_load "$parsed"
+}
+
+submission_recovery_retire() {
+  local repository="$1" branch="$2" claim_id="$3"
+  python3 "$(lifecycle_helper)" submission-recovery-retire \
+    --repository "$repository" --branch "$branch" --claim-id "$claim_id" >/dev/null
+}
+
+submission_lifecycle_reduce() {
+  local root="$1" home="$2" issue="$3" claim_id="$4" branch="$5" descriptor_digest="$6"
+  local markers parsed line key value home_arg="${home:--}"
+  markers="$(mktemp "${TMPDIR:-/tmp}/workbench-submission-markers.XXXXXX")"
+  lifecycle_markers_for_issue "$root" "$home" "$issue" > "$markers" \
+    || { rm -f "$markers"; return 1; }
+  parsed="$(python3 "$(lifecycle_helper)" lifecycle-reduce --markers-file "$markers" \
+    --branch "$branch" --claim-id "$claim_id" --issue "$issue" --home "$home_arg" \
+    --descriptor-digest "$descriptor_digest")" \
+    || { rm -f "$markers"; return 1; }
+  rm -f "$markers"
+  SUBMISSION_LIFECYCLE_PHASE=""; SUBMISSION_LIFECYCLE_PR=""
+  SUBMISSION_LIFECYCLE_HEAD=""; SUBMISSION_LIFECYCLE_TERMINAL_EVENT=""
+  SUBMISSION_LIFECYCLE_TERMINAL_REVISION=""
+  while IFS= read -r line; do
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      phase) SUBMISSION_LIFECYCLE_PHASE="$value" ;;
+      pull_request) SUBMISSION_LIFECYCLE_PR="$value" ;;
+      head_revision) SUBMISSION_LIFECYCLE_HEAD="$value" ;;
+      terminal_event) SUBMISSION_LIFECYCLE_TERMINAL_EVENT="$value" ;;
+      terminal_revision) SUBMISSION_LIFECYCLE_TERMINAL_REVISION="$value" ;;
+    esac
+  done <<< "$parsed"
+  [ -n "$SUBMISSION_LIFECYCLE_PHASE" ]
+}
+
+submission_recovery_guard() {
+  local branch root origin descriptor default_ref default_branch head
+  SUBMISSION_RECOVERY_ACTIVE=false
+  branch="$(git -C "$TASK_DIR" branch --show-current)"; [ -n "$branch" ] || return 1
+  descriptor="$(index_get workspace_authority_descriptor_digest)"
+  root="$(wb_root)"
+  observe_workspace_authority "$root" "$descriptor" || return 1
+  origin="$(git -C "$TASK_DIR" remote get-url origin 2>/dev/null)" || return 1
+  default_ref="$AUTHORITY_DEFAULT_REF"; default_branch="${default_ref#refs/heads/}"
+  [ "refs/heads/$default_branch" = "$default_ref" ] || return 1
+  head="$(git -C "$TASK_DIR" rev-parse HEAD)" || return 1
+  submission_recovery_validate "$origin" "$default_ref" "$branch" "$head" \
+    "$TASK_DIR/task/index.md" || return 1
+  [ "$SUBMISSION_RECOVERY_STAGE" = restored ] || return 1
+  [ "$SUBMISSION_RECOVERY_DESCRIPTOR_DIGEST" = "$descriptor" ] || return 1
+  submission_pr_observe "$branch" "$head" "$default_branch" \
+    "$SUBMISSION_RECOVERY_PR_URL" || return 1
+  [ "$SUBMISSION_PR_NUMBER" = "$SUBMISSION_RECOVERY_PR_NUMBER" ] || return 1
+  submission_lifecycle_reduce "$root" "$SUBMISSION_RECOVERY_HOME" \
+    "$SUBMISSION_RECOVERY_ISSUE" "$SUBMISSION_RECOVERY_CLAIM_ID" "$branch" \
+    "$SUBMISSION_RECOVERY_DESCRIPTOR_DIGEST" || return 1
+  case "$SUBMISSION_LIFECYCLE_PHASE" in
+    submitted|submitted-verified|terminal)
+      [ "$SUBMISSION_LIFECYCLE_PR" = "$SUBMISSION_RECOVERY_PR_NUMBER" ] \
+        && [ "$SUBMISSION_LIFECYCLE_HEAD" = "$SUBMISSION_RECOVERY_HEAD" ] \
+        || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  SUBMISSION_RECOVERY_ACTIVE=true
+}
+
+submission_restore_task() {
+  local root="$1" branch="$2" head="$3" origin="$4" default_ref="$5"
+  submission_recovery_validate "$origin" "$default_ref" "$branch" "$head" || return 1
+  [ "$SUBMISSION_RECOVERY_STAGE" = submitted ] \
+    || [ "$SUBMISSION_RECOVERY_STAGE" = restored ] || return 1
+  submission_pr_observe "$branch" "$head" "${default_ref#refs/heads/}" \
+    "$SUBMISSION_RECOVERY_PR_URL" || return 1
+  [ "$SUBMISSION_PR_NUMBER" = "$SUBMISSION_RECOVERY_PR_NUMBER" ] || return 1
+  submission_lifecycle_reduce "$root" "$SUBMISSION_RECOVERY_HOME" \
+    "$SUBMISSION_RECOVERY_ISSUE" "$SUBMISSION_RECOVERY_CLAIM_ID" "$branch" \
+    "$SUBMISSION_RECOVERY_DESCRIPTOR_DIGEST" || return 1
+  case "$SUBMISSION_LIFECYCLE_PHASE" in submitted|submitted-verified) ;; *) return 1 ;; esac
+  [ "$SUBMISSION_LIFECYCLE_PR" = "$SUBMISSION_RECOVERY_PR_NUMBER" ] \
+    && [ "$SUBMISSION_LIFECYCLE_HEAD" = "$SUBMISSION_RECOVERY_HEAD" ] || return 1
+  if [ "$SUBMISSION_RECOVERY_STAGE" = submitted ]; then
+    python3 "$(lifecycle_helper)" submission-recovery-restore \
+      --repository "$TASK_DIR" --branch "$branch" >/dev/null || return 1
+    submission_recovery_advance "$branch" restored || return 1
+  fi
+  python3 "$(lifecycle_helper)" submission-recovery-codebases \
+    --repository "$TASK_DIR" --branch "$branch" --direction restore >/dev/null || return 1
+  submission_recovery_validate "$origin" "$default_ref" "$branch" "$head" \
+    "$TASK_DIR/task/index.md" || return 1
+}
+
+submission_bind_increment() {
+  local pr_number="$1" pr_url="$2" revision="$3" dir file count=0 selected=""
+  local owner kind owner_context acceptance_authority required external state acceptance_ref
+  dir="$(deliverable_dir)"
+  for file in "$dir"/*.record; do
+    [ -f "$file" ] || continue
+    [ "$(record_get "$file" kind)" = workbench-increment ] || continue
+    count=$((count + 1)); selected="$file"
+  done
+  [ "$count" -le 1 ] || return 1
+  [ "$count" -eq 1 ] || return 0
+  file="$selected"; owner="$(record_get "$file" owner)"; kind="$(record_get "$file" kind)"
+  owner_context="$(record_get "$file" owner_context_ref)"
+  acceptance_authority="$(record_get "$file" acceptance_authority_ref)"
+  required="$(record_get "$file" required)"; external="$(record_get "$file" external_ref)"
+  state="$(record_get "$file" state)"; acceptance_ref="$(record_get "$file" acceptance_ref)"
+  case "$state" in
+    declared)
+      [ -z "$external$(record_get "$file" revision)$acceptance_ref" ] || return 1
+      write_deliverable_record "$file" "$(record_get "$file" deliverable_id)" "$owner" "$kind" \
+        "$owner_context" "$acceptance_authority" "$required" "$pr_url" "$revision" submitted
+      ;;
+    submitted|accepted)
+      [ "$external" = "$pr_url" ] \
+        && [ "$(record_get "$file" revision)" = "$revision" ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 submission_index_snapshot() {
   local branch="$1" output="$2" commit
-  for commit in $(git -C "$TASK_DIR" rev-list --first-parent HEAD); do
-    if git -C "$TASK_DIR" show "$commit:task/index.md" > "$output" 2>/dev/null; then
-      python3 "$(lifecycle_helper)" task-index --file "$output" --branch "$branch" \
-        --format json >/dev/null || return 1
-      printf '%s\n' "$commit"
-      return 0
-    fi
-  done
-  return 1
+  commit="$(git -C "$TASK_DIR" rev-parse HEAD)" || return 1
+  if ! git -C "$TASK_DIR" show "$commit:task/index.md" > "$output" 2>/dev/null; then
+    [ "$(git -C "$TASK_DIR" rev-list --parents -n 1 HEAD | wc -w | tr -d ' ')" = 2 ] \
+      || return 1
+    commit="$(git -C "$TASK_DIR" rev-parse HEAD^)" || return 1
+    git -C "$TASK_DIR" show "$commit:task/index.md" > "$output" 2>/dev/null || return 1
+  fi
+  python3 "$(lifecycle_helper)" task-index --file "$output" --branch "$branch" \
+    --format json >/dev/null || return 1
+  printf '%s\n' "$commit"
+  return 0
 }
 
 submission_load_identity() {
@@ -4769,16 +4969,19 @@ submission_load_identity() {
 }
 
 submission_pr_observe() {
-  local branch="$1" expected_head="$2" expected_url="${3:-}" adapter origin observation parsed state
+  local branch="$1" expected_head="$2" base_ref="$3" expected_url="${4:-}"
+  local adapter origin observation parsed state
   adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
   [ -n "$adapter" ] && [ -x "$adapter" ] || return 1
   origin="$(git -C "$TASK_DIR" remote get-url origin 2>/dev/null)" || return 1
   observation="$(mktemp "${TMPDIR:-/tmp}/workbench-submission-observation.XXXXXX")"
   if ! (cd "$TASK_DIR" && "$adapter" submission --repository "$TASK_DIR" \
-    --head-branch "$branch" --head-revision "$expected_head" --format json) \
+    --head-branch "$branch" --head-revision "$expected_head" --default-ref "$base_ref" \
+    --format json) \
     > "$observation" 2>/dev/null; then rm -f "$observation"; return 1; fi
   parsed="$(python3 "$(lifecycle_helper)" submission --observation-file "$observation" \
-    --repository-origin-url "$origin" --head-branch "$branch" --head-revision "$expected_head")" \
+    --repository-origin-url "$origin" --head-branch "$branch" \
+    --head-revision "$expected_head" --base-ref "$base_ref")" \
     || { rm -f "$observation"; return 1; }
   rm -f "$observation"
   state="$(printf '%s\n' "$parsed" | sed -n 's/^state=//p')"
@@ -4794,47 +4997,18 @@ submission_pr_observe() {
 
 submission_lifecycle_state() {
   local root="$1" home="$2" issue="$3" claim_id="$4" branch="$5" pr="$6"
-  local revision="$7" task_contract="$8" descriptor_digest="$9" markers line event contract
-  local current_pr="" current_revision="" current=false marker_pr terminal=false cleaned=false
-  markers="$(lifecycle_markers_for_issue "$root" "$home" "$issue")" || return 1
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    [ "$(lifecycle_field "$line" branch)" = "$branch" ] || continue
-    contract="$(lifecycle_field "$line" task_contract)"
-    [ "$contract" = "$task_contract" ] \
-      && [ "$(lifecycle_field "$line" claim_id)" = "$claim_id" ] \
-      && [ "$(lifecycle_field "$line" issue)" = "$issue" ] \
-      && [ "$(lifecycle_field "$line" home)" = "$home" ] \
-      || return 1
-    if [ "$task_contract" = workbench-task/v2 ]; then
-      [ "$(lifecycle_field "$line" workspace_authority_descriptor_digest)" = "$descriptor_digest" ] \
-        || return 1
-    fi
-    event="$(lifecycle_field "$line" event)"
-    if [ "$terminal" = true ]; then
-      [ "$event" = task-cleaned ] && [ "$cleaned" = false ] || return 1
-      cleaned=true; current=false; current_pr=""; current_revision=""
-      continue
-    fi
-    case "$event" in
-      task-submitted)
-        current=true
-        current_pr="$(lifecycle_field "$line" pr)"
-        current_revision="$(lifecycle_field "$line" revision)"
-        ;;
-      task-active) current=false; current_pr=""; current_revision="" ;;
-      task-completed|task-abandoned)
-        marker_pr="$(lifecycle_field "$line" pr)"
-        [ -z "$marker_pr" ] || { [ "$current" = true ] && [ "$marker_pr" = "$current_pr" ]; } \
-          || return 1
-        terminal=true
-        ;;
-      task-cleaned) return 1 ;;
-    esac
-  done <<< "$markers"
-  [ "$terminal" = false ] || return 1
-  [ "$current" = true ] || return 10
-  [ "$current_pr" = "$pr" ] && [ "$current_revision" = "$revision" ]
+  local revision="$7" task_contract="$8" descriptor_digest="$9"
+  [ "$task_contract" = workbench-task/v2 ] || return 1
+  submission_lifecycle_reduce "$root" "$home" "$issue" "$claim_id" "$branch" \
+    "$descriptor_digest" || return 1
+  case "$SUBMISSION_LIFECYCLE_PHASE" in
+    submitted|submitted-verified)
+      [ "$SUBMISSION_LIFECYCLE_PR" = "$pr" ] \
+        && [ "$SUBMISSION_LIFECYCLE_HEAD" = "$revision" ]
+      ;;
+    active|verified) return 10 ;;
+    *) return 1 ;;
+  esac
 }
 
 submission_lifecycle_reconcile() {
@@ -4867,22 +5041,34 @@ cmd_submit() {
   [ -n "$body_file" ] && [ -f "$body_file" ] || die "--body-file 필요 (PR 본문은 판단 레이어가 작성한다)"
   require_task_worktree
 
-  [ -z "$(git -C "$TASK_DIR" status --porcelain)" ] \
-    || die "커밋 안 된 변경 있음 — 정리(커밋 또는 폐기) 후 재시도"
-  if [ -f "$TASK_DIR/task/index.md" ]; then
-    cmd_check
-  fi
-
   local root branch id issue home claim_id task_contract descriptor_digest snapshot snapshot_commit
+  local tracked_task=false recovered_task=false pending_restore=false dirty current
   root="$(wb_root)"
   branch="$(git -C "$TASK_DIR" rev-parse --abbrev-ref HEAD)"
   if [ -f "$TASK_DIR/task/index.md" ]; then
-    submission_load_identity "$TASK_DIR/task/index.md" "$branch" \
-      || die "invalid task identity for submission"
-    id="$SUBMISSION_TASK_ID"; issue="$SUBMISSION_ISSUE"; home="$SUBMISSION_HOME"
-    claim_id="$SUBMISSION_CLAIM_ID"; task_contract="$SUBMISSION_TASK_CONTRACT"
-    descriptor_digest="$SUBMISSION_DESCRIPTOR_DIGEST"
-  else
+    if git -C "$TASK_DIR" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
+      tracked_task=true
+    else
+      if submission_recovery_guard >/dev/null 2>&1; then
+        recovered_task=true
+      else
+        pending_restore=true
+      fi
+    fi
+    if [ "$pending_restore" = false ]; then
+      submission_load_identity "$TASK_DIR/task/index.md" "$branch" \
+        || die "invalid task identity for submission"
+      id="$SUBMISSION_TASK_ID"; issue="$SUBMISSION_ISSUE"; home="$SUBMISSION_HOME"
+      claim_id="$SUBMISSION_CLAIM_ID"; task_contract="$SUBMISSION_TASK_CONTRACT"
+      descriptor_digest="$SUBMISSION_DESCRIPTOR_DIGEST"
+      if [ "$recovered_task" = true ]; then
+        snapshot_commit="$SUBMISSION_RECOVERY_SNAPSHOT"
+      else
+        snapshot_commit="$(git -C "$TASK_DIR" rev-parse HEAD)"
+      fi
+    fi
+  fi
+  if [ ! -f "$TASK_DIR/task/index.md" ] || [ "$pending_restore" = true ]; then
     snapshot="$(mktemp "${TMPDIR:-/tmp}/workbench-submission-index.XXXXXX")"
     if snapshot_commit="$(submission_index_snapshot "$branch" "$snapshot")"; then
       submission_load_identity "$snapshot" "$branch" \
@@ -4904,56 +5090,146 @@ cmd_submit() {
   fi
   [ -n "$claim_id" ] || claim_id="$branch"
 
-  # cleanup: task/ 의 추적 파일 제거 (task/codebases/ 는 untracked라 디스크에 남음)
-  if [ -f "$TASK_DIR/task/index.md" ]; then
-    info "cleanup: task/ 추적 파일 제거"
-    git -C "$TASK_DIR" rm -r -q task
-    git -C "$TASK_DIR" commit -q -m "task($id): cleanup"
-  else
-    info "task/ 이미 cleanup됨 — 건너뜀"
-  fi
-
-  # 안전망: PR diff에 task/ 가 남아 있으면 거부
-  local mref; mref="$(main_ref "$TASK_DIR")"
-  if git -C "$TASK_DIR" diff "$mref...HEAD" --name-only | grep -q '^task/'; then
-    die "diff에 task/ 잔존 — cleanup 상태를 확인할 것"
-  fi
-  git -C "$TASK_DIR" diff --quiet "$mref...HEAD" && die "main 대비 변경 없음 — 제출할 증분이 없다"
-
-  info "push: $branch"
-  git -C "$TASK_DIR" push -u origin "$branch"
-  local pr_url pr_number revision
-  revision="$(git -C "$TASK_DIR" rev-parse HEAD)"
   if [ "$task_contract" != workbench-task/v2 ]; then
+    [ -z "$(git -C "$TASK_DIR" status --porcelain)" ] \
+      || die "커밋 안 된 변경 있음 — 정리(커밋 또는 폐기) 후 재시도"
+    if [ -f "$TASK_DIR/task/index.md" ]; then
+      cmd_check
+      info "cleanup: task/ 추적 파일 제거"
+      git -C "$TASK_DIR" rm -r -q task
+      git -C "$TASK_DIR" commit -q -m "task($id): cleanup"
+    else
+      info "task/ 이미 cleanup됨 — 건너뜀"
+    fi
+    local mref base_branch pr_url pr_number revision
+    mref="$(main_ref "$TASK_DIR")"; base_branch="${mref#origin/}"
+    if git -C "$TASK_DIR" diff "$mref...HEAD" --name-only | grep -q '^task/'; then
+      die "diff에 task/ 잔존 — cleanup 상태를 확인할 것"
+    fi
+    git -C "$TASK_DIR" diff --quiet "$mref...HEAD" \
+      && die "protected base 대비 변경 없음 — 제출할 증분이 없다"
+    info "push: $branch"
+    git -C "$TASK_DIR" push -u origin "$branch"
+    revision="$(git -C "$TASK_DIR" rev-parse HEAD)"
     info "PR 생성 (squash 머지 전제)"
-    pr_url="$(cd "$TASK_DIR" && gh pr create --base main --head "$branch" \
+    pr_url="$(cd "$TASK_DIR" && gh pr create --base "$base_branch" --head "$branch" \
       --title "$title" --body-file "$body_file")" || return 1
     pr_number="$(pr_number_from_url "$pr_url")"
     printf '%s\n' "$pr_url"
     lifecycle_emit_optional "$root" "$home" "$issue" task-submitted "$claim_id" "$branch" "$pr_number"
     return 0
   fi
+
+  printf '%s' "$descriptor_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+    || { echo "error: missing submitted task authority identity" >&2; return 1; }
+  observe_workspace_authority "$root" "$descriptor_digest"
+  local origin default_ref default_branch mref revision pr_url pr_number
+  origin="$(git -C "$TASK_DIR" remote get-url origin)"
+  [ "$origin" = "$AUTHORITY_ORIGIN_URL" ] || die "submission authority origin mismatch"
+  default_ref="$AUTHORITY_DEFAULT_REF"; default_branch="${default_ref#refs/heads/}"
+  [ "refs/heads/$default_branch" = "$default_ref" ] \
+    || die "submission authority default ref is invalid"
+  mref="origin/$default_branch"
+  git -C "$TASK_DIR" rev-parse --verify --quiet "$mref" >/dev/null 2>&1 \
+    || die "submission authority tracking ref is unavailable: $mref"
+
+  if [ "$recovered_task" = true ]; then
+    dirty="$(git -C "$TASK_DIR" status --porcelain | grep -v '^?? task/$' || true)"
+    [ -z "$dirty" ] || die "submitted task recovery has unrelated worktree changes"
+  else
+    submission_recovery_prepare "$origin" "$default_ref" "$branch" "$snapshot_commit" \
+      || die "submission recovery preparation failed"
+    current="$(git -C "$TASK_DIR" rev-parse HEAD)"
+    if [ "$current" = "$snapshot_commit" ] && [ ! -f "$TASK_DIR/task/index.md" ]; then
+      dirty="$(git -C "$TASK_DIR" status --porcelain)"
+      [ -n "$dirty" ] \
+        && [ -z "$(printf '%s\n' "$dirty" | grep -Ev '^D  task/' || true)" ] \
+        || die "interrupted submission cleanup is not exact"
+      git -C "$TASK_DIR" restore --staged --worktree -- task \
+        || die "interrupted submission cleanup could not be rolled back"
+      python3 "$(lifecycle_helper)" submission-recovery-codebases \
+        --repository "$TASK_DIR" --branch "$branch" --direction restore >/dev/null \
+        || die "interrupted submission codebases could not be restored"
+      tracked_task=true
+    fi
+    if [ "$tracked_task" = true ]; then
+      [ -z "$(git -C "$TASK_DIR" status --porcelain)" ] \
+        || die "커밋 안 된 변경 있음 — 정리(커밋 또는 폐기) 후 재시도"
+      cmd_check
+      [ "${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" != prepared ] \
+        || { echo "error: simulated failure after submission preparation" >&2; return 1; }
+      python3 "$(lifecycle_helper)" submission-recovery-codebases \
+        --repository "$TASK_DIR" --branch "$branch" --direction park >/dev/null \
+        || die "submission codebases parking failed"
+      info "cleanup: task/ 추적 파일 제거"
+      git -C "$TASK_DIR" rm -r -q task
+      [ "${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" != cleanup-staged ] \
+        || { echo "error: simulated failure after staged submission cleanup" >&2; return 1; }
+      git -C "$TASK_DIR" commit -q -m "task($id): cleanup"
+      revision="$(git -C "$TASK_DIR" rev-parse HEAD)"
+      submission_recovery_advance "$branch" cleanup-committed \
+        --cleanup-revision "$revision" || die "submission cleanup recovery binding failed"
+    else
+      revision="$current"
+      submission_recovery_advance "$branch" cleanup-committed \
+        --cleanup-revision "$revision" || die "historical submission cleanup is invalid"
+      if [ "$pending_restore" = true ]; then
+        dirty="$(git -C "$TASK_DIR" status --porcelain | grep -v '^?? task/$' || true)"
+        [ -z "$dirty" ] || die "pending submission restoration has unrelated changes"
+      else
+        [ -z "$(git -C "$TASK_DIR" status --porcelain)" ] \
+          || die "post-cleanup submission worktree is occupied"
+      fi
+    fi
+    [ "${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" != cleanup-committed ] \
+      || { echo "error: simulated failure after submission cleanup commit" >&2; return 1; }
+  fi
+
+  revision="$(git -C "$TASK_DIR" rev-parse HEAD)"
+  submission_recovery_validate "$origin" "$default_ref" "$branch" "$revision" \
+    || die "submission recovery validation failed"
+  if git -C "$TASK_DIR" diff "$mref...HEAD" --name-only | grep -q '^task/'; then
+    die "diff에 task/ 잔존 — cleanup 상태를 확인할 것"
+  fi
+  git -C "$TASK_DIR" diff --quiet "$mref...HEAD" \
+    && die "protected base 대비 변경 없음 — 제출할 증분이 없다"
+  info "push: $branch"
+  git -C "$TASK_DIR" push -u origin "$branch"
+
   SUBMISSION_PR_URL=""; SUBMISSION_PR_NUMBER=""; SUBMISSION_PR_HEAD=""
   local observe_rc created_url
-  if submission_pr_observe "$branch" "$revision"; then
+  if submission_pr_observe "$branch" "$revision" "$default_branch"; then
     info "기존 PR 검증: $SUBMISSION_PR_URL"
   else
     observe_rc=$?
     [ "$observe_rc" -eq 10 ] \
       || { echo "error: submission PR mapping unavailable or ambiguous" >&2; return 1; }
     info "PR 생성 (squash 머지 전제)"
-    if ! created_url="$(cd "$TASK_DIR" && gh pr create --base main --head "$branch" \
+    if ! created_url="$(cd "$TASK_DIR" && gh pr create --base "$default_branch" --head "$branch" \
       --title "$title" --body-file "$body_file")"; then return 1; fi
-    submission_pr_observe "$branch" "$revision" "$created_url" \
+    submission_pr_observe "$branch" "$revision" "$default_branch" "$created_url" \
       || { echo "error: submission PR identity mismatch" >&2; return 1; }
   fi
   pr_url="$SUBMISSION_PR_URL"; pr_number="$SUBMISSION_PR_NUMBER"
+  submission_recovery_advance "$branch" pr-observed \
+    --pull-request "$pr_number" --pull-request-url "$pr_url" --head-revision "$revision" \
+    || { echo "error: submission PR recovery binding failed" >&2; return 1; }
+  [ "${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" != pr-observed ] \
+    || { echo "error: simulated failure after submission PR observation" >&2; return 1; }
   printf '%s\n' "$pr_url"
-  printf '%s' "$descriptor_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
-    || { echo "error: missing submitted task authority identity" >&2; return 1; }
   submission_lifecycle_reconcile "$root" "$home" "$issue" "$claim_id" "$branch" \
     "$pr_number" "$revision" "$task_contract" "$descriptor_digest" \
     || { echo "error: lifecycle-write-failed: task-submitted" >&2; return 1; }
+  submission_recovery_advance "$branch" submitted \
+    || { echo "error: submission lifecycle recovery binding failed" >&2; return 1; }
+  [ "${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" != submitted ] \
+    || { echo "error: simulated failure after submission lifecycle" >&2; return 1; }
+  submission_restore_task "$root" "$branch" "$revision" "$origin" "$default_ref" \
+    || { echo "error: authenticated task restoration failed" >&2; return 1; }
+  submission_bind_increment "$pr_number" "$pr_url" "$revision" \
+    || { echo "error: workbench increment submission binding failed" >&2; return 1; }
+  [ "${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" != restored ] \
+    || { echo "error: simulated failure after task restoration" >&2; return 1; }
 }
 
 # ── commit subject policy ─────────────────────────────────────────────
@@ -5815,7 +6091,7 @@ terminal_outcome_report() {
 }
 
 cmd_complete() {
-  local instance_id="" authorization_file="" format="" target revision terminal_rc
+  local instance_id="" authorization_file="" format="" target revision terminal_rc terminal_pr="-"
   while [ $# -gt 0 ]; do
     case "$1" in --action-instance-id) instance_id="$2"; shift 2 ;; --authorization-file) authorization_file="$2"; shift 2 ;;
       --format) format="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac
@@ -5863,8 +6139,10 @@ cmd_complete() {
   local authorization_ref="$(record_get "$action_file" authorization_ref)"
   write_terminal_outcome completed "$GOVERNED_ACTION_INSTANCE_ID" "$GOVERNED_INTENT_DIGEST" \
     "$manifest_digest" "$authorization_ref" "$revision"
+  [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" != true ] \
+    || terminal_pr="$SUBMISSION_RECOVERY_PR_NUMBER"
   if ! lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-completed \
-    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" - "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
+    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" "$terminal_pr" "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
     workbench-task/v2 "" "$GOVERNED_INTENT_DIGEST"; then
     return 1
   fi
@@ -5878,7 +6156,7 @@ cmd_complete() {
 
 cmd_abandon() {
   local reason_code="" reason_ref="" instance_id="" authorization_file="" format="" target revision terminal_rc
-  local recovery_rc payload_file frozen_plan action_file manifest_digest authorization_ref primary_digest
+  local recovery_rc payload_file frozen_plan action_file manifest_digest authorization_ref primary_digest terminal_pr="-"
   while [ $# -gt 0 ]; do
     case "$1" in
       --reason-code) reason_code="$2"; shift 2 ;;
@@ -5937,8 +6215,10 @@ cmd_abandon() {
   authorization_ref="$(record_get "$action_file" authorization_ref)"
   write_terminal_outcome abandoned "$GOVERNED_ACTION_INSTANCE_ID" "$GOVERNED_INTENT_DIGEST" \
     "$manifest_digest" "$authorization_ref" "$revision" "$frozen_plan" "$reason_code" "$reason_ref"
+  [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" != true ] \
+    || terminal_pr="$SUBMISSION_RECOVERY_PR_NUMBER"
   if ! lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-abandoned \
-    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" - "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
+    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" "$terminal_pr" "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
     workbench-task/v2 "" "$GOVERNED_INTENT_DIGEST"; then
     return 1
   fi
@@ -6507,7 +6787,7 @@ cmd_done_v2() {
   local root latest event lifecycle_actor terminal revision="" outcome target action_id="" wt name journal_rc stage helper
   local journal_file policy_file plan_file payload_file completed_file dirty
   local task_workspace=false local_branch=false intent="" manifest="" authorization_ref="" removal_plan=""
-  local primary_digest stored_plan
+  local primary_digest stored_plan recovered_submission=false
   root="$(wb_root)"; helper="$(cleanup_contract_helper)"
   CLEANUP_TASK_ID="$id"; CLEANUP_BRANCH="$branch"; CLEANUP_CLAIM_ID=""
   CLEANUP_BLOCKER_COUNT=0; CLEANUP_REMOVED_COUNT=0; CLEANUP_REMOVED_WRITER_COUNT=0
@@ -6562,12 +6842,22 @@ cmd_done_v2() {
       fi
       cleanup_mark_completed_plan
       if [ "$event" = task-cleaned ]; then
+        if ! submission_recovery_retire "$root" "$branch" "$CLEANUP_CLAIM_ID"; then
+          cleanup_add_blocker submission-recovery-retirement-failed "$branch"
+          rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
+            "$authorization_ref" "$revision" "$removal_plan" true true; return 1
+        fi
         rm -f "$journal_file"; print_cleanup_json cleaned false "$action_id" "$intent" "$manifest" \
           "$authorization_ref" "$revision" "$removal_plan" true true; return 0
       fi
       if ! lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-cleaned "$CLEANUP_CLAIM_ID" \
         "$branch" - "$revision" "$action_id" workbench-task/v2 "" "$intent"; then
         cleanup_add_blocker lifecycle-write-failed "$branch"
+        rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
+          "$authorization_ref" "$revision" "$removal_plan" true true; return 1
+      fi
+      if ! submission_recovery_retire "$root" "$branch" "$CLEANUP_CLAIM_ID"; then
+        cleanup_add_blocker submission-recovery-retirement-failed "$branch"
         rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
           "$authorization_ref" "$revision" "$removal_plan" true true; return 1
       fi
@@ -6606,6 +6896,11 @@ cmd_done_v2() {
       print_cleanup_json "" false "$action_id" "$intent" "$manifest" "$authorization_ref" \
         "$revision" "$removal_plan" true true; return 1
     fi
+    if ! submission_recovery_retire "$root" "$branch" "$CLEANUP_CLAIM_ID"; then
+      cleanup_add_blocker submission-recovery-retirement-failed "$branch"
+      print_cleanup_json "" false "$action_id" "$intent" "$manifest" "$authorization_ref" \
+        "$revision" "$removal_plan" true true; return 1
+    fi
     print_cleanup_json cleaned true "$action_id" "$intent" "$manifest" "$authorization_ref" \
       "$revision" "$removal_plan" true true; return 0
   fi
@@ -6616,21 +6911,34 @@ cmd_done_v2() {
   }
   TASK_DIR="$dir"; CLEANUP_CLAIM_ID="$(index_get claim_id)"
   [ -n "$CLEANUP_CLAIM_ID" ] || CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
+  if ! git -C "$dir" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
+    if submission_recovery_guard; then
+      recovered_submission=true
+    else
+      cleanup_add_blocker submission-recovery-unavailable "$branch"
+    fi
+  fi
   terminal="$(task_state_dir)/terminal"
   if [ ! -f "$terminal" ]; then cleanup_add_blocker missing-terminal-outcome "$branch"
   else
     outcome="$(record_get "$terminal" outcome)"; revision="$(record_get "$terminal" revision)"
     case "$outcome" in completed|abandoned) ;; *) cleanup_add_blocker missing-terminal-outcome "$branch" ;; esac
   fi
-  dirty="$(git -C "$dir" status --porcelain | grep -v ' task/.workbench/actions/' || true)"
+  if [ "$recovered_submission" = true ]; then
+    dirty="$(git -C "$dir" status --porcelain | grep -v '^?? task/$' || true)"
+  else
+    dirty="$(git -C "$dir" status --porcelain | grep -v ' task/.workbench/actions/' || true)"
+  fi
   [ -z "$dirty" ] || cleanup_add_blocker dirty-task-worktree "$branch"
   for wt in "$dir"/task/codebases/*/; do
     [ -d "$wt" ] || continue; name="$(basename "${wt%/}")"
     [ -z "$(git -C "$wt" status --porcelain)" ] || cleanup_add_blocker dirty-codebase-worktree "$name"
   done
-  if ! git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$branch" \
-    || [ "$(git -C "$root" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 1)" -gt 0 ]; then
-    cleanup_add_blocker unpushed-task-branch "$branch"
+  if [ "$recovered_submission" != true ]; then
+    if ! git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$branch" \
+      || [ "$(git -C "$root" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 1)" -gt 0 ]; then
+      cleanup_add_blocker unpushed-task-branch "$branch"
+    fi
   fi
   if [ "$CLEANUP_BLOCKER_COUNT" -gt 0 ]; then
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "$revision" "" false false; return 1
@@ -6714,6 +7022,11 @@ cmd_done_v2() {
   if ! lifecycle_emit "$root" "$HOME_REPO" "$ISSUE" task-cleaned "$CLEANUP_CLAIM_ID" \
     "$branch" - "$revision" "$action_id" workbench-task/v2 "" "$intent"; then
     cleanup_add_blocker lifecycle-write-failed "$branch"
+    print_cleanup_json "" false "$action_id" "$intent" "$manifest" "$authorization_ref" \
+      "$revision" "$removal_plan" true true; return 1
+  fi
+  if ! submission_recovery_retire "$root" "$branch" "$CLEANUP_CLAIM_ID"; then
+    cleanup_add_blocker submission-recovery-retirement-failed "$branch"
     print_cleanup_json "" false "$action_id" "$intent" "$manifest" "$authorization_ref" \
       "$revision" "$removal_plan" true true; return 1
   fi
