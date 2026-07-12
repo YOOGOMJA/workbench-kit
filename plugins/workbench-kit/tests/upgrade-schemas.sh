@@ -25,6 +25,7 @@ from workbench_kit_contracts import (
     node_digest,
     parse_authority_approval,
     parse_reviewed_overlay,
+    validate_authority_approval,
     validate_equivalence_receipt,
     validate_generation_receipt,
     validate_generator_receipt,
@@ -35,9 +36,10 @@ from workbench_kit_contracts import (
     validate_relative_path,
     validate_removal_approval,
     validate_result,
+    validate_reviewed_overlay,
     validate_journal,
 )
-from workbench_kit_schema import load_schema_suite
+from workbench_kit_schema import SchemaValidationError, load_schema_suite
 
 SHA = "sha256:" + "a" * 64
 OID = "1" * 40
@@ -47,14 +49,26 @@ schema_documents = schema_suite.documents
 
 
 def schema_accepts(filename, value):
-    validator = schema_suite.validator(filename)
+    validator = schema_suite.schema_validator(filename)
     errors = list(validator.iter_errors(value))
     assert not errors, (filename, errors[0].json_path, errors[0].message)
 
 
 def schema_rejects(filename, value):
-    validator = schema_suite.validator(filename)
+    validator = schema_suite.schema_validator(filename)
     assert list(validator.iter_errors(value)), filename
+
+
+def product_accepts(filename, value, *, context=None):
+    assert schema_suite.validate(filename, value, context=context) == value
+
+
+def product_rejects(filename, value, *, context=None):
+    try:
+        schema_suite.validate(filename, value, context=context)
+    except SchemaValidationError:
+        return
+    raise AssertionError(f"runtime-invalid product document was accepted: {filename}")
 
 unordered = {"z": 1, "a": {"y": 2, "b": 3}}
 reordered = {"a": {"b": 3, "y": 2}, "z": 1}
@@ -743,6 +757,9 @@ bad_manifest = {
 }
 bad["legacy_manifest_digest"] = canonical_digest(bad_manifest)
 rejected(lambda: validate_equivalence_receipt(bad))
+schema_accepts("plugin-equivalence.schema.json", bad)
+product_rejects("plugin-equivalence.schema.json", bad)
+escaping_equivalence = copy.deepcopy(bad)
 
 removal = {
     "contract_version": "workbench-kit-removal-approval/v1",
@@ -1064,7 +1081,7 @@ bad["completion_result"]["result_digest"] = canonical_digest(
 )
 rejected(lambda: validate_journal(bad))
 
-for filename, document in (
+top_level_documents = (
     ("bootstrap-authority-approval.schema.json", authority),
     ("generation-receipt.schema.json", generation_receipt),
     ("generator-receipt.schema.json", generator),
@@ -1075,8 +1092,17 @@ for filename, document in (
     ("upgrade-plan.schema.json", changed),
     ("upgrade-result.schema.json", result),
     ("upgrade-journal.schema.json", journal),
-):
+)
+for filename, document in top_level_documents:
     schema_accepts(filename, document)
+    if filename in (
+        "upgrade-result.schema.json",
+        "upgrade-journal.schema.json",
+    ):
+        product_accepts(filename, document, context={"plan": changed})
+        product_rejects(filename, document)
+    else:
+        product_accepts(filename, document)
 
 bad_overlay = copy.deepcopy(overlay)
 bad_overlay["content_base64"] = "AB=="
@@ -1124,6 +1150,120 @@ schema_rejects("upgrade-journal.schema.json", bad_schema_journal)
 bad_schema_result = copy.deepcopy(result)
 bad_schema_result["changed"] = False
 schema_rejects("upgrade-result.schema.json", bad_schema_result)
+
+ALT_SHA = "sha256:" + "0" * 64
+parity_authority = copy.deepcopy(authority)
+parity_authority["protection"]["ref"] = "refs/heads/other"
+parity_generation = copy.deepcopy(generation_receipt)
+parity_generation["candidate_basis_digest"] = ALT_SHA
+parity_generator = copy.deepcopy(generator)
+parity_generator["receipt_digest"] = ALT_SHA
+parity_migration = copy.deepcopy(migration_receipt)
+parity_migration["candidate_basis_digest"] = ALT_SHA
+parity_removal = copy.deepcopy(removal)
+parity_removal["approved_at"] = "2026-02-29T00:00:00Z"
+parity_overlay = copy.deepcopy(overlay)
+parity_overlay["content_digest"] = ALT_SHA
+parity_plan = copy.deepcopy(changed)
+parity_plan["plan_digest"] = ALT_SHA
+parity_result = copy.deepcopy(result)
+parity_result["result_digest"] = ALT_SHA
+parity_journal = copy.deepcopy(journal)
+parity_journal["plan_digest"] = ALT_SHA
+parity_journal["journal_id"] = "upgrade-" + "0" * 64
+for effect in parity_journal["effects"]:
+    if effect["temp_path"] is None:
+        continue
+    parent = pathlib.PurePosixPath(effect["path"]).parent.as_posix()
+    name = (
+        ".workbench-kit."
+        + parity_journal["journal_id"]
+        + "."
+        + effect["effect_id"]
+        + ".tmp"
+    )
+    effect["temp_path"] = name if parent == "." else f"{parent}/{name}"
+
+runtime_parity_corpus = (
+    (
+        "bootstrap-authority-approval.schema.json",
+        parity_authority,
+        lambda value: validate_authority_approval(value),
+        None,
+        True,
+    ),
+    (
+        "generation-receipt.schema.json",
+        parity_generation,
+        lambda value: validate_generation_receipt(value),
+        None,
+        True,
+    ),
+    (
+        "generator-receipt.schema.json",
+        parity_generator,
+        lambda value: validate_generator_receipt(value),
+        None,
+        True,
+    ),
+    (
+        "migration-receipt.schema.json",
+        parity_migration,
+        lambda value: validate_migration_receipt(value),
+        None,
+        True,
+    ),
+    (
+        "plugin-equivalence.schema.json",
+        escaping_equivalence,
+        lambda value: validate_equivalence_receipt(value),
+        None,
+        True,
+    ),
+    (
+        "removal-approval.schema.json",
+        parity_removal,
+        lambda value: validate_removal_approval(value),
+        None,
+        True,
+    ),
+    (
+        "reviewed-overlay.schema.json",
+        parity_overlay,
+        lambda value: validate_reviewed_overlay(value),
+        None,
+        True,
+    ),
+    (
+        "upgrade-plan.schema.json",
+        parity_plan,
+        lambda value: validate_plan(value),
+        None,
+        True,
+    ),
+    (
+        "upgrade-result.schema.json",
+        parity_result,
+        lambda value: validate_result(value),
+        {"plan": changed},
+        True,
+    ),
+    (
+        "upgrade-journal.schema.json",
+        parity_journal,
+        lambda value: validate_journal(value, changed),
+        {"plan": changed},
+        True,
+    ),
+)
+assert {item[0] for item in runtime_parity_corpus} == set(schema_documents)
+for filename, document, runtime_validator, context, schema_valid in runtime_parity_corpus:
+    if schema_valid:
+        schema_accepts(filename, document)
+    else:
+        schema_rejects(filename, document)
+    rejected(lambda document=document, validator=runtime_validator: validator(document))
+    product_rejects(filename, document, context=context)
 
 print("PASS: strict migration schemas and canonical digests")
 PY

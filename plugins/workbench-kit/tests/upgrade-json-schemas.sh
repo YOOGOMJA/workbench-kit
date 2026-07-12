@@ -70,11 +70,11 @@ assert schema_suite.documents == documents
 
 
 def validator_for(filename):
-    return schema_suite.validator(filename)
+    return schema_suite.schema_validator(filename)
 
 
 def definition_accepts(filename, name, value):
-    validator = schema_suite.definition_validator(filename, name)
+    validator = schema_suite.schema_definition_validator(filename, name)
     return not list(validator.iter_errors(value))
 
 generation = json.loads((schema_dir / "generation-receipt.schema.json").read_bytes())

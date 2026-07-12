@@ -17,11 +17,21 @@ from pathlib import Path
 from workbench_kit_schema import load_schema_suite
 
 suite = load_schema_suite(Path("schemas"))
-validator = suite.validator("upgrade-plan.schema.json")
-errors = list(validator.iter_errors(document))
+validated_plan = suite.validate("upgrade-plan.schema.json", document)
+validated_result = suite.validate(
+    "upgrade-result.schema.json",
+    result_document,
+    context={"plan": validated_plan},
+)
 ```
 
 `load_schema_suite()` registers every shipped schema by its canonical `$id` and
-installs all workbench-kit format checks. Importing the normal upgrade CLI does
-not import `jsonschema`; only consumers of this validator surface need these
-dependencies.
+installs all workbench-kit format checks. `SchemaSuite.validate()` is the only
+runtime-equivalent entry point: it runs JSON Schema validation and the matching
+top-level runtime contract validator. Upgrade journal and result documents also
+require the exact `{"plan": plan}` context shown above. The
+`schema_validator()` and `schema_definition_validator()` methods are structural
+schema-authoring tools and must not be used to claim runtime equivalence.
+
+Importing the normal upgrade CLI does not import `jsonschema`; only consumers
+of this validator surface need these dependencies.
