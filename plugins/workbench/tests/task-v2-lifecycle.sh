@@ -1942,7 +1942,7 @@ SH
 }
 
 test_work_ref_local_lock_fails_closed_on_symlink() {
-  local repo task_dir claim common digest lock target work_ref reservation out rc
+  local repo task_dir claim common digest lock target work_ref reservation out rc comments
   repo="$(setup_workbench work_ref_local_lock_symlink)"
   task_dir="$(start_task work_ref_local_lock_symlink "$repo" 29)"
   claim="$(sed -n 's/^claim_id: *//p' "$task_dir/task/index.md")"
@@ -1969,6 +1969,10 @@ test_work_ref_local_lock_fails_closed_on_symlink() {
   [ -z "$(git ls-remote --heads "$TMPDIR/work_ref_local_lock_symlink/origin.git" \
     "$reservation")" ] || fail "symlinked work-ref local lock changed remote reservation"
   [ "$(cat "$target")" = attacker ] || fail "symlinked work-ref local lock changed its target"
+  comments="$TMPDIR/work_ref_local_lock_symlink/comments/29.comments"
+  if grep -Fq '"event":"task-active"' "$comments"; then
+    fail "symlinked work-ref local lock published task-active before failing"
+  fi
 }
 
 test_work_ref_selection_reports_duplicate_after_existing_selection_race() {

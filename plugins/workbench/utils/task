@@ -3471,7 +3471,6 @@ cmd_refs() {
       [ -z "$set_context$clear_context" ] || [ -z "$set_context" ] || [ -z "$clear_context" ] || usage_error "context set and clear are mutually exclusive"
       [ -z "$set_work$clear_work" ] || [ -z "$set_work" ] || [ -z "$clear_work" ] || usage_error "work set and clear are mutually exclusive"
       require_v2_task task.refs.set
-      require_mutable_task task.refs.set || return 1
       if [ -n "$set_work$clear_work" ] \
         && [ "${WORKBENCH_WORK_REF_LOCAL_LOCKED:-0}" != 1 ]; then
         local common claim lock_rc
@@ -3488,6 +3487,7 @@ cmd_refs() {
           lock_rc=$?; return "$lock_rc"
         fi
       fi
+      require_mutable_task task.refs.set || return 1
       root="$(wb_root)"
       if [ -n "$set_context$clear_context" ] \
         && [ -f "$(task_state_dir)/policy-context/state.record" ] \
