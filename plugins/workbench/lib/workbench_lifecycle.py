@@ -98,6 +98,88 @@ SUBMISSION_RECOVERY_STAGES = (
     "submitted",
     "restored",
 )
+DELIVERABLE_RECORD_FIELDS = (
+    "deliverable_id",
+    "owner",
+    "kind",
+    "owner_context_ref",
+    "acceptance_authority_ref",
+    "required",
+    "external_ref",
+    "revision",
+    "state",
+    "acceptance_ref",
+    "governance_action",
+    "reason_code",
+    "reason_ref",
+    "governance_action_instance_id",
+    "governance_intent_digest",
+    "governance_policy_manifest_digest",
+    "authorization_ref",
+)
+ACCEPTANCE_ATTEMPT_RECORD_FIELDS = (
+    "acceptance_id",
+    "deliverable_id",
+    "owner",
+    "kind",
+    "external_ref",
+    "revision",
+    "subject_authority_digest",
+    "created_at",
+    "probed_at",
+)
+ACCEPTANCE_RECORD_FIELDS = (
+    "acceptance_id",
+    "deliverable_id",
+    "owner",
+    "kind",
+    "owner_context_ref",
+    "acceptance_authority_ref",
+    "revision",
+    "authority_type",
+    "authority_contract",
+    "authority_ref",
+    "authority_digest",
+    "subject_authority_digest",
+    "actor",
+    "action_instance_id",
+    "intent_digest",
+    "policy_manifest_digest",
+    "authorization_ref",
+    "accepted_at",
+)
+ACTION_RECORD_FIELDS = (
+    "id",
+    "action_id",
+    "task_claim_id",
+    "target_ref",
+    "revision",
+    "intent_digest",
+    "policy_manifest_digest",
+    "status",
+    "consumed_provenance_digest",
+    "authorization_id",
+    "authorization_ref",
+    "authorization_actor",
+    "authorization_at",
+)
+TERMINAL_RECORD_FIELDS = (
+    "outcome",
+    "action_instance_id",
+    "intent_digest",
+    "policy_manifest_digest",
+    "authorization_ref",
+    "revision",
+    "removal_plan_digest",
+    "at",
+    "reason_code",
+    "reason_ref",
+)
+RESTORED_OPERATIONAL_DIRECTORIES = {
+    ".workbench/acceptance-attempts",
+    ".workbench/acceptances",
+    ".workbench/actions",
+}
 MARKER_FIELDS = {
     "task_contract",
     "event",
@@ -710,6 +792,8 @@ def reduce_lifecycle_marker(
         group["active"] = False
         group["terminal_event"] = event
         group["terminal_revision"] = marker["revision"]
+        group["terminal_action_instance_id"] = marker["action_instance_id"]
+        group["terminal_intent_digest"] = marker["intent_digest"]
         group["phase"] = "terminal"
 
 
@@ -1376,6 +1460,13 @@ def cmd_submission_recovery_prepare(args: argparse.Namespace) -> None:
         lock = open_submission_lock(directory, args.branch)
         current = read_submission_recovery_at(directory, args.branch)
         if current is None:
+            head = git_bytes(args.repository, "rev-parse", "HEAD").decode(
+                "ascii"
+            ).strip()
+            if head != value["snapshot_revision"]:
+                validate_cleanup_revision(args.repository, value, head)
+                value["cleanup_revision"] = head
+                value["stage"] = "cleanup-committed"
             validate_recovery_worktree(args.repository, value, True)
             write_submission_recovery_at(directory, args.branch, value)
             current = value
@@ -1491,6 +1582,7 @@ def cmd_submission_recovery_validate(args: argparse.Namespace) -> None:
             with open(args.index_file, "rb") as handle:
                 if handle.read() != raw:
                     raise ValueError("restored task index does not match its snapshot")
+            validate_restored_submission_state(args.repository, directory, value)
         print_submission_recovery_shell(value)
     finally:
         if lock >= 0:
@@ -1753,6 +1845,536 @@ def validate_materialized_task(
     }
     if observed_files != set(entries) or observed_directories != expected_directories:
         raise ValueError("restored task tree is not the exact snapshot")
+
+
+def parse_submission_record(
+    raw: bytes, fields: Tuple[str, ...], kind: str
+) -> Dict[str, str]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("restored {} is not UTF-8".format(kind)) from exc
+    value: Dict[str, str] = {}
+    order: List[str] = []
+    for line in text.splitlines(keepends=True):
+        if not line.endswith("\n") or line.endswith("\r\n") or "=" not in line:
+            raise ValueError("restored {} is malformed".format(kind))
+        key, item = line[:-1].split("=", 1)
+        if not key or key in value or "\r" in item or "\n" in item:
+            raise ValueError("restored {} has invalid fields".format(kind))
+        value[key] = item
+        order.append(key)
+    if tuple(order) != fields:
+        raise ValueError("restored {} fields are not exact".format(kind))
+    return value
+
+
+def read_restored_task_entries(
+    repository: str,
+) -> Tuple[Dict[str, Tuple[str, bytes]], Dict[str, int], Optional[os.stat_result]]:
+    root = os.open(os.path.abspath(repository), secure_directory_flags())
+    task = -1
+    entries: Dict[str, Tuple[str, bytes]] = {}
+    directories: Dict[str, int] = {}
+    codebases: Optional[os.stat_result] = None
+
+    def require_same_inode(
+        before: os.stat_result, opened: os.stat_result, after: os.stat_result, kind: str
+    ) -> None:
+        identity = (before.st_dev, before.st_ino)
+        if identity != (opened.st_dev, opened.st_ino) or identity != (
+            after.st_dev,
+            after.st_ino,
+        ):
+            raise ValueError("restored task {} changed while opening".format(kind))
+
+    def walk(directory: int, prefix: str) -> None:
+        nonlocal codebases
+        children = sorted(os.listdir(directory))
+        for child in children:
+            relative = child if not prefix else prefix + "/" + child
+            value = os.stat(child, dir_fd=directory, follow_symlinks=False)
+            if relative == "codebases":
+                nested = os.open(child, secure_directory_flags(), dir_fd=directory)
+                try:
+                    opened = os.fstat(nested)
+                    validate_parked_directory(opened)
+                    after = os.stat(child, dir_fd=directory, follow_symlinks=False)
+                    require_same_inode(value, opened, after, "codebases directory")
+                    codebases = opened
+                finally:
+                    os.close(nested)
+                continue
+            if stat.S_ISDIR(value.st_mode):
+                nested = os.open(child, secure_directory_flags(), dir_fd=directory)
+                try:
+                    opened = os.fstat(nested)
+                    validate_owned_directory(nested, "restored task directory")
+                    after = os.stat(child, dir_fd=directory, follow_symlinks=False)
+                    require_same_inode(value, opened, after, "directory")
+                    mode = stat.S_IMODE(opened.st_mode)
+                    if mode != 0o700:
+                        raise ValueError("restored task directory mode is not 0700")
+                    directories[relative] = mode
+                    walk(nested, relative)
+                    final = os.stat(child, dir_fd=directory, follow_symlinks=False)
+                    require_same_inode(value, os.fstat(nested), final, "directory")
+                finally:
+                    os.close(nested)
+                continue
+            if stat.S_ISLNK(value.st_mode):
+                target = os.fsencode(os.readlink(child, dir_fd=directory))
+                after = os.stat(child, dir_fd=directory, follow_symlinks=False)
+                if (value.st_dev, value.st_ino) != (after.st_dev, after.st_ino):
+                    raise ValueError("restored task symlink changed while reading")
+                entries[relative] = (
+                    "120000",
+                    target,
+                )
+                continue
+            validate_recovery_inode(value, "restored task file")
+            mode = stat.S_IMODE(value.st_mode)
+            if mode not in (0o600, 0o644, 0o755):
+                raise ValueError("restored task file mode is unsafe")
+            descriptor = os.open(
+                child, secure_file_flags(os.O_RDONLY), dir_fd=directory
+            )
+            try:
+                opened = os.fstat(descriptor)
+                validate_recovery_inode(opened, "restored task file")
+                if (opened.st_dev, opened.st_ino) != (value.st_dev, value.st_ino):
+                    raise ValueError("restored task file changed while opening")
+                with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                    raw = handle.read()
+                after = os.stat(child, dir_fd=directory, follow_symlinks=False)
+                require_same_inode(value, opened, after, "file")
+            finally:
+                os.close(descriptor)
+            modes = {0o600: "100600", 0o644: "100644", 0o755: "100755"}
+            entries[relative] = (modes[mode], raw)
+        if sorted(os.listdir(directory)) != children:
+            raise ValueError("restored task directory changed while reading")
+
+    try:
+        task_before = os.stat("task", dir_fd=root, follow_symlinks=False)
+        task = os.open("task", secure_directory_flags(), dir_fd=root)
+        task_opened = os.fstat(task)
+        validate_exact_task_directory(task, "restored task tree")
+        task_after = os.stat("task", dir_fd=root, follow_symlinks=False)
+        require_same_inode(task_before, task_opened, task_after, "root")
+        walk(task, "")
+        task_final = os.stat("task", dir_fd=root, follow_symlinks=False)
+        require_same_inode(task_before, os.fstat(task), task_final, "root")
+        return entries, directories, codebases
+    finally:
+        if task >= 0:
+            os.close(task)
+        os.close(root)
+
+
+def validate_submitted_increment(
+    snapshot: bytes, current: bytes, value: Dict[str, Any]
+) -> Dict[str, str]:
+    expected = parse_submission_record(
+        snapshot, DELIVERABLE_RECORD_FIELDS, "snapshot deliverable"
+    )
+    observed = parse_submission_record(
+        current, DELIVERABLE_RECORD_FIELDS, "restored deliverable"
+    )
+    if expected["kind"] != "workbench-increment":
+        raise ValueError("restored mutable deliverable kind is invalid")
+    if current == snapshot:
+        return expected
+    if (
+        expected["state"] != "declared"
+        or expected["external_ref"]
+        or expected["revision"]
+        or expected["acceptance_ref"]
+    ):
+        raise ValueError("submission snapshot increment is not bindable")
+    for field in DELIVERABLE_RECORD_FIELDS:
+        if field in ("external_ref", "revision", "state", "acceptance_ref"):
+            continue
+        if observed[field] != expected[field]:
+            raise ValueError("restored increment diverges from its snapshot")
+    if (
+        observed["external_ref"] != value["pull_request_url"]
+        or observed["revision"] != value["head_revision"]
+        or observed["state"] not in ("submitted", "accepted")
+    ):
+        raise ValueError("restored increment does not join submission recovery")
+    if observed["state"] == "submitted" and observed["acceptance_ref"]:
+        raise ValueError("submitted increment carries an acceptance")
+    if observed["state"] == "accepted" and re.fullmatch(
+        r"workbench:acceptance/[A-Za-z0-9][A-Za-z0-9._-]*",
+        observed["acceptance_ref"],
+    ) is None:
+        raise ValueError("accepted increment lacks an exact acceptance reference")
+    return observed
+
+
+def parse_restored_action_request(raw: bytes) -> Dict[str, Any]:
+    from workbench_intent import load_request
+
+    descriptor, path = tempfile.mkstemp(prefix="workbench-restored-action-")
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw)
+        return load_request(path)
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def validate_restored_acceptance_files(
+    current: Dict[str, Tuple[str, bytes]],
+    extras: set,
+    increment: Optional[Dict[str, str]],
+    value: Dict[str, Any],
+) -> None:
+    attempt_paths = sorted(
+        path for path in extras if path.startswith(".workbench/acceptance-attempts/")
+    )
+    receipt_paths = sorted(
+        path for path in extras if path.startswith(".workbench/acceptances/")
+    )
+    if increment is None:
+        if attempt_paths or receipt_paths:
+            raise ValueError("restored task has acceptance state without an increment")
+        return
+    deliverable_id = increment["deliverable_id"]
+    attempt_path = ".workbench/acceptance-attempts/{}.record".format(deliverable_id)
+    if attempt_paths not in ([], [attempt_path]) or len(receipt_paths) > 1:
+        raise ValueError("restored acceptance membership is not exact")
+    attempt = None
+    if attempt_paths:
+        mode, raw = current[attempt_path]
+        if mode != "100600":
+            raise ValueError("restored acceptance attempt mode is not 0600")
+        attempt = parse_submission_record(
+            raw, ACCEPTANCE_ATTEMPT_RECORD_FIELDS, "acceptance attempt"
+        )
+        expected = {
+            "deliverable_id": deliverable_id,
+            "owner": increment["owner"],
+            "kind": increment["kind"],
+            "external_ref": value["pull_request_url"],
+            "revision": value["head_revision"],
+        }
+        if any(attempt[field] != item for field, item in expected.items()):
+            raise ValueError("restored acceptance attempt is not submission-bound")
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", attempt["acceptance_id"])
+            is None
+            or RFC3339.fullmatch(attempt["created_at"]) is None
+            or bool(attempt["subject_authority_digest"]) != bool(attempt["probed_at"])
+            or (
+                attempt["subject_authority_digest"]
+                and DIGEST.fullmatch(attempt["subject_authority_digest"]) is None
+            )
+            or (attempt["probed_at"] and RFC3339.fullmatch(attempt["probed_at"]) is None)
+        ):
+            raise ValueError("restored acceptance attempt contract is invalid")
+    receipt = None
+    if receipt_paths:
+        mode, raw = current[receipt_paths[0]]
+        if mode != "100600":
+            raise ValueError("restored acceptance receipt mode is not 0600")
+        receipt = parse_submission_record(
+            raw, ACCEPTANCE_RECORD_FIELDS, "acceptance receipt"
+        )
+        expected_path = ".workbench/acceptances/{}.record".format(
+            receipt["acceptance_id"]
+        )
+        empty = (
+            "owner_context_ref",
+            "acceptance_authority_ref",
+            "actor",
+            "action_instance_id",
+            "intent_digest",
+            "policy_manifest_digest",
+            "authorization_ref",
+        )
+        expected = {
+            "deliverable_id": deliverable_id,
+            "owner": increment["owner"],
+            "kind": increment["kind"],
+            "revision": value["head_revision"],
+            "authority_type": "kernel-probe",
+            "authority_contract": "workbench-probe/github-pr/v1",
+            "authority_ref": value["pull_request_url"],
+        }
+        if (
+            receipt_paths[0] != expected_path
+            or any(receipt[field] != item for field, item in expected.items())
+            or any(receipt[field] for field in empty)
+            or DIGEST.fullmatch(receipt["authority_digest"]) is None
+            or DIGEST.fullmatch(receipt["subject_authority_digest"]) is None
+            or RFC3339.fullmatch(receipt["accepted_at"]) is None
+            or attempt is None
+            or receipt["acceptance_id"] != attempt["acceptance_id"]
+            or receipt["subject_authority_digest"]
+            != attempt["subject_authority_digest"]
+            or receipt["accepted_at"] != attempt["probed_at"]
+        ):
+            raise ValueError("restored acceptance receipt is not exact")
+    if increment["state"] == "accepted":
+        if receipt is None or increment["acceptance_ref"] != (
+            "workbench:acceptance/" + receipt["acceptance_id"]
+        ):
+            raise ValueError("restored accepted increment is not receipt-bound")
+    elif receipt is not None and attempt is None:
+        raise ValueError("restored pending acceptance lacks its attempt")
+
+
+def validate_restored_terminal_files(
+    current: Dict[str, Tuple[str, bytes]],
+    extras: set,
+    value: Dict[str, Any],
+    target_ref: str,
+    cleanup_authority: Optional[Dict[str, str]] = None,
+) -> None:
+    action_records = sorted(
+        path
+        for path in extras
+        if re.fullmatch(
+            r"\.workbench/actions/[A-Za-z0-9][A-Za-z0-9._-]*\.record", path
+        )
+    )
+    action_requests = sorted(
+        path
+        for path in extras
+        if re.fullmatch(
+            r"\.workbench/actions/[A-Za-z0-9][A-Za-z0-9._-]*\.request\.json",
+            path,
+        )
+    )
+    terminal_path = ".workbench/terminal"
+    terminal_present = terminal_path in extras
+    if not action_records and not action_requests and not terminal_present:
+        return
+    if len(action_records) != 1 or len(action_requests) != 1:
+        raise ValueError("restored terminal action membership is not exact")
+    action_mode, action_raw = current[action_records[0]]
+    request_mode, request_raw = current[action_requests[0]]
+    if action_mode != "100600" or request_mode != "100600":
+        raise ValueError("restored terminal action mode is not 0600")
+    action = parse_submission_record(
+        action_raw, ACTION_RECORD_FIELDS, "terminal action"
+    )
+    action_id = action["id"]
+    if (
+        action_records[0] != ".workbench/actions/{}.record".format(action_id)
+        or action_requests[0]
+        != ".workbench/actions/{}.request.json".format(action_id)
+        or action["action_id"]
+        not in (
+            ("task.complete", "task.abandon")
+            if cleanup_authority is None
+            else ("task.cleanup",)
+        )
+        or action["task_claim_id"] != value["claim_id"]
+        or action["target_ref"] != target_ref
+        or DIGEST.fullmatch(action["revision"]) is None
+        or DIGEST.fullmatch(action["intent_digest"]) is None
+        or DIGEST.fullmatch(action["policy_manifest_digest"]) is None
+        or action["status"] not in ("pending", "authorized", "consumed")
+        or (
+            action["status"] == "consumed"
+            and DIGEST.fullmatch(action["consumed_provenance_digest"]) is None
+        )
+        or (
+            action["status"] != "consumed" and action["consumed_provenance_digest"]
+        )
+    ):
+        raise ValueError("restored terminal action is not exact")
+    request = parse_restored_action_request(request_raw)
+    for field in ("action_id", "task_claim_id", "target_ref", "revision"):
+        if request[field] != action[field]:
+            raise ValueError("restored terminal request binding mismatch")
+    if request["intent_digest"] != action["intent_digest"]:
+        raise ValueError("restored terminal request digest mismatch")
+    authorization = (
+        action["authorization_id"],
+        action["authorization_ref"],
+        action["authorization_actor"],
+        action["authorization_at"],
+    )
+    if (
+        (any(authorization) and not all(authorization))
+        or (
+            all(authorization)
+            and (
+                re.fullmatch(
+                    r"auth_[A-Za-z0-9][A-Za-z0-9._-]*",
+                    action["authorization_id"],
+                )
+                is None
+                or RFC3339.fullmatch(action["authorization_at"]) is None
+            )
+        )
+        or (
+            action["status"] == "pending"
+            and (any(authorization) or action["consumed_provenance_digest"])
+        )
+        or (
+            action["status"] == "authorized"
+            and action["consumed_provenance_digest"]
+        )
+    ):
+        raise ValueError("restored terminal action state is not closed")
+    if cleanup_authority is not None:
+        if terminal_present:
+            raise ValueError("restored remote cleanup state contains a local terminal")
+        if (
+            action["revision"] != cleanup_authority["terminal_revision"]
+            or request["payload_contract"]
+            != "workbench-task-cleanup-intent/v1"
+        ):
+            raise ValueError("restored cleanup action is not terminal-bound")
+        from workbench_intent import parse_line_payload
+
+        payload = parse_line_payload(request["payload_contract"], request["payload"])
+        if (
+            payload["terminal_revision"]
+            != cleanup_authority["terminal_revision"]
+            or payload["removal_plan_digest"]
+            != cleanup_authority["removal_plan_digest"]
+        ):
+            raise ValueError("restored cleanup request is not removal-plan-bound")
+        return
+    if not terminal_present:
+        return
+    terminal_mode, terminal_raw = current[terminal_path]
+    if terminal_mode != "100600":
+        raise ValueError("restored terminal record mode is not 0600")
+    terminal = parse_submission_record(
+        terminal_raw, TERMINAL_RECORD_FIELDS, "terminal record"
+    )
+    expected_action = {
+        "completed": "task.complete",
+        "abandoned": "task.abandon",
+    }.get(terminal["outcome"])
+    if (
+        expected_action != action["action_id"]
+        or terminal["action_instance_id"] != action_id
+        or terminal["revision"] != action["revision"]
+        or terminal["intent_digest"] != action["intent_digest"]
+        or terminal["policy_manifest_digest"] != action["policy_manifest_digest"]
+        or terminal["authorization_ref"] != action["authorization_ref"]
+        or RFC3339.fullmatch(terminal["at"]) is None
+    ):
+        raise ValueError("restored terminal record is not action-bound")
+
+
+def validate_restored_operational_files(
+    current: Dict[str, Tuple[str, bytes]],
+    extras: set,
+    increment: Optional[Dict[str, str]],
+    value: Dict[str, Any],
+    target_ref: str,
+    cleanup_authority: Optional[Dict[str, str]] = None,
+) -> None:
+    acceptance = {
+        path
+        for path in extras
+        if path.startswith(".workbench/acceptance-attempts/")
+        or path.startswith(".workbench/acceptances/")
+    }
+    terminal = extras - acceptance
+    if any(
+        not (
+            path == ".workbench/terminal"
+            or re.fullmatch(
+                r"\.workbench/actions/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:record|request\.json)",
+                path,
+            )
+        )
+        for path in terminal
+    ):
+        raise ValueError("restored task contains unauthenticated content")
+    validate_restored_acceptance_files(current, acceptance, increment, value)
+    validate_restored_terminal_files(
+        current, terminal, value, target_ref, cleanup_authority
+    )
+
+
+def validate_restored_submission_state(
+    repository: str,
+    directory: int,
+    value: Dict[str, Any],
+    cleanup_authority: Optional[Dict[str, str]] = None,
+) -> None:
+    _, snapshot_index, _ = submission_snapshot_index(
+        repository, value["snapshot_revision"], value["branch"]
+    )
+    terminal_target_ref = snapshot_index["work_ref"] or (
+        "workbench:task/" + value["claim_id"]
+    )
+    target_ref = (
+        "workbench:task/" + value["claim_id"]
+        if cleanup_authority is not None
+        else terminal_target_ref
+    )
+    if cleanup_authority is not None and cleanup_authority["target_ref"] != target_ref:
+        raise ValueError("restored cleanup target does not join the snapshot index")
+    snapshot = snapshot_task_entries(repository, value["snapshot_revision"])
+    current, directories, codebases = read_restored_task_entries(repository)
+    snapshot_directories = {
+        "/".join(relative.split("/")[:index])
+        for relative in snapshot
+        for index in range(1, len(relative.split("/")))
+    }
+    if any(relative == "codebases" or relative.startswith("codebases/") for relative in snapshot):
+        raise ValueError("submission snapshot unexpectedly tracks codebases")
+    missing_directories = snapshot_directories - set(directories)
+    foreign_directories = (
+        set(directories) - snapshot_directories - RESTORED_OPERATIONAL_DIRECTORIES
+    )
+    if missing_directories or foreign_directories:
+        raise ValueError("restored task directories diverge from the snapshot")
+    if any(mode != 0o700 for mode in directories.values()):
+        raise ValueError("restored task directory mode changed")
+
+    mutable: List[Dict[str, str]] = []
+    for relative, (mode, raw) in snapshot.items():
+        observed = current.get(relative)
+        if observed is None:
+            raise ValueError("restored task is missing snapshot content")
+        if mode == "100644" and re.fullmatch(
+            r"\.workbench/deliverables/[A-Za-z0-9][A-Za-z0-9._-]*\.record",
+            relative,
+        ):
+            record = parse_submission_record(
+                raw, DELIVERABLE_RECORD_FIELDS, "snapshot deliverable"
+            )
+            if record["kind"] == "workbench-increment":
+                if observed[0] != mode:
+                    raise ValueError("restored increment mode changed")
+                mutable.append(validate_submitted_increment(raw, observed[1], value))
+                continue
+        if observed != (mode, raw):
+            raise ValueError("restored task content diverges from the snapshot")
+    if len(mutable) > 1:
+        raise ValueError("submission snapshot has multiple workbench increments")
+    extras = set(current) - set(snapshot)
+    validate_restored_operational_files(
+        current,
+        extras,
+        mutable[0] if mutable else None,
+        value,
+        target_ref,
+        cleanup_authority,
+    )
+
+    marker = read_codebases_marker(directory, value["branch"])
+    if codebases is None:
+        if marker is not None:
+            raise ValueError("restored task codebases marker has no directory")
+    elif marker != codebases_marker_value(value, codebases):
+        raise ValueError("restored task codebases are not recovery-bound")
 
 
 def submission_task_staging_name(value: Dict[str, Any]) -> str:
@@ -2160,6 +2782,12 @@ def cmd_lifecycle_reduce(args: argparse.Namespace) -> None:
     sys.stdout.write(
         "terminal_revision={}\n".format(group.get("terminal_revision", ""))
     )
+    sys.stdout.write(
+        "terminal_action_instance_id={}\nterminal_intent_digest={}\n".format(
+            group.get("terminal_action_instance_id", ""),
+            group.get("terminal_intent_digest", ""),
+        )
+    )
 
 
 def load_submission_observation(
@@ -2226,8 +2854,8 @@ def cmd_submission(args: argparse.Namespace) -> None:
     )
     sys.stdout.write("state={}\n".format(state))
     if item is not None:
-        sys.stdout.write("number={}\nurl={}\nhead_revision={}\n".format(
-            item["number"], item["url"], item["head_revision"]
+        sys.stdout.write("number={}\nurl={}\nhead_revision={}\npull_request_state={}\n".format(
+            item["number"], item["url"], item["head_revision"], item["state"]
         ))
 
 

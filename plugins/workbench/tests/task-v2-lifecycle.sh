@@ -21,7 +21,11 @@ TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/workbench-task-v2.XXXXXX")"
 cleanup() {
   local rc=$?
   trap - EXIT
-  rm -rf "$TMPDIR"
+  if [ "${WORKBENCH_TEST_KEEP_TMP:-0}" = 1 ]; then
+    printf 'preserved test tmpdir: %s\n' "$TMPDIR" >&2
+  else
+    rm -rf "$TMPDIR"
+  fi
   if [ "$SOURCE_HEAD" != "$(git -C "$SOURCE_REPO" rev-parse HEAD)" ] \
     || [ "$SOURCE_STATUS" != "$(git -C "$SOURCE_REPO" status --porcelain=v1)" ]; then
     echo "FAIL: test mutated source repository" >&2
@@ -140,8 +144,11 @@ case "${1:-} ${2:-}" in
       && grep -Fq "\"event\":\"$GH_FAIL_LIFECYCLE_EVENT\"" "$body_file"; then
       exit 43
     fi
-    cat "$body_file" >> "$GH_COMMENTS_DIR/$issue.comments"
-    printf '\n' >> "$GH_COMMENTS_DIR/$issue.comments"
+    {
+      printf '%s\n' '<!-- fixture-comment-author:test@example.invalid -->'
+      cat "$body_file"
+      printf '%s\n' '<!-- fixture-comment-end -->'
+    } >> "$GH_COMMENTS_DIR/$issue.comments"
     if [ -n "${GH_CLEANUP_RACE_DIRTY_WORKTREE:-}" ] \
       && grep -Fq '"stage":"prepared"' "$body_file"; then
       printf '%s\n' dirty-after-prepared > "$GH_CLEANUP_RACE_DIRTY_WORKTREE/RACE.txt"
@@ -292,7 +299,7 @@ for path in sorted(comment_paths, key=lambda item: int(item.stem)):
         flags=re.DOTALL,
     )
     observed = []
-    if trusted_body:
+    if trusted_body.strip():
         observed.append({"author_identity": "test@example.invalid", "body": trusted_body})
     observed.extend(
         {"author_identity": match.group(1), "body": match.group(2)}
@@ -333,6 +340,10 @@ PY
   exit
 fi
 if [ "$command" = lifecycle ]; then
+  if [ -n "${WORKBENCH_TEST_LIFECYCLE_OBSERVATION:-}" ]; then
+    cat "$WORKBENCH_TEST_LIFECYCLE_OBSERVATION"
+    exit
+  fi
   python3 - "$repository" "$issue" "${GH_COMMENTS_DIR:-}/$issue.comments" <<'PY'
 import json
 import pathlib
@@ -358,7 +369,7 @@ trusted_body = re.sub(
     flags=re.DOTALL,
 )
 observed_comments = []
-if trusted_body:
+if trusted_body.strip():
     observed_comments.append({"author_identity": "test@example.invalid", "body": trusted_body})
 observed_comments.extend(
     {"author_identity": match.group(1), "body": match.group(2)}
@@ -598,6 +609,7 @@ run_task_in_dir() {
     WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT="${WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT:-0}" \
     WORKBENCH_TEST_FAIL_SUBMISSION_STAGE="${WORKBENCH_TEST_FAIL_SUBMISSION_STAGE:-}" \
     WORKBENCH_TEST_SUBMISSION_OBSERVATION="${WORKBENCH_TEST_SUBMISSION_OBSERVATION:-}" \
+    WORKBENCH_TEST_LIFECYCLE_OBSERVATION="${WORKBENCH_TEST_LIFECYCLE_OBSERVATION:-}" \
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
@@ -643,11 +655,18 @@ start_task() {
 }
 
 prepare_submission_fixture() {
-  local case_name="$1"
+  local case_name="$1" completion="${2:-false}" cleanup_decision="${3:-allow}"
+  local terminal_action="${4:-complete}"
   SUBMISSION_REPO="$(setup_workbench "$case_name")"
+  if [ "$completion" = true ]; then
+    printf '%s\n' \
+      'schema=workbench-policy/v1' \
+      "action.task.$terminal_action=allow" \
+      "action.task.cleanup=$cleanup_decision" > "$SUBMISSION_REPO/.workbench/policy.conf"
+  fi
   printf '%s\n' 'kit: https://github.com/example/workbench.git' \
     > "$SUBMISSION_REPO/codebases.yaml"
-  git -C "$SUBMISSION_REPO" add codebases.yaml
+  git -C "$SUBMISSION_REPO" add .workbench/policy.conf codebases.yaml
   git -C "$SUBMISSION_REPO" commit -q -m "test: register submission owner"
   git -C "$SUBMISSION_REPO" push -q
   SUBMISSION_TASK_DIR="$(start_task "$case_name" "$SUBMISSION_REPO")"
@@ -2845,9 +2864,11 @@ value = {
     "at": "2026-07-11T05:30:00Z",
 }
 with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write("<!-- fixture-comment-author:test@example.invalid -->\n")
     handle.write("<!-- workbench-task-lifecycle:v2\n")
     handle.write(json.dumps(value, separators=(",", ":")) + "\n")
-    handle.write("-->\nworkbench task lifecycle: task-active\n\n")
+    handle.write("-->\nworkbench task lifecycle: task-active\n")
+    handle.write("<!-- fixture-comment-end -->\n")
 PY
   out="$TMPDIR/terminal_absorbing/retry.out"
   if run_task_in_dir terminal_absorbing "$task_dir" abandon \
@@ -5287,6 +5308,548 @@ test_v2_submission_restore_never_overwrites_occupied_state() {
     || fail "safe restoration did not recover after isolated materialization failure"
 }
 
+test_v2_submission_reconstructs_recovery_in_fresh_clone() {
+  local clone device_task branch head common out mode observation origin lifecycle actual pr_creates
+  local terminal_clone terminal_task terminal_common
+  prepare_submission_fixture submit_cross_device true
+  run_task_in_dir submit_cross_device "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: cross-device submission" --body-file "$SUBMISSION_BODY" >/dev/null
+  branch="$(git -C "$SUBMISSION_TASK_DIR" branch --show-current)"
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+
+  clone="$TMPDIR/submit_cross_device/device-two"
+  git clone -q "$TMPDIR/submit_cross_device/origin.git" "$clone"
+  git -C "$clone" config user.name "Test User"
+  git -C "$clone" config user.email "test@example.invalid"
+  mkdir -p "$clone/.worktrees"
+  device_task="$(task_dir_for "$clone")"
+  git -C "$clone" worktree add -q -b "$branch" "$device_task" "origin/$branch"
+  common="$(git -C "$device_task" rev-parse --path-format=absolute --git-common-dir)"
+  [ ! -e "$common/workbench-v2" ] \
+    || fail "fresh clone unexpectedly inherited local submission recovery state"
+  origin="$(git -C "$device_task" remote get-url origin)"
+
+  for mode in fork multiple changed-head bad-base; do
+    observation="$TMPDIR/submit_cross_device/$mode.json"
+    python3 - "$observation" "$origin" "$branch" "$head" "$mode" <<'PY'
+import copy
+import json
+import sys
+
+path, origin, branch, head, mode = sys.argv[1:]
+pagination = {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None}
+item = {
+    "number": 17,
+    "url": "https://github.com/example/workbench/pull/17",
+    "head_branch": branch,
+    "head_revision": "0" * 40 if mode == "changed-head" else head,
+    "head_repository_origin_url": origin,
+    "head_is_fork": mode == "fork",
+    "base_ref": "other" if mode == "bad-base" else "main",
+    "state": "open",
+}
+items = [item]
+if mode == "multiple":
+    duplicate = copy.deepcopy(item)
+    duplicate["number"] = 18
+    duplicate["url"] = "https://github.com/example/workbench/pull/18"
+    items.append(duplicate)
+value = {
+    "contract_version": "workbench-hosting-submission-observation/v1",
+    "repository_origin_url": origin,
+    "head_branch": branch,
+    "base_ref": "other" if mode == "bad-base" else "main",
+    "pagination": pagination,
+    "pull_requests": items,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+    out="$TMPDIR/submit_cross_device/$mode.out"
+    if WORKBENCH_TEST_SUBMISSION_OBSERVATION="$observation" \
+      run_task_in_dir submit_cross_device "$device_task" submit \
+        --title "feat: cross-device submission" --body-file "$SUBMISSION_BODY" \
+        >"$out" 2>&1; then
+      fail "fresh-clone recovery accepted $mode PR observation"
+    fi
+    [ ! -e "$device_task/task" ] \
+      || fail "invalid $mode PR observation restored task state"
+  done
+
+  lifecycle="$TMPDIR/submit_cross_device/ambiguous-lifecycle.json"
+  python3 - "$lifecycle" "$origin" "$TMPDIR/submit_cross_device/comments/29.comments" <<'PY'
+import json
+import re
+import sys
+
+path, origin, comments = sys.argv[1:]
+body = open(comments, encoding="utf-8").read()
+submitted = next(
+    raw
+    for raw in re.findall(r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->", body)
+    if json.loads(raw)["event"] == "task-submitted"
+)
+body += (
+    "<!-- workbench-task-lifecycle:v2\n"
+    + submitted
+    + "\n-->\nworkbench task lifecycle: task-submitted duplicate\n\n"
+)
+value = {
+    "contract_version": "workbench-hosting-lifecycle-observation/v1",
+    "repository_origin_url": origin,
+    "issue": 29,
+    "pagination": {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None},
+    "comments": [{"author_identity": "test@example.invalid", "body": body}],
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  out="$TMPDIR/submit_cross_device/ambiguous-lifecycle.out"
+  if WORKBENCH_TEST_LIFECYCLE_OBSERVATION="$lifecycle" \
+    run_task_in_dir submit_cross_device "$device_task" submit \
+      --title "feat: cross-device submission" --body-file "$SUBMISSION_BODY" \
+      >"$out" 2>&1; then
+    fail "fresh-clone recovery accepted ambiguous submission lifecycle"
+  fi
+  [ ! -e "$device_task/task" ] \
+    || fail "ambiguous lifecycle restored fresh-clone task state"
+
+  actual="$(run_task_in_dir submit_cross_device "$device_task" submit \
+    --title "feat: cross-device submission" --body-file "$SUBMISSION_BODY")"
+  assert_contains "$actual" 'https://github.com/example/workbench/pull/17'
+  [ -f "$device_task/task/index.md" ] \
+    || fail "fresh clone did not reconstruct and restore submitted task state"
+  git -C "$device_task" ls-files --error-unmatch task/index.md >/dev/null 2>&1 \
+    && fail "fresh-clone restored task state became tracked"
+  pr_creates="$(grep -c 'pr create' "$TMPDIR/submit_cross_device/gh.log" || true)"
+  [ "$pr_creates" = 1 ] || fail "fresh clone created a duplicate submitted PR"
+
+  python3 - "$TMPDIR/submit_cross_device/comments/pr-17.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["state"] = "MERGED"
+value["merged"] = True
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_cross_device "$device_task" deliverable accept \
+      --id workbench-pr --format json >/dev/null
+  actual="$(GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_cross_device "$device_task" verify --format json)"
+  assert_contains "$actual" '"verified":true'
+  actual="$(GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_cross_device "$device_task" complete --format json)"
+  assert_contains "$actual" '"outcome":"completed"'
+
+  rm -rf "$clone"
+  terminal_clone="$TMPDIR/submit_cross_device/device-three"
+  git clone -q "$TMPDIR/submit_cross_device/origin.git" "$terminal_clone"
+  git -C "$terminal_clone" config user.name "Test User"
+  git -C "$terminal_clone" config user.email "test@example.invalid"
+  mkdir -p "$terminal_clone/.worktrees"
+  terminal_task="$(task_dir_for "$terminal_clone")"
+  git -C "$terminal_clone" worktree add -q -b "$branch" "$terminal_task" "origin/$branch"
+  terminal_common="$(git -C "$terminal_task" rev-parse --path-format=absolute --git-common-dir)"
+  [ ! -e "$terminal_common/workbench-v2" ] \
+    || fail "terminal handoff clone unexpectedly inherited submission recovery state"
+  actual="$(run_task submit_cross_device "$terminal_clone" done 29 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+  [ ! -d "$terminal_task" ] \
+    || fail "fresh-clone submitted task workspace survived terminal cleanup"
+  [ -z "$(find "$terminal_common/workbench-v2" -maxdepth 1 \
+    \( -name 'submission-*' -o -name '.submission-task-stage-*' \) -print)" ] \
+    || fail "fresh-clone terminal cleanup retained submission recovery state"
+}
+
+mark_submission_pr_merged() {
+  local case_name="$1"
+  python3 - "$TMPDIR/$case_name/comments/pr-17.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["state"] = "MERGED"
+value["merged"] = True
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+}
+
+test_v2_submission_rejects_restored_deliverable_tampering() {
+  local deliverable original head out
+  prepare_submission_fixture submit_tampered_deliverable
+  run_task_in_dir submit_tampered_deliverable "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: tampered restored deliverable" --body-file "$SUBMISSION_BODY" >/dev/null
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  mark_submission_pr_merged submit_tampered_deliverable
+  deliverable="$SUBMISSION_TASK_DIR/task/.workbench/deliverables/workbench-pr.record"
+  original="$TMPDIR/submit_tampered_deliverable/workbench-pr.record"
+  cp "$deliverable" "$original"
+  sed 's/^required=true$/required=false/' "$original" > "$deliverable"
+  out="$TMPDIR/submit_tampered_deliverable/accept.out"
+  if GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_tampered_deliverable "$SUBMISSION_TASK_DIR" deliverable accept \
+      --id workbench-pr --format json >"$out" 2>&1; then
+    fail "submitted task accepted a deliverable that diverged from its authenticated snapshot"
+  fi
+  cp "$original" "$deliverable"
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_tampered_deliverable "$SUBMISSION_TASK_DIR" deliverable accept \
+      --id workbench-pr --format json >/dev/null
+}
+
+test_v2_submission_rejects_deleted_restored_deliverable() {
+  local deliverable head out verify_accepted=false complete_accepted=false
+  prepare_submission_fixture submit_deleted_deliverable true
+  run_task_in_dir submit_deleted_deliverable "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: deleted restored deliverable" --body-file "$SUBMISSION_BODY" >/dev/null
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  deliverable="$SUBMISSION_TASK_DIR/task/.workbench/deliverables/workbench-pr.record"
+  rm "$deliverable"
+  out="$TMPDIR/submit_deleted_deliverable/verify.out"
+  if GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_deleted_deliverable "$SUBMISSION_TASK_DIR" verify \
+      --format json >"$out" 2>&1; then
+    verify_accepted=true
+  fi
+  out="$TMPDIR/submit_deleted_deliverable/complete.out"
+  if GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_deleted_deliverable "$SUBMISSION_TASK_DIR" complete \
+      --format json >"$out" 2>&1; then
+    complete_accepted=true
+  fi
+  [ "$verify_accepted" = false ] \
+    || fail "submitted task verified after its required deliverable was deleted"
+  [ "$complete_accepted" = false ] \
+    || fail "submitted task completed after its required deliverable was deleted"
+}
+
+test_v2_submission_rejects_deleted_restored_required_check() {
+  local check head out verify_accepted=false complete_accepted=false
+  prepare_submission_fixture submit_deleted_check true
+  run_task_in_dir submit_deleted_check "$SUBMISSION_TASK_DIR" required-check declare \
+    --id restored-check --owner kit --format json >/dev/null
+  printf '\n## [2026-07-12 13:01:00] code · create task/.workbench/required-checks/restored-check.record | require restored task check\n' \
+    >> "$SUBMISSION_TASK_DIR/task/log.md"
+  printf '%s\n' '# Status' '' '상태: restored task check required' \
+    > "$SUBMISSION_TASK_DIR/task/status.md"
+  git -C "$SUBMISSION_TASK_DIR" add task
+  git -C "$SUBMISSION_TASK_DIR" commit -q -m "test: require restored task check"
+  git -C "$SUBMISSION_TASK_DIR" push -q
+  SUBMISSION_SNAPSHOT="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  run_task_in_dir submit_deleted_check "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: deleted restored check" --body-file "$SUBMISSION_BODY" >/dev/null
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  mark_submission_pr_merged submit_deleted_check
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_deleted_check "$SUBMISSION_TASK_DIR" deliverable accept \
+      --id workbench-pr --format json >/dev/null
+  check="$SUBMISSION_TASK_DIR/task/.workbench/required-checks/restored-check.record"
+  rm "$check"
+  out="$TMPDIR/submit_deleted_check/verify.out"
+  if GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_deleted_check "$SUBMISSION_TASK_DIR" verify \
+      --format json >"$out" 2>&1; then
+    verify_accepted=true
+  fi
+  out="$TMPDIR/submit_deleted_check/complete.out"
+  if GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_deleted_check "$SUBMISSION_TASK_DIR" complete \
+      --format json >"$out" 2>&1; then
+    complete_accepted=true
+  fi
+  [ "$verify_accepted" = false ] \
+    || fail "submitted task verified after its required check was deleted"
+  [ "$complete_accepted" = false ] \
+    || fail "submitted task completed after its required check was deleted"
+}
+
+test_v2_submission_rejects_restored_acceptance_tampering() {
+  local acceptance original head out actual field forged
+  prepare_submission_fixture submit_tampered_acceptance
+  run_task_in_dir submit_tampered_acceptance "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: tampered restored acceptance" --body-file "$SUBMISSION_BODY" >/dev/null
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  mark_submission_pr_merged submit_tampered_acceptance
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_tampered_acceptance "$SUBMISSION_TASK_DIR" deliverable accept \
+      --id workbench-pr --format json >/dev/null
+  acceptance="$(find "$SUBMISSION_TASK_DIR/task/.workbench/acceptances" \
+    -maxdepth 1 -type f -name '*.record')"
+  [ -n "$acceptance" ] \
+    && [ "$(printf '%s\n' "$acceptance" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "acceptance tamper fixture did not create exactly one receipt"
+  original="$TMPDIR/submit_tampered_acceptance/acceptance.record"
+  cp "$acceptance" "$original"
+  for field in authority_digest subject_authority_digest; do
+    [ "$field" = authority_digest ] \
+      && forged="sha256:1111111111111111111111111111111111111111111111111111111111111111" \
+      || forged="sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    sed "s/^$field=sha256:[0-9a-f]*$/$field=$forged/" "$original" > "$acceptance"
+    out="$TMPDIR/submit_tampered_acceptance/$field.out"
+    if GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+      run_task_in_dir submit_tampered_acceptance "$SUBMISSION_TASK_DIR" verify \
+        --format json >"$out" 2>&1; then
+      fail "submitted task verified a tampered $field acceptance binding"
+    fi
+  done
+  cp "$original" "$acceptance"
+  actual="$(GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_tampered_acceptance "$SUBMISSION_TASK_DIR" verify --format json)"
+  assert_contains "$actual" '"verified":true'
+}
+
+test_v2_submitted_completion_keeps_cleanup_authorization_separate() {
+  local branch head clone task out rc pending instance claim target revision manifest intent auth actual
+  prepare_submission_fixture submit_cleanup_gate true ask
+  run_task_in_dir submit_cleanup_gate "$SUBMISSION_TASK_DIR" submit \
+    --title "feat: separate terminal cleanup gate" --body-file "$SUBMISSION_BODY" >/dev/null
+  branch="$(git -C "$SUBMISSION_TASK_DIR" branch --show-current)"
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  mark_submission_pr_merged submit_cleanup_gate
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_cleanup_gate "$SUBMISSION_TASK_DIR" deliverable accept \
+      --id workbench-pr --format json >/dev/null
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_cleanup_gate "$SUBMISSION_TASK_DIR" verify --format json >/dev/null
+  actual="$(GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_cleanup_gate "$SUBMISSION_TASK_DIR" complete --format json)"
+  assert_contains "$actual" '"outcome":"completed"'
+  if grep -Fq 'workbench-task-cleanup:v1' "$TMPDIR/submit_cleanup_gate/comments/29.comments"; then
+    fail "completion minted a cleanup journal before the cleanup authorization gate"
+  fi
+  if grep -Rqs '^action_id=task.cleanup$' "$SUBMISSION_TASK_DIR/task/.workbench/actions"; then
+    fail "completion pre-authorized task.cleanup"
+  fi
+
+  rm -rf "$SUBMISSION_REPO"
+  clone="$TMPDIR/submit_cleanup_gate/device-two"
+  git clone -q "$TMPDIR/submit_cleanup_gate/origin.git" "$clone"
+  git -C "$clone" config user.name "Test User"
+  git -C "$clone" config user.email "test@example.invalid"
+  mkdir -p "$clone/.worktrees"
+  task="$(task_dir_for "$clone")"
+  git -C "$clone" worktree add -q -b "$branch" "$task" "origin/$branch"
+  out="$TMPDIR/submit_cleanup_gate/cleanup-ask.out"
+  if run_task submit_cleanup_gate "$clone" done 29 --format json > "$out"; then
+    fail "fresh-clone cleanup bypassed its independent authorization gate"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 3 ] || fail "fresh-clone cleanup ask returned $rc"
+  pending="$(cat "$out")"
+  instance="$(json_get "$pending" action_instance.id)"
+  claim="$(json_get "$pending" action_instance.task_claim_id)"
+  target="$(json_get "$pending" action_instance.target_ref)"
+  [ "$target" = "workbench:task/$claim" ] \
+    || fail "fresh-clone cleanup action did not retain its claim-only target"
+  revision="$(json_get "$pending" action_instance.revision)"
+  manifest="$(json_get "$pending" action_instance.policy_manifest.digest)"
+  intent="$(json_get "$pending" action_instance.intent_digest)"
+  auth="$TMPDIR/submit_cleanup_gate/cleanup-authorization.json"
+  write_authorization "$auth" "$instance" task.cleanup "$claim" "$target" \
+    "$revision" "$manifest" allow cleanup-owner@example.com 2026-07-12T13:05:00Z \
+    conversation:message/cleanup-terminal "$intent"
+  actual="$(run_task submit_cleanup_gate "$clone" done 29 \
+    --action-instance-id "$instance" --authorization-file "$auth" --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+}
+
+test_v2_submitted_abandonment_publishes_one_terminal_checkpoint() {
+  local branch clone task actual comments
+  prepare_submission_fixture submit_abandon_checkpoint true allow abandon
+  run_task_in_dir submit_abandon_checkpoint "$SUBMISSION_TASK_DIR" submit \
+    --title "fix: abandon submitted task" --body-file "$SUBMISSION_BODY" >/dev/null
+  branch="$(git -C "$SUBMISSION_TASK_DIR" branch --show-current)"
+  actual="$(run_task_in_dir submit_abandon_checkpoint "$SUBMISSION_TASK_DIR" abandon \
+    --reason-code superseded --reason-ref issue:55 --format json)"
+  assert_contains "$actual" '"outcome":"abandoned"'
+  comments="$TMPDIR/submit_abandon_checkpoint/comments/29.comments"
+  python3 - "$comments" <<'PY'
+import re
+import sys
+
+body = open(sys.argv[1], encoding="utf-8").read()
+comments = [
+    match.group(1)
+    for match in re.finditer(
+        r"<!-- fixture-comment-author:[^\r\n ]+ -->\n(.*?)<!-- fixture-comment-end -->",
+        body,
+        re.DOTALL,
+    )
+]
+paired = [item for item in comments if "workbench-task-terminal-checkpoint:v1" in item]
+assert len(paired) == 1
+assert paired[0].count("workbench-task-terminal-checkpoint:v1") == 1
+assert paired[0].count('"event":"task-abandoned"') == 1
+assert body.count('"event":"task-abandoned"') == 1
+PY
+
+  rm -rf "$SUBMISSION_REPO"
+  clone="$TMPDIR/submit_abandon_checkpoint/device-two"
+  git clone -q "$TMPDIR/submit_abandon_checkpoint/origin.git" "$clone"
+  git -C "$clone" config user.name "Test User"
+  git -C "$clone" config user.email "test@example.invalid"
+  mkdir -p "$clone/.worktrees"
+  task="$(task_dir_for "$clone")"
+  git -C "$clone" worktree add -q -b "$branch" "$task" "origin/$branch"
+  actual="$(run_task submit_abandon_checkpoint "$clone" done 29 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+}
+
+test_v2_terminal_checkpoint_rejects_adversarial_observations() {
+  local branch head valid mode observation clone task out rc comments before after retry_clone retry_task
+  prepare_submission_fixture submit_checkpoint_adversarial true ask
+  run_task_in_dir submit_checkpoint_adversarial "$SUBMISSION_TASK_DIR" submit \
+    --title "fix: authenticate terminal checkpoint" --body-file "$SUBMISSION_BODY" >/dev/null
+  branch="$(git -C "$SUBMISSION_TASK_DIR" branch --show-current)"
+  head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
+  mark_submission_pr_merged submit_checkpoint_adversarial
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_checkpoint_adversarial "$SUBMISSION_TASK_DIR" deliverable accept \
+      --id workbench-pr --format json >/dev/null
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_checkpoint_adversarial "$SUBMISSION_TASK_DIR" verify \
+      --format json >/dev/null
+  GH_PR_HEAD="$head" GH_PR_MERGE=merge789 \
+    run_task_in_dir submit_checkpoint_adversarial "$SUBMISSION_TASK_DIR" complete \
+      --format json >/dev/null
+  comments="$TMPDIR/submit_checkpoint_adversarial/comments/29.comments"
+  valid="$TMPDIR/submit_checkpoint_adversarial/valid-lifecycle.json"
+  GH_COMMENTS_DIR="$TMPDIR/submit_checkpoint_adversarial/comments" \
+    "$TMPDIR/submit_checkpoint_adversarial/bin/hosting-authority" lifecycle \
+      --repository "$SUBMISSION_REPO" --issue 29 --format json > "$valid"
+  python3 - "$valid" "$TMPDIR/submit_checkpoint_adversarial" <<'PY'
+import copy
+import json
+import pathlib
+import re
+import sys
+
+source = json.load(open(sys.argv[1], encoding="utf-8"))
+target = pathlib.Path(sys.argv[2])
+index = next(
+    offset
+    for offset, comment in enumerate(source["comments"])
+    if "workbench-task-terminal-checkpoint:v1" in comment["body"]
+)
+comment = source["comments"][index]
+body = comment["body"]
+pattern = re.compile(r"<!-- workbench-task-terminal-checkpoint:v1\n([^\r\n]+)\n-->")
+match = pattern.search(body)
+assert match is not None
+checkpoint = json.loads(match.group(1))
+marker = match.group(0)
+
+def replace_checkpoint(value):
+    encoded = json.dumps(value, separators=(",", ":"))
+    return body[:match.start(1)] + encoded + body[match.end(1):]
+
+def emit(name, value, replacement=None):
+    observed = copy.deepcopy(source)
+    if replacement is None:
+        replacement = replace_checkpoint(value)
+    observed["comments"][index]["body"] = replacement
+    with open(target / ("adversarial-{}.json".format(name)), "w", encoding="utf-8") as handle:
+        json.dump(observed, handle, separators=(",", ":"))
+        handle.write("\n")
+
+observed = copy.deepcopy(source)
+observed["comments"][index]["author_identity"] = "attacker@example.invalid"
+with open(target / "adversarial-wrong-author.json", "w", encoding="utf-8") as handle:
+    json.dump(observed, handle, separators=(",", ":")); handle.write("\n")
+
+emit("duplicate", checkpoint, body[:match.end()] + "\n" + marker + body[match.end():])
+observed = copy.deepcopy(source)
+terminal_body = body[:match.start()] + body[match.end():]
+observed["comments"][index:index + 1] = [
+    {"author_identity": comment["author_identity"], "body": marker + "\n"},
+    {"author_identity": comment["author_identity"], "body": terminal_body},
+]
+with open(target / "adversarial-split.json", "w", encoding="utf-8") as handle:
+    json.dump(observed, handle, separators=(",", ":")); handle.write("\n")
+emit("malformed", checkpoint, body[:match.end() - 3] + "-- >" + body[match.end():])
+
+value = copy.deepcopy(checkpoint); value["terminal"]["revision"] = "sha256:" + "1" * 64
+emit("terminal", value)
+value = copy.deepcopy(checkpoint); value["terminal_action"]["intent_digest"] = "sha256:" + "2" * 64
+emit("action", value)
+value = copy.deepcopy(checkpoint)
+value["terminal_request"]["payload"] = value["terminal_request"]["payload"].replace(
+    value["terminal"]["revision"], "sha256:" + "3" * 64
+)
+emit("request", value)
+value = copy.deepcopy(checkpoint); value["claim_id"] = "task__forged-claim"
+emit("claim", value)
+value = copy.deepcopy(checkpoint)
+value["workspace_authority_descriptor_digest"] = "sha256:" + "4" * 64
+emit("descriptor", value)
+value = copy.deepcopy(checkpoint); value["head_revision"] = value["snapshot_revision"]
+emit("pr-head", value)
+value = copy.deepcopy(checkpoint); value["pull_request_url"] = "https://github.com/example/workbench/pull/999"
+emit("pr-url", value)
+value = copy.deepcopy(checkpoint); value["at"] = "2026-07-12T00:00:00Z"
+emit("at", value)
+value = dict(reversed(list(copy.deepcopy(checkpoint).items())))
+emit("top-order", value)
+value = copy.deepcopy(checkpoint); value["terminal"] = dict(reversed(list(value["terminal"].items())))
+emit("terminal-order", value)
+value = copy.deepcopy(checkpoint); value["terminal_action"] = dict(reversed(list(value["terminal_action"].items())))
+emit("action-order", value)
+value = copy.deepcopy(checkpoint); value["terminal_request"] = dict(reversed(list(value["terminal_request"].items())))
+emit("request-order", value)
+PY
+
+  before="$(grep -c 'workbench-task-cleanup:v1' "$comments" || true)"
+  rm -rf "$SUBMISSION_REPO"
+  for mode in wrong-author duplicate split malformed terminal action request claim descriptor \
+    pr-head pr-url at top-order terminal-order action-order request-order; do
+    observation="$TMPDIR/submit_checkpoint_adversarial/adversarial-$mode.json"
+    clone="$TMPDIR/submit_checkpoint_adversarial/device-$mode"
+    git clone -q "$TMPDIR/submit_checkpoint_adversarial/origin.git" "$clone"
+    git -C "$clone" config user.name "Test User"
+    git -C "$clone" config user.email "test@example.invalid"
+    mkdir -p "$clone/.worktrees"
+    task="$(task_dir_for "$clone")"
+    git -C "$clone" worktree add -q -b "$branch" "$task" "origin/$branch"
+    out="$TMPDIR/submit_checkpoint_adversarial/$mode.out"
+    if WORKBENCH_TEST_LIFECYCLE_OBSERVATION="$observation" \
+      run_task submit_checkpoint_adversarial "$clone" done 29 --format json > "$out" 2>&1; then
+      fail "terminal checkpoint accepted adversarial $mode observation"
+    else
+      rc=$?
+    fi
+    [ "$rc" = 1 ] || fail "adversarial $mode observation returned $rc"
+    [ ! -e "$task/task" ] \
+      || fail "adversarial $mode observation restored task state"
+    if [ "$mode" = pr-url ]; then
+      retry_clone="$clone"; retry_task="$task"
+    else
+      rm -rf "$clone"
+    fi
+  done
+  after="$(grep -c 'workbench-task-cleanup:v1' "$comments" || true)"
+  [ "$before" = "$after" ] || fail "adversarial receipt emitted a cleanup journal"
+
+  out="$TMPDIR/submit_checkpoint_adversarial/cursor-retry.out"
+  if run_task submit_checkpoint_adversarial "$retry_clone" done 29 --format json > "$out"; then
+    fail "valid retry bypassed its cleanup ask gate"
+  else
+    rc=$?
+  fi
+  [ "$rc" = 3 ] || fail "valid receipt could not recover an earlier fail-closed cursor"
+  [ -f "$retry_task/task/index.md" ] || fail "valid receipt retry did not restore snapshot state"
+}
+
 test_v2_submission_rejects_noncanonical_pr_and_lifecycle_state() {
   local mode observation origin branch head out claim descriptor comments
   prepare_submission_fixture submit_invalid_current
@@ -5295,7 +5858,7 @@ test_v2_submission_rejects_noncanonical_pr_and_lifecycle_state() {
   origin="$(git -C "$SUBMISSION_TASK_DIR" remote get-url origin)"
   branch="$(git -C "$SUBMISSION_TASK_DIR" branch --show-current)"
   head="$(git -C "$SUBMISSION_TASK_DIR" rev-parse HEAD)"
-  for mode in fork multiple changed-head; do
+  for mode in fork multiple changed-head bad-base; do
     observation="$TMPDIR/submit_invalid_current/$mode.json"
     python3 - "$observation" "$origin" "$branch" "$head" "$mode" <<'PY'
 import copy
@@ -5311,7 +5874,7 @@ item = {
     "head_revision": "0" * 40 if mode == "changed-head" else head,
     "head_repository_origin_url": origin,
     "head_is_fork": mode == "fork",
-    "base_ref": "main",
+    "base_ref": "other" if mode == "bad-base" else "main",
     "state": "open",
 }
 items = [item]
@@ -5324,7 +5887,7 @@ value = {
     "contract_version": "workbench-hosting-submission-observation/v1",
     "repository_origin_url": origin,
     "head_branch": branch,
-    "base_ref": "main",
+    "base_ref": "other" if mode == "bad-base" else "main",
     "pagination": pagination,
     "pull_requests": items,
 }
@@ -5366,9 +5929,11 @@ value = {
     "at": "2026-07-12T14:00:00Z",
 }
 with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write("<!-- fixture-comment-author:test@example.invalid -->\n")
     handle.write("<!-- workbench-task-lifecycle:v2\n")
     handle.write(json.dumps(value, separators=(",", ":")) + "\n")
-    handle.write("-->\nworkbench task lifecycle: task-active\n\n")
+    handle.write("-->\nworkbench task lifecycle: task-active\n")
+    handle.write("<!-- fixture-comment-end -->\n")
 PY
   out="$TMPDIR/submit_invalid_current/reactivated.out"
   if run_task_in_dir submit_invalid_current "$SUBMISSION_TASK_DIR" \
@@ -5723,6 +6288,14 @@ run_case test_v1_submission_without_origin_head_uses_main_fallback
 run_case test_v2_submission_restores_authenticated_state_to_terminal_cleanup
 run_case test_v2_submission_crash_boundaries_are_idempotent
 run_case test_v2_submission_restore_never_overwrites_occupied_state
+run_case test_v2_submission_reconstructs_recovery_in_fresh_clone
+run_case test_v2_submission_rejects_restored_deliverable_tampering
+run_case test_v2_submission_rejects_deleted_restored_deliverable
+run_case test_v2_submission_rejects_deleted_restored_required_check
+run_case test_v2_submission_rejects_restored_acceptance_tampering
+run_case test_v2_submitted_completion_keeps_cleanup_authorization_separate
+run_case test_v2_submitted_abandonment_publishes_one_terminal_checkpoint
+run_case test_v2_terminal_checkpoint_rejects_adversarial_observations
 run_case test_v2_submission_rejects_noncanonical_pr_and_lifecycle_state
 run_case test_v2_submission_rejects_noncanonical_cleanup_history
 run_case test_lifecycle_parser_is_strict_trusted_and_key_order_independent

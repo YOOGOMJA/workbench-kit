@@ -3342,7 +3342,7 @@ write_deliverable_record() {
     printf 'governance_intent_digest=%s\n' "$governance_intent_digest"
     printf 'governance_policy_manifest_digest=%s\n' "$governance_policy_manifest_digest"
     printf 'authorization_ref=%s\n' "$authorization_ref"
-  } > "$tmp" && mv "$tmp" "$file"
+  } > "$tmp" && chmod 0644 "$tmp" && mv "$tmp" "$file"
 }
 
 print_deliverable_json() {
@@ -3440,6 +3440,8 @@ EOF
   [ "$state" = MERGED ] && [ "$head" = "$revision" ] && [ -n "$merge" ] || return 1
   observed="$(utc_now)"; helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
   PROBE_OBSERVED_AT="$observed"
+  PROBE_HEAD_REVISION="$head"
+  PROBE_MERGE_REVISION="$merge"
   PROBE_DIGEST="$(python3 "$helper" github-probe --repository "$PROBE_REPOSITORY" \
     --pull-request "$PROBE_NUMBER" --external-ref "$external" --state merged \
     --head-revision "$head" --merge-revision "$merge" --observed-at "$observed" --format digest)" \
@@ -3448,6 +3450,26 @@ EOF
     --pull-request "$PROBE_NUMBER" --external-ref "$external" --state merged \
     --head-revision "$head" --merge-revision "$merge" --observed-at "$observed" \
     --format subject-digest)" || return 1
+}
+
+kernel_acceptance_receipt_matches() {
+  local deliverable_file="$1" acceptance_file="$2" accepted_at expected helper
+  acceptance_receipt_matches "$deliverable_file" "$acceptance_file" || return 1
+  [ "$(record_get "$acceptance_file" authority_type)" = kernel-probe ] \
+    && [ "$(record_get "$acceptance_file" authority_contract)" = workbench-probe/github-pr/v1 ] \
+    && [ "$(record_get "$acceptance_file" authority_ref)" = "$(record_get "$deliverable_file" external_ref)" ] \
+    || return 1
+  probe_kernel_deliverable "$deliverable_file" || return 10
+  [ "$(record_get "$acceptance_file" subject_authority_digest)" = "$PROBE_SUBJECT_DIGEST" ] \
+    || return 1
+  accepted_at="$(record_get "$acceptance_file" accepted_at)"
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  expected="$(python3 "$helper" github-probe --repository "$PROBE_REPOSITORY" \
+    --pull-request "$PROBE_NUMBER" \
+    --external-ref "$(record_get "$deliverable_file" external_ref)" --state merged \
+    --head-revision "$PROBE_HEAD_REVISION" --merge-revision "$PROBE_MERGE_REVISION" \
+    --observed-at "$accepted_at" --format digest)" || return 1
+  [ "$(record_get "$acceptance_file" authority_digest)" = "$expected" ]
 }
 
 mint_acceptance_id() {
@@ -3469,7 +3491,7 @@ write_acceptance_attempt() {
     printf 'subject_authority_digest=%s\n' "$subject_digest"
     printf 'created_at=%s\n' "$created_at"
     printf 'probed_at=%s\n' "$probed_at"
-  } > "$tmp" && mv "$tmp" "$file"
+  } > "$tmp" && chmod 0600 "$tmp" && mv "$tmp" "$file"
 }
 
 acceptance_attempt_matches() {
@@ -3509,7 +3531,7 @@ write_acceptance_record() {
     printf 'policy_manifest_digest=%s\n' "$policy_manifest_digest"
     printf 'authorization_ref=%s\n' "$authorization_ref"
     printf 'accepted_at=%s\n' "$accepted_at"
-  } > "$tmp" && mv "$tmp" "$file"
+  } > "$tmp" && chmod 0600 "$tmp" && mv "$tmp" "$file"
 }
 
 print_acceptance_json() {
@@ -3727,6 +3749,7 @@ recover_terminal_effect() {
   local requested="$1" supplied_instance="$2" terminal action_id action_file request_file status
   local latest event expected_event secondary result decision primary_digest intent target revision
   local manifest authorization_ref removal_plan reason_code reason_ref governed_action terminal_pr="-"
+  local publish_submitted=false
   terminal="$(task_state_dir)/terminal"; [ -f "$terminal" ] || return 10
   [ "$(record_get "$terminal" outcome)" = "$requested" ] || return 10
   validate_local_terminal_record || return 10
@@ -3754,17 +3777,22 @@ recover_terminal_effect() {
   [ "$decision" = reconcile ] || return 10
   intent="$(record_get "$terminal" intent_digest)"; revision="$(record_get "$terminal" revision)"
   if printf '%s' "$result" | grep -Fq '"write_secondary":true'; then
-    [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" != true ] \
-      || terminal_pr="$SUBMISSION_RECOVERY_PR_NUMBER"
-    lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$expected_event" \
-      "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" "$terminal_pr" "$revision" "$action_id" \
-      workbench-task/v2 "" "$intent" \
-      || return 1
+    if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ]; then
+      publish_submitted=true
+    else
+      lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$expected_event" \
+        "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" "$terminal_pr" "$revision" "$action_id" \
+        workbench-task/v2 "" "$intent" \
+        || return 1
+    fi
   fi
   primary_digest="$(json_string_field "$result" primary_digest)"
   target="$(record_get "$action_file" target_ref)"
   consume_governed_action "$governed_action" "$target" "$revision" "$action_id" "$intent" \
     "$primary_digest" || return 1
+  if [ "$publish_submitted" = true ]; then
+    submission_publish_terminal_checkpoint || return 1
+  fi
   manifest="$(record_get "$terminal" policy_manifest_digest)"
   authorization_ref="$(record_get "$terminal" authorization_ref)"
   removal_plan="$(record_get "$terminal" removal_plan_digest)"
@@ -3843,7 +3871,7 @@ cmd_deliverable() {
       print_deliverable_mutation_json true "$file"
       ;;
     accept)
-      local id="" owner_acceptance_file="" instance_id="" authorization_file="" format=""
+      local id="" owner_acceptance_file="" instance_id="" authorization_file="" format="" receipt_rc=0
       while [ $# -gt 0 ]; do
         case "$1" in
           --id) id="$2"; shift 2 ;; --owner-acceptance-file) owner_acceptance_file="$2"; shift 2 ;;
@@ -3871,16 +3899,19 @@ cmd_deliverable() {
           if [ -n "$acceptance_ref" ]; then
             acceptance_id="${acceptance_ref#workbench:acceptance/}"
             acceptance_file="$(acceptance_dir)/$acceptance_id.record"
-            acceptance_receipt_matches "$file" "$acceptance_file" \
-              || die "acceptance-authority-mismatch: $id"
-            probe_kernel_deliverable "$file" || die "external-not-accepted: $id"
-            [ "$(record_get "$acceptance_file" subject_authority_digest)" = "$PROBE_SUBJECT_DIGEST" ] \
-              || die "acceptance-authority-mismatch: $id"
+            if kernel_acceptance_receipt_matches "$file" "$acceptance_file"; then
+              :
+            else
+              receipt_rc=$?
+              [ "$receipt_rc" = 10 ] && die "external-not-accepted: $id" \
+                || die "acceptance-authority-mismatch: $id"
+            fi
             print_deliverable_acceptance_json false "$file" "$acceptance_file"; return 0
           fi
           [ "$state" = submitted ] || die "deliverable-not-submitted: $id"
           local attempt_dir attempt_file attempt_created attempt_subject
           attempt_dir="$(acceptance_attempt_dir)"; mkdir -p "$attempt_dir" "$(acceptance_dir)"
+          chmod 0700 "$attempt_dir" "$(acceptance_dir)"
           attempt_file="$attempt_dir/$id.record"
           if [ -f "$attempt_file" ] && acceptance_attempt_matches "$attempt_file" \
             "$id" "$owner" "$kind" "$external_ref" "$revision"; then
@@ -3907,10 +3938,14 @@ cmd_deliverable() {
           acceptance_ref="workbench:acceptance/$acceptance_id"
           acceptance_file="$(acceptance_dir)/$acceptance_id.record"
           if [ -e "$acceptance_file" ]; then
-            acceptance_receipt_matches "$file" "$acceptance_file" \
-              && [ "$(record_get "$acceptance_file" acceptance_id)" = "$acceptance_id" ] \
-              && [ "$(record_get "$acceptance_file" authority_type)" = kernel-probe ] \
-              && [ "$(record_get "$acceptance_file" subject_authority_digest)" = "$PROBE_SUBJECT_DIGEST" ] \
+            if kernel_acceptance_receipt_matches "$file" "$acceptance_file"; then
+              :
+            else
+              receipt_rc=$?
+              [ "$receipt_rc" = 10 ] && die "external-not-accepted: $id" \
+                || die "acceptance-authority-mismatch: $id"
+            fi
+            [ "$(record_get "$acceptance_file" acceptance_id)" = "$acceptance_id" ] \
               || die "acceptance-authority-mismatch: $id"
           else
             write_acceptance_record "$acceptance_file" "$acceptance_id" "$id" "$owner" "$kind" "" "" "$revision" \
@@ -3991,7 +4026,7 @@ cmd_deliverable() {
           governed_authorization_ref="$(record_get "$action_file" authorization_ref)"
           [ "$auth_actor" = "$OWNER_ACCEPTANCE_ACTOR" ] && [ "$auth_at" = "$OWNER_ACCEPTANCE_AT" ] \
             || die "acceptance-authority-mismatch"
-          mkdir -p "$(acceptance_dir)"
+          mkdir -p "$(acceptance_dir)"; chmod 0700 "$(acceptance_dir)"
           write_acceptance_record "$acceptance_file" "$acceptance_id" "$id" "$owner" "$kind" \
             "$owner_context_ref" "$acceptance_authority_ref" "$revision" owner-authorization \
             workbench-owner-acceptance/v1 "$acceptance_authority_ref" "$OWNER_ACCEPTANCE_DIGEST" \
@@ -4833,7 +4868,8 @@ submission_lifecycle_reduce() {
   rm -f "$markers"
   SUBMISSION_LIFECYCLE_PHASE=""; SUBMISSION_LIFECYCLE_PR=""
   SUBMISSION_LIFECYCLE_HEAD=""; SUBMISSION_LIFECYCLE_TERMINAL_EVENT=""
-  SUBMISSION_LIFECYCLE_TERMINAL_REVISION=""
+  SUBMISSION_LIFECYCLE_TERMINAL_REVISION=""; SUBMISSION_LIFECYCLE_TERMINAL_ACTION=""
+  SUBMISSION_LIFECYCLE_TERMINAL_INTENT=""
   while IFS= read -r line; do
     key="${line%%=*}"; value="${line#*=}"
     case "$key" in
@@ -4842,6 +4878,8 @@ submission_lifecycle_reduce() {
       head_revision) SUBMISSION_LIFECYCLE_HEAD="$value" ;;
       terminal_event) SUBMISSION_LIFECYCLE_TERMINAL_EVENT="$value" ;;
       terminal_revision) SUBMISSION_LIFECYCLE_TERMINAL_REVISION="$value" ;;
+      terminal_action_instance_id) SUBMISSION_LIFECYCLE_TERMINAL_ACTION="$value" ;;
+      terminal_intent_digest) SUBMISSION_LIFECYCLE_TERMINAL_INTENT="$value" ;;
     esac
   done <<< "$parsed"
   [ -n "$SUBMISSION_LIFECYCLE_PHASE" ]
@@ -4971,6 +5009,7 @@ submission_load_identity() {
 submission_pr_observe() {
   local branch="$1" expected_head="$2" base_ref="$3" expected_url="${4:-}"
   local adapter origin observation parsed state
+  SUBMISSION_PR_NUMBER=""; SUBMISSION_PR_URL=""; SUBMISSION_PR_HEAD=""; SUBMISSION_PR_STATE=""
   adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
   [ -n "$adapter" ] && [ -x "$adapter" ] || return 1
   origin="$(git -C "$TASK_DIR" remote get-url origin 2>/dev/null)" || return 1
@@ -4990,6 +5029,7 @@ submission_pr_observe() {
   SUBMISSION_PR_NUMBER="$(printf '%s\n' "$parsed" | sed -n 's/^number=//p')"
   SUBMISSION_PR_URL="$(printf '%s\n' "$parsed" | sed -n 's/^url=//p')"
   SUBMISSION_PR_HEAD="$(printf '%s\n' "$parsed" | sed -n 's/^head_revision=//p')"
+  SUBMISSION_PR_STATE="$(printf '%s\n' "$parsed" | sed -n 's/^pull_request_state=//p')"
   [ -z "$expected_url" ] || [ "$SUBMISSION_PR_URL" = "$expected_url" ] || return 1
   [ -n "$SUBMISSION_PR_NUMBER" ] && [ -n "$SUBMISSION_PR_URL" ] \
     && [ "$SUBMISSION_PR_HEAD" = "$expected_head" ]
@@ -5874,11 +5914,16 @@ compute_verification() {
         else
           acceptance_id="${acceptance_ref#workbench:acceptance/}"
           acceptance_file="$(acceptance_dir)/$acceptance_id.record"
-          if ! acceptance_receipt_matches "$file" "$acceptance_file"; then
+          if [ "$(record_get "$acceptance_file" authority_type)" = kernel-probe ]; then
+            local receipt_rc=0
+            kernel_acceptance_receipt_matches "$file" "$acceptance_file" || receipt_rc=$?
+            if [ "$receipt_rc" = 10 ]; then
+              add_blocker external-not-accepted "$id"
+            elif [ "$receipt_rc" != 0 ]; then
+              add_blocker acceptance-authority-mismatch "$id"
+            fi
+          elif ! acceptance_receipt_matches "$file" "$acceptance_file"; then
             add_blocker acceptance-authority-mismatch "$id"
-          elif [ "$(record_get "$acceptance_file" authority_type)" = kernel-probe ] \
-            && ! probe_kernel_deliverable "$file"; then
-            add_blocker external-not-accepted "$id"
           fi
         fi
         ;;
@@ -5986,7 +6031,7 @@ write_terminal_outcome() {
     printf 'at=%s\n' "$(utc_now)"
     printf 'reason_code=%s\n' "$reason_code"
     printf 'reason_ref=%s\n' "$reason_ref"
-  } > "$tmp" && mv "$tmp" "$file"
+  } > "$tmp" && chmod 0600 "$tmp" && mv "$tmp" "$file"
 }
 
 json_string_field() {
@@ -6090,18 +6135,220 @@ terminal_outcome_report() {
   print_outcome_json "" false "" "" "" "" "$revision" "" "" ""; return 2
 }
 
+terminal_checkpoint_latest() {
+  local root="$1" home="$2" issue="$3" task_id="$4" branch="$5"
+  local dir adapter origin observation output rc helper
+  dir="$(lifecycle_issue_dir "$root" "$home")"; [ -d "$dir" ] || return 2
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] || return 2
+  origin="$(git -C "$dir" remote get-url origin 2>/dev/null)" || return 2
+  observation="$(mktemp "${TMPDIR:-/tmp}/workbench-terminal-checkpoint.XXXXXX")"
+  if ! (cd "$dir" && "$adapter" lifecycle --repository "$dir" --issue "$issue" --format json) \
+    > "$observation" 2>/dev/null; then rm -f "$observation"; return 2; fi
+  helper="$(cleanup_contract_helper)"
+  if output="$(python3 "$helper" terminal-checkpoint-find-observation \
+    --observation-file "$observation" --repository-origin-url "$origin" \
+    --issue "$issue" --task-id "$task_id" --branch "$branch" \
+    2>/dev/null)"; then
+    rm -f "$observation"; printf '%s\n' "$output"; return 0
+  else
+    rc=$?; rm -f "$observation"
+    [ "$rc" = 1 ] && return 1
+    [ "$rc" = 3 ] && return 3
+    return 2
+  fi
+}
+
+terminal_checkpoint_field() {
+  python3 "$(cleanup_contract_helper)" terminal-checkpoint-field "$1" "$2"
+}
+
+submission_terminal_checkpoint_recover() {
+  local root="$1" dir="$2" branch="$3" checkpoint="$4"
+  local descriptor origin default_ref default_branch snapshot cleanup pr pr_url outcome
+  local expected_event current_head stage
+  TASK_DIR="$dir"
+  descriptor="$(terminal_checkpoint_field "$checkpoint" workspace_authority_descriptor_digest)" \
+    || return 1
+  observe_workspace_authority "$root" "$descriptor" || return 1
+  origin="$(git -C "$dir" remote get-url origin 2>/dev/null)" || return 1
+  [ "$origin" = "$(terminal_checkpoint_field "$checkpoint" repository_origin_url)" ] \
+    || return 1
+  default_ref="$AUTHORITY_DEFAULT_REF"; default_branch="${default_ref#refs/heads/}"
+  [ "refs/heads/$default_branch" = "$default_ref" ] || return 1
+  snapshot="$(terminal_checkpoint_field "$checkpoint" snapshot_revision)" || return 1
+  cleanup="$(terminal_checkpoint_field "$checkpoint" cleanup_revision)" || return 1
+  current_head="$(git -C "$dir" rev-parse HEAD)" || return 1
+  [ "$current_head" = "$cleanup" ] || return 1
+  submission_recovery_prepare "$origin" "$default_ref" "$branch" "$snapshot" || return 1
+  [ "$SUBMISSION_RECOVERY_TASK_ID" = "$(terminal_checkpoint_field "$checkpoint" task_id)" ] \
+    && [ "$SUBMISSION_RECOVERY_CLAIM_ID" = "$(terminal_checkpoint_field "$checkpoint" claim_id)" ] \
+    && [ "$SUBMISSION_RECOVERY_ISSUE" = "$(terminal_checkpoint_field "$checkpoint" issue)" ] \
+    && [ "$SUBMISSION_RECOVERY_HOME" = "$(terminal_checkpoint_field "$checkpoint" home)" ] \
+    && [ "$SUBMISSION_RECOVERY_BRANCH" = "$branch" ] \
+    && [ "$SUBMISSION_RECOVERY_DESCRIPTOR_DIGEST" = "$descriptor" ] \
+    && [ "$SUBMISSION_RECOVERY_SNAPSHOT" = "$snapshot" ] \
+    && [ "$SUBMISSION_RECOVERY_CLEANUP" = "$cleanup" ] \
+    || return 1
+  pr="$(terminal_checkpoint_field "$checkpoint" pull_request)" || return 1
+  pr_url="$(terminal_checkpoint_field "$checkpoint" pull_request_url)" || return 1
+  submission_pr_observe "$branch" "$cleanup" "$default_branch" "$pr_url" || return 1
+  [ "$SUBMISSION_PR_NUMBER" = "$pr" ] && [ "$SUBMISSION_PR_HEAD" = "$cleanup" ] \
+    || return 1
+  outcome="$(terminal_checkpoint_field "$checkpoint" terminal.outcome)" || return 1
+  if [ "$outcome" = completed ]; then
+    [ "$SUBMISSION_PR_STATE" = merged ] || return 1
+    expected_event=task-completed
+  else
+    [ "$outcome" = abandoned ] || return 1
+    expected_event=task-abandoned
+  fi
+  submission_lifecycle_reduce "$root" "$SUBMISSION_RECOVERY_HOME" \
+    "$SUBMISSION_RECOVERY_ISSUE" "$SUBMISSION_RECOVERY_CLAIM_ID" "$branch" \
+    "$descriptor" || return 1
+  [ "$SUBMISSION_LIFECYCLE_PHASE" = terminal ] \
+    && [ "$SUBMISSION_LIFECYCLE_PR" = "$pr" ] \
+    && [ "$SUBMISSION_LIFECYCLE_HEAD" = "$cleanup" ] \
+    && [ "$SUBMISSION_LIFECYCLE_TERMINAL_EVENT" = "$expected_event" ] \
+    && [ "$SUBMISSION_LIFECYCLE_TERMINAL_REVISION" = "$(terminal_checkpoint_field "$checkpoint" terminal.revision)" ] \
+    && [ "$SUBMISSION_LIFECYCLE_TERMINAL_ACTION" = "$(terminal_checkpoint_field "$checkpoint" terminal.action_instance_id)" ] \
+    && [ "$SUBMISSION_LIFECYCLE_TERMINAL_INTENT" = "$(terminal_checkpoint_field "$checkpoint" terminal.intent_digest)" ] \
+    || return 1
+  submission_recovery_advance "$branch" pr-observed \
+    --pull-request "$pr" --pull-request-url "$pr_url" --head-revision "$cleanup" \
+    || return 1
+  submission_recovery_advance "$branch" submitted || return 1
+  stage="$SUBMISSION_RECOVERY_STAGE"
+  if [ "$stage" = submitted ]; then
+    python3 "$(lifecycle_helper)" submission-recovery-restore \
+      --repository "$dir" --branch "$branch" >/dev/null || return 1
+    submission_recovery_advance "$branch" restored || return 1
+  fi
+  [ "$SUBMISSION_RECOVERY_STAGE" = restored ] && [ -f "$dir/task/index.md" ] \
+    || return 1
+  CURRENT_CLAIM_ID="$SUBMISSION_RECOVERY_CLAIM_ID"; CURRENT_ROOT="$root"
+  CURRENT_HOME="$SUBMISSION_RECOVERY_HOME"; CURRENT_ISSUE="$SUBMISSION_RECOVERY_ISSUE"
+  CURRENT_BRANCH="$branch"
+  build_terminal_removal_plan || return 1
+  python3 "$(cleanup_contract_helper)" terminal-checkpoint-validate-recovery \
+    --checkpoint-file "$checkpoint" --repository "$dir" --branch "$branch" \
+    --removal-plan-digest "$TERMINAL_REMOVAL_PLAN_DIGEST" \
+    >/dev/null || return 1
+  SUBMISSION_RECOVERY_ACTIVE=true
+}
+
+terminal_checkpoint_emit() {
+  local root="$1" home="$2" issue="$3" checkpoint="$4" dir body terminal event
+  local home_json pr revision action intent descriptor
+  dir="$(lifecycle_issue_dir "$root" "$home")"; [ -d "$dir" ] || return 1
+  terminal="$(task_state_dir)/terminal"
+  [ "$(record_get "$terminal" outcome)" = completed ] \
+    && event=task-completed || event=task-abandoned
+  [ -n "$home" ] && home_json="\"$(json_escape "$home")\"" || home_json=null
+  pr="$SUBMISSION_RECOVERY_PR_NUMBER"; revision="$(record_get "$terminal" revision)"
+  action="$(record_get "$terminal" action_instance_id)"
+  intent="$(record_get "$terminal" intent_digest)"
+  descriptor="$SUBMISSION_RECOVERY_DESCRIPTOR_DIGEST"
+  body="$(mktemp "${TMPDIR:-/tmp}/workbench-terminal-checkpoint-body.XXXXXX")"
+  {
+    printf '%s\n' '<!-- workbench-task-terminal-checkpoint:v1'
+    cat "$checkpoint"
+    printf '%s\n' '-->'
+    printf '%s\n' '<!-- workbench-task-lifecycle:v2'
+    printf '{"task_contract":"workbench-task/v2","event":"%s","claim_id":"%s","issue":%s,"home":%s,"branch":"%s","workspace_authority_descriptor_digest":"%s","pr":%s,"revision":"%s","action_instance_id":"%s","intent_digest":"%s","actor":"%s","tool":"workbench","at":"%s"}\n' \
+      "$event" "$(json_escape "$CURRENT_CLAIM_ID")" "$issue" "$home_json" \
+      "$(json_escape "$CURRENT_BRANCH")" "$descriptor" "$pr" "$revision" \
+      "$action" "$intent" "$(json_escape "$(actor_id "$root")")" "$(utc_now)"
+    printf '%s\n' '-->'
+    printf 'workbench task terminal checkpoint `%s`\n' "$(safe_field "$CURRENT_BRANCH")"
+  } > "$body"
+  if [ "$(wc -c < "$body" | tr -d ' ')" -gt 65536 ]; then
+    echo "error: terminal checkpoint exceeds the hosting comment size limit" >&2
+    rm -f "$body"; return 1
+  fi
+  if ! (cd "$dir" && gh issue comment "$issue" --body-file "$body") >/dev/null; then
+    rm -f "$body"; return 1
+  fi
+  rm -f "$body"
+}
+
+submission_publish_terminal_checkpoint() {
+  [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ] || return 0
+  local terminal action request checkpoint existing helper home_arg work_ref
+  terminal="$(task_state_dir)/terminal"; [ -f "$terminal" ] || return 1
+  validate_local_terminal_record || return 1
+  submission_recovery_guard || return 1
+  case "$SUBMISSION_LIFECYCLE_PHASE" in
+    submitted|submitted-verified) ;;
+    terminal)
+      [ "$SUBMISSION_LIFECYCLE_TERMINAL_REVISION" = "$(record_get "$terminal" revision)" ] \
+        || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  action="$(task_state_dir)/actions/$(record_get "$terminal" action_instance_id).record"
+  request="$(task_state_dir)/actions/$(record_get "$terminal" action_instance_id).request.json"
+  [ -f "$action" ] && [ -f "$request" ] || return 1
+  checkpoint="$(mktemp "${TMPDIR:-/tmp}/workbench-terminal-checkpoint-value.XXXXXX")"
+  existing="$(mktemp "${TMPDIR:-/tmp}/workbench-terminal-checkpoint-existing.XXXXXX")"
+  helper="$(cleanup_contract_helper)"; home_arg="${CURRENT_HOME:--}"
+  work_ref="$(index_get work_ref)"; [ -n "$work_ref" ] || work_ref=-
+  python3 "$helper" terminal-checkpoint-build --task-id "$(index_get id)" \
+    --claim-id "$CURRENT_CLAIM_ID" --issue "$CURRENT_ISSUE" --home "$home_arg" \
+    --branch "$CURRENT_BRANCH" --work-ref "$work_ref" \
+    --descriptor-digest "$SUBMISSION_RECOVERY_DESCRIPTOR_DIGEST" \
+    --repository-origin-url "$SUBMISSION_RECOVERY_ORIGIN" \
+    --snapshot-revision "$SUBMISSION_RECOVERY_SNAPSHOT" \
+    --cleanup-revision "$SUBMISSION_RECOVERY_CLEANUP" \
+    --pull-request "$SUBMISSION_RECOVERY_PR_NUMBER" \
+    --pull-request-url "$SUBMISSION_RECOVERY_PR_URL" \
+    --head-revision "$SUBMISSION_RECOVERY_HEAD" --terminal-file "$terminal" \
+    --terminal-action-file "$action" --terminal-request-file "$request" \
+    --at "$(record_get "$terminal" at)" > "$checkpoint" \
+    || { rm -f "$checkpoint" "$existing"; return 1; }
+  if terminal_checkpoint_latest "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" \
+    "$(index_get id)" "$CURRENT_BRANCH" > "$existing"; then
+    cmp -s "$checkpoint" "$existing" \
+      || { rm -f "$checkpoint" "$existing"; return 1; }
+  else
+    local checkpoint_rc=$?
+    [ "$checkpoint_rc" = 1 ] \
+      && terminal_checkpoint_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" "$checkpoint" \
+      || { rm -f "$checkpoint" "$existing"; return 1; }
+  fi
+  terminal_checkpoint_latest "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" \
+    "$(index_get id)" "$CURRENT_BRANCH" > "$existing" \
+    && cmp -s "$checkpoint" "$existing" \
+    || { rm -f "$checkpoint" "$existing"; return 1; }
+  rm -f "$checkpoint" "$existing"
+}
+
 cmd_complete() {
   local instance_id="" authorization_file="" format="" target revision terminal_rc terminal_pr="-"
+  local completion_action_id completion_intent
   while [ $# -gt 0 ]; do
     case "$1" in --action-instance-id) instance_id="$2"; shift 2 ;; --authorization-file) authorization_file="$2"; shift 2 ;;
       --format) format="$2"; shift 2 ;; *) die "unknown option: $1" ;; esac
   done
   [ "$format" = json ] || die "unsupported format: ${format:-none}"
   require_v2_task; current_task_identity
+  if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ] \
+    && [ -f "$(task_state_dir)/terminal" ] \
+    && [ "$(record_get "$(task_state_dir)/terminal" outcome)" = completed ] \
+    && [ "$(record_get "$(task_state_dir)/actions/$(record_get "$(task_state_dir)/terminal" action_instance_id).record" status)" = consumed ]; then
+    submission_publish_terminal_checkpoint || return 1
+  fi
   local recovery_rc
-  if recover_terminal_effect completed "$instance_id"; then return 0
+  if recover_terminal_effect completed "$instance_id"; then
+    submission_publish_terminal_checkpoint || return 1
+    return 0
   else recovery_rc=$?; fi
   [ "$recovery_rc" = 10 ] || return "$recovery_rc"
+  if [ -f "$(task_state_dir)/terminal" ] \
+    && [ "$(record_get "$(task_state_dir)/terminal" outcome)" = completed ] \
+    && terminal_lifecycle_matches; then
+    submission_publish_terminal_checkpoint || return 1
+  fi
   if terminal_outcome_report completed; then return 0; else terminal_rc=$?; [ "$terminal_rc" != 2 ] || return 1; fi
   if [ ! -f "$(task_state_dir)/policy-context/state.record" ]; then
     [ -z "$(index_get context_ref)" ] || {
@@ -6137,20 +6384,22 @@ cmd_complete() {
   local action_file="$(task_state_dir)/actions/$GOVERNED_ACTION_INSTANCE_ID.record"
   local manifest_digest="$(record_get "$action_file" policy_manifest_digest)"
   local authorization_ref="$(record_get "$action_file" authorization_ref)"
-  write_terminal_outcome completed "$GOVERNED_ACTION_INSTANCE_ID" "$GOVERNED_INTENT_DIGEST" \
+  completion_action_id="$GOVERNED_ACTION_INSTANCE_ID"
+  completion_intent="$GOVERNED_INTENT_DIGEST"
+  write_terminal_outcome completed "$completion_action_id" "$completion_intent" \
     "$manifest_digest" "$authorization_ref" "$revision"
-  [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" != true ] \
-    || terminal_pr="$SUBMISSION_RECOVERY_PR_NUMBER"
-  if ! lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-completed \
-    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" "$terminal_pr" "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
-    workbench-task/v2 "" "$GOVERNED_INTENT_DIGEST"; then
+  local primary_digest="$(digest_manifest "$(task_state_dir)/terminal")"
+  consume_governed_action task.complete "$target" "$revision" "$completion_action_id" \
+    "$completion_intent" "$primary_digest" || return 1
+  if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ]; then
+    submission_publish_terminal_checkpoint || return 1
+  elif ! lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-completed \
+    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" "$terminal_pr" "$revision" "$completion_action_id" \
+    workbench-task/v2 "" "$completion_intent"; then
     return 1
   fi
-  local primary_digest="$(digest_manifest "$(task_state_dir)/terminal")"
-  consume_governed_action task.complete "$target" "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
-    "$GOVERNED_INTENT_DIGEST" "$primary_digest"
   VERIFY_BLOCKER_COUNT=0
-  print_outcome_json completed true "$GOVERNED_ACTION_INSTANCE_ID" "$GOVERNED_INTENT_DIGEST" \
+  print_outcome_json completed true "$completion_action_id" "$completion_intent" \
     "$manifest_digest" "$authorization_ref" "$revision" "" "" ""
 }
 
@@ -6170,9 +6419,22 @@ cmd_abandon() {
   [ "$format" = json ] || die "unsupported format: ${format:-none}"; require_single_line reason_code "$reason_code"
   [ -z "$reason_ref" ] || require_single_line reason_ref "$reason_ref"
   require_v2_task; current_task_identity
-  if recover_terminal_effect abandoned "$instance_id"; then return 0
+  if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ] \
+    && [ -f "$(task_state_dir)/terminal" ] \
+    && [ "$(record_get "$(task_state_dir)/terminal" outcome)" = abandoned ] \
+    && [ "$(record_get "$(task_state_dir)/actions/$(record_get "$(task_state_dir)/terminal" action_instance_id).record" status)" = consumed ]; then
+    submission_publish_terminal_checkpoint || return 1
+  fi
+  if recover_terminal_effect abandoned "$instance_id"; then
+    submission_publish_terminal_checkpoint || return 1
+    return 0
   else recovery_rc=$?; fi
   [ "$recovery_rc" = 10 ] || return "$recovery_rc"
+  if [ -f "$(task_state_dir)/terminal" ] \
+    && [ "$(record_get "$(task_state_dir)/terminal" outcome)" = abandoned ] \
+    && terminal_lifecycle_matches; then
+    submission_publish_terminal_checkpoint || return 1
+  fi
   if terminal_outcome_report abandoned; then return 0; else terminal_rc=$?; [ "$terminal_rc" != 2 ] || return 1; fi
   if [ ! -f "$(task_state_dir)/policy-context/state.record" ]; then
     [ -z "$(index_get context_ref)" ] || {
@@ -6215,16 +6477,16 @@ cmd_abandon() {
   authorization_ref="$(record_get "$action_file" authorization_ref)"
   write_terminal_outcome abandoned "$GOVERNED_ACTION_INSTANCE_ID" "$GOVERNED_INTENT_DIGEST" \
     "$manifest_digest" "$authorization_ref" "$revision" "$frozen_plan" "$reason_code" "$reason_ref"
-  [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" != true ] \
-    || terminal_pr="$SUBMISSION_RECOVERY_PR_NUMBER"
-  if ! lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-abandoned \
+  primary_digest="$(digest_manifest "$(task_state_dir)/terminal")"
+  consume_governed_action task.abandon "$target" "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
+    "$GOVERNED_INTENT_DIGEST" "$primary_digest" || return 1
+  if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ]; then
+    submission_publish_terminal_checkpoint || return 1
+  elif ! lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-abandoned \
     "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" "$terminal_pr" "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
     workbench-task/v2 "" "$GOVERNED_INTENT_DIGEST"; then
     return 1
   fi
-  primary_digest="$(digest_manifest "$(task_state_dir)/terminal")"
-  consume_governed_action task.abandon "$target" "$revision" "$GOVERNED_ACTION_INSTANCE_ID" \
-    "$GOVERNED_INTENT_DIGEST" "$primary_digest"
   VERIFY_BLOCKER_COUNT=0
   print_outcome_json abandoned true "$GOVERNED_ACTION_INSTANCE_ID" "$GOVERNED_INTENT_DIGEST" \
     "$manifest_digest" "$authorization_ref" "$revision" "$frozen_plan" "$reason_code" "$reason_ref"
@@ -6434,9 +6696,23 @@ cleanup_materialize_snapshot() {
 }
 
 cleanup_validate_retry_snapshot() {
-  local root="$1" dir="$2" branch="$3" journal_file="$4" claim descriptor terminal
-  local missing_private=""
+  local root="$1" dir="$2" branch="$3" journal_file="$4" checkpoint_file="${5:-}"
+  local claim descriptor terminal missing_private="" args
   [ -d "$dir" ] || missing_private=--allow-missing-private-action
+  if [ -n "$checkpoint_file" ]; then
+    args=(validate-snapshot --journal-file "$journal_file" --task-dir "$dir" \
+      --branch "$branch" --now "$(utc_now)" \
+      --provenance-file "$CLEANUP_JOURNAL_PROVENANCE_FILE" \
+      --terminal-checkpoint-file "$checkpoint_file" --snapshot-repository "$root")
+    [ -z "$missing_private" ] || args+=("$missing_private")
+    python3 "$(cleanup_contract_helper)" "${args[@]}" >/dev/null || {
+      rm -f "$CLEANUP_JOURNAL_PROVENANCE_FILE"
+      CLEANUP_JOURNAL_PROVENANCE_FILE=""; return 1
+    }
+    rm -f "$CLEANUP_JOURNAL_PROVENANCE_FILE"
+    CLEANUP_JOURNAL_PROVENANCE_FILE=""
+    return 0
+  fi
   cleanup_materialize_snapshot "$root" "$dir" "$branch" || return 1
   if ! python3 "$(cleanup_contract_helper)" validate-snapshot \
     --journal-file "$journal_file" --task-dir "$CLEANUP_SNAPSHOT_DIR" \
@@ -6785,9 +7061,9 @@ cleanup_mark_completed_plan() {
 cmd_done_v2() {
   local id="$1" parent="$2" branch="$3" dir="$4" instance_id="$5" authorization_file="$6"
   local root latest event lifecycle_actor terminal revision="" outcome target action_id="" wt name journal_rc stage helper
-  local journal_file policy_file plan_file payload_file completed_file dirty
+  local journal_file policy_file plan_file payload_file completed_file dirty checkpoint_file checkpoint_latest checkpoint_rc
   local task_workspace=false local_branch=false intent="" manifest="" authorization_ref="" removal_plan=""
-  local primary_digest stored_plan recovered_submission=false
+  local primary_digest stored_plan recovered_submission=false remote_terminal=false retry_checkpoint=""
   root="$(wb_root)"; helper="$(cleanup_contract_helper)"
   CLEANUP_TASK_ID="$id"; CLEANUP_BRANCH="$branch"; CLEANUP_CLAIM_ID=""
   CLEANUP_BLOCKER_COUNT=0; CLEANUP_REMOVED_COUNT=0; CLEANUP_REMOVED_WRITER_COUNT=0
@@ -6796,6 +7072,9 @@ cmd_done_v2() {
   CLEANUP_PLAN_COUNT=0; CLEANUP_PLAN_WRITER_COUNT=0; CLEANUP_PLAN_NAMES=()
   CLEANUP_PLAN_OPERATION_IDS=(); CLEANUP_PLAN_WRITER_IDS=(); CLEANUP_PLAN_DISPOSITIONS=()
   journal_file="$(mktemp "${TMPDIR:-/tmp}/workbench-cleanup-journal.XXXXXX")"
+  checkpoint_file="$(mktemp "${TMPDIR:-/tmp}/workbench-terminal-checkpoint.XXXXXX")"
+  checkpoint_latest="${checkpoint_file}.latest"
+  trap 'trap - RETURN; rm -f "$checkpoint_file" "$checkpoint_latest"' RETURN
 
   latest="$(lifecycle_latest_for_branch "$root" "$HOME_REPO" "$ISSUE" "$branch")" || {
     cleanup_add_blocker lifecycle-write-failed "$branch"
@@ -6803,8 +7082,25 @@ cmd_done_v2() {
   }
   event="$(lifecycle_field "$latest" event)"
   lifecycle_actor="$(lifecycle_field "$latest" actor)"
+  if [ ! -f "$dir/task/.workbench/terminal" ]; then
+    if terminal_checkpoint_latest "$root" "$HOME_REPO" "$ISSUE" "$id" "$branch" \
+      > "$checkpoint_file"; then
+      remote_terminal=true
+    else
+      checkpoint_rc=$?
+      if [ "$checkpoint_rc" -ne 1 ]; then
+        CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
+        [ "$checkpoint_rc" -eq 3 ] \
+          && cleanup_add_blocker terminal-checkpoint-untrusted "$branch" \
+          || cleanup_add_blocker terminal-checkpoint-unavailable "$branch"
+        rm -f "$journal_file" "$checkpoint_file"
+        print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
+      fi
+    fi
+  fi
   if cleanup_journal_latest "$root" "$HOME_REPO" "$ISSUE" "$id" "$branch" \
-    "$lifecycle_actor" > "$journal_file"; then
+    "$lifecycle_actor" \
+    > "$journal_file"; then
     journal_rc=0
   else
     journal_rc=$?
@@ -6820,6 +7116,15 @@ cmd_done_v2() {
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
   fi
   if [ "$journal_rc" -eq 0 ]; then
+    if [ "$remote_terminal" = true ] && [ -d "$dir" ]; then
+      submission_terminal_checkpoint_recover "$root" "$dir" "$branch" \
+        "$checkpoint_file" || {
+        CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
+        cleanup_add_blocker terminal-checkpoint-unreconciled "$branch"
+        rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false
+        return 1
+      }
+    fi
     CLEANUP_CLAIM_ID="$(python3 "$helper" field "$journal_file" claim_id)"
     revision="$(python3 "$helper" field "$journal_file" revision)"
     action_id="$(python3 "$helper" field "$journal_file" action_instance_id)"
@@ -6829,7 +7134,9 @@ cmd_done_v2() {
     removal_plan="$(python3 "$helper" field "$journal_file" removal_plan_digest)"
     stage="$(python3 "$helper" field "$journal_file" stage)"
     cleanup_load_plan "$journal_file"
-    if ! cleanup_validate_retry_snapshot "$root" "$dir" "$branch" "$journal_file"; then
+    [ "$remote_terminal" != true ] || retry_checkpoint="$checkpoint_file"
+    if ! cleanup_validate_retry_snapshot "$root" "$dir" "$branch" "$journal_file" \
+      "$retry_checkpoint"; then
       cleanup_add_blocker cleanup-journal-unreconciled "$branch"
       rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
         "$authorization_ref" "$revision" "$removal_plan" false false; return 1
@@ -6868,8 +7175,9 @@ cmd_done_v2() {
     if [ -d "$dir" ] && [ -f "$dir/task/.workbench/actions/$action_id.record" ]; then
       TASK_DIR="$dir"; CURRENT_CLAIM_ID="$CLEANUP_CLAIM_ID"; CURRENT_ROOT="$root"
       CURRENT_HOME="$HOME_REPO"; CURRENT_ISSUE="$ISSUE"; CURRENT_BRANCH="$branch"
+      target="workbench:task/$CLEANUP_CLAIM_ID"
       primary_digest="$(digest_manifest "$journal_file")"
-      consume_governed_action task.cleanup "workbench:task/$CLEANUP_CLAIM_ID" "$revision" \
+      consume_governed_action task.cleanup "$target" "$revision" \
         "$action_id" "$intent" "$primary_digest" || {
         cleanup_add_blocker action-effect-unreconciled "$action_id"
         rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
@@ -6905,13 +7213,25 @@ cmd_done_v2() {
       "$revision" "$removal_plan" true true; return 0
   fi
 
+  if [ "$remote_terminal" = true ]; then
+    if submission_terminal_checkpoint_recover "$root" "$dir" "$branch" \
+      "$checkpoint_file"; then
+      recovered_submission=true
+    else
+      CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
+      cleanup_add_blocker terminal-checkpoint-unreconciled "$branch"
+      rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false
+      return 1
+    fi
+  fi
   [ -d "$dir" ] && [ -f "$dir/task/index.md" ] || {
     CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"; cleanup_add_blocker missing-terminal-outcome "$branch"
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "" "" false false; return 1
   }
   TASK_DIR="$dir"; CLEANUP_CLAIM_ID="$(index_get claim_id)"
   [ -n "$CLEANUP_CLAIM_ID" ] || CLEANUP_CLAIM_ID="$(lifecycle_field "$latest" claim_id)"
-  if ! git -C "$dir" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
+  if [ "$remote_terminal" != true ] \
+    && ! git -C "$dir" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
     if submission_recovery_guard; then
       recovered_submission=true
     else
@@ -6919,7 +7239,12 @@ cmd_done_v2() {
     fi
   fi
   terminal="$(task_state_dir)/terminal"
-  if [ ! -f "$terminal" ]; then cleanup_add_blocker missing-terminal-outcome "$branch"
+  if [ "$remote_terminal" = true ]; then
+    [ ! -e "$terminal" ] && [ ! -L "$terminal" ] \
+      || cleanup_add_blocker terminal-checkpoint-unreconciled "$branch"
+    outcome="$(terminal_checkpoint_field "$checkpoint_file" terminal.outcome)"
+    revision="$(terminal_checkpoint_field "$checkpoint_file" terminal.revision)"
+  elif [ ! -f "$terminal" ]; then cleanup_add_blocker missing-terminal-outcome "$branch"
   else
     outcome="$(record_get "$terminal" outcome)"; revision="$(record_get "$terminal" revision)"
     case "$outcome" in completed|abandoned) ;; *) cleanup_add_blocker missing-terminal-outcome "$branch" ;; esac
@@ -6944,13 +7269,23 @@ cmd_done_v2() {
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "$revision" "" false false; return 1
   fi
 
-  CURRENT_CLAIM_ID="$CLEANUP_CLAIM_ID"; target="workbench:task/$CLEANUP_CLAIM_ID"; CURRENT_ROOT="$root"; CURRENT_HOME="$HOME_REPO"
+  CURRENT_CLAIM_ID="$CLEANUP_CLAIM_ID"; CURRENT_ROOT="$root"; CURRENT_HOME="$HOME_REPO"
   CURRENT_ISSUE="$ISSUE"; CURRENT_BRANCH="$branch"
+  target="workbench:task/$CLEANUP_CLAIM_ID"
   if ! build_terminal_removal_plan; then
     cleanup_add_blocker cleanup-plan-mismatch "$branch"
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "$revision" "" false false; return 1
   fi
-  removal_plan="$TERMINAL_REMOVAL_PLAN_DIGEST"; stored_plan="$(record_get "$terminal" removal_plan_digest)"
+  removal_plan="$TERMINAL_REMOVAL_PLAN_DIGEST"
+  if [ "$remote_terminal" = true ]; then
+    if [ "$outcome" = abandoned ]; then
+      stored_plan="$(terminal_checkpoint_field "$checkpoint_file" terminal.removal_plan_digest)"
+    else
+      stored_plan="$removal_plan"
+    fi
+  else
+    stored_plan="$(record_get "$terminal" removal_plan_digest)"
+  fi
   if [ "$outcome" = abandoned ] && [ "$stored_plan" != "$removal_plan" ]; then
     cleanup_add_blocker cleanup-plan-mismatch "$branch"
     rm -f "$journal_file"; print_cleanup_json "" false "" "" "" "" "$revision" \
@@ -6969,7 +7304,19 @@ cmd_done_v2() {
     *) rm -f "$journal_file"; return "$GOVERNED_POLICY_RC" ;;
   esac
   action_id="$GOVERNED_ACTION_INSTANCE_ID"; intent="$GOVERNED_INTENT_DIGEST"
-  if [ "$(record_get "$terminal" revision)" != "$revision" ] \
+  local terminal_stale=false
+  if [ "$remote_terminal" = true ]; then
+    if ! terminal_checkpoint_latest "$root" "$HOME_REPO" "$ISSUE" "$id" "$branch" \
+      > "$checkpoint_latest" \
+      || ! cmp -s "$checkpoint_file" "$checkpoint_latest" \
+      || ! submission_terminal_checkpoint_recover "$root" "$dir" "$branch" \
+        "$checkpoint_file"; then
+      terminal_stale=true
+    fi
+  elif [ "$(record_get "$terminal" revision)" != "$revision" ]; then
+    terminal_stale=true
+  fi
+  if [ "$terminal_stale" = true ] \
     || ! build_terminal_removal_plan \
     || [ "$TERMINAL_REMOVAL_PLAN_DIGEST" != "$removal_plan" ]; then
     cleanup_add_blocker action-binding-stale task.cleanup

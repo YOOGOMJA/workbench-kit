@@ -350,7 +350,7 @@ write_action_record() {
     printf 'authorization_ref=%s\n' "$authorization_ref"
     printf 'authorization_actor=%s\n' "$authorization_actor"
     printf 'authorization_at=%s\n' "$authorization_at"
-  } > "$tmp" && mv "$tmp" "$file"
+  } > "$tmp" && chmod 0600 "$tmp" && mv "$tmp" "$file"
 }
 
 rewrite_action_status() {
@@ -438,7 +438,8 @@ mint_bound_action() {
   if [ -n "${REQUEST_FILE:-}" ]; then
     local request_target="$actions_dir/$id.request.json"
     local request_tmp="$actions_dir/.$id.request.$$"
-    cp "$REQUEST_FILE" "$request_tmp" && mv "$request_tmp" "$request_target"
+    cp "$REQUEST_FILE" "$request_tmp" && chmod 0600 "$request_tmp" \
+      && mv "$request_tmp" "$request_target"
   fi
   CURRENT_DECISION="$decision"
 }
@@ -482,7 +483,7 @@ cmd_resolve() {
 
   ROOT="$(workspace_root)"; TOP="$(task_root)"
   [ "$(index_get claim_id)" = "$CLAIM_ID" ] || integrity_error "task claim binding mismatch"
-  actions_dir="$TOP/task/.workbench/actions"; mkdir -p "$actions_dir"
+  actions_dir="$TOP/task/.workbench/actions"; mkdir -p "$actions_dir"; chmod 0700 "$actions_dir"
   build_policy_manifest
   case "$ACTION_ID" in task.policy-context.register) requires_auth=1 ;; esac
   [ "${WORKBENCH_REQUIRE_EXPLICIT_AUTHORIZATION:-}" != 1 ] || requires_auth=1

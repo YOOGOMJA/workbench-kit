@@ -7,14 +7,33 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from workbench_intent import intent_manifest, load_request, parse_line_payload
-from workbench_lifecycle import load_comment_observation, parse_index
-from workbench_terminal import ACTION_FIELDS, read_exact_record, validate_terminal_record
+from workbench_lifecycle import (
+    V2_MARKER,
+    load_comment_observation,
+    open_submission_lock,
+    open_submission_directory,
+    parse_index,
+    parse_v2,
+    read_submission_recovery_at,
+    submission_snapshot_index,
+    validate_cleanup_revision,
+    validate_recovery_snapshot,
+    validate_recovery_worktree,
+    validate_restored_submission_state,
+)
+from workbench_terminal import (
+    ACTION_FIELDS,
+    TERMINAL_FIELDS,
+    read_exact_record,
+    validate_terminal_record,
+)
 from workbench_writer import current_claim_state, latest_effect, read_ledger
 
 
@@ -69,6 +88,32 @@ UUID = re.compile(
 MARKER = re.compile(
     r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->", re.MULTILINE
 )
+TERMINAL_CHECKPOINT_MARKER = re.compile(
+    r"<!-- workbench-task-terminal-checkpoint:v1\n([^\r\n]+)\n-->",
+    re.MULTILINE,
+)
+TERMINAL_CHECKPOINT_FIELDS = (
+    "contract_version",
+    "task_id",
+    "claim_id",
+    "issue",
+    "home",
+    "branch",
+    "work_ref",
+    "workspace_authority_descriptor_digest",
+    "repository_origin_url",
+    "snapshot_revision",
+    "cleanup_revision",
+    "pull_request",
+    "pull_request_url",
+    "head_revision",
+    "terminal",
+    "terminal_action",
+    "terminal_request",
+    "terminal_primary_digest",
+    "at",
+)
+OID = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?\Z")
 
 
 def unique_object(pairs: Iterable[Tuple[str, Any]]) -> Dict[str, Any]:
@@ -291,6 +336,366 @@ def validate_journal(value: Any) -> Mapping[str, Any]:
     return value
 
 
+def record_bytes(value: Mapping[str, str], fields: Sequence[str]) -> bytes:
+    return ("".join("{}={}\n".format(field, value[field]) for field in fields)).encode(
+        "utf-8"
+    )
+
+
+def validate_terminal_request(value: Any) -> Mapping[str, Any]:
+    fields = (
+        "contract_version",
+        "action_id",
+        "task_claim_id",
+        "target_ref",
+        "revision",
+        "payload_contract",
+        "payload",
+    )
+    require_fields(value, fields, "terminal checkpoint request")
+    if tuple(value) != fields:
+        raise ValueError("terminal checkpoint request fields are not canonical")
+    if value["contract_version"] != "workbench-action-request/v1":
+        raise ValueError("terminal checkpoint request contract is invalid")
+    for field in ("action_id", "task_claim_id", "target_ref", "payload_contract"):
+        require_text(value[field], field)
+    require_digest(value["revision"], "terminal request revision")
+    if not isinstance(value["payload"], str):
+        raise ValueError("terminal checkpoint request payload is invalid")
+    return value
+
+
+def validate_terminal_checkpoint(value: Any) -> Mapping[str, Any]:
+    require_fields(value, TERMINAL_CHECKPOINT_FIELDS, "terminal checkpoint")
+    if tuple(value) != TERMINAL_CHECKPOINT_FIELDS:
+        raise ValueError("terminal checkpoint fields are not canonical")
+    if value["contract_version"] != "workbench-task-terminal-checkpoint/v1":
+        raise ValueError("unsupported terminal checkpoint contract")
+    for field in (
+        "task_id",
+        "claim_id",
+        "branch",
+        "repository_origin_url",
+        "pull_request_url",
+    ):
+        require_text(value[field], field)
+    if not isinstance(value["issue"], int) or isinstance(value["issue"], bool) or value["issue"] <= 0:
+        raise ValueError("terminal checkpoint issue is invalid")
+    if value["home"] is not None:
+        require_text(value["home"], "home")
+    if value["work_ref"] is not None:
+        require_text(value["work_ref"], "work_ref")
+    require_digest(
+        value["workspace_authority_descriptor_digest"],
+        "workspace_authority_descriptor_digest",
+    )
+    for field in ("snapshot_revision", "cleanup_revision", "head_revision"):
+        if not isinstance(value[field], str) or OID.fullmatch(value[field]) is None:
+            raise ValueError("terminal checkpoint {} is invalid".format(field))
+    if value["head_revision"] != value["cleanup_revision"]:
+        raise ValueError("terminal checkpoint PR head does not join cleanup")
+    if (
+        not isinstance(value["pull_request"], int)
+        or isinstance(value["pull_request"], bool)
+        or value["pull_request"] <= 0
+    ):
+        raise ValueError("terminal checkpoint pull request is invalid")
+    require_time(value["at"], "terminal checkpoint at")
+
+    terminal = require_fields(value["terminal"], TERMINAL_FIELDS, "terminal checkpoint terminal")
+    action = require_fields(value["terminal_action"], ACTION_FIELDS, "terminal checkpoint action")
+    if tuple(terminal) != TERMINAL_FIELDS or tuple(action) != ACTION_FIELDS:
+        raise ValueError("terminal checkpoint record fields are not canonical")
+    request = validate_terminal_request(value["terminal_request"])
+    outcome = terminal["outcome"]
+    expected_action = {"completed": "task.complete", "abandoned": "task.abandon"}.get(outcome)
+    if expected_action is None:
+        raise ValueError("terminal checkpoint outcome is invalid")
+    for field in TERMINAL_FIELDS:
+        if not isinstance(terminal[field], str):
+            raise ValueError("terminal checkpoint terminal fields must be strings")
+    for field in ACTION_FIELDS:
+        if not isinstance(action[field], str):
+            raise ValueError("terminal checkpoint action fields must be strings")
+    expected = {
+        "id": terminal["action_instance_id"],
+        "action_id": expected_action,
+        "task_claim_id": value["claim_id"],
+        "target_ref": value["work_ref"] or ("workbench:task/" + value["claim_id"]),
+        "revision": terminal["revision"],
+        "intent_digest": terminal["intent_digest"],
+        "policy_manifest_digest": terminal["policy_manifest_digest"],
+        "authorization_ref": terminal["authorization_ref"],
+    }
+    for field, item in expected.items():
+        if action[field] != item:
+            raise ValueError("terminal checkpoint action binding mismatch: {}".format(field))
+    if ACTION_ID.fullmatch(terminal["action_instance_id"]) is None:
+        raise ValueError("terminal checkpoint action instance ID is invalid")
+    for field in ("intent_digest", "policy_manifest_digest", "revision"):
+        require_digest(terminal[field], "terminal " + field)
+    for field in ("authorization_ref", "reason_ref"):
+        if terminal[field]:
+            require_text(terminal[field], "terminal " + field)
+    require_time(terminal["at"], "terminal at")
+    if value["at"] != terminal["at"]:
+        raise ValueError("terminal checkpoint time does not join its terminal")
+    if outcome == "completed":
+        if any(
+            terminal[field]
+            for field in ("removal_plan_digest", "reason_code", "reason_ref")
+        ):
+            raise ValueError("completed terminal checkpoint carries abandonment fields")
+    else:
+        require_digest(terminal["removal_plan_digest"], "terminal removal plan")
+        require_text(terminal["reason_code"], "terminal reason code")
+    for field in ("revision", "intent_digest", "policy_manifest_digest"):
+        require_digest(action[field], "terminal action " + field)
+    authorization = (
+        action["authorization_id"],
+        action["authorization_ref"],
+        action["authorization_actor"],
+        action["authorization_at"],
+    )
+    if terminal["authorization_ref"]:
+        if (
+            not all(authorization)
+            or re.fullmatch(
+                r"auth_[A-Za-z0-9][A-Za-z0-9._-]*", action["authorization_id"]
+            )
+            is None
+            or action["authorization_ref"] != terminal["authorization_ref"]
+            or RFC3339_UTC.fullmatch(action["authorization_at"]) is None
+        ):
+            raise ValueError("terminal checkpoint authorization is not exact")
+        for field in (
+            "authorization_id",
+            "authorization_ref",
+            "authorization_actor",
+        ):
+            require_text(action[field], "terminal action " + field)
+    elif any(authorization):
+        raise ValueError("terminal checkpoint carries an unbound authorization")
+    primary_digest = sha256(record_bytes(terminal, TERMINAL_FIELDS))
+    require_digest(value["terminal_primary_digest"], "terminal primary digest")
+    if (
+        value["terminal_primary_digest"] != primary_digest
+        or action["status"] != "consumed"
+        or action["consumed_provenance_digest"] != primary_digest
+    ):
+        raise ValueError("terminal checkpoint action projection is not primary-bound")
+    for field in ("action_id", "task_claim_id", "target_ref", "revision"):
+        if request[field] != action[field]:
+            raise ValueError("terminal checkpoint request binding mismatch: {}".format(field))
+    payload = parse_line_payload(request["payload_contract"], request["payload"])
+    if (
+        request["payload_contract"]
+        != ("workbench-task-complete-intent/v1" if outcome == "completed" else "workbench-task-abandon-intent/v1")
+        or payload["outcome"] != outcome
+    ):
+        raise ValueError("terminal checkpoint intent outcome mismatch")
+    revision_field = "completion_snapshot" if outcome == "completed" else "abandonment_revision"
+    if payload[revision_field] != terminal["revision"]:
+        raise ValueError("terminal checkpoint intent revision mismatch")
+    payload_digest = sha256(request["payload"].encode("utf-8"))
+    if sha256(intent_manifest(request, payload_digest)) != action["intent_digest"]:
+        raise ValueError("terminal checkpoint intent digest mismatch")
+
+    return value
+
+
+def cmd_terminal_checkpoint_build(args: argparse.Namespace) -> None:
+    terminal = read_exact_record(Path(args.terminal_file), TERMINAL_FIELDS)
+    action = dict(read_exact_record(Path(args.terminal_action_file), ACTION_FIELDS))
+    primary_digest = sha256(record_bytes(terminal, TERMINAL_FIELDS))
+    if action["status"] != "consumed" or action["consumed_provenance_digest"] != primary_digest:
+        raise ValueError("consumed terminal action does not join its primary")
+    request = load_json(args.terminal_request_file)
+    value = dict(
+        zip(
+            TERMINAL_CHECKPOINT_FIELDS,
+            (
+                "workbench-task-terminal-checkpoint/v1",
+                args.task_id,
+                args.claim_id,
+                args.issue,
+                None if args.home == "-" else args.home,
+                args.branch,
+                None if args.work_ref == "-" else args.work_ref,
+                args.descriptor_digest,
+                args.repository_origin_url,
+                args.snapshot_revision,
+                args.cleanup_revision,
+                args.pull_request,
+                args.pull_request_url,
+                args.head_revision,
+                terminal,
+                action,
+                request,
+                primary_digest,
+                args.at,
+            ),
+        )
+    )
+    validate_terminal_checkpoint(value)
+    if len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ) > 60000:
+        raise ValueError("terminal checkpoint exceeds the authenticated comment budget")
+    write_json(value)
+
+
+def cmd_terminal_checkpoint_validate_recovery(args: argparse.Namespace) -> None:
+    checkpoint = validate_terminal_checkpoint(load_json(args.checkpoint_file))
+    require_digest(args.removal_plan_digest, "derived cleanup removal plan")
+    if (
+        checkpoint["terminal"]["outcome"] == "abandoned"
+        and checkpoint["terminal"]["removal_plan_digest"]
+        != args.removal_plan_digest
+    ):
+        raise ValueError("derived cleanup plan changed the abandoned terminal")
+    directory = open_submission_directory(args.repository, False)
+    if directory is None:
+        raise ValueError("terminal checkpoint recovery cursor is unavailable")
+    lock = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        recovery = read_submission_recovery_at(directory, args.branch)
+        if recovery is None or recovery["stage"] != "restored":
+            raise ValueError("terminal checkpoint recovery is not restored")
+        expected = {
+            "repository_origin_url": checkpoint["repository_origin_url"],
+            "branch": checkpoint["branch"],
+            "task_id": checkpoint["task_id"],
+            "issue": checkpoint["issue"],
+            "home": checkpoint["home"],
+            "claim_id": checkpoint["claim_id"],
+            "workspace_authority_descriptor_digest": checkpoint[
+                "workspace_authority_descriptor_digest"
+            ],
+            "snapshot_revision": checkpoint["snapshot_revision"],
+            "cleanup_revision": checkpoint["cleanup_revision"],
+            "pull_request": checkpoint["pull_request"],
+            "pull_request_url": checkpoint["pull_request_url"],
+            "head_revision": checkpoint["head_revision"],
+        }
+        for field, item in expected.items():
+            if recovery[field] != item:
+                raise ValueError(
+                    "terminal checkpoint recovery binding mismatch: {}".format(field)
+                )
+        validate_recovery_snapshot(args.repository, recovery)
+        validate_cleanup_revision(
+            args.repository, recovery, recovery["cleanup_revision"]
+        )
+        validate_recovery_worktree(args.repository, recovery)
+        _, index, _ = submission_snapshot_index(
+            args.repository, recovery["snapshot_revision"], recovery["branch"]
+        )
+        if index["work_ref"] != checkpoint["work_ref"]:
+            raise ValueError("terminal checkpoint work reference changed")
+        target_ref = "workbench:task/" + checkpoint["claim_id"]
+        validate_restored_submission_state(
+            args.repository,
+            directory,
+            recovery,
+            {
+                "target_ref": target_ref,
+                "terminal_revision": checkpoint["terminal"]["revision"],
+                "removal_plan_digest": args.removal_plan_digest,
+            },
+        )
+    finally:
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
+def cmd_terminal_checkpoint_find_observation(args: argparse.Namespace) -> None:
+    values: List[Mapping[str, Any]] = []
+    comments = load_comment_observation(
+        args.observation_file, args.repository_origin_url, args.issue
+    )
+    for comment in comments:
+        body = comment["body"]
+        matches = list(TERMINAL_CHECKPOINT_MARKER.finditer(body))
+        if body.count("<!-- workbench-task-terminal-checkpoint:v1") != len(matches):
+            raise ValueError("malformed terminal checkpoint marker")
+        for match in matches:
+            if len(match.group(1).encode("utf-8")) > 60000:
+                raise ValueError("terminal checkpoint exceeds the authenticated comment budget")
+            value = validate_terminal_checkpoint(
+                json.loads(match.group(1), object_pairs_hook=unique_object)
+            )
+            if value["task_id"] != args.task_id or value["branch"] != args.branch:
+                continue
+            if (
+                value["issue"] != args.issue
+                or value["repository_origin_url"] != args.repository_origin_url
+            ):
+                raise ValueError("terminal checkpoint observation identity mismatch")
+            lifecycle_matches = list(V2_MARKER.finditer(body))
+            if body.count("<!-- workbench-task-lifecycle:v2") != len(lifecycle_matches):
+                raise ValueError("malformed paired terminal lifecycle marker")
+            terminal = value["terminal"]
+            expected_event = (
+                "task-completed"
+                if terminal["outcome"] == "completed"
+                else "task-abandoned"
+            )
+            terminal_markers = []
+            for lifecycle_match in lifecycle_matches:
+                marker = parse_v2(
+                    lifecycle_match.group(1), comment["author_identity"], args.issue
+                )
+                if (
+                    marker["event"] == expected_event
+                    and marker["branch"] == value["branch"]
+                    and marker["claim_id"] == value["claim_id"]
+                ):
+                    terminal_markers.append(marker)
+            if len(terminal_markers) != 1:
+                raise ValueError("terminal checkpoint is not paired one-to-one")
+            marker = terminal_markers[0]
+            expected = {
+                "event": expected_event,
+                "claim_id": value["claim_id"],
+                "issue": value["issue"],
+                "home": value["home"],
+                "branch": value["branch"],
+                "workspace_authority_descriptor_digest": value[
+                    "workspace_authority_descriptor_digest"
+                ],
+                "pr": value["pull_request"],
+                "revision": terminal["revision"],
+                "action_instance_id": terminal["action_instance_id"],
+                "intent_digest": terminal["intent_digest"],
+            }
+            if any(marker[field] != item for field, item in expected.items()):
+                raise ValueError("terminal checkpoint lifecycle binding mismatch")
+            values.append(value)
+    if not values:
+        raise LookupError("terminal checkpoint not found")
+    if len(values) != 1:
+        raise ValueError("terminal checkpoint is duplicated or ambiguous")
+    write_json(values[0])
+
+
+def cmd_terminal_checkpoint_field(args: argparse.Namespace) -> None:
+    value = validate_terminal_checkpoint(load_json(args.file))
+    item: Any = value
+    for field in args.field.split("."):
+        if not isinstance(item, dict) or field not in item:
+            raise ValueError("unknown terminal checkpoint field")
+        item = item[field]
+    if isinstance(item, (dict, list)):
+        sys.stdout.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+    elif item is None:
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(str(item) + "\n")
+
+
 def immutable_binding(value: Mapping[str, Any]) -> str:
     selected = {key: value[key] for key in JOURNAL_FIELDS if key not in ("stage", "effect_owner_events", "at")}
     return json.dumps(selected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -459,22 +864,60 @@ def cmd_find_observation(args: argparse.Namespace) -> None:
 def cmd_validate_snapshot(args: argparse.Namespace) -> None:
     journal = validate_journal(load_json(args.journal_file))
     task_dir = Path(args.task_dir)
-    index = parse_index(str(task_dir / "task/index.md"), args.branch)
+    checkpoint = None
+    if args.terminal_checkpoint_file is not None:
+        checkpoint = validate_terminal_checkpoint(
+            load_json(args.terminal_checkpoint_file)
+        )
+    index_path = task_dir / "task/index.md"
+    if index_path.is_file():
+        index = parse_index(str(index_path), args.branch)
+    elif checkpoint is not None and args.snapshot_repository is not None:
+        _, index, _ = submission_snapshot_index(
+            args.snapshot_repository,
+            checkpoint["snapshot_revision"],
+            args.branch,
+        )
+    else:
+        raise ValueError("cleanup task index provenance is missing")
     if (
         index["id"] != journal["task_id"]
         or index["claim_id"] != journal["claim_id"]
         or index["task_contract"] != "workbench-task/v2"
     ):
         raise ValueError("cleanup journal does not join the task index")
-    now = datetime.datetime.strptime(args.now, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=datetime.timezone.utc
-    )
-    terminal = validate_terminal_record(
-        task_dir,
-        task_dir / "task/.workbench/terminal",
-        journal["claim_id"],
-        now,
-    )
+    target_ref = "workbench:task/" + journal["claim_id"]
+    if checkpoint is None:
+        now = datetime.datetime.strptime(args.now, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+        terminal = validate_terminal_record(
+            task_dir,
+            task_dir / "task/.workbench/terminal",
+            journal["claim_id"],
+            now,
+        )
+    else:
+        expected_checkpoint = {
+            "task_id": journal["task_id"],
+            "claim_id": journal["claim_id"],
+            "branch": journal["branch"],
+            "work_ref": index["work_ref"],
+        }
+        for field, item in expected_checkpoint.items():
+            if checkpoint[field] != item:
+                raise ValueError(
+                    "cleanup journal terminal checkpoint mismatch: {}".format(field)
+                )
+        terminal_path = task_dir / "task/.workbench/terminal"
+        if terminal_path.exists() or terminal_path.is_symlink():
+            raise ValueError("remote terminal checkpoint has a local terminal projection")
+        terminal = checkpoint["terminal"]
+        if (
+            terminal["outcome"] == "abandoned"
+            and terminal["removal_plan_digest"] != journal["removal_plan_digest"]
+        ):
+            raise ValueError("cleanup journal changed the abandoned removal plan")
     if terminal["revision"] != journal["revision"]:
         raise ValueError("cleanup journal does not join the terminal revision")
 
@@ -490,7 +933,7 @@ def cmd_validate_snapshot(args: argparse.Namespace) -> None:
         "contract_version": "workbench-action-request/v1",
         "action_id": "task.cleanup",
         "task_claim_id": journal["claim_id"],
-        "target_ref": "workbench:task/" + journal["claim_id"],
+        "target_ref": target_ref,
         "revision": journal["revision"],
         "payload_contract": "workbench-task-cleanup-intent/v1",
         "payload": payload,
@@ -512,7 +955,7 @@ def cmd_validate_snapshot(args: argparse.Namespace) -> None:
         "id": journal["action_instance_id"],
         "action_id": "task.cleanup",
         "task_claim_id": journal["claim_id"],
-        "target_ref": "workbench:task/" + journal["claim_id"],
+        "target_ref": target_ref,
         "revision": journal["revision"],
         "intent_digest": journal["intent_digest"],
         "policy_manifest_digest": manifest["digest"],
@@ -528,7 +971,7 @@ def cmd_validate_snapshot(args: argparse.Namespace) -> None:
     if (
         stored_request["action_id"] != "task.cleanup"
         or stored_request["task_claim_id"] != journal["claim_id"]
-        or stored_request["target_ref"] != "workbench:task/" + journal["claim_id"]
+        or stored_request["target_ref"] != target_ref
         or stored_request["revision"] != journal["revision"]
         or stored_request["intent_digest"] != journal["intent_digest"]
     ):
@@ -724,6 +1167,8 @@ def parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--now", required=True)
     snapshot.add_argument("--provenance-file", required=True)
     snapshot.add_argument("--allow-missing-private-action", action="store_true")
+    snapshot.add_argument("--terminal-checkpoint-file")
+    snapshot.add_argument("--snapshot-repository")
     snapshot.set_defaults(func=cmd_validate_snapshot)
 
     field = commands.add_parser("field")
@@ -744,6 +1189,46 @@ def parser() -> argparse.ArgumentParser:
     released.add_argument("--journal-file", required=True)
     released.add_argument("--ledger-file", required=True)
     released.set_defaults(func=cmd_verify_released_writers)
+    checkpoint = commands.add_parser("terminal-checkpoint-build")
+    checkpoint.add_argument("--task-id", required=True)
+    checkpoint.add_argument("--claim-id", required=True)
+    checkpoint.add_argument("--issue", type=int, required=True)
+    checkpoint.add_argument("--home", required=True)
+    checkpoint.add_argument("--branch", required=True)
+    checkpoint.add_argument("--work-ref", required=True)
+    checkpoint.add_argument("--descriptor-digest", required=True)
+    checkpoint.add_argument("--repository-origin-url", required=True)
+    checkpoint.add_argument("--snapshot-revision", required=True)
+    checkpoint.add_argument("--cleanup-revision", required=True)
+    checkpoint.add_argument("--pull-request", type=int, required=True)
+    checkpoint.add_argument("--pull-request-url", required=True)
+    checkpoint.add_argument("--head-revision", required=True)
+    checkpoint.add_argument("--terminal-file", required=True)
+    checkpoint.add_argument("--terminal-action-file", required=True)
+    checkpoint.add_argument("--terminal-request-file", required=True)
+    checkpoint.add_argument("--at", required=True)
+    checkpoint.set_defaults(func=cmd_terminal_checkpoint_build)
+    checkpoint_find = commands.add_parser("terminal-checkpoint-find-observation")
+    checkpoint_find.add_argument("--observation-file", required=True)
+    checkpoint_find.add_argument("--repository-origin-url", required=True)
+    checkpoint_find.add_argument("--issue", type=int, required=True)
+    checkpoint_find.add_argument("--task-id", required=True)
+    checkpoint_find.add_argument("--branch", required=True)
+    checkpoint_find.set_defaults(func=cmd_terminal_checkpoint_find_observation)
+    checkpoint_validate = commands.add_parser(
+        "terminal-checkpoint-validate-recovery"
+    )
+    checkpoint_validate.add_argument("--checkpoint-file", required=True)
+    checkpoint_validate.add_argument("--repository", required=True)
+    checkpoint_validate.add_argument("--branch", required=True)
+    checkpoint_validate.add_argument("--removal-plan-digest", required=True)
+    checkpoint_validate.set_defaults(
+        func=cmd_terminal_checkpoint_validate_recovery
+    )
+    checkpoint_field = commands.add_parser("terminal-checkpoint-field")
+    checkpoint_field.add_argument("file")
+    checkpoint_field.add_argument("field")
+    checkpoint_field.set_defaults(func=cmd_terminal_checkpoint_field)
     return root
 
 
