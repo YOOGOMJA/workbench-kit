@@ -188,7 +188,7 @@ def operation_files(paths: Sequence[str]) -> List[Dict[str, Any]]:
 
 def removal_disposition(operation: Mapping[str, Any]) -> str:
     stage = operation["stage"]
-    if stage == "cancelled":
+    if stage in ("prepared", "authorization-pending", "cancelled"):
         return "cancel-no-effect"
     if stage == "consumed":
         return "retire-consumed"

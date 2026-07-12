@@ -1213,6 +1213,8 @@ def cmd_contract(args: argparse.Namespace) -> None:
             "cleanup_journal_contracts": [
                 "workbench-task-removal-plan/v1",
                 "workbench-task-cleanup-journal/v1",
+                "workbench-task-quarantine-authority/v1",
+                "workbench-task-quarantine-receipt/v1",
             ],
             "doctor_contracts": ["workbench-doctor/v1"],
             "evidence_contracts": ["workbench-evidence/v1"],

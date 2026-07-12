@@ -138,6 +138,10 @@ case "${1:-} ${2:-}" in
       && grep -Fq '"stage":"prepared"' "$body_file"; then
       exit 41
     fi
+    if [ "${GH_FAIL_CLEANUP_STAGE:-}" = quarantined ] \
+      && grep -Fq '"stage":"quarantined"' "$body_file"; then
+      exit 45
+    fi
     if [ "${GH_FAIL_CLEANUP_STAGE:-}" = completed ] \
       && grep -Fq '"stage":"completed"' "$body_file"; then
       exit 42
@@ -628,6 +632,8 @@ run_task_in_dir() {
     WORKBENCH_TEST_GOVERNED_FINAL_HOOK="${WORKBENCH_TEST_GOVERNED_FINAL_HOOK:-}" \
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
     WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK="${WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK:-}" \
+    WORKBENCH_TEST_FAIL_QUARANTINE_STAGE="${WORKBENCH_TEST_FAIL_QUARANTINE_STAGE:-}" \
+    WORKBENCH_TEST_QUARANTINE_RENAME_HOOK="${WORKBENCH_TEST_QUARANTINE_RENAME_HOOK:-}" \
     WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="${WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK:-}" \
     WORKBENCH_TEST_WORK_REF_BARRIER_DIR="${WORKBENCH_TEST_WORK_REF_BARRIER_DIR:-}" \
     WORKBENCH_TEST_WORK_REF_BARRIER_ID="${WORKBENCH_TEST_WORK_REF_BARRIER_ID:-}" \
@@ -815,6 +821,20 @@ manifest = (
     "local_branch\t{}\n"
 ).format(claim, branch, plan["task_workspace"], branch).encode()
 digest = "sha256:" + hashlib.sha256(manifest).hexdigest()
+device = "device:attacker/fixture"
+clone = "123e4567-e89b-12d3-a456-426614174000"
+authority_manifest = (
+    "workbench-task-quarantine-authority/v1\n"
+    "task_id\t29\n"
+    "claim_id\t{}\n"
+    "branch\t{}\n"
+    "device_id\t{}\n"
+    "clone_id\t{}\n"
+    "workspace_locator\t{}\n"
+).format(claim, branch, device, clone, plan["task_workspace"]).encode()
+quarantine_locator = (
+    "workbench-v2/cleanup-quarantine/" + hashlib.sha256(authority_manifest).hexdigest()
+)
 value = {
     "contract_version": "workbench-task-cleanup-journal/v1",
     "journal_id": "cleanup-" + claim,
@@ -833,6 +853,14 @@ value = {
     "authorization_ref": None,
     "removal_plan_digest": digest,
     "removal_plan": plan,
+    "quarantine_authority": {
+        "contract_version": "workbench-task-quarantine-authority/v1",
+        "device_id": device,
+        "clone_id": clone,
+        "workspace_locator": plan["task_workspace"],
+        "quarantine_locator": quarantine_locator,
+    },
+    "quarantine_receipt": None,
     "effect_owner_events": [],
     "at": "2026-07-11T00:00:00Z",
 }
@@ -4075,41 +4103,66 @@ test_cleanup_revalidates_outer_task_before_forced_removal() {
 }
 
 test_cleanup_refuses_bytes_created_at_task_removal_boundary() {
-  local out branch rc hook injected action
+  local out branch hook injected action common locator quarantine actual
   prepare_cleanup_fixture cleanup_task_removal_boundary
   branch="task/29-v2-lifecycle-fixture-29"
   hook="$TMPDIR/cleanup_task_removal_boundary/inject-removal-race"
   injected="$TMPDIR/cleanup_task_removal_boundary/removal-boundary-injected"
-  cat > "$hook" <<'SH'
+cat > "$hook" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' dirty-at-removal-boundary > "$1/BOUNDARY.txt"
+mkdir -p "$1/task/codebases/boundary"
+printf '%s\n' ignored-at-removal-boundary > "$1/task/codebases/boundary/BOUNDARY.txt"
+for action in "$1"/task/.workbench/actions/*.record; do
+  if grep -Fq 'action_id=task.cleanup' "$action"; then
+    printf '%s\n' boundary_payload=must-survive >> "$action"
+  fi
+done
 printf '%s\n' injected > "$WORKBENCH_TEST_CLEANUP_RACE_MARKER"
 SH
   chmod +x "$hook"
 
   out="$TMPDIR/cleanup_task_removal_boundary/done.out"
-  if WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK="$hook" \
+  actual="$(WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK="$hook" \
     WORKBENCH_TEST_CLEANUP_RACE_MARKER="$injected" \
     WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
     WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
     run_task cleanup_task_removal_boundary "$CLEANUP_REPO" done 29 \
-      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
-    [ -f "$injected" ] \
-      || fail "task removal boundary injection was not reached"
-    fail "cleanup deleted bytes created at the task removal boundary"
-  else rc=$?; fi
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json 2>"$out")" \
+    || fail "cleanup did not quarantine boundary bytes: $(cat "$out")"
+  assert_contains "$actual" '"outcome":"cleaned"'
   [ -f "$injected" ] \
     || fail "task removal boundary injection was not reached"
-  [ "$rc" = 1 ] || fail "task removal boundary race returned $rc"
-  [ -d "$CLEANUP_TASK_DIR" ] || fail "task removal boundary race removed the workspace"
-  [ -f "$CLEANUP_TASK_DIR/BOUNDARY.txt" ] \
-    || fail "task removal boundary race lost user bytes"
-  action="$CLEANUP_TASK_DIR/task/.workbench/actions/$CLEANUP_ACTION_INSTANCE.record"
-  [ "$(sed -n 's/^status=//p' "$action")" = consumed ] \
-    || fail "task removal boundary race did not restore the consumed cleanup action"
-  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
-    || fail "task removal boundary race removed the local branch"
+  [ ! -e "$CLEANUP_TASK_DIR" ] || fail "quarantined workspace retained its active path"
+  if git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+    fail "completed quarantine retained the local branch"
+  fi
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  locator="$(python3 - "$TMPDIR/cleanup_task_removal_boundary/comments/29.comments" <<'PY'
+import json
+import re
+import sys
+
+documents = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+]
+receipts = [item["quarantine_receipt"] for item in documents if item["stage"] == "quarantined"]
+assert receipts and all(item == receipts[0] for item in receipts)
+print(receipts[0]["quarantine_locator"])
+PY
+)"
+  quarantine="$common/$locator/workspace"
+  [ -f "$quarantine/task/codebases/boundary/BOUNDARY.txt" ] \
+    || fail "quarantine lost ignored bytes created at the removal boundary"
+  action="$quarantine/task/.workbench/actions/$CLEANUP_ACTION_INSTANCE.record"
+  assert_file_contains "$action" 'boundary_payload=must-survive'
+  [ -f "$common/$locator/receipt.json" ] \
+    || fail "completed cleanup physically deleted its quarantine receipt"
 }
 
 test_cleanup_revalidates_clean_head_after_prepared_journal() {
@@ -4232,14 +4285,15 @@ def unique(pairs):
 
 text = open(sys.argv[1], encoding="utf-8").read()
 matches = re.findall(r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->", text)
-assert len(matches) == 1, matches
-journal = json.loads(matches[0], object_pairs_hook=unique)
+assert len(matches) == 2, matches
+journals = [json.loads(item, object_pairs_hook=unique) for item in matches]
+journal = journals[0]
 policy = json.load(open(sys.argv[2], encoding="utf-8"), object_pairs_hook=unique)
 assert list(journal) == [
     "contract_version", "journal_id", "stage", "task_id", "claim_id", "branch",
     "revision", "action_instance_id", "intent_digest", "policy_manifest",
     "authorization_ref", "removal_plan_digest", "removal_plan",
-    "effect_owner_events", "at",
+    "quarantine_authority", "quarantine_receipt", "effect_owner_events", "at",
 ]
 assert journal["contract_version"] == "workbench-task-cleanup-journal/v1"
 assert journal["journal_id"] == "cleanup-" + sys.argv[4]
@@ -4259,8 +4313,17 @@ assert journal["removal_plan"] == {
     "local_branch": sys.argv[6],
 }
 
+assert journal["quarantine_authority"]["workspace_locator"] == journal["removal_plan"]["task_workspace"]
+assert journal["quarantine_authority"]["quarantine_locator"].startswith(
+    "workbench-v2/cleanup-quarantine/"
+)
+assert journal["quarantine_receipt"] is None
 assert journal["effect_owner_events"] == []
 assert re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", journal["at"])
+assert journals[1]["stage"] == "quarantined"
+assert journals[1]["quarantine_receipt"]["quarantine_locator"] == journal["quarantine_authority"]["quarantine_locator"]
+assert journals[1]["quarantine_receipt"]["device_id"] == journal["quarantine_authority"]["device_id"]
+assert journals[1]["quarantine_receipt"]["clone_id"] == journal["quarantine_authority"]["clone_id"]
 PY
 
   out="$TMPDIR/cleanup_recovery/lifecycle-failure.out"
@@ -4300,11 +4363,15 @@ def unique(pairs):
 text = open(sys.argv[1], encoding="utf-8").read()
 matches = re.findall(r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->", text)
 journals = [json.loads(item, object_pairs_hook=unique) for item in matches]
-assert [item["stage"] for item in journals] == ["prepared", "completed"]
+assert [item["stage"] for item in journals] == ["prepared", "quarantined", "completed"]
 assert text.index('"stage":"prepared"') < text.index('"stage":"completed"')
+assert text.index('"stage":"prepared"') < text.index('"stage":"quarantined"')
+assert text.index('"stage":"quarantined"') < text.index('"stage":"completed"')
 assert text.index('"stage":"completed"') < text.index('"event":"task-cleaned"')
-for key in ("journal_id", "task_id", "claim_id", "branch", "revision", "action_instance_id", "intent_digest", "policy_manifest", "authorization_ref", "removal_plan_digest", "removal_plan", "effect_owner_events"):
+for key in ("journal_id", "task_id", "claim_id", "branch", "revision", "action_instance_id", "intent_digest", "policy_manifest", "authorization_ref", "removal_plan_digest", "removal_plan", "quarantine_authority", "effect_owner_events"):
     assert journals[0][key] == journals[1][key]
+assert journals[0]["quarantine_receipt"] is None
+assert journals[1]["quarantine_receipt"] == journals[2]["quarantine_receipt"]
 PY
 }
 
@@ -4319,6 +4386,24 @@ test_cleanup_releases_work_ref_reservation_after_workspace_removal() {
   [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
     "$selection")" ] || fail "cleanup fixture did not retain its work-ref selection"
   branch="task/29-v2-lifecycle-fixture-29"
+  out="$TMPDIR/cleanup_work_ref_release/quarantine-failure.out"
+  if GH_FAIL_CLEANUP_STAGE=quarantined \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_work_ref_release "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup released global state before its quarantine receipt was durable"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "failed quarantine publication returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-unavailable"'
+  [ ! -e "$CLEANUP_TASK_DIR" ] || fail "local quarantine retained its active workspace path"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "failed quarantine publication removed the retry branch"
+  [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
+    "$reservation")" ] || fail "failed quarantine publication dropped its reservation"
+  [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_work_ref_release/origin.git" \
+    "$selection")" ] || fail "failed quarantine publication dropped its selection"
+
   out="$TMPDIR/cleanup_work_ref_release/release-failure.out"
   if WORKBENCH_TEST_WORK_REF_RELEASE_FAIL=1 \
     WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
@@ -4345,6 +4430,339 @@ test_cleanup_releases_work_ref_reservation_after_workspace_removal() {
     "$selection")" ] || fail "cleanup retained its work-ref selection"
 }
 
+test_cleanup_prepared_quarantine_cannot_be_promoted_by_foreign_clone() {
+  local out rc foreign branch actual comments common foreign_task device clone
+  prepare_cleanup_fixture cleanup_quarantine_foreign
+  branch="task/29-v2-lifecycle-fixture-29"
+  comments="$TMPDIR/cleanup_quarantine_foreign/comments/29.comments"
+  out="$TMPDIR/cleanup_quarantine_foreign/quarantine-failure.out"
+  if GH_FAIL_CLEANUP_STAGE=quarantined \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_foreign "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "foreign-clone fixture unexpectedly published its quarantine receipt"
+  fi
+  [ ! -e "$CLEANUP_TASK_DIR" ] || fail "foreign-clone fixture retained its active path"
+  foreign="$TMPDIR/cleanup_quarantine_foreign/foreign"
+  git clone -q "$TMPDIR/cleanup_quarantine_foreign/origin.git" "$foreign"
+  git -C "$foreign" config user.name "Foreign Test User"
+  git -C "$foreign" config user.email "foreign@example.invalid"
+  out="$TMPDIR/cleanup_quarantine_foreign/foreign.out"
+  if run_task cleanup_quarantine_foreign "$foreign" done 29 --format json >"$out" 2>&1; then
+    fail "a foreign clone promoted a prepared quarantine without its local receipt"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "foreign quarantine promotion returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  if grep -Fq '"stage":"quarantined"' "$comments"; then
+    fail "foreign clone published another device's quarantine receipt"
+  fi
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "foreign clone removed the owning clone's retry branch"
+
+  IFS=$'\t' read -r device clone <<EOF
+$(python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+raw = re.findall(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+    open(sys.argv[1], encoding="utf-8").read(),
+)[0]
+authority = json.loads(raw)["quarantine_authority"]
+print(authority["device_id"] + "\t" + authority["clone_id"])
+PY
+)
+EOF
+  common="$(git -C "$foreign" rev-parse --git-common-dir)"
+  common="$(cd "$foreign" && cd "$common" && pwd -P)"
+  printf '%s\n' "$device" > "$common/workbench-v2/device-id"
+  printf '%s\n' "$clone" > "$common/workbench-v2/clone-id"
+  foreign_task="$foreign/.worktrees/task__29-v2-lifecycle-fixture-29"
+  mkdir -p "$foreign/.worktrees"
+  git -C "$foreign" worktree add -q -b "$branch" "$foreign_task" "origin/$branch"
+  out="$TMPDIR/cleanup_quarantine_foreign/spoofed-foreign.out"
+  if run_task cleanup_quarantine_foreign "$foreign" done 29 --format json >"$out" 2>&1; then
+    fail "a foreign clone promoted prepared cleanup after copying public runtime IDs"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "spoofed foreign quarantine promotion returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  [ -d "$foreign_task" ] || fail "spoofed foreign cleanup moved the reconstructed workspace"
+  if grep -Fq '"stage":"quarantined"' "$comments"; then
+    fail "spoofed foreign clone published an unarmed quarantine receipt"
+  fi
+
+  actual="$(run_task cleanup_quarantine_foreign "$CLEANUP_REPO" done 29 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+}
+
+test_cleanup_quarantine_conflict_preserves_recreated_path() {
+  local out rc branch common locator bundle
+  prepare_cleanup_fixture cleanup_quarantine_conflict
+  branch="task/29-v2-lifecycle-fixture-29"
+  out="$TMPDIR/cleanup_quarantine_conflict/quarantine-failure.out"
+  if GH_FAIL_CLEANUP_STAGE=quarantined \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_conflict "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "conflict fixture unexpectedly published its quarantine receipt"
+  fi
+  mkdir -p "$CLEANUP_TASK_DIR"
+  printf '%s\n' concurrent-recreated-path > "$CLEANUP_TASK_DIR/CONCURRENT.txt"
+  out="$TMPDIR/cleanup_quarantine_conflict/retry.out"
+  if run_task cleanup_quarantine_conflict "$CLEANUP_REPO" done 29 \
+    --format json >"$out" 2>&1; then
+    fail "cleanup overwrote a path recreated after local quarantine"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "quarantine path conflict returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-conflict"'
+  assert_file_contains "$CLEANUP_TASK_DIR/CONCURRENT.txt" concurrent-recreated-path
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  locator="$(python3 - "$TMPDIR/cleanup_quarantine_conflict/comments/29.comments" <<'PY'
+import json
+import re
+import sys
+
+raw = re.findall(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+    open(sys.argv[1], encoding="utf-8").read(),
+)[0]
+print(json.loads(raw)["quarantine_authority"]["quarantine_locator"])
+PY
+)"
+  bundle="$common/$locator"
+  [ -d "$bundle/workspace" ] || fail "quarantine conflict lost the original workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "quarantine conflict removed the retry branch"
+}
+
+test_cleanup_rejects_tampered_local_quarantine_receipt() {
+  local out rc branch common locator bundle
+  prepare_cleanup_fixture cleanup_quarantine_tamper
+  branch="task/29-v2-lifecycle-fixture-29"
+  out="$TMPDIR/cleanup_quarantine_tamper/quarantine-failure.out"
+  if GH_FAIL_CLEANUP_STAGE=quarantined \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_tamper "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "tamper fixture unexpectedly published its quarantine receipt"
+  fi
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  locator="$(python3 - "$TMPDIR/cleanup_quarantine_tamper/comments/29.comments" <<'PY'
+import json
+import re
+import sys
+
+raw = re.findall(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+    open(sys.argv[1], encoding="utf-8").read(),
+)[0]
+print(json.loads(raw)["quarantine_authority"]["quarantine_locator"])
+PY
+)"
+  bundle="$common/$locator"
+  python3 - "$bundle/receipt.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["workspace_tree_digest"] = "sha256:" + "f" * 64
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  out="$TMPDIR/cleanup_quarantine_tamper/retry.out"
+  if run_task cleanup_quarantine_tamper "$CLEANUP_REPO" done 29 \
+    --format json >"$out" 2>&1; then
+    fail "cleanup trusted a tampered local quarantine receipt"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "tampered local quarantine returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  assert_file_contains "$bundle/receipt.json" "sha256:$(printf 'f%.0s' {1..64})"
+  [ -d "$bundle/workspace" ] || fail "tampered receipt cleanup deleted its quarantine"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "tampered receipt cleanup removed the retry branch"
+}
+
+test_cleanup_quarantine_rejects_hardlinked_boundary_without_deletion() {
+  local out rc hook marker common locator bundle branch
+  prepare_cleanup_fixture cleanup_quarantine_hardlink
+  branch="task/29-v2-lifecycle-fixture-29"
+  hook="$TMPDIR/cleanup_quarantine_hardlink/inject-hardlink"
+  marker="$TMPDIR/cleanup_quarantine_hardlink/external-boundary.txt"
+  printf '%s\n' hardlinked-boundary > "$marker"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$1/task/codebases/hardlink"
+ln "$WORKBENCH_TEST_CLEANUP_RACE_MARKER" "$1/task/codebases/hardlink/BOUNDARY.txt"
+SH
+  chmod +x "$hook"
+  out="$TMPDIR/cleanup_quarantine_hardlink/done.out"
+  if WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK="$hook" \
+    WORKBENCH_TEST_CLEANUP_RACE_MARKER="$marker" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_hardlink "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup authenticated a workspace with an externally mutable hardlink"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "hardlinked quarantine boundary returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  assert_file_contains "$marker" hardlinked-boundary
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  locator="$(python3 - "$TMPDIR/cleanup_quarantine_hardlink/comments/29.comments" <<'PY'
+import json
+import re
+import sys
+
+raw = re.findall(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+    open(sys.argv[1], encoding="utf-8").read(),
+)[0]
+print(json.loads(raw)["quarantine_authority"]["quarantine_locator"])
+PY
+)"
+  bundle="$common/$locator"
+  assert_file_contains "$bundle/workspace/task/codebases/hardlink/BOUNDARY.txt" hardlinked-boundary
+  [ ! -e "$bundle/receipt.json" ] || fail "hardlinked quarantine minted a local receipt"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "hardlinked quarantine removed the retry branch"
+}
+
+test_cleanup_quarantine_rolls_forward_after_workspace_rename_crash() {
+  local out rc branch common locator bundle actual comments
+  prepare_cleanup_fixture cleanup_quarantine_roll_forward
+  branch="task/29-v2-lifecycle-fixture-29"
+  comments="$TMPDIR/cleanup_quarantine_roll_forward/comments/29.comments"
+  out="$TMPDIR/cleanup_quarantine_roll_forward/interrupted.out"
+  if WORKBENCH_TEST_FAIL_QUARANTINE_STAGE=workspace-renamed \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_roll_forward "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "workspace-rename crash fixture unexpectedly completed cleanup"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "workspace-rename interruption returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  [ ! -e "$CLEANUP_TASK_DIR" ] || fail "workspace-rename interruption retained the active path"
+  if grep -Fq '"stage":"quarantined"' "$comments"; then
+    fail "workspace-rename interruption published a premature quarantine receipt"
+  fi
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  locator="$(python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+raw = re.findall(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+    open(sys.argv[1], encoding="utf-8").read(),
+)[0]
+print(json.loads(raw)["quarantine_authority"]["quarantine_locator"])
+PY
+)"
+  bundle="$common/$locator"
+  [ -d "$bundle/workspace" ] || fail "workspace-rename interruption lost the moved workspace"
+  [ ! -e "$bundle/receipt.json" ] || fail "workspace-rename interruption minted a receipt"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "workspace-rename interruption removed the retry branch"
+
+  actual="$(run_task cleanup_quarantine_roll_forward "$CLEANUP_REPO" done 29 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+  [ -f "$bundle/receipt.json" ] || fail "roll-forward retry did not publish a local receipt"
+}
+
+test_cleanup_quarantine_never_replaces_a_racing_destination() {
+  local out rc hook branch common locator bundle mode
+  prepare_cleanup_fixture cleanup_quarantine_destination_race
+  branch="task/29-v2-lifecycle-fixture-29"
+  hook="$TMPDIR/cleanup_quarantine_destination_race/occupy-destination"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${2##*/}" = workspace ] && [ ! -e "$2" ]; then
+  mkdir -m 0711 "$2"
+fi
+SH
+  chmod +x "$hook"
+  out="$TMPDIR/cleanup_quarantine_destination_race/done.out"
+  if WORKBENCH_TEST_QUARANTINE_RENAME_HOOK="$hook" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_destination_race "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup replaced a destination occupied at the rename boundary"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "quarantine destination race returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "destination race moved the source workspace"
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  locator="$(python3 - "$TMPDIR/cleanup_quarantine_destination_race/comments/29.comments" <<'PY'
+import json
+import re
+import sys
+
+raw = re.findall(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+    open(sys.argv[1], encoding="utf-8").read(),
+)[0]
+print(json.loads(raw)["quarantine_authority"]["quarantine_locator"])
+PY
+)"
+  bundle="$common/$locator"
+  [ -d "$bundle/workspace" ] || fail "destination race lost the occupying directory"
+  mode="$(stat -f '%Lp' "$bundle/workspace" 2>/dev/null || stat -c '%a' "$bundle/workspace")"
+  [ "$mode" = 711 ] || fail "destination race replaced the occupying directory"
+  [ ! -e "$bundle/receipt.json" ] || fail "destination race minted a quarantine receipt"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "destination race removed the retry branch"
+}
+
+test_cleanup_quarantine_rejects_parent_symlink_swap() {
+  local out rc hook marker branch
+  prepare_cleanup_fixture cleanup_quarantine_parent_symlink
+  branch="task/29-v2-lifecycle-fixture-29"
+  hook="$TMPDIR/cleanup_quarantine_parent_symlink/swap-parent"
+  marker="$TMPDIR/cleanup_quarantine_parent_symlink/swapped"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ ! -e "$WORKBENCH_TEST_CLEANUP_RACE_MARKER" ]; then
+  bundle="$(dirname "$2")"
+  quarantine="$(dirname "$bundle")"
+  mv "$quarantine" "$quarantine.original"
+  ln -s "$quarantine.original" "$quarantine"
+  printf '%s\n' swapped > "$WORKBENCH_TEST_CLEANUP_RACE_MARKER"
+fi
+SH
+  chmod +x "$hook"
+  out="$TMPDIR/cleanup_quarantine_parent_symlink/done.out"
+  if WORKBENCH_TEST_QUARANTINE_RENAME_HOOK="$hook" \
+    WORKBENCH_TEST_CLEANUP_RACE_MARKER="$marker" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_parent_symlink "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup followed a quarantine parent replaced by a symlink"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "quarantine parent symlink swap returned $rc"
+  [ -f "$marker" ] || fail "quarantine parent symlink hook did not run"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "parent symlink swap moved the source workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "parent symlink swap removed the retry branch"
+}
+
 test_cleanup_deleted_retry_rejects_tampered_immutable_intent() {
   local out comments rc
   prepare_cleanup_fixture cleanup_tampered_retry
@@ -4369,7 +4787,7 @@ text, count = re.subn(
     lambda match: match.group(1) + 'sha256:' + 'f' * 64 + match.group(2),
     text,
 )
-assert count == 1, count
+assert count == 2, count
 with open(path, "w", encoding="utf-8") as handle:
     handle.write(text)
 PY
@@ -5027,6 +5445,7 @@ test_writer_operation_cancel_distinguishes_no_effect_from_external_effect() {
   sed -i.bak 's/action.task.concurrent-write=allow/action.task.concurrent-write=ask/' \
     "$WRITER_REPO/.workbench/policy.conf"
   rm "$WRITER_REPO/.workbench/policy.conf.bak"
+  printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
   git -C "$WRITER_REPO" add .workbench/policy.conf
   git -C "$WRITER_REPO" commit -q -m "test: require writer authorization"
   git -C "$WRITER_REPO" push -q
@@ -5080,6 +5499,34 @@ PY
     --operation-id "$operation_id" --format json)"
   assert_contains "$actual" '"changed":false'
 
+  actual="$(run_task_in_dir writer_operation_cancel "$task_dir" abandon \
+    --reason-code superseded --reason-ref issue:80 --format json)"
+  assert_contains "$actual" '"outcome":"abandoned"'
+  git -C "$task_dir" add task
+  if ! git -C "$task_dir" diff --cached --quiet; then
+    git -C "$task_dir" commit -q -m "test: persist cancelled-writer abandonment"
+  fi
+  git -C "$task_dir" push -q
+  actual="$(run_task writer_operation_cancel "$WRITER_REPO" done 29 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+  assert_contains "$actual" '"released_writer_operations":['
+  python3 - "$TMPDIR/writer_operation_cancel/comments/29.comments" <<'PY'
+import json
+import re
+import sys
+
+documents = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+]
+assert [item["stage"] for item in documents] == ["prepared", "quarantined", "completed"]
+assert all(item["effect_owner_events"] == [] for item in documents)
+assert documents[-1]["removal_plan"]["writer_operations"][0]["disposition"] == "cancel-no-effect"
+PY
+
   prepare_writer_task writer_operation_cancel 31 claim; claim_task="$WRITER_TASK_DIR"
   claim_out="$TMPDIR/writer_operation_cancel/remote-claim.out"
   if WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM=1 \
@@ -5111,6 +5558,43 @@ rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().
 claims = [row for row in rows if row[0] == "claim" and row[1] == sys.argv[2]]
 assert [row[-1] for row in claims] == ["active"]
 assert not [row for row in rows if row[0] == "effect-owner" and row[2] == sys.argv[2]]
+PY
+
+  actual="$(run_task_in_dir writer_operation_cancel "$claim_task" abandon \
+    --reason-code superseded --reason-ref issue:81 --format json)"
+  assert_contains "$actual" '"outcome":"abandoned"'
+  git -C "$claim_task" add task
+  if ! git -C "$claim_task" diff --cached --quiet; then
+    git -C "$claim_task" commit -q -m "test: persist remote-claimed abandonment"
+  fi
+  git -C "$claim_task" push -q
+  actual="$(run_task writer_operation_cancel "$WRITER_REPO" done 31 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+  git --git-dir="$TMPDIR/writer_operation_cancel/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$claim_operation_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row for row in rows if row[0] == "claim" and row[1] == sys.argv[2]]
+effects = [row for row in rows if row[0] == "effect-owner" and row[2] == sys.argv[2]]
+assert [row[-1] for row in claims] == ["active", "released"]
+assert effects == []
+PY
+  python3 - "$TMPDIR/writer_operation_cancel/comments/31.comments" <<'PY'
+import json
+import re
+import sys
+
+documents = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+]
+assert [item["stage"] for item in documents] == ["prepared", "quarantined", "completed"]
+assert all(item["effect_owner_events"] == [] for item in documents)
+assert documents[-1]["removal_plan"]["writer_operations"][0]["disposition"] == "compensate-release"
 PY
 }
 
@@ -5176,6 +5660,70 @@ assert [row[-1] for row in claims] == ["active"]
 assert [row[-1] for row in effects] == ["acquired", "released", "acquired"]
 assert effects[-1][4:6] == [sys.argv[3], sys.argv[4]]
 assert effects[0][4:6] == effects[1][4:6]
+PY
+}
+
+test_cleanup_releases_handoff_ready_claim_after_quarantine() {
+  local task_dir actual operation_id claim_id target_device target_clone ledger ref comments
+  setup_writer_workbench cleanup_handoff_ready
+  printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
+  git -C "$WRITER_REPO" add .workbench/policy.conf
+  git -C "$WRITER_REPO" commit -q -m "test: allow handoff cleanup abandonment"
+  git -C "$WRITER_REPO" push -q
+  prepare_writer_task cleanup_handoff_ready 29 handoffcleanup; task_dir="$WRITER_TASK_DIR"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir cleanup_handoff_ready "$task_dir" add-repo shared-api --format json)"
+  operation_id="$(json_get "$actual" operation_id)"
+  claim_id="$(json_get "$actual" claim_id)"
+  target_device=device:fixture/handoff-cleanup
+  target_clone=22222222-2222-4222-8222-222222222222
+  actual="$(run_task_in_dir cleanup_handoff_ready "$task_dir" writer-operation handoff \
+    --operation-id "$operation_id" --to-device-id "$target_device" \
+    --to-clone-id "$target_clone" --format json)"
+  assert_contains "$actual" '"operation_stage":"handoff-ready"'
+  [ ! -e "$task_dir/task/codebases/shared-api" ] || fail "handoff cleanup retained a worktree"
+
+  actual="$(run_task_in_dir cleanup_handoff_ready "$task_dir" abandon \
+    --reason-code superseded --reason-ref issue:79 --format json)"
+  assert_contains "$actual" '"outcome":"abandoned"'
+  git -C "$task_dir" add task
+  if ! git -C "$task_dir" diff --cached --quiet; then
+    git -C "$task_dir" commit -q -m "test: persist handoff-ready abandonment"
+  fi
+  git -C "$task_dir" push -q
+  actual="$(run_task cleanup_handoff_ready "$WRITER_REPO" done 29 --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
+  assert_contains "$actual" "\"released_writer_operations\":[{\"operation_id\":\"$operation_id\",\"claim_id\":\"$claim_id\"}]"
+
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/cleanup_handoff_ready/writer-claims.tsv"
+  git --git-dir="$TMPDIR/cleanup_handoff_ready/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$operation_id" "$claim_id" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert [row[-1] for row in claims] == ["active", "released"]
+assert [row[-1] for row in effects] == ["acquired", "released"]
+PY
+  comments="$TMPDIR/cleanup_handoff_ready/comments/29.comments"
+  python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+documents = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+]
+assert [item["stage"] for item in documents] == ["prepared", "quarantined", "completed"]
+assert all(item["effect_owner_events"] == [] for item in documents)
+assert documents[-1]["quarantine_receipt"] == documents[1]["quarantine_receipt"]
 PY
 }
 
@@ -5726,7 +6274,7 @@ PY
 
 test_cleanup_retires_consumed_writer_before_local_deletion() {
   local task_dir actual operation_id claim_id ledger ref comments operation gitdir marker backup out
-  local observation revision legacy_adapter frozen_task_oid
+  local observation revision legacy_adapter frozen_task_oid common locator bundle admin_count
   setup_writer_workbench writer_cleanup
   printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
   git -C "$WRITER_REPO" add .workbench/policy.conf
@@ -5832,6 +6380,38 @@ PY
   fi
   assert_file_contains "$out" '"code":"cleanup-journal-unavailable"'
   [ ! -d "$task_dir" ] || fail "prepared writer cleanup did not remove the task workspace"
+  comments="$TMPDIR/writer_cleanup/comments/29.comments"
+  common="$(git -C "$WRITER_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$WRITER_REPO" && cd "$common" && pwd -P)"
+  locator="$(python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+documents = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+]
+receipts = [item["quarantine_receipt"] for item in documents if item["stage"] == "quarantined"]
+assert receipts and all(item == receipts[0] for item in receipts)
+print(receipts[0]["quarantine_locator"])
+PY
+)"
+  bundle="$common/$locator"
+  [ -f "$bundle/workspace/task/codebases/shared-api/README.md" ] \
+    || fail "writer quarantine lost nested codebase bytes"
+  [ -f "$bundle/workspace/task/.workbench/writer-operations/$operation_id.json" ] \
+    || fail "writer quarantine lost its operation provenance"
+  [ -d "$bundle/admins/task" ] || fail "writer quarantine lost the task admin record"
+  admin_count="$(find "$bundle/admins" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+  [ "$admin_count" = 2 ] || fail "writer quarantine did not preserve both admin records"
+  if git -C "$WRITER_REPO/.codebases/shared-api" worktree list --porcelain \
+    | grep -Fq 'branch refs/heads/task/29-v2-lifecycle-fixture-29'; then
+    fail "writer quarantine retained the live nested worktree registration"
+  fi
   [ "$(git --git-dir="$TMPDIR/writer_cleanup/origin.git" \
     rev-parse refs/heads/task/29-v2-lifecycle-fixture-29)" = "$frozen_task_oid" ] \
     || fail "cleanup rewrote frozen terminal task content"
@@ -5858,7 +6438,6 @@ assert [row[-1] for row in claims] == ["active", "released"]
 assert [row[-1] for row in effects] == ["acquired", "released"]
 assert effects[0][4:6] == effects[1][4:6]
 PY
-  comments="$TMPDIR/writer_cleanup/comments/29.comments"
   python3 - "$comments" "$operation_id" "$claim_id" <<'PY'
 import json
 import re
@@ -5870,6 +6449,15 @@ documents = [
 ]
 assert documents[0]["stage"] == "prepared"
 assert documents[-1]["stage"] == "completed"
+quarantined = [item for item in documents if item["stage"] == "quarantined"]
+assert quarantined
+assert quarantined[0]["effect_owner_events"] == []
+assert documents.index(quarantined[0]) < next(
+    index for index, item in enumerate(documents) if item["effect_owner_events"]
+)
+receipt = quarantined[0]["quarantine_receipt"]
+assert receipt is not None
+assert all(item["quarantine_receipt"] == receipt for item in documents[1:])
 events = documents[-1]["effect_owner_events"]
 assert [(item["state"], item["phase"]) for item in events] == [
     ("acquired", "intended"), ("acquired", "verified"),
@@ -7780,6 +8368,13 @@ run_case test_cleanup_rejects_untrusted_prepared_journal
 run_case test_cleanup_rejects_prepared_journal_without_terminal_action_join
 run_case test_cleanup_journal_recovers_completed_and_lifecycle_after_deletion
 run_case test_cleanup_releases_work_ref_reservation_after_workspace_removal
+run_case test_cleanup_prepared_quarantine_cannot_be_promoted_by_foreign_clone
+run_case test_cleanup_quarantine_conflict_preserves_recreated_path
+run_case test_cleanup_rejects_tampered_local_quarantine_receipt
+run_case test_cleanup_quarantine_rejects_hardlinked_boundary_without_deletion
+run_case test_cleanup_quarantine_rolls_forward_after_workspace_rename_crash
+run_case test_cleanup_quarantine_never_replaces_a_racing_destination
+run_case test_cleanup_quarantine_rejects_parent_symlink_swap
 run_case test_cleanup_deleted_retry_rejects_tampered_immutable_intent
 run_case test_v2_cleanup_requires_terminal_outcome_even_with_force
 run_case test_writer_claim_cas_retry_rechecks_conflict_before_local_creation
@@ -7798,6 +8393,7 @@ run_case test_writer_zero_history_recovery_rebinds_before_once_only_owner_acquir
 run_case test_writer_zero_history_rejects_nonexact_remote_binding
 run_case test_writer_operation_cancel_distinguishes_no_effect_from_external_effect
 run_case test_writer_operation_handoff_transfers_to_explicit_clone
+run_case test_cleanup_releases_handoff_ready_claim_after_quarantine
 run_case test_writer_effect_prefix_crashes_resume_once_only
 run_case test_writer_effect_prefix_mismatch_preserves_external_effects
 run_case test_writer_effect_prefix_resumes_bound_conflict_action

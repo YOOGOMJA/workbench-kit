@@ -40,7 +40,7 @@ The following English identifiers are stable across tools and output languages.
 | knowledge | Reusable decisions, lessons, and runbooks accumulated across tasks |
 | completion | Acceptance of every required outcome under current evidence and policy |
 | abandonment | A terminal decision not to adopt the task's intended result |
-| cleanup | Removal of task workspaces and local branches after a terminal outcome |
+| cleanup | Authenticated retirement of task workspaces into non-deleting quarantine, followed by local-branch release |
 
 Translations may be shown to a person, but stored keys, schema IDs, lifecycle values,
 capability IDs, and command names stay in English.
@@ -139,11 +139,12 @@ selection chain. Any failed atomic push re-observes the requested reservation so
 owner remains a duplicate-work failure even when this claim already had a prior selection.
 Malformed history or a remote without atomic-push support fails closed.
 
-A terminal task retains its selection and reservation until cleanup has removed the task
-workspace; cleanup then atomically releases the selection and every reservation bound to that
-claim and branch before deleting the local branch. This ordering lets a cleanup retry finish
-after the workspace is gone without making the work item concurrently reusable while user
-bytes still exist. Tasks created before this coordination contract remain readable; their
+A terminal task retains its selection and reservation until cleanup has durably published an
+authenticated quarantine receipt for the task workspace. Cleanup then atomically releases the
+selection and every reservation bound to that claim and branch before deleting the local
+branch. This ordering lets a cleanup retry finish after the active workspace path is gone
+without making the work item concurrently reusable before every user byte is preserved in
+quarantine. Tasks created before this coordination contract remain readable; their
 current value and first selection are materialized lazily on the next matching `refs set`,
 while authoritative inventory continues to protect them during migration.
 
@@ -418,21 +419,24 @@ accepted deliverables, passing evidence, harvest disposition, or completed write
 claiming those would misstate non-adoption as completion. It freezes new writer effects and
 delegates exact compensation and release of existing operations to cleanup.
 
-Cleanup is never a completion predicate. Destructive cleanup before completion or
+Cleanup is never a completion predicate. Cleanup before completion or
 abandonment is invalid for v2 tasks. Existing v1 force-cleanup behavior remains a legacy
 compatibility path until migration policy removes it in a future major contract. V2 cleanup
 is the governed `task.cleanup` action and has its own terminal-revision plus exact
 `workbench-task-removal-plan/v1` intent binding, blockers, and
-retry semantics in [[workbench-v2-cli-contract]]. Before deleting task-local recovery state,
-it persists a `prepared` cleanup journal in the task home's issue comments; retries reconcile
-that external receipt's writer operation/claim pairs and every intended/verified effect-owner
-event through exact worktree retirement, verified CAS release, `completed`, and
-`task-cleaned`. All releases finish before task
-workspace deletion. The final deletion rechecks ownership and dirtiness, temporarily stages
-only cleanup-owned mutable action state (or an authenticated submitted-state restoration),
-and uses non-forced worktree removal. A concurrent byte makes removal fail and the staged
-state is restored for retry. A post-delete retry uses the external journal and remote ledger.
-Release does not mutate frozen task content.
+retry semantics in [[workbench-v2-cli-contract]]. It first fsyncs a clone-local arm record,
+then persists a `prepared` cleanup journal in the task home's issue comments. The owning clone
+uses atomic no-replace renames to move the complete task workspace plus every linked-worktree
+admin record into a private git-common-relative quarantine. A strict no-follow inode/tree
+authentication covers tracked, untracked, ignored, private-action, nested-codebase, and Git
+admin bytes. The resulting fsynced receipt is published externally as `quarantined` before
+any writer claim, effect owner, work-reference reservation, or task branch is released.
+Retries then reconcile every intended/verified effect-owner event through verified CAS
+release, `completed`, and `task-cleaned`. A crash rolls the local quarantine transaction
+forward; it never restores over an occupied path. A different clone cannot promote
+`prepared` without the owning clone's local arm/receipt. Cleanup does not physically delete
+the quarantine; retention or garbage collection is a separate future operation. Release does
+not mutate frozen task content.
 
 Completion and abandonment both freeze every revision-affecting fact. Refs, context set,
 deliverables and acceptance, required checks, evidence, harvest, and writer claims reject
@@ -658,7 +662,7 @@ The canonical v1 shape is:
       "workbench-owner-acceptance/v1"
     ],
     "external_probe_contracts": ["workbench-probe/github-pr-subject/v1", "workbench-probe/github-pr/v1"],
-    "cleanup_journal_contracts": ["workbench-task-removal-plan/v1", "workbench-task-cleanup-journal/v1"],
+    "cleanup_journal_contracts": ["workbench-task-removal-plan/v1", "workbench-task-cleanup-journal/v1", "workbench-task-quarantine-authority/v1", "workbench-task-quarantine-receipt/v1"],
     "doctor_contracts": ["workbench-doctor/v1"],
     "evidence_contracts": ["workbench-evidence/v1"],
     "writer_claim_contracts": [
