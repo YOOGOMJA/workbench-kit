@@ -5138,7 +5138,7 @@ PY
 }
 
 test_writer_authority_revalidation_fails_closed_without_compensation() {
-  local task_dir out first operation_id claim_id retry ledger ref
+  local task_dir out first operation_id claim_id retry ledger ref authority
   setup_writer_workbench writer_revalidate_authority
   prepare_writer_task writer_revalidate_authority 29 authgate; task_dir="$WRITER_TASK_DIR"
   out="$TMPDIR/writer_revalidate_authority/claim.out"
@@ -5150,9 +5150,14 @@ test_writer_authority_revalidation_fails_closed_without_compensation() {
   fi
   first="$(cat "$out")"; operation_id="$(json_get "$first" operation_id)"
   claim_id="$(json_get "$first" claim_id)"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 9' \
-    > "$TMPDIR/writer_revalidate_authority/bin/hosting-authority"
-  chmod +x "$TMPDIR/writer_revalidate_authority/bin/hosting-authority"
+  authority="$TMPDIR/writer_revalidate_authority/bin/hosting-authority"
+  mv "$authority" "$authority.real"
+  cat > "$authority" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = authority ]; then exit 9; fi
+exec "$authority.real" "\$@"
+EOF
+  chmod +x "$authority"
   retry="$TMPDIR/writer_revalidate_authority/retry.out"
   if WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
     WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
