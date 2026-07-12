@@ -4963,6 +4963,13 @@ submission_recovery_retire() {
     --repository "$repository" --branch "$branch" --claim-id "$claim_id" >/dev/null
 }
 
+submission_recovery_reactivate() {
+  local repository="$1" branch="$2" claim_id="$3" revision="$4"
+  python3 "$(lifecycle_helper)" submission-recovery-reactivate \
+    --repository "$repository" --branch "$branch" --claim-id "$claim_id" \
+    --reactivation-revision "$revision" >/dev/null
+}
+
 submission_lifecycle_reduce() {
   local root="$1" home="$2" issue="$3" claim_id="$4" branch="$5" descriptor_digest="$6"
   local markers parsed line key value home_arg="${home:--}"
@@ -5605,13 +5612,38 @@ current_task_identity() {
 }
 
 activate_v2_task_once() {
-  local latest event
+  local latest event recovered=false reactivation_revision
   latest="$(lifecycle_latest_for_branch "$CURRENT_ROOT" "$CURRENT_HOME" \
-    "$CURRENT_ISSUE" "$CURRENT_BRANCH" 2>/dev/null)" || return 0
+    "$CURRENT_ISSUE" "$CURRENT_BRANCH" 2>/dev/null)" || return 1
   event="$(lifecycle_field "$latest" event)"
-  [ "$event" = task-claimed ] || return 0
-  lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-active \
-    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" >/dev/null 2>&1 || true
+  case "$event" in
+    task-active)
+      submission_recovery_reactivate "$TASK_DIR" "$CURRENT_BRANCH" "$CURRENT_CLAIM_ID" \
+        "$(git -C "$TASK_DIR" rev-parse HEAD)" || return 1
+      return 0
+      ;;
+    task-claimed|task-verified|task-submitted) ;;
+    *) echo "error: lifecycle activation transition is unavailable" >&2; return 1 ;;
+  esac
+  if [ "${SUBMISSION_RECOVERY_ACTIVE:-false}" = true ] \
+    && ! git -C "$TASK_DIR" ls-files --error-unmatch task/index.md >/dev/null 2>&1; then
+    git -C "$TASK_DIR" add -f -- task ':(exclude)task/codebases' || return 1
+    recovered=true
+    git -C "$TASK_DIR" commit -q -m "task($(index_get id)): reactivate" || return 1
+  fi
+  reactivation_revision="$(git -C "$TASK_DIR" rev-parse HEAD)" || return 1
+  if [ "$recovered" = true ] || [ "$event" = task-submitted ]; then
+    git -C "$TASK_DIR" push -q -u origin "$CURRENT_BRANCH" || return 1
+  fi
+  if ! lifecycle_emit "$CURRENT_ROOT" "$CURRENT_HOME" "$CURRENT_ISSUE" task-active \
+    "$CURRENT_CLAIM_ID" "$CURRENT_BRANCH" >/dev/null 2>&1; then
+    return 1
+  fi
+  if [ "$recovered" = true ] || [ "$event" = task-submitted ]; then
+    submission_recovery_reactivate "$TASK_DIR" "$CURRENT_BRANCH" "$CURRENT_CLAIM_ID" \
+      "$reactivation_revision" || return 1
+    SUBMISSION_RECOVERY_ACTIVE=false
+  fi
 }
 
 require_mutable_task() {

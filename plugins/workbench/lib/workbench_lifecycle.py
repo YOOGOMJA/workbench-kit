@@ -699,22 +699,21 @@ def validate_active_pull_requests(value: Any) -> List[Dict[str, Any]]:
 
 
 def reduce_lifecycle_marker(
-    groups: Dict[str, Dict[str, Any]], marker: Dict[str, Any]
+    groups: Dict[Tuple[str, str], Dict[str, Any]], marker: Dict[str, Any]
 ) -> None:
-    if marker["event"] == "task-claim-conflict":
-        return
     branch = marker["branch"]
+    key = (branch, marker["claim_id"])
     identity = (
         marker["claim_id"],
         marker["workspace_authority_descriptor_digest"],
         marker["issue"],
         marker["home"],
     )
-    group = groups.get(branch)
+    group = groups.get(key)
     if group is None:
         if marker["event"] != "task-claimed":
             raise ValueError("active task lifecycle does not begin with task-claimed")
-        groups[branch] = {
+        groups[key] = {
             "branch": branch,
             "claim_id": identity[0],
             "workspace_authority_descriptor_digest": identity[1],
@@ -723,6 +722,7 @@ def reduce_lifecycle_marker(
             "active": True,
             "terminal": False,
             "cleaned": False,
+            "conflicted": False,
             "submission": None,
             "phase": "claimed",
         }
@@ -737,6 +737,15 @@ def reduce_lifecycle_marker(
     event = marker["event"]
     if event == "task-claimed":
         raise ValueError("active task lifecycle claim is duplicated")
+    if event == "task-claim-conflict":
+        if group["phase"] != "claimed" or group["terminal"] or group["cleaned"]:
+            raise ValueError("active task claim conflict transition is invalid")
+        group["active"] = False
+        group["conflicted"] = True
+        group["phase"] = "claim-conflict"
+        return
+    if group["conflicted"]:
+        raise ValueError("active task lifecycle resumed after claim conflict")
     if event == "task-cleaned":
         if not group["terminal"] or group["cleaned"]:
             raise ValueError("active task cleanup transition is invalid")
@@ -747,6 +756,13 @@ def reduce_lifecycle_marker(
     if group["terminal"]:
         raise ValueError("active task lifecycle resumed after a terminal event")
     if event == "task-active":
+        if group["phase"] not in (
+            "claimed",
+            "verified",
+            "submitted",
+            "submitted-verified",
+        ):
+            raise ValueError("active task activation transition is invalid")
         group["active"] = True
         group["submission"] = None
         group["phase"] = "active"
@@ -805,7 +821,7 @@ def active_lifecycle_groups(
         raise ValueError("active task issues are not canonically sorted")
     if len(issues) != len({item.get("number") for item in issues}):
         raise ValueError("duplicate active task issue")
-    groups: Dict[str, Dict[str, Any]] = {}
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for issue in issues:
         require_fields(issue, ACTIVE_ISSUE_FIELDS, "active task issue")
         number = issue["number"]
@@ -830,7 +846,16 @@ def active_lifecycle_groups(
             if marker["issue"] != number:
                 raise ValueError("active task lifecycle issue does not match its issue")
             reduce_lifecycle_marker(groups, marker)
-    return [group for group in groups.values() if group["active"]]
+    active: List[Dict[str, Any]] = []
+    branches = set()
+    for group in groups.values():
+        if not group["active"]:
+            continue
+        if group["branch"] in branches:
+            raise ValueError("active task lifecycle branch has multiple live claims")
+        branches.add(group["branch"])
+        active.append(group)
+    return active
 
 
 def build_active_task_inventory(
@@ -2747,8 +2772,101 @@ def cmd_submission_recovery_retire(args: argparse.Namespace) -> None:
         os.close(directory)
 
 
+def cmd_submission_recovery_reactivate(args: argparse.Namespace) -> None:
+    directory = open_submission_directory(args.repository, False)
+    if directory is None:
+        return
+    lock = -1
+    try:
+        lock = open_submission_lock(directory, args.branch)
+        value = read_submission_recovery_at(directory, args.branch)
+        if value is None:
+            lock_status = os.fstat(lock)
+            lock_name = submission_recovery_name(args.branch) + ".lock"
+            named = os.stat(lock_name, dir_fd=directory, follow_symlinks=False)
+            validate_recovery_inode(named, "lock")
+            if (lock_status.st_dev, lock_status.st_ino) != (named.st_dev, named.st_ino):
+                raise ValueError("submission recovery lock changed before reactivation")
+            os.unlink(lock_name, dir_fd=directory)
+            os.fsync(directory)
+            return
+        if (
+            value["branch"] != args.branch
+            or value["claim_id"] != args.claim_id
+            or value["stage"] != "restored"
+        ):
+            raise ValueError("submission recovery reactivation identity mismatch")
+        validate_recovery_snapshot(args.repository, value)
+        validate_cleanup_revision(args.repository, value, value["cleanup_revision"])
+        validate_recovery_authority(args.repository, value)
+        head = git_bytes(args.repository, "rev-parse", "HEAD").decode("ascii").strip()
+        if head != args.reactivation_revision or OID.fullmatch(head) is None:
+            raise ValueError("submission reactivation revision changed")
+        branch = git_bytes(
+            args.repository, "symbolic-ref", "--quiet", "--short", "HEAD"
+        ).decode("utf-8").strip()
+        if branch != value["branch"]:
+            raise ValueError("submission reactivation branch changed")
+        parents = git_bytes(
+            args.repository, "rev-list", "--parents", "-n", "1", head
+        ).decode("ascii").split()
+        if parents != [head, value["cleanup_revision"]]:
+            raise ValueError("submission reactivation is not a direct cleanup successor")
+        changed = git_bytes(
+            args.repository,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            head,
+        ).decode("utf-8").splitlines()
+        if not changed or any(not path.startswith("task/") for path in changed):
+            raise ValueError("submission reactivation changed a non-task path")
+        if git_bytes(args.repository, "status", "--porcelain"):
+            raise ValueError("submission reactivation worktree is dirty")
+        validate_restored_submission_state(args.repository, directory, value)
+        staging = submission_task_staging_name(value)
+        try:
+            os.stat(staging, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("submission recovery staging remains during reactivation")
+        parking = codebases_parking_name(args.branch)
+        try:
+            os.stat(parking, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("submission codebases remain parked during reactivation")
+        marker = read_codebases_marker(directory, args.branch)
+        if marker is not None:
+            if (
+                marker["branch"] != value["branch"]
+                or marker["claim_id"] != value["claim_id"]
+                or marker["snapshot_revision"] != value["snapshot_revision"]
+            ):
+                raise ValueError("submission codebases reactivation marker mismatch")
+            unlink_regular_at(
+                directory, codebases_marker_name(args.branch), "codebases marker"
+            )
+        unlink_regular_at(directory, submission_recovery_name(args.branch), "record")
+        lock_status = os.fstat(lock)
+        lock_name = submission_recovery_name(args.branch) + ".lock"
+        named = os.stat(lock_name, dir_fd=directory, follow_symlinks=False)
+        validate_recovery_inode(named, "lock")
+        if (lock_status.st_dev, lock_status.st_ino) != (named.st_dev, named.st_ino):
+            raise ValueError("submission recovery lock changed before reactivation")
+        os.unlink(lock_name, dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        if lock >= 0:
+            os.close(lock)
+        os.close(directory)
+
+
 def cmd_lifecycle_reduce(args: argparse.Namespace) -> None:
-    groups: Dict[str, Dict[str, Any]] = {}
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
     with open(args.markers_file, encoding="utf-8") as handle:
         for raw in handle:
             if not raw.endswith("\n"):
@@ -2758,10 +2876,17 @@ def cmd_lifecycle_reduce(args: argparse.Namespace) -> None:
             if marker["task_contract"] != "workbench-task/v2":
                 continue
             reduce_lifecycle_marker(groups, marker)
-    group = groups.get(args.branch)
+    group = groups.get((args.branch, args.claim_id))
     expected_home = None if args.home == "-" else args.home
     if group is None:
         raise ValueError("submission lifecycle identity is absent")
+    if any(
+        candidate["branch"] == args.branch
+        and candidate["claim_id"] != args.claim_id
+        and candidate["active"]
+        for candidate in groups.values()
+    ):
+        raise ValueError("submission lifecycle branch has another live claim")
     if (
         group["claim_id"] != args.claim_id
         or group["issue"] != args.issue
@@ -2931,6 +3056,12 @@ def parser() -> argparse.ArgumentParser:
     recovery_retire.add_argument("--branch", required=True)
     recovery_retire.add_argument("--claim-id", required=True)
     recovery_retire.set_defaults(func=cmd_submission_recovery_retire)
+    recovery_reactivate = commands.add_parser("submission-recovery-reactivate")
+    recovery_reactivate.add_argument("--repository", required=True)
+    recovery_reactivate.add_argument("--branch", required=True)
+    recovery_reactivate.add_argument("--claim-id", required=True)
+    recovery_reactivate.add_argument("--reactivation-revision", required=True)
+    recovery_reactivate.set_defaults(func=cmd_submission_recovery_reactivate)
     lifecycle_reduce = commands.add_parser("lifecycle-reduce")
     lifecycle_reduce.add_argument("--markers-file", required=True)
     lifecycle_reduce.add_argument("--branch", required=True)

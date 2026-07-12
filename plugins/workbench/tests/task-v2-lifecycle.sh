@@ -1482,6 +1482,44 @@ PY
     || fail "status lost the task authority descriptor binding"
 }
 
+test_verified_result_change_reactivates_before_primary() {
+  local repo task_dir comments out rc actual
+  repo="$(setup_workbench lifecycle_reactivation)"
+  task_dir="$(start_task lifecycle_reactivation "$repo")"
+  run_task_in_dir lifecycle_reactivation "$task_dir" policy-context seal --format json >/dev/null
+  run_task_in_dir lifecycle_reactivation "$task_dir" verify --format json >/dev/null
+  comments="$TMPDIR/lifecycle_reactivation/comments/29.comments"
+  assert_file_contains "$comments" '"event":"task-verified"'
+
+  out="$TMPDIR/lifecycle_reactivation/reactivation-failed.out"
+  if GH_FAIL_LIFECYCLE_EVENT=task-active \
+    run_task_in_dir lifecycle_reactivation "$task_dir" refs set \
+      --work-ref toolbox:scenario/SCN-REACTIVATE --format json >"$out" 2>&1; then
+    fail "verified result changed after task-active publication failed"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "failed verified reactivation returned $rc"
+  [ -z "$(sed -n 's/^work_ref: *//p' "$task_dir/task/index.md")" ] \
+    || fail "failed verified reactivation wrote the primary"
+
+  actual="$(run_task_in_dir lifecycle_reactivation "$task_dir" refs set \
+    --work-ref toolbox:scenario/SCN-REACTIVATE --format json)"
+  assert_contains "$actual" '"changed":true'
+  python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+markers = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+]
+assert [item["event"] for item in markers][-2:] == ["task-verified", "task-active"], markers
+PY
+}
+
 test_refs_are_opaque_and_duplicate_active_work_is_rejected() {
   local repo first second actual out rc
   repo="$(setup_workbench refs)"
@@ -1836,6 +1874,69 @@ PY
     fail "active inventory accepted a lifecycle identity without task-claimed"
   fi
   assert_file_contains "$out" 'active-task-inventory-unavailable'
+}
+
+test_claim_conflict_retires_only_losing_attempt() {
+  local repo first second branch claim descriptor comments out rc
+  repo="$(setup_workbench claim_conflict_reducer)"
+  first="$(start_task claim_conflict_reducer "$repo" 29)"
+  run_task_in_dir claim_conflict_reducer "$first" refs set \
+    --work-ref toolbox:scenario/SCN-CLAIM-WINNER --format json >/dev/null
+  git -C "$first" add task/index.md
+  git -C "$first" commit -q -m "test: persist winning work reference"
+  git -C "$first" push -q
+  branch="$(git -C "$first" branch --show-current)"
+  claim="$(sed -n 's/^claim_id: *//p' "$first/task/index.md")"
+  descriptor="$(sed -n 's/^workspace_authority_descriptor_digest: *//p' \
+    "$first/task/index.md")"
+  comments="$TMPDIR/claim_conflict_reducer/comments/29.comments"
+  python3 - "$comments" "$branch" "$descriptor" <<'PY'
+import json
+import sys
+
+path, branch, descriptor = sys.argv[1:]
+loser = "task__29-losing-concurrent-claim"
+with open(path, "a", encoding="utf-8") as handle:
+    for event, at in (
+        ("task-claimed", "2026-07-12T10:00:00Z"),
+        ("task-claim-conflict", "2026-07-12T10:00:01Z"),
+    ):
+        marker = {
+            "task_contract": "workbench-task/v2",
+            "event": event,
+            "claim_id": loser,
+            "issue": 29,
+            "home": None,
+            "branch": branch,
+            "workspace_authority_descriptor_digest": descriptor,
+            "pr": None,
+            "revision": None,
+            "action_instance_id": None,
+            "intent_digest": None,
+            "actor": "test@example.invalid",
+            "tool": "workbench",
+            "at": at,
+        }
+        handle.write("<!-- fixture-comment-author:test@example.invalid -->\n")
+        handle.write("<!-- workbench-task-lifecycle:v2\n")
+        handle.write(json.dumps(marker, separators=(",", ":")) + "\n")
+        handle.write("-->\nworkbench task lifecycle: {}\n".format(event))
+        handle.write("<!-- fixture-comment-end -->\n")
+PY
+
+  second="$(start_task claim_conflict_reducer "$repo" 31)"
+  out="$TMPDIR/claim_conflict_reducer/duplicate.out"
+  if run_task_in_dir claim_conflict_reducer "$second" refs set \
+    --work-ref toolbox:scenario/SCN-CLAIM-WINNER --format json >"$out" 2>&1; then
+    fail "losing claim conflict erased the winning work reference"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "claim conflict duplicate returned $rc"
+  assert_file_contains "$out" 'duplicate active work_ref'
+  if grep -Fq 'active-task-inventory-unavailable' "$out"; then
+    fail "losing claim conflict left lifecycle identity ambiguous"
+  fi
+  [ "$(sed -n 's/^claim_id: *//p' "$first/task/index.md")" = "$claim" ] \
+    || fail "claim conflict changed the winning local identity"
 }
 
 test_policy_context_is_owner_authorized_sealed_and_manifest_bound() {
@@ -5426,6 +5527,42 @@ PY
   [ "$(git -C "$task_dir" branch --show-current)" = "$branch" ] || fail "submit changed task branch"
 }
 
+test_submitted_result_change_reactivates_tracked_task() {
+  local branch comments actual repeated
+  prepare_submission_fixture submit_reactivation
+  run_task_in_dir submit_reactivation "$SUBMISSION_TASK_DIR" submit \
+    --title "fix: reactivate submitted task" --body-file "$SUBMISSION_BODY" >/dev/null
+  branch="$(git -C "$SUBMISSION_TASK_DIR" branch --show-current)"
+  ! git -C "$SUBMISSION_TASK_DIR" ls-files --error-unmatch task/index.md >/dev/null 2>&1 \
+    || fail "submitted fixture unexpectedly retained tracked task state"
+
+  actual="$(run_task_in_dir submit_reactivation "$SUBMISSION_TASK_DIR" refs set \
+    --work-ref toolbox:scenario/SCN-SUBMITTED-CHANGE --format json)"
+  assert_contains "$actual" '"changed":true'
+  git -C "$SUBMISSION_TASK_DIR" ls-files --error-unmatch task/index.md >/dev/null 2>&1 \
+    || fail "submitted reactivation did not restore tracked task state"
+  repeated="$(run_task_in_dir submit_reactivation "$SUBMISSION_TASK_DIR" refs set \
+    --work-ref toolbox:scenario/SCN-SUBMITTED-CHANGE --format json)"
+  assert_contains "$repeated" '"changed":false'
+
+  comments="$TMPDIR/submit_reactivation/comments/29.comments"
+  python3 - "$comments" "$branch" <<'PY'
+import json
+import re
+import sys
+
+markers = [
+    json.loads(raw)
+    for raw in re.findall(
+        r"<!-- workbench-task-lifecycle:v2\n([^\r\n]+)\n-->",
+        open(sys.argv[1], encoding="utf-8").read(),
+    )
+    if json.loads(raw)["branch"] == sys.argv[2]
+]
+assert [item["event"] for item in markers][-2:] == ["task-submitted", "task-active"], markers
+PY
+}
+
 test_v1_submission_without_origin_head_uses_main_fallback() {
   local repo task_dir body actual
   repo="$(setup_workbench v1_submit_no_head workbench/v1)"
@@ -6686,6 +6823,7 @@ run_case() {
 run_case test_v1_rejects_v2_mutation_but_keeps_legacy_start
 run_case test_start_rejects_noncanonical_schema_slug_and_home
 run_case test_v2_start_and_resume_are_authority_bound_skeletons
+run_case test_verified_result_change_reactivates_before_primary
 run_case test_refs_are_opaque_and_duplicate_active_work_is_rejected
 run_case test_work_ref_uniqueness_rejects_remote_only_task
 run_case test_work_ref_uniqueness_retains_submitted_deleted_branch
@@ -6695,6 +6833,7 @@ run_case test_work_ref_inventory_is_cross_clone
 run_case test_work_ref_inventory_uses_authority_default_ref
 run_case test_work_ref_inventory_fails_closed_on_identity_mismatch
 run_case test_work_ref_inventory_rejects_lifecycle_without_initial_claim
+run_case test_claim_conflict_retires_only_losing_attempt
 run_case test_deliverables_and_revision_bound_evidence
 run_case test_tracked_v2_records_cannot_forge_accepted_or_waived_state
 run_case test_evidence_time_is_kernel_owned_and_future_rows_fail_closed
@@ -6758,6 +6897,7 @@ run_case test_cleanup_descriptor_pins_task_and_clone_common_dirs
 run_case test_cleanup_rejects_broken_symlink_worktree
 run_case test_status_reports_concurrent_writer_conflicts
 run_case test_v2_submit_reconciles_durable_submission_without_v1_fallback
+run_case test_submitted_result_change_reactivates_tracked_task
 run_case test_v1_submission_without_origin_head_uses_main_fallback
 run_case test_v2_submission_restores_authenticated_state_to_terminal_cleanup
 run_case test_v2_submission_crash_boundaries_are_idempotent
