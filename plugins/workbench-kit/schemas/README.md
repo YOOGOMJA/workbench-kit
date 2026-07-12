@@ -35,3 +35,16 @@ schema-authoring tools and must not be used to claim runtime equivalence.
 
 Importing the normal upgrade CLI does not import `jsonschema`; only consumers
 of this validator surface need these dependencies.
+
+Validated product documents are normalized to the member order listed by their
+contract before canonical serialization and object hashing. Raw JSON member
+order is not semantic, so callers must validate and normalize strict contract
+objects before calling `canonical_bytes()` or `canonical_digest()`.
+
+In a plugin-equivalence receipt, an `allowed_roots` entry owns either the file
+or symlink at that exact path, or the removable nodes strictly below a directory
+at that path. Exact leaf roots are required for discovery links such as
+`.agents/skills` and `.claude/skills`; sibling state such as
+`.claude/settings.json` remains outside the removal surface. Allowed roots and
+removable nodes remain path-sorted, collision-free, and ancestor-disjoint, and
+every discovery link must be an identical member of `removable_nodes`.

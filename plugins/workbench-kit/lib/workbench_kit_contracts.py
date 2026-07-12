@@ -309,7 +309,7 @@ def canonical_bytes(value: Any) -> bytes:
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
-            sort_keys=True,
+            sort_keys=False,
         )
     except (TypeError, ValueError) as error:
         raise ContractError("canonical-json-invalid", "value") from error
@@ -703,7 +703,10 @@ def validate_equivalence_receipt(value: Any) -> dict[str, Any]:
     if not removable:
         fail("removable_nodes")
     for node in removable:
-        if not any(node["path"].startswith(root + "/") for root in roots):
+        if not any(
+            node["path"] == root or node["path"].startswith(root + "/")
+            for root in roots
+        ):
             fail("removable_nodes")
     discovery = [
         validate_legacy_node(item, "discovery_link")

@@ -49,6 +49,63 @@ class SchemaValidationError(ValueError):
         self.ref = ref
 
 
+def _bind_result_to_plan(
+    filename: str,
+    result: dict[str, Any],
+    plan: dict[str, Any],
+    *,
+    allow_terminal_replay: bool,
+) -> None:
+    for field, plan_field in (
+        ("plan_digest", "plan_digest"),
+        ("classification_before", "classification_before"),
+        ("target_classification", "target_classification"),
+        ("embedded_engine", "embedded_engine"),
+        ("provenance_final", "provenance_after"),
+        ("workspace", "workspace"),
+        ("preserved", "preserved"),
+        ("active_v1_tasks", "active_v1_tasks"),
+    ):
+        if result[field] != plan[plan_field]:
+            raise SchemaValidationError(filename, "context", field)
+
+    expected_applied = [
+        {
+            "op": operation["op"],
+            "path": operation["path"],
+            "before_digest": operation["before_digest"],
+            "after_digest": operation["after_digest"],
+        }
+        for operation in plan["operations"]
+    ]
+    expected_cursor = len(plan["operations"]) + sum(
+        parent["before_type"] is None
+        for parent in plan["parent_directories"]
+    )
+    transaction = result["transaction"]
+    if transaction["stage"] == "completed":
+        if transaction["cursor"] != expected_cursor:
+            raise SchemaValidationError(
+                filename, "context", "transaction.cursor"
+            )
+        if result["applied"] == expected_applied:
+            if result["changed"] is not bool(expected_applied):
+                raise SchemaValidationError(filename, "context", "changed")
+        elif not (
+            allow_terminal_replay
+            and transaction["resumed"] is True
+            and result["applied"] == []
+            and result["changed"] is False
+        ):
+            raise SchemaValidationError(filename, "context", "applied")
+    elif (
+        transaction["cursor"] != 0
+        or result["applied"] != []
+        or result["changed"] is not False
+    ):
+        raise SchemaValidationError(filename, "context", "rolled-back")
+
+
 def canonical_base64_format(value: Any) -> bool:
     if not isinstance(value, str):
         return True
@@ -164,7 +221,15 @@ class SchemaSuite:
         try:
             if filename == "upgrade-journal.schema.json":
                 assert plan is not None
-                return validate_journal(value, plan)
+                normalized = validate_journal(value, plan)
+                if normalized["completion_result"] is not None:
+                    _bind_result_to_plan(
+                        filename,
+                        normalized["completion_result"],
+                        plan,
+                        allow_terminal_replay=False,
+                    )
+                return normalized
             normalized = RUNTIME_VALIDATORS[filename](value)
         except ContractError as error:
             raise SchemaValidationError(
@@ -173,19 +238,12 @@ class SchemaSuite:
 
         if filename == "upgrade-result.schema.json":
             assert plan is not None
-            for field, plan_field in (
-                ("plan_digest", "plan_digest"),
-                ("classification_before", "classification_before"),
-                ("target_classification", "target_classification"),
-                ("embedded_engine", "embedded_engine"),
-                ("provenance_final", "provenance_after"),
-                ("workspace", "workspace"),
-                ("active_v1_tasks", "active_v1_tasks"),
-            ):
-                if normalized[field] != plan[plan_field]:
-                    raise SchemaValidationError(
-                        filename, "context", field
-                    )
+            _bind_result_to_plan(
+                filename,
+                normalized,
+                plan,
+                allow_terminal_replay=True,
+            )
         return normalized
 
 

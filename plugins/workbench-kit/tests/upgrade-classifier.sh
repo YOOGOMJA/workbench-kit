@@ -136,6 +136,54 @@ equivalence = {
     ],
 }
 
+leaf_skill = b"# Task start\n"
+leaf_nodes = [
+    {
+        "path": ".agents/skills",
+        "node_type": "symlink",
+        "mode": "120000",
+        "digest": node_digest("symlink", "120000", link_target="../skills"),
+        "link_target": "../skills",
+    },
+    {
+        "path": ".claude/skills",
+        "node_type": "symlink",
+        "mode": "120000",
+        "digest": node_digest("symlink", "120000", link_target="../skills"),
+        "link_target": "../skills",
+    },
+    {
+        "path": "skills/task-start/SKILL.md",
+        "node_type": "file",
+        "mode": "100644",
+        "digest": node_digest("file", "100644", content=leaf_skill),
+        "link_target": None,
+    },
+    {
+        "path": "utils/task",
+        "node_type": "file",
+        "mode": "100755",
+        "digest": node_digest("file", "100755", content=engine_bytes),
+        "link_target": None,
+    },
+]
+leaf_manifest = {
+    "contract_version": "workbench-legacy-engine-manifest/v1",
+    "source_ref": legacy_manifest["source_ref"],
+    "source_revision": legacy_manifest["source_revision"],
+    "allowed_roots": [".agents/skills", ".claude/skills", "skills", "utils"],
+    "removable_nodes": leaf_nodes,
+    "discovery_links": leaf_nodes[:2],
+}
+leaf_equivalence = copy.deepcopy(equivalence)
+leaf_equivalence.update({
+    "receipt_id": "equivalence-leaf-roots-1",
+    "legacy_manifest_digest": canonical_digest(leaf_manifest),
+    "allowed_roots": leaf_manifest["allowed_roots"],
+    "removable_nodes": leaf_manifest["removable_nodes"],
+    "discovery_links": leaf_manifest["discovery_links"],
+})
+
 
 def generated_root(root):
     agents = header + core + separator + overlay
@@ -288,6 +336,34 @@ with tempfile.TemporaryDirectory(prefix="workbench-classifier-") as temporary:
     result = diagnose(root)
     assert result["classification"] == "embedded-legacy"
     assert result["embedded_engine"]["state"] == "present-verified"
+
+    root = base / "embedded-discovery-links"
+    generated_root(root)
+    write(root, "skills/task-start/SKILL.md", leaf_skill)
+    write(root, "utils/task", engine_bytes, 0o755)
+    (root / ".agents").mkdir()
+    os.symlink("../skills", root / ".agents/skills")
+    os.symlink("../skills", root / ".claude/skills")
+    settings_before = (root / ".claude/settings.json").read_bytes()
+    result = diagnose_workspace(
+        root,
+        kernel("workbench/v1", False),
+        generator_receipts=[generator],
+        equivalence_receipt=leaf_equivalence,
+    )
+    assert result["classification"] == "embedded-legacy", result
+    assert result["embedded_engine"]["state"] == "present-verified", result
+    for node in leaf_nodes:
+        (root / node["path"]).unlink()
+    result = diagnose_workspace(
+        root,
+        kernel("workbench/v1", False),
+        generator_receipts=[generator],
+        equivalence_receipt=leaf_equivalence,
+    )
+    assert result["classification"] == "generated-minimal", result
+    assert result["embedded_engine"]["state"] == "absent", result
+    assert (root / ".claude/settings.json").read_bytes() == settings_before
 
     root = base / "generated-drift"
     generated_root(root)

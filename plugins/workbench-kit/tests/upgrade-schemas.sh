@@ -72,8 +72,8 @@ def product_rejects(filename, value, *, context=None):
 
 unordered = {"z": 1, "a": {"y": 2, "b": 3}}
 reordered = {"a": {"b": 3, "y": 2}, "z": 1}
-assert canonical_bytes(unordered) == canonical_bytes(reordered)
-assert canonical_digest(unordered) == canonical_digest(reordered)
+assert canonical_bytes(unordered) == b'{"z":1,"a":{"y":2,"b":3}}\n'
+assert canonical_bytes(reordered) == b'{"a":{"b":3,"y":2},"z":1}\n'
 
 
 def rejected(callable_):
@@ -109,7 +109,7 @@ authority = {
     "source_ref": "github:repository/example/workbench",
 }
 authority_sources = [
-    json.dumps(authority, separators=(",", ":")).encode() + b"\n",
+    json.dumps(authority).encode() + b"\n",
     canonical_bytes(authority),
     json.dumps(
         dict(reversed(list(authority.items()))), separators=(",", ":")
@@ -118,9 +118,13 @@ authority_sources = [
 authority_inputs = [parse_authority_approval(raw) for raw in authority_sources]
 authority_input = authority_inputs[1]
 assert all(item["receipt"] == authority for item in authority_inputs)
+authority_canonical = (
+    json.dumps(authority, ensure_ascii=False, separators=(",", ":")) + "\n"
+).encode("utf-8")
+assert canonical_bytes(authority_inputs[0]["receipt"]) == authority_canonical
 assert {
     item["object_digest"] for item in authority_inputs
-} == {canonical_digest(authority)}
+} == {canonical_digest(authority_canonical, raw=True)}
 assert {
     item["source_digest"] for item in authority_inputs
 } == {
@@ -731,6 +735,55 @@ equivalence = {
     ],
 }
 assert validate_equivalence_receipt(equivalence) == equivalence
+
+leaf_nodes = [
+    {
+        "path": ".agents/skills",
+        "node_type": "symlink",
+        "mode": "120000",
+        "digest": node_digest("symlink", "120000", link_target="../skills"),
+        "link_target": "../skills",
+    },
+    {
+        "path": ".claude/skills",
+        "node_type": "symlink",
+        "mode": "120000",
+        "digest": node_digest("symlink", "120000", link_target="../skills"),
+        "link_target": "../skills",
+    },
+    {
+        "path": "skills/task-start/SKILL.md",
+        "node_type": "file",
+        "mode": "100644",
+        "digest": node_digest("file", "100644", content=b"# Task start\n"),
+        "link_target": None,
+    },
+    {
+        "path": "utils/task",
+        "node_type": "file",
+        "mode": "100755",
+        "digest": node_digest("file", "100755", content=b"#!/bin/sh\n"),
+        "link_target": None,
+    },
+]
+leaf_manifest = {
+    "contract_version": "workbench-legacy-engine-manifest/v1",
+    "source_ref": legacy_manifest["source_ref"],
+    "source_revision": legacy_manifest["source_revision"],
+    "allowed_roots": [".agents/skills", ".claude/skills", "skills", "utils"],
+    "removable_nodes": leaf_nodes,
+    "discovery_links": leaf_nodes[:2],
+}
+leaf_equivalence = copy.deepcopy(equivalence)
+leaf_equivalence.update({
+    "receipt_id": "equivalence-leaf-roots-1",
+    "legacy_manifest_digest": canonical_digest(leaf_manifest),
+    "allowed_roots": leaf_manifest["allowed_roots"],
+    "removable_nodes": leaf_manifest["removable_nodes"],
+    "discovery_links": leaf_manifest["discovery_links"],
+})
+assert validate_equivalence_receipt(leaf_equivalence) == leaf_equivalence
+
 bad = copy.deepcopy(equivalence)
 bad["verification_evidence"] = bad["verification_evidence"][1:]
 rejected(lambda: validate_equivalence_receipt(bad))
@@ -1080,6 +1133,139 @@ bad["completion_result"]["result_digest"] = canonical_digest(
     bad["completion_result"], null_field="result_digest"
 )
 rejected(lambda: validate_journal(bad))
+
+
+def refresh_result(document):
+    document["result_digest"] = None
+    document["result_digest"] = canonical_digest(
+        document, null_field="result_digest"
+    )
+    return document
+
+
+context_result_mutations = {}
+bad = copy.deepcopy(result)
+bad["plan_digest"] = "sha256:" + "8" * 64
+bad["transaction"]["journal_id"] = "upgrade-" + "8" * 64
+context_result_mutations["plan_digest"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["classification_before"] = "already-current"
+context_result_mutations["classification_before"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["target_classification"] = "already-current"
+bad["validation"]["classification_after"] = "already-current"
+bad["validation"]["digest"] = canonical_digest(
+    bad["validation"], null_field="digest"
+)
+context_result_mutations["target_classification"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["embedded_engine"] = {
+    "before": "present-unverified",
+    "after": "present-unverified",
+    "equivalence_receipt_digest": None,
+}
+context_result_mutations["embedded_engine"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["provenance_final"] = {
+    "kind": None, "state": "absent", "receipt_digest": None, "ref": None,
+}
+context_result_mutations["provenance_final"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["workspace"]["root"] = "/tmp/other-workbench"
+bad["transaction"]["workspace_id"] = "ws-" + hashlib.sha256(
+    b"workbench-kit-workspace-id/v1\nroot\t/tmp/other-workbench\n"
+).hexdigest()
+context_result_mutations["workspace"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["preserved"] = [{
+    "path": "README.md",
+    "node_type": "file",
+    "mode": "100644",
+    "digest": "sha256:" + "7" * 64,
+    "link_target": None,
+}]
+context_result_mutations["preserved"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["active_v1_tasks"]["source_inventory_object_digest"] = (
+    "sha256:" + "7" * 64
+)
+bad["active_v1_tasks"]["digest"] = canonical_digest(
+    bad["active_v1_tasks"], null_field="digest"
+)
+context_result_mutations["active_v1_tasks"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["transaction"]["cursor"] = 1
+context_result_mutations["transaction.cursor"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["applied"][0]["path"] = ".workbench/other"
+context_result_mutations["applied"] = refresh_result(bad)
+bad = copy.deepcopy(result)
+bad["changed"] = False
+bad["applied"] = []
+bad["transaction"]["resumed"] = False
+context_result_mutations["non-replay-empty-applied"] = refresh_result(bad)
+
+assert set(context_result_mutations) == {
+    "plan_digest",
+    "classification_before",
+    "target_classification",
+    "embedded_engine",
+    "provenance_final",
+    "workspace",
+    "preserved",
+    "active_v1_tasks",
+    "transaction.cursor",
+    "applied",
+    "non-replay-empty-applied",
+}
+for field, document in context_result_mutations.items():
+    assert validate_result(document) == document, field
+    schema_accepts("upgrade-result.schema.json", document)
+    product_rejects(
+        "upgrade-result.schema.json", document, context={"plan": changed}
+    )
+
+terminal_replay = copy.deepcopy(result)
+terminal_replay["changed"] = False
+terminal_replay["applied"] = []
+terminal_replay["transaction"]["resumed"] = True
+refresh_result(terminal_replay)
+assert validate_result(terminal_replay) == terminal_replay
+product_accepts(
+    "upgrade-result.schema.json", terminal_replay, context={"plan": changed}
+)
+
+completion_context_gaps = {
+    "classification_before",
+    "target_classification",
+    "embedded_engine",
+    "provenance_final",
+    "workspace",
+    "preserved",
+    "active_v1_tasks",
+}
+for field, mutated_result in context_result_mutations.items():
+    wrapped = copy.deepcopy(completed)
+    wrapped["completion_result"] = copy.deepcopy(mutated_result)
+    if field == "target_classification":
+        wrapped["validation"] = copy.deepcopy(
+            wrapped["completion_result"]["validation"]
+        )
+    elif field == "workspace":
+        wrapped["workspace"] = copy.deepcopy(
+            wrapped["completion_result"]["workspace"]
+        )
+        wrapped["workspace_id"] = wrapped["completion_result"]["transaction"][
+            "workspace_id"
+        ]
+    if field in completion_context_gaps:
+        assert validate_journal(wrapped, changed) == wrapped, field
+    else:
+        rejected(lambda wrapped=wrapped: validate_journal(wrapped, changed))
+    schema_accepts("upgrade-journal.schema.json", wrapped)
+    product_rejects(
+        "upgrade-journal.schema.json", wrapped, context={"plan": changed}
+    )
 
 top_level_documents = (
     ("bootstrap-authority-approval.schema.json", authority),
