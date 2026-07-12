@@ -7577,15 +7577,15 @@ cmd_done_v2() {
     stage="$(python3 "$helper" field "$journal_file" stage)"
     cleanup_load_plan "$journal_file"
     [ "$remote_terminal" != true ] || retry_checkpoint="$checkpoint_file"
-    if [ -d "$dir" ] \
-      && ! cleanup_verify_task_removal_preconditions "$root" "$dir" "$branch"; then
-      cleanup_add_blocker "$CLEANUP_TASK_BLOCKER" "${CLEANUP_TASK_BLOCKER_REF:-$branch}"
-      rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
-        "$authorization_ref" "$revision" "$removal_plan" false false; return 1
-    fi
     if ! cleanup_validate_retry_snapshot "$root" "$dir" "$branch" "$journal_file" \
       "$retry_checkpoint"; then
       cleanup_add_blocker cleanup-journal-unreconciled "$branch"
+      rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
+        "$authorization_ref" "$revision" "$removal_plan" false false; return 1
+    fi
+    if [ -d "$dir" ] \
+      && ! cleanup_verify_task_removal_preconditions "$root" "$dir" "$branch"; then
+      cleanup_add_blocker "$CLEANUP_TASK_BLOCKER" "${CLEANUP_TASK_BLOCKER_REF:-$branch}"
       rm -f "$journal_file"; print_cleanup_json "" false "$action_id" "$intent" "$manifest" \
         "$authorization_ref" "$revision" "$removal_plan" false false; return 1
     fi
