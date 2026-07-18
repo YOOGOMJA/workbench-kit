@@ -31,7 +31,9 @@ Releasing is **GitOps**: the release happens automatically when a version bump l
    and add a fresh empty `## [Unreleased]` above it.
 2. **Verify locally:** run `claude plugin validate --strict` on the marketplace and all
    three plugins, then add/list the local marketplace in an isolated Codex home. CI runs
-   the dependency-light shared suite, but these real CLI gates stay local.
+   the dependency-light shared suite, but these real CLI gates stay local. A release that
+   changes the `workbench` plugin or its embedded-engine coverage must regenerate the
+   equivalence receipt from a committed source revision and pass its offline manifest audit.
 3. **Commit + PR + merge to `main`** (`chore(release): vX.Y.Z`). Install resolves against
    the default branch, so the work must be on `main` to be installable.
 4. **Automatic.** On that push to `main`, `.github/workflows/release.yml` sees the new

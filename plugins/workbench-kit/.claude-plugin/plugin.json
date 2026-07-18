@@ -1,7 +1,7 @@
 {
   "name": "workbench-kit",
   "description": "Bootstrap personalized workbenches and safely upgrade existing ones through governed migration plans.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": { "name": "YOOGOMJA" },
   "homepage": "https://github.com/YOOGOMJA/workbench-kit",
   "repository": "https://github.com/YOOGOMJA/workbench-kit",

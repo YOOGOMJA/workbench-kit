@@ -148,6 +148,29 @@ Toolbox는 생성된 워크벤치의 필수 의존성이 아닙니다. 엔진·�
 않고 설치하거나 제거할 수 있습니다. Codex에서는 `$product-start`, `$product-run`
 같은 `$skill-name` 형식으로 해당 스킬을 호출합니다.
 
+## 기존 워크벤치 업그레이드
+
+`0.2.0`부터 기존 워크벤치를 거버넌스 절차로 마이그레이션할 수 있습니다.
+`workbench`와 `workbench-kit` 플러그인을 갱신하고, 업그레이드할 워크벤치 안에 전용
+마이그레이션 task를 만든 뒤 Claude Code에서는 `/workbench-kit:upgrade-workbench`,
+Codex에서는 `$upgrade-workbench`를 호출합니다. 스킬은 먼저 읽기 전용 진단을 하고,
+작업 공간 밖에 불변 계획을 만든 다음 그 계획만 crash 복구 저널로 적용합니다.
+
+- 엔진을 복사하지 않은 generated-minimal v1 워크벤치는 repo 안에 엔진을 새로 넣지
+  않고 v2 거버넌스 파일로 전환할 수 있습니다.
+- repo-local embedded 엔진은 소유한 모든 바이트와 discovery symlink가 번들 등가성
+  영수증과 일치할 때만 제거할 수 있습니다. `0.2.0` 영수증의 정확한 대상은
+  `YOOGOMJA/workbench@ffb426f1c316485c56950e599b7560d155fd220c`입니다.
+- 엔진 제거에는 dry-run의 정확한 basis에 묶인 별도 승인이 필요합니다. 알 수 없는
+  revision, 로컬 drift, malformed 작업 공간, 낡은 계획, 바뀐 승인은 아무것도 지우지
+  않고 중단합니다.
+- 영수증의 정확한 제거 표면 밖에 있는 사용자 파일·지식·템플릿·활성 v1 task 사실과
+  Git 상태는 보존하고 적용 뒤 다시 검증합니다.
+
+전체 플래그와 증거 파일 조건은 설치된
+[`upgrade-workbench` CLI 참고서](plugins/workbench-kit/skills/upgrade-workbench/references/cli.md)에
+있습니다.
+
 ## 어떻게 동작하나
 
 - **작업은 휘발, 지식은 축적.** 모든 일은 task 브랜치에서 일어나고, 끝나면 `task/`를
@@ -186,8 +209,8 @@ scaffold는 부트스트랩 플러그인 **안에** 있어 마켓플레이스 �
 
 ## 상태 & 알려진 한계
 
-- **초기 단계.** 최신 릴리스는 `0.1.1`이며, 거버넌스를 따르는 수명주기와 안전한
-  마이그레이션, 선택형 toolbox를 `0.2.0`으로 준비 중입니다.
+- **초기 단계.** 최신 릴리스는 `0.2.0`이며, 거버넌스를 따르는 수명주기와
+  소스에 결박된 안전한 마이그레이션, 선택형 toolbox를 포함합니다.
   [CHANGELOG.md](CHANGELOG.md) 참고.
 - **번역 진행 중.** 프레임워크 표면(이 README, `AGENTS.core`, scaffold, 부트스트랩
   스킬)과 모든 스킬 *설명*은 영어입니다. 엔진 스킬 *본문*과 `framework-docs/`는 아직

@@ -23,6 +23,7 @@ required = {
     "bin/workbench-kit",
     "lib/workbench_kit_schema.py",
     "receipts/upgrade-runtime.json",
+    "receipts/workbench-ffb426f1-equivalence.json",
     "schemas/README.md",
     "schemas/requirements.txt",
     "skills/upgrade-workbench/SKILL.md",
@@ -68,7 +69,9 @@ runtime = json.loads(
     (plugin / "receipts/upgrade-runtime.json").read_text(encoding="utf-8")
 )
 assert runtime["contract_version"] == "workbench-kit-upgrade-runtime/v1"
-assert runtime["plugin_equivalence_file"] is None
+assert runtime["plugin_equivalence_file"] == (
+    "receipts/workbench-ffb426f1-equivalence.json"
+)
 assert runtime["legacy_engine_markers"] == sorted(
     runtime["legacy_engine_markers"]
 )

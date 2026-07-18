@@ -45,8 +45,9 @@ interpreting exit status, or preparing external evidence and journal paths.
 3. **Apply only after approval.** Create an external `0600` result file and apply
    the exact plan with the same route inputs. Reuse an explicit journal directory on
    retries. Do not add `--remove-embedded-engine` during apply; the plan already binds
-   that request. If bundled equivalence is unavailable, stop on
-   `plugin-equivalence-unavailable`.
+   that request. Bundled equivalence covers only the exact source revision and node
+   manifest named by its receipt; any absent receipt or byte drift stops on
+   `plugin-equivalence-unavailable` or an embedded-engine verification blocker.
 
 4. **Verify and submit.** Require a `completed` transaction, the expected target
    classification, unchanged preserved paths, and unchanged active v1 task facts.

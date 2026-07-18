@@ -57,18 +57,14 @@ jobs:
       - name: Repository test suite
         run: bash tests/run.sh
 
-  upgrade:
-    name: Upgrade suite (Python ${{ matrix.python-version }})
+  upgrade-latest:
+    name: Upgrade suite (latest Python)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.9.22", "3.x"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.x"
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: "0.7.6"

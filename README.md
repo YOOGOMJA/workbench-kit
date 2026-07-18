@@ -152,6 +152,28 @@ Toolbox is never required by a generated workbench. Install or remove it without
 changing the engine/bootstrap contract. In Codex, invoke the corresponding skills
 with `$product-start`, `$product-run`, and the other `$skill-name` forms.
 
+## Upgrade an existing workbench
+
+Version `0.2.0` adds a governed migration path for existing workbenches. Update the
+`workbench` and `workbench-kit` plugins, create a dedicated migration task in the
+workbench you are upgrading, and invoke `/workbench-kit:upgrade-workbench` (Claude
+Code) or `$upgrade-workbench` (Codex). The skill diagnoses first, writes an external
+immutable plan, and applies only that reviewed plan through a crash-recoverable journal.
+
+- A generated-minimal v1 workbench can move to the v2 governance files without
+  copying an engine into the repository.
+- A repo-local embedded engine is removable only when every owned byte and discovery
+  symlink matches the bundled equivalence receipt. The `0.2.0` receipt covers
+  `YOOGOMJA/workbench@ffb426f1c316485c56950e599b7560d155fd220c`.
+- Engine removal needs a separate approval bound to the exact dry-run basis. Unknown
+  revisions, local drift, malformed workspaces, stale plans, and changed approvals all
+  stop without deleting anything.
+- User-owned files, knowledge, templates, active v1 task facts, and Git state outside
+  the receipt's exact removal surface are preserved and verified after apply.
+
+The complete flag matrix and evidence-file requirements are in the installed
+[`upgrade-workbench` CLI reference](plugins/workbench-kit/skills/upgrade-workbench/references/cli.md).
+
 ## How it works
 
 - **Work is disposable, knowledge accumulates.** Everything happens on a task
@@ -191,8 +213,8 @@ the engine reads it via `${CLAUDE_PLUGIN_ROOT}`.
 
 ## Status & known gaps
 
-- **Early stage.** The latest release is `0.1.1`; the governed lifecycle, safe
-  migration, and optional toolbox are being prepared for `0.2.0`. See
+- **Early stage.** The latest release is `0.2.0`, including the governed lifecycle,
+  source-bound safe migration, and optional toolbox. See
   [CHANGELOG.md](CHANGELOG.md).
 - **Translation in progress.** Framework-facing content (this README, `AGENTS.core`,
   scaffold, bootstrap skills) and all skill *descriptions* are English. The engine

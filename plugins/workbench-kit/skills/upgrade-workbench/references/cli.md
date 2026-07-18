@@ -43,8 +43,9 @@ workbench-kit --workspace "$ROOT" upgrade-workbench --dry-run \
 
 For an explicit embedded-engine removal request, add both
 `--remove-embedded-engine` and `--removal-approval-file "$REMOVAL"` to dry-run.
-Removal remains fail-closed with `plugin-equivalence-unavailable` until a bundled,
-verified equivalence receipt exists.
+Removal is available only when the bundled equivalence receipt verifies every owned
+legacy node and the installed engine manifest. Unknown revisions and byte drift remain
+fail-closed with `plugin-equivalence-unavailable` or an embedded-engine blocker.
 
 ## Apply
 

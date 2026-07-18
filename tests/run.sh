@@ -18,11 +18,13 @@ run "plugin suite inventory" bash tests/check-plugin-suite.sh
 
 root_tests=(
   tests/check-compose-smoke.sh
+  tests/cross-plugin-e2e.sh
   tests/check-skill-frontmatter.sh
   tests/check-install-model.sh
   tests/check-codebases-yaml.sh
   tests/check-changelog-section-guard.sh
   tests/check-generated-scaffold-hygiene.sh
+  tests/check-equivalence-receipt.sh
   tests/check-marketplace-parity.sh
   tests/check-marketplace-parity-guard.sh
   tests/check-plugin-suite-guard.sh

@@ -13,10 +13,6 @@ grep -q '## \[Unreleased\]' CHANGELOG.md || { echo "CHANGELOG.md has no [Unrelea
 
 echo "== bump =="      ; bash scripts/bump-version.sh "$V"
 echo "== checks =="
-bash plugins/workbench-kit/tests/run.sh >/dev/null
-echo "✔ upgrade suite"
-# Own line, not `cmd && echo`: under `set -e` the left side of `&&` is exempt, so a
-# failing test would not stop release preparation.
 bash tests/run.sh
 
 cat <<NEXT
