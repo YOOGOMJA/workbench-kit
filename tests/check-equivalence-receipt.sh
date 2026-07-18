@@ -128,28 +128,47 @@ PYTHONDONTWRITEBYTECODE=1 python3 \
   "$TMP/checkout/scripts/equivalence-receipt.py" check
 
 # Exercise the next normal release without requiring its E2E blob to change. The generated
-# 0.3.0 receipt remains uncommitted, exactly as it is when `release.sh finalize` starts the
-# full suite; the synthetic main commit must include that working-tree receipt.
-git clone -q --no-local "$TMP/origin.git" "$TMP/next-release"
+# receipt remains uncommitted, exactly as it is when `release.sh finalize` starts the full
+# suite; the synthetic main commit must include that working-tree receipt. Derive a new patch
+# version so the regression never collides with a real version/tag as the repository advances.
+git clone -q --no-local --branch main "$TMP/origin.git" "$TMP/next-release"
 git -C "$TMP/next-release" config user.name test
 git -C "$TMP/next-release" config user.email test@example.invalid
-bash "$TMP/next-release/scripts/bump-version.sh" 0.3.0 >/dev/null
+NEXT_VERSION="$(python3 - "$TMP/next-release/plugins/workbench/.claude-plugin/plugin.json" <<'PY'
+import json
+import re
+import sys
+
+version = json.load(open(sys.argv[1], encoding="utf-8"))["version"]
+match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+].*)?", version)
+if match is None:
+    raise SystemExit("current plugin version is not SemVer: " + repr(version))
+major, minor, patch = (int(item) for item in match.groups())
+print("{}.{}.{}".format(major, minor, patch + 1))
+PY
+)"
+NEXT_TAG="workbench-equivalence-v$NEXT_VERSION"
+bash "$TMP/next-release/scripts/bump-version.sh" "$NEXT_VERSION" >/dev/null
 git -C "$TMP/next-release" add plugins
-git -C "$TMP/next-release" commit -q -m 'test: prepare 0.3.0 evidence source'
+git -C "$TMP/next-release" commit -q -m "test: prepare $NEXT_VERSION evidence source"
 NEXT_REVISION="$(git -C "$TMP/next-release" rev-parse HEAD)"
-git -C "$TMP/next-release" tag workbench-equivalence-v0.3.0 "$NEXT_REVISION"
+git -C "$TMP/next-release" tag "$NEXT_TAG" "$NEXT_REVISION"
 PYTHONDONTWRITEBYTECODE=1 python3 \
   "$TMP/next-release/scripts/equivalence-receipt.py" generate \
   --replacement-revision "$NEXT_REVISION" >/dev/null
-python3 - "$TMP/next-release/plugins/workbench-kit/receipts/workbench-ffb426f1-equivalence.json" <<'PY'
+python3 - "$TMP/next-release/plugins/workbench-kit/receipts/workbench-ffb426f1-equivalence.json" \
+  "$NEXT_VERSION" <<'PY'
 import json
 import sys
 
 receipt = json.load(open(sys.argv[1], encoding="utf-8"))
-assert receipt["receipt_id"] == "workbench-0.3.0-replaces-workbench-ffb426f1"
-assert receipt["replacement_plugin"]["plugin_version"] == "0.3.0"
+version = sys.argv[2]
+assert receipt["receipt_id"] == (
+    "workbench-{}-replaces-workbench-ffb426f1".format(version)
+)
+assert receipt["replacement_plugin"]["plugin_version"] == version
 PY
-NEXT_SNAPSHOT="$(git -C "$TMP/next-release" stash create '0.3.0 finalized receipt')"
+NEXT_SNAPSHOT="$(git -C "$TMP/next-release" stash create "$NEXT_VERSION finalized receipt")"
 [ -n "$NEXT_SNAPSHOT" ] || {
   echo "next-release simulation did not capture the generated receipt" >&2
   exit 1
@@ -157,7 +176,7 @@ NEXT_SNAPSHOT="$(git -C "$TMP/next-release" stash create '0.3.0 finalized receip
 git init -q --bare "$TMP/next-origin.git"
 git -C "$TMP/next-release" push -q "$TMP/next-origin.git" \
   "$NEXT_SNAPSHOT:refs/heads/main" \
-  'refs/tags/workbench-equivalence-v0.3.0:refs/tags/workbench-equivalence-v0.3.0'
+  "refs/tags/$NEXT_TAG:refs/tags/$NEXT_TAG"
 git init -q "$TMP/next-checkout"
 git -C "$TMP/next-checkout" remote add origin "$TMP/next-origin.git"
 git -C "$TMP/next-checkout" fetch -q origin \
