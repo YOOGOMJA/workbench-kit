@@ -41,11 +41,22 @@ workbench-kit --workspace "$ROOT" upgrade-workbench --dry-run \
   --format json > "$PLAN"
 ```
 
-For an explicit embedded-engine removal request, add both
-`--remove-embedded-engine` and `--removal-approval-file "$REMOVAL"` to dry-run.
-Removal is available only when the bundled equivalence receipt verifies every owned
-legacy node and the installed engine manifest. Unknown revisions and byte drift remain
-fail-closed with `plugin-equivalence-unavailable` or an embedded-engine blocker.
+An explicit embedded-engine removal uses two dry-runs because the approval must bind the
+exact removal basis:
+
+1. Run the route-specific dry-run with `--remove-embedded-engine` but without `--removal-approval-file`.
+   A removable engine exits `1` with the
+   `removal-approval-required` blocker and emits `removal_plan_basis_digest`.
+2. Give that blocked candidate plan to a human or trusted adapter. It must independently
+   review the exact nodes and write an external `0600` receipt conforming to
+   `schemas/removal-approval.schema.json`, with `approved_plan_basis_digest` equal to the
+   candidate value. The upgrade skill and agent never create or infer this receipt.
+3. Repeat the same dry-run with both `--remove-embedded-engine` and
+   `--removal-approval-file "$REMOVAL"`; save this unblocked output as the canonical plan.
+
+Removal is available only when the bundled equivalence receipt verifies every owned legacy
+node and the installed engine manifest. Unknown revisions and byte drift remain fail-closed
+with `plugin-equivalence-unavailable` or an embedded-engine blocker.
 
 ## Apply
 

@@ -35,7 +35,10 @@ interpreting exit status, or preparing external evidence and journal paths.
    `malformed`, continue only when every blocker is exactly
    `generator-composition-invalid` at `AGENTS.md` and a human-supplied reviewed-overlay
    receipt is available; run the documented reviewed-overlay recovery dry-run without
-   editing workspace evidence. All other `malformed` classifications stop.
+   editing workspace evidence. All other `malformed` classifications stop. If embedded
+   engine removal is requested, use the CLI reference's two dry-runs: first obtain the
+   blocked removal basis without a removal receipt, then let a human or trusted adapter
+   supply the basis-bound receipt before producing the canonical plan.
 
 2. **Review before writing.** Summarize `classification_before`, target,
    `actionable`, blockers, embedded-engine before/after, operations, preserved paths,

@@ -105,6 +105,16 @@ assert "--authority-file" not in surface
 assert "generator-composition-invalid" in skill
 assert "human-supplied reviewed-overlay" in skill
 assert "All other `malformed`" in skill
+for required_text in (
+    "without `--removal-approval-file`",
+    "removal_plan_basis_digest",
+    "removal-approval.schema.json",
+    "human or trusted adapter",
+):
+    assert required_text in cli, required_text
+candidate = cli.index("without `--removal-approval-file`")
+approved = cli.index('`--removal-approval-file "$REMOVAL"`', candidate)
+assert candidate < approved
 
 changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
 version_heading = "## [{}]".format(claude_manifest["version"])

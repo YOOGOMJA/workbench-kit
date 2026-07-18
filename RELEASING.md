@@ -26,17 +26,18 @@ to `main` → let the release workflow tag and publish it.
 Releasing is **GitOps**: the release happens automatically when a version bump lands on
 `main`. You never tag by hand.
 
-1. **Prep on a branch:** `scripts/release.sh X.Y.Z` — bumps all 6 manifests and runs the
-   checks. Then edit `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`
-   and add a fresh empty `## [Unreleased]` above it.
-2. **Verify locally:** run `claude plugin validate --strict` on the marketplace and all
+1. **Promote `## [Unreleased]` on a branch:** rename it to
+   `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]` above it.
+2. **Prepare:** run `scripts/release.sh X.Y.Z`. It validates the dated release notes before
+   changing files, bumps all 6 manifests, and then runs the complete repository suite.
+3. **Verify locally:** run `claude plugin validate --strict` on the marketplace and all
    three plugins, then add/list the local marketplace in an isolated Codex home. CI runs
    the dependency-light shared suite, but these real CLI gates stay local. A release that
    changes the `workbench` plugin or its embedded-engine coverage must regenerate the
    equivalence receipt from a committed source revision and pass its offline manifest audit.
-3. **Commit + PR + merge to `main`** (`chore(release): vX.Y.Z`). Install resolves against
+4. **Commit + PR + merge to `main`** (`chore(release): vX.Y.Z`). Install resolves against
    the default branch, so the work must be on `main` to be installable.
-4. **Automatic.** On that push to `main`, `.github/workflows/release.yml` sees the new
+5. **Automatic.** On that push to `main`, `.github/workflows/release.yml` sees the new
    version (matching `CHANGELOG [X.Y.Z]`, no `vX.Y.Z` tag yet) and **cuts the tag +
    GitHub Release** from the CHANGELOG section. Nothing else to do.
 

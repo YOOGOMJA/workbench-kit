@@ -33,6 +33,13 @@ for name, workflow in (("CI", ci), ("release", release)):
 if ci.index("- name: Set up uv") > ci.index("bash tests/run.sh"):
     raise SystemExit("CI provisions uv after the repository suite")
 
+history_checkout = "- uses: actions/checkout@v4\n        with:\n          fetch-depth: 0"
+checks_job = ci.split("\n  checks:\n", 1)[1].split("\n  upgrade-latest:\n", 1)[0]
+if history_checkout not in checks_job:
+    raise SystemExit("CI repository suite does not fetch receipt-bound Git history")
+if history_checkout not in release:
+    raise SystemExit("release preflight does not fetch receipt-bound Git history")
+
 preflight = 'bash scripts/release-preflight.sh "${{ steps.rel.outputs.version }}"'
 publish = 'gh release create "v${{ steps.rel.outputs.version }}"'
 tag_check = 'git rev-parse "refs/tags/v$V^{commit}"'
