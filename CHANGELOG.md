@@ -27,7 +27,7 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   terminal completion or abandonment, coordinated multi-repo writer claims, legacy-writer
   projection, claim-scoped atomic work-ref selection with local process serialization,
   lost-response claim compensation, authenticated terminal recovery, governed cleanup,
-  authenticated non-deleting cleanup quarantine with an external release barrier,
+  authenticated non-deleting cleanup quarantine with a secret-commitment external release barrier,
   readiness diagnosis, and a canonical installed-engine manifest while retaining v1 task
   flows (#26).
 - **Frozen released-section guard** — a CI `changelog-frozen` job

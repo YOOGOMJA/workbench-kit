@@ -102,3 +102,5 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-07-11 13:08:05] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Added applied-effect-first recovery, receipt-first governed pack acceptance, ungoverned kernel acceptance, zero-history writer rebind, and mandatory pre-CAS release state
 
 ## [2026-07-13 06:01:59] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Replaced destructive worktree removal with an armed non-deleting quarantine, strict inode/tree receipts, and a durable external release barrier
+
+## [2026-07-13 08:31:34] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Bound quarantine promotion to a private arm-secret commitment and required prepared journal genesis

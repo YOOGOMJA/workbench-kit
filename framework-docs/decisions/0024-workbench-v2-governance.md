@@ -204,6 +204,12 @@
       the complete workspace and linked admin records with atomic no-replace renames, hashes
       the exact no-follow inode tree, publishes `quarantined` before any release, and leaves
       physical deletion to a separate retention/GC contract.
+  56. Treat public device/clone bindings and caller-supplied tree digests as proof of local
+      quarantine. Another clone could copy those fields and forge `quarantined`. The owning
+      clone now fsyncs a random secret before `prepared`, publishes only its complete immutable-
+      journal-binding commitment, and reveals it in a proof-digested receipt after quarantine.
+      The reducer also requires `prepared` as the first marker and rejects receipt reuse across
+      revisions, actions, policies, or removal plans.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing

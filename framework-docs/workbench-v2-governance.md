@@ -424,17 +424,20 @@ abandonment is invalid for v2 tasks. Existing v1 force-cleanup behavior remains 
 compatibility path until migration policy removes it in a future major contract. V2 cleanup
 is the governed `task.cleanup` action and has its own terminal-revision plus exact
 `workbench-task-removal-plan/v1` intent binding, blockers, and
-retry semantics in [[workbench-v2-cli-contract]]. It first fsyncs a clone-local arm record,
-then persists a `prepared` cleanup journal in the task home's issue comments. The owning clone
+retry semantics in [[workbench-v2-cli-contract]]. It first fsyncs a clone-local 256-bit arm
+secret and publishes only its immutable-journal-bound commitment in the `prepared` cleanup
+journal. The owning clone
 uses atomic no-replace renames to move the complete task workspace plus every linked-worktree
 admin record into a private git-common-relative quarantine. A strict no-follow inode/tree
 authentication covers tracked, untracked, ignored, private-action, nested-codebase, and Git
-admin bytes. The resulting fsynced receipt is published externally as `quarantined` before
+admin bytes. The resulting fsynced receipt discloses the committed secret and binds its complete
+public body with a domain-separated proof digest. It is published externally as `quarantined` before
 any writer claim, effect owner, work-reference reservation, or task branch is released.
 Retries then reconcile every intended/verified effect-owner event through verified CAS
 release, `completed`, and `task-cleaned`. A crash rolls the local quarantine transaction
-forward; it never restores over an occupied path. A different clone cannot promote
-`prepared` without the owning clone's local arm/receipt. Cleanup does not physically delete
+forward; it never restores over an occupied path. The journal reducer requires a `prepared`
+genesis and rejects a forged receipt, so a different clone cannot promote `prepared` by copying
+public runtime IDs. Cleanup does not physically delete
 the quarantine; retention or garbage collection is a separate future operation. Release does
 not mutate frozen task content.
 

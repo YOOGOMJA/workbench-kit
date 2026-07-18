@@ -1001,15 +1001,20 @@ PY
 }
 
 test_cleanup_journal_binds_the_exact_removal_plan_prefix() {
-  local helper plan policy prepared quarantined completed receipt comments actual digest manifest_digest intent
+  local helper plan policy prepared changed_prepared quarantined completed receipt forged_receipt comments standalone actual digest manifest_digest intent
+  local arm_secret arm_commitment receipt_digest
   helper="$ROOT/lib/workbench_cleanup.py"
   plan="$TMPDIR/cleanup-plan.json"; policy="$TMPDIR/cleanup-policy.json"
   prepared="$TMPDIR/cleanup-prepared.json"; quarantined="$TMPDIR/cleanup-quarantined.json"
+  changed_prepared="$TMPDIR/cleanup-changed-prepared.json"
   completed="$TMPDIR/cleanup-completed.json"; receipt="$TMPDIR/cleanup-quarantine-receipt.json"
+  forged_receipt="$TMPDIR/cleanup-forged-quarantine-receipt.json"
   comments="$TMPDIR/cleanup-comments.txt"
+  standalone="$TMPDIR/cleanup-standalone-comments.txt"
   digest="sha256:$(printf 'workbench-task-removal-plan/v1\ntask_id\t42\nclaim_id\tclaim-policy-42\ntask_branch\ttask/42-policy\ntask_workspace\t.worktrees/task__42-policy\nlocal_branch\ttask/42-policy\n' | shasum -a 256 | awk '{print $1}')"
   manifest_digest="sha256:$(printf '9%.0s' {1..64})"
   intent="sha256:$(printf '7%.0s' {1..64})"
+  arm_secret="$(printf 'a%.0s' {1..64})"
   python3 - "$plan" "$policy" "$manifest_digest" <<'PY'
 import json
 import sys
@@ -1050,7 +1055,34 @@ PY
     --revision "sha256:$(printf '2%.0s' {1..64})" --action-instance-id act_cleanup_1 \
     --intent-digest "$intent" --removal-plan-digest "$digest" --removal-plan-file "$plan" \
     --device-id device:trusted/mac-1 --clone-id 123e4567-e89b-12d3-a456-426614174000 \
+    --arm-commitment "sha256:$(printf '0%.0s' {1..64})" \
     --at 2026-07-11T03:30:00Z > "$prepared"
+  arm_commitment="$(PYTHONPATH="$ROOT/lib" python3 - "$prepared" "$arm_secret" <<'PY'
+import json
+import sys
+from workbench_cleanup import quarantine_arm_binding, quarantine_arm_commitment
+
+journal = json.load(open(sys.argv[1], encoding="utf-8"))
+print(quarantine_arm_commitment(sys.argv[2], quarantine_arm_binding(journal)))
+PY
+)"
+  python3 "$helper" build --policy-resolution-file "$policy" --task-id 42 \
+    --claim-id claim-policy-42 --branch task/42-policy \
+    --revision "sha256:$(printf '2%.0s' {1..64})" --action-instance-id act_cleanup_1 \
+    --intent-digest "$intent" --removal-plan-digest "$digest" --removal-plan-file "$plan" \
+    --device-id device:trusted/mac-1 --clone-id 123e4567-e89b-12d3-a456-426614174000 \
+    --arm-commitment "$arm_commitment" \
+    --at 2026-07-11T03:30:00Z > "$prepared"
+  python3 - "$prepared" "$changed_prepared" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["action_instance_id"] = "act_cleanup_2"
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
   python3 - "$prepared" <<'PY'
 import json
 import sys
@@ -1069,6 +1101,7 @@ assert value["quarantine_authority"] == {
     "clone_id": "123e4567-e89b-12d3-a456-426614174000",
     "workspace_locator": ".worktrees/task__42-policy",
     "quarantine_locator": value["quarantine_authority"]["quarantine_locator"],
+    "arm_commitment": value["quarantine_authority"]["arm_commitment"],
 }
 assert value["quarantine_authority"]["quarantine_locator"].startswith(
     "workbench-v2/cleanup-quarantine/"
@@ -1080,15 +1113,17 @@ assert list(value["removal_plan"]) == [
     "writer_operations", "codebase_worktrees", "task_workspace", "local_branch",
 ]
 PY
-  python3 - "$prepared" "$receipt" <<'PY'
+  PYTHONPATH="$ROOT/lib" python3 - "$prepared" "$receipt" "$forged_receipt" "$arm_secret" <<'PY'
 import json
 import sys
+from workbench_cleanup import quarantine_receipt_digest
 
 journal = json.load(open(sys.argv[1], encoding="utf-8"))
 authority = journal["quarantine_authority"]
 value = {
     "contract_version": "workbench-task-quarantine-receipt/v1",
-    "receipt_digest": "sha256:" + "3" * 64,
+    "receipt_digest": "",
+    "arm_secret": sys.argv[4],
     "task_id": journal["task_id"],
     "claim_id": journal["claim_id"],
     "branch": journal["branch"],
@@ -1102,16 +1137,40 @@ value = {
     "admin_manifest_digest": "sha256:" + "5" * 64,
     "quarantined_at": "2026-07-11T03:31:00Z",
 }
+value["receipt_digest"] = quarantine_receipt_digest(value)
 with open(sys.argv[2], "w", encoding="utf-8") as handle:
     json.dump(value, handle, separators=(",", ":"))
+    handle.write("\n")
+forged = dict(value)
+forged["arm_secret"] = "b" * 64
+forged["receipt_digest"] = quarantine_receipt_digest(forged)
+with open(sys.argv[3], "w", encoding="utf-8") as handle:
+    json.dump(forged, handle, separators=(",", ":"))
     handle.write("\n")
 PY
   if python3 "$helper" stage "$prepared" --stage completed \
     --at 2026-07-11T03:31:00Z >/dev/null 2>&1; then
     fail "cleanup journal completed without a durable quarantine receipt"
   fi
+  if python3 "$helper" quarantine "$prepared" --receipt-file "$forged_receipt" \
+    --at 2026-07-11T03:31:00Z >/dev/null 2>&1; then
+    fail "cleanup journal accepted a quarantine receipt without local arm proof"
+  fi
+  if python3 "$helper" quarantine "$changed_prepared" --receipt-file "$receipt" \
+    --at 2026-07-11T03:31:00Z >/dev/null 2>&1; then
+    fail "cleanup journal reused a quarantine receipt across immutable bindings"
+  fi
   python3 "$helper" quarantine "$prepared" --receipt-file "$receipt" \
     --at 2026-07-11T03:31:00Z > "$quarantined"
+  {
+    printf '%s\n' '<!-- workbench-task-cleanup:v1'
+    cat "$quarantined"
+    printf '%s\n' '-->'
+  } > "$standalone"
+  if python3 "$helper" find --comments-file "$standalone" --task-id 42 \
+    --branch task/42-policy >/dev/null 2>&1; then
+    fail "cleanup reducer accepted a post-prepare marker without prepared genesis"
+  fi
   python3 "$helper" stage "$quarantined" --stage completed \
     --at 2026-07-11T03:31:00Z > "$completed"
   {
@@ -1127,7 +1186,8 @@ PY
     --branch task/42-policy)"
   assert_eq completed "$(json_path "$actual" stage)" \
     "cleanup reducer must select the unique longest valid prefix"
-  assert_eq "sha256:$(printf '3%.0s' {1..64})" \
+  receipt_digest="$(json_path "$(cat "$receipt")" receipt_digest)"
+  assert_eq "$receipt_digest" \
     "$(json_path "$actual" quarantine_receipt.receipt_digest)" \
     "cleanup reducer must preserve the exact quarantine receipt"
 }

@@ -2383,12 +2383,13 @@ branch, or disposition changes the digest and supersedes a pending cleanup autho
 `retire-consumed`.
 
 The durable recovery journal is stored in the task home's GitHub issue comments, outside the
-local task workspace. Before publishing it, the selected clone fsyncs a private local arm
-record under the exact git-common-relative quarantine locator. The first external marker is:
+local task workspace. Before publishing it, the selected clone generates and fsyncs a private
+256-bit local arm secret under the exact git-common-relative quarantine locator. The first
+external marker carries only its domain-separated commitment:
 
 ```html
 <!-- workbench-task-cleanup:v1
-{"contract_version":"workbench-task-cleanup-journal/v1","journal_id":"cleanup-task__workbench-kit__25","stage":"prepared","task_id":"workbench-kit#25","claim_id":"task__workbench-kit__25-20260711T030000Z-1234","branch":"task/25-example","revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","intent_digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777","policy_manifest":{"contract_version":"workbench-policy-manifest/v1","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","sources":[{"layer":"workspace","context_ref":null,"policy_ref":".workbench/policy.conf","policy_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","authority_identity":"github:example/workbench","authority_ref":"refs/heads/main","authority_revision":"1111111111111111111111111111111111111111","authority_receipt_digest":"sha256:abababababababababababababababababababababababababababababababab","decision":"allow"}]},"authorization_ref":"conversation:message/msg-123","removal_plan_digest":"sha256:9999999999999999999999999999999999999999999999999999999999999999","removal_plan":{"writer_operations":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","disposition":"retire-consumed"}],"codebase_worktrees":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","owner":"web-app","expected_path":"task/codebases/web-app"}],"task_workspace":".worktrees/task__workbench-kit__25","local_branch":"task/25-example"},"quarantine_authority":{"contract_version":"workbench-task-quarantine-authority/v1","device_id":"device:trusted/mac-1","clone_id":"123e4567-e89b-12d3-a456-426614174000","workspace_locator":".worktrees/task__workbench-kit__25","quarantine_locator":"workbench-v2/cleanup-quarantine/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"quarantine_receipt":null,"effect_owner_events":[],"at":"2026-07-11T03:30:00Z"}
+{"contract_version":"workbench-task-cleanup-journal/v1","journal_id":"cleanup-task__workbench-kit__25","stage":"prepared","task_id":"workbench-kit#25","claim_id":"task__workbench-kit__25-20260711T030000Z-1234","branch":"task/25-example","revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","intent_digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777","policy_manifest":{"contract_version":"workbench-policy-manifest/v1","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","sources":[{"layer":"workspace","context_ref":null,"policy_ref":".workbench/policy.conf","policy_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","authority_identity":"github:example/workbench","authority_ref":"refs/heads/main","authority_revision":"1111111111111111111111111111111111111111","authority_receipt_digest":"sha256:abababababababababababababababababababababababababababababababab","decision":"allow"}]},"authorization_ref":"conversation:message/msg-123","removal_plan_digest":"sha256:9999999999999999999999999999999999999999999999999999999999999999","removal_plan":{"writer_operations":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","disposition":"retire-consumed"}],"codebase_worktrees":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","owner":"web-app","expected_path":"task/codebases/web-app"}],"task_workspace":".worktrees/task__workbench-kit__25","local_branch":"task/25-example"},"quarantine_authority":{"contract_version":"workbench-task-quarantine-authority/v1","device_id":"device:trusted/mac-1","clone_id":"123e4567-e89b-12d3-a456-426614174000","workspace_locator":".worktrees/task__workbench-kit__25","quarantine_locator":"workbench-v2/cleanup-quarantine/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","arm_commitment":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"quarantine_receipt":null,"effect_owner_events":[],"at":"2026-07-11T03:30:00Z"}
 -->
 ```
 
@@ -2398,8 +2399,12 @@ objects have `operation_id`, `claim_id`, `disposition`, and worktree objects hav
 `operation_id`, `claim_id`, `owner`, `expected_path`, in those orders. Arrays use the same
 canonical sorting as the manifest. `quarantine_authority` has exact fields
 `contract_version`, `device_id`, `clone_id`, `workspace_locator`, and
-`quarantine_locator`. The locator is an opaque SHA-256-derived path relative to the selected
-clone's Git common directory; no external record contains an absolute quarantine path.
+`quarantine_locator`, and `arm_commitment`. The locator is an opaque SHA-256-derived path
+relative to the selected clone's Git common directory; no external record contains an absolute
+quarantine path. `arm_commitment` domain-separates and hashes the secret together with the
+complete immutable journal projection: task/claim/branch, revision, action, intent, policy,
+authorization, removal plan, and quarantine authority except the commitment itself. Stage,
+receipt, owner-event prefix, and observation time are the only excluded fields.
 
 `stage` is exactly `prepared`, `quarantined`, or `completed`. `prepared` requires a null
 `quarantine_receipt` and no owner events. The owning clone atomically no-replace renames the
@@ -2408,10 +2413,12 @@ quarantine. It follows no symlink component, preserves ignored and private files
 hard-linked or special files, checks stable inode/metadata before and after every read, fsyncs
 the transaction, and never rolls back over a path recreated by another process. The local
 receipt is projected externally with exact fields `contract_version`, `receipt_digest`,
-`task_id`, `claim_id`, `branch`, `device_id`, `clone_id`, `workspace_locator`,
+`arm_secret`, `task_id`, `claim_id`, `branch`, `device_id`, `clone_id`, `workspace_locator`,
 `quarantine_locator`, `workspace_device`, `workspace_inode`, `workspace_tree_digest`,
 `admin_manifest_digest`, and `quarantined_at`. That projection produces `stage:
-"quarantined"` and is immutable thereafter.
+"quarantined"` and is immutable thereafter. The secret is disclosed only after local
+quarantine. The reducer recomputes both the prepared commitment and a domain-separated
+`receipt_digest` over that secret plus the complete public receipt body.
 
 Only `quarantined` may append `effect_owner_events`. It is a prefix-ordered array of strict
 objects with exact fields `event_id`, `operation_id`, `claim_id`, `device_id`, `clone_id`,
@@ -2430,18 +2437,21 @@ cleanup retires those remaining claims without inventing an effect transition.
 Comments with one `journal_id` form an append-only prefix chain: immutable top-level bindings
 and removal plan are byte-equal, the receipt transitions exactly once from null to one exact
 value, every later event array extends the prior array, and timestamps are nondecreasing. The
-only stage transitions are `prepared -> quarantined -> completed`; repeated identical
-observations are idempotent. The unique longest valid prefix is current. A fork, receipt
-replacement, rewrite, duplicate non-idempotent prefix, or remote disagreement is
+only stage transitions are `prepared -> quarantined -> completed`; the first observation must
+be `prepared`, and repeated identical observations are idempotent. The unique longest valid
+prefix is current. A missing genesis, forged proof, fork, receipt replacement, rewrite,
+duplicate non-idempotent prefix, or malformed authenticated observation is
+`cleanup-journal-untrusted`; a later remote-state disagreement is
 `cleanup-reconciliation-failed`.
 
 The kernel writes `stage: "prepared"` only after final policy resolution and after fsyncing
 the local arm. The prepared journal is the applied-effect consumption source. The reducer
 never reauthorizes it and marks private status consumed when local state still exists. If the
 comment cannot be written, it returns `cleanup-journal-unavailable` and leaves the active
-workspace untouched. Once prepared is external, only the clone holding the matching local arm
-or receipt may promote it; another clone returns `cleanup-quarantine-unconfirmed` even if it
-copies public device/clone IDs and reconstructs the task branch.
+workspace untouched. Once prepared is external, only the clone holding the commitment's secret
+and matching local arm may mint its exact receipt and promote it. Another clone returns
+`cleanup-quarantine-unconfirmed` even if it copies public device/clone IDs and reconstructs the
+task branch; injecting a forged external receipt is `cleanup-journal-untrusted`.
 
 After external `quarantined` is durable, the active workspace path and all live linked-worktree
 admin records are absent while their exact bytes remain under the opaque quarantine locator.

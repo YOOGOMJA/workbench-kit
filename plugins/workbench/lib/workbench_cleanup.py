@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -86,10 +87,12 @@ QUARANTINE_AUTHORITY_FIELDS = (
     "clone_id",
     "workspace_locator",
     "quarantine_locator",
+    "arm_commitment",
 )
 QUARANTINE_RECEIPT_FIELDS = (
     "contract_version",
     "receipt_digest",
+    "arm_secret",
     "task_id",
     "claim_id",
     "branch",
@@ -147,6 +150,20 @@ OID = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?\Z")
 QUARANTINE_LOCATOR = re.compile(
     r"workbench-v2/cleanup-quarantine/[0-9a-f]{64}\Z"
 )
+ARM_SECRET = re.compile(r"[0-9a-f]{64}\Z")
+LOCAL_QUARANTINE_PROOF_FIELDS = (
+    "contract_version",
+    "task_id",
+    "claim_id",
+    "branch",
+    "device_id",
+    "clone_id",
+    "workspace_locator",
+    "quarantine_locator",
+    "journal_binding_digest",
+    "arm_commitment",
+    "arm_secret",
+)
 LOCAL_QUARANTINE_INTENT_FIELDS = (
     "contract_version",
     "task_id",
@@ -171,6 +188,7 @@ LOCAL_ADMIN_INTENT_FIELDS = (
 LOCAL_QUARANTINE_RECEIPT_FIELDS = (
     "contract_version",
     "receipt_digest",
+    "arm_secret",
     "task_id",
     "claim_id",
     "branch",
@@ -393,6 +411,26 @@ def quarantine_locator(
     ).hexdigest()
 
 
+def require_arm_secret(value: Any, field: str = "arm_secret") -> str:
+    if not isinstance(value, str) or ARM_SECRET.fullmatch(value) is None:
+        raise ValueError("{} must be a 256-bit lowercase hex secret".format(field))
+    return value
+
+
+def quarantine_arm_commitment(
+    secret: str,
+    journal_binding_digest: str,
+) -> str:
+    require_arm_secret(secret)
+    require_digest(journal_binding_digest, "quarantine journal binding digest")
+    rows = (
+        "workbench-task-quarantine-arm-proof/v1\n"
+        "journal_binding_digest\t{}\n"
+        "arm_secret\t{}\n"
+    ).format(journal_binding_digest, secret)
+    return sha256(rows.encode("utf-8"))
+
+
 def validate_quarantine_authority(
     value: Any,
     task_id: str,
@@ -419,6 +457,7 @@ def validate_quarantine_authority(
         raise ValueError("quarantine authority locator does not bind its identity")
     if QUARANTINE_LOCATOR.fullmatch(value["quarantine_locator"]) is None:
         raise ValueError("quarantine authority locator is not canonical")
+    require_digest(value["arm_commitment"], "quarantine authority arm_commitment")
     return value
 
 
@@ -440,6 +479,7 @@ def validate_quarantine_receipt(
     if value["contract_version"] != "workbench-task-quarantine-receipt/v1":
         raise ValueError("unsupported quarantine receipt contract")
     require_digest(value["receipt_digest"], "quarantine receipt digest")
+    secret = require_arm_secret(value["arm_secret"], "quarantine receipt arm_secret")
     expected = {
         "task_id": journal["task_id"],
         "claim_id": journal["claim_id"],
@@ -464,6 +504,11 @@ def validate_quarantine_receipt(
         value["admin_manifest_digest"], "quarantine receipt admin manifest"
     )
     require_time(value["quarantined_at"], "quarantine receipt quarantined_at")
+    commitment = quarantine_arm_commitment(secret, quarantine_arm_binding(journal))
+    if commitment != authority["arm_commitment"]:
+        raise ValueError("quarantine receipt does not prove the local arm secret")
+    if quarantine_receipt_digest(value) != value["receipt_digest"]:
+        raise ValueError("quarantine receipt proof digest mismatch")
     return value
 
 
@@ -525,6 +570,48 @@ def canonical_json_bytes(value: Any) -> bytes:
     return (
         json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
     ).encode("utf-8")
+
+
+def quarantine_arm_binding(value: Mapping[str, Any]) -> str:
+    selected: Dict[str, Any] = {}
+    for field in JOURNAL_FIELDS:
+        if field in ("stage", "quarantine_receipt", "effect_owner_events", "at"):
+            continue
+        if field == "quarantine_authority":
+            authority = dict(value[field])
+            authority.pop("arm_commitment", None)
+            selected[field] = authority
+        else:
+            selected[field] = value[field]
+    raw = (
+        b"workbench-task-quarantine-journal-binding/v1\n"
+        + (
+            json.dumps(
+                selected,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+    return sha256(raw)
+
+
+def quarantine_receipt_digest(value: Mapping[str, Any]) -> str:
+    secret = require_arm_secret(value["arm_secret"], "quarantine receipt arm_secret")
+    body = {
+        field: value[field]
+        for field in QUARANTINE_RECEIPT_FIELDS
+        if field != "receipt_digest"
+    }
+    raw = (
+        b"workbench-task-quarantine-receipt-proof/v1\n"
+        + bytes.fromhex(secret)
+        + b"\n"
+        + canonical_json_bytes(body)
+    )
+    return sha256(raw)
 
 
 def secure_directory_flags() -> int:
@@ -617,10 +704,55 @@ def write_durable_json(directory: str, name: str, value: Mapping[str, Any]) -> N
 
 
 def read_strict_local_json(path: str, fields: Sequence[str], name: str) -> Mapping[str, Any]:
-    value = load_json(path)
+    directory_fd = open_absolute_directory_nofollow(os.path.dirname(path))
+    descriptor = -1
+    try:
+        filename = os.path.basename(path)
+        before = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise ValueError("{} is not a private regular record".format(name))
+        descriptor = os.open(filename, secure_file_flags(), dir_fd=directory_fd)
+        opened = os.fstat(descriptor)
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_mode,
+            item.st_nlink,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if identity(opened) != identity(before):
+            raise ValueError("{} changed before secure open".format(name))
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 16 * 1024 * 1024:
+                raise ValueError("{} exceeds the local record budget".format(name))
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        if identity(after) != identity(opened) or identity(current) != identity(after):
+            raise ValueError("{} changed during secure read".format(name))
+        raw = b"".join(chunks)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
     require_fields(value, fields, name)
     if tuple(value) != tuple(fields):
         raise ValueError("{} fields are not canonical".format(name))
+    if raw != canonical_json_bytes(value):
+        raise ValueError("{} bytes are not canonical".format(name))
     return value
 
 
@@ -762,6 +894,60 @@ def quarantine_base_directory(common: str, locator: str, create: bool) -> str:
             os.chmod(candidate, 0o700)
         current = candidate
     return os.path.join(current, parts[-1])
+
+
+def validate_local_quarantine_proof(
+    value: Any,
+    task_id: str,
+    claim_id: str,
+    branch: str,
+    device_id: str,
+    clone_id: str,
+    workspace_locator: str,
+    locator: str,
+    journal_binding_digest: str,
+) -> Mapping[str, Any]:
+    require_fields(value, LOCAL_QUARANTINE_PROOF_FIELDS, "local quarantine proof")
+    if tuple(value) != LOCAL_QUARANTINE_PROOF_FIELDS:
+        raise ValueError("local quarantine proof fields are not canonical")
+    if value["contract_version"] != "workbench-local-task-quarantine-proof/v1":
+        raise ValueError("unsupported local quarantine proof contract")
+    expected = {
+        "task_id": task_id,
+        "claim_id": claim_id,
+        "branch": branch,
+        "device_id": device_id,
+        "clone_id": clone_id,
+        "workspace_locator": workspace_locator,
+        "quarantine_locator": locator,
+        "journal_binding_digest": journal_binding_digest,
+    }
+    if any(value[field] != item for field, item in expected.items()):
+        raise ValueError("local quarantine proof changed its cleanup binding")
+    secret = require_arm_secret(value["arm_secret"], "local quarantine arm_secret")
+    commitment = quarantine_arm_commitment(secret, journal_binding_digest)
+    if value["arm_commitment"] != commitment:
+        raise ValueError("local quarantine proof commitment mismatch")
+    return value
+
+
+def local_proof_for_journal(bundle: str, journal: Mapping[str, Any]) -> Mapping[str, Any]:
+    authority = journal["quarantine_authority"]
+    return validate_local_quarantine_proof(
+        read_strict_local_json(
+            os.path.join(bundle, "proof.json"),
+            LOCAL_QUARANTINE_PROOF_FIELDS,
+            "local quarantine proof",
+        ),
+        journal["task_id"],
+        journal["claim_id"],
+        journal["branch"],
+        authority["device_id"],
+        authority["clone_id"],
+        authority["workspace_locator"],
+        authority["quarantine_locator"],
+        quarantine_arm_binding(journal),
+    )
 
 
 def admin_intent(
@@ -1019,8 +1205,7 @@ def rename_directory_noreplace(source: str, destination: str) -> None:
 
 
 def local_receipt_digest(value: Mapping[str, Any]) -> str:
-    body = {key: value[key] for key in LOCAL_QUARANTINE_RECEIPT_FIELDS if key != "receipt_digest"}
-    return sha256(canonical_json_bytes(body))
+    return quarantine_receipt_digest(external_quarantine_receipt(value))
 
 
 def validate_local_quarantine_receipt(
@@ -1076,6 +1261,7 @@ def external_quarantine_receipt(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return {
         "contract_version": "workbench-task-quarantine-receipt/v1",
         "receipt_digest": value["receipt_digest"],
+        "arm_secret": value["arm_secret"],
         "task_id": value["task_id"],
         "claim_id": value["claim_id"],
         "branch": value["branch"],
@@ -1096,6 +1282,7 @@ def authenticate_local_quarantine(
     bundle: str,
     intent: Mapping[str, Any],
     journal: Mapping[str, Any],
+    arm_secret: str,
 ) -> Mapping[str, Any]:
     workspace = os.path.join(bundle, "workspace")
     source_workspace = os.path.join(root, intent["workspace_locator"])
@@ -1138,7 +1325,8 @@ def authenticate_local_quarantine(
             journal,
         )
         if (
-            receipt["workspace_tree_digest"] != workspace_digest
+            receipt["arm_secret"] != arm_secret
+            or receipt["workspace_tree_digest"] != workspace_digest
             or receipt["admin_records"] != admin_receipts
             or receipt["admin_manifest_digest"] != admin_digest
         ):
@@ -1146,6 +1334,7 @@ def authenticate_local_quarantine(
         return receipt
     receipt_body = {
         "contract_version": "workbench-local-task-quarantine-receipt/v1",
+        "arm_secret": arm_secret,
         "task_id": intent["task_id"],
         "claim_id": intent["claim_id"],
         "branch": intent["branch"],
@@ -1169,6 +1358,99 @@ def authenticate_local_quarantine(
     validate_local_quarantine_receipt(ordered, intent, journal)
     write_durable_json(bundle, "receipt.json", ordered)
     return ordered
+
+
+def ensure_local_quarantine_bundle(common: str, locator: str) -> str:
+    bundle = quarantine_base_directory(common, locator, True)
+    admins = os.path.join(bundle, "admins")
+    if not os.path.lexists(bundle):
+        os.mkdir(bundle, 0o700)
+        fsync_directory(os.path.dirname(bundle))
+        os.mkdir(admins, 0o700)
+        fsync_directory(bundle)
+    else:
+        value = os.lstat(bundle)
+        admin_value = os.lstat(admins)
+        if (
+            not stat.S_ISDIR(value.st_mode)
+            or stat.S_ISLNK(value.st_mode)
+            or stat.S_IMODE(value.st_mode) != 0o700
+            or not stat.S_ISDIR(admin_value.st_mode)
+            or stat.S_ISLNK(admin_value.st_mode)
+            or stat.S_IMODE(admin_value.st_mode) != 0o700
+        ):
+            raise ValueError("cleanup quarantine arm bundle is not exact")
+    return bundle
+
+
+def cmd_quarantine_proof(args: argparse.Namespace) -> None:
+    journal = validate_journal(load_json(args.journal_file))
+    if journal["stage"] != "prepared":
+        raise ValueError("local quarantine proof requires a prepared journal")
+    authority = journal["quarantine_authority"]
+    if authority["device_id"] != args.device_id or authority["clone_id"] != args.clone_id:
+        raise PermissionError("local quarantine proof belongs to another device or clone")
+    workspace_locator = authority["workspace_locator"]
+    locator = authority["quarantine_locator"]
+    journal_binding_digest = quarantine_arm_binding(journal)
+    if not os.path.isabs(args.workspace_root):
+        raise ValueError("local quarantine proof workspace root must be absolute")
+    root = os.path.realpath(args.workspace_root)
+    task_path = os.path.join(root, workspace_locator)
+    if os.path.realpath(args.task_dir) != task_path:
+        raise ValueError("local quarantine proof task path does not bind the workspace")
+    common = normalized_real_path(root, git_value(root, "rev-parse", "--git-common-dir"))
+    if os.path.dirname(common) != root:
+        raise ValueError("local quarantine proof common directory does not bind the workspace")
+    bundle = ensure_local_quarantine_bundle(common, locator)
+    proof_path = os.path.join(bundle, "proof.json")
+    if os.path.lexists(proof_path):
+        proof = validate_local_quarantine_proof(
+            read_strict_local_json(
+                proof_path, LOCAL_QUARANTINE_PROOF_FIELDS, "local quarantine proof"
+            ),
+            journal["task_id"],
+            journal["claim_id"],
+            journal["branch"],
+            authority["device_id"],
+            authority["clone_id"],
+            workspace_locator,
+            locator,
+            journal_binding_digest,
+        )
+    else:
+        unexpected = set(os.listdir(bundle)) - {"admins"}
+        if unexpected or os.listdir(os.path.join(bundle, "admins")):
+            raise ValueError("cleanup quarantine proof bundle contains unbound state")
+        secret = secrets.token_hex(32)
+        proof = {
+            "contract_version": "workbench-local-task-quarantine-proof/v1",
+            "task_id": journal["task_id"],
+            "claim_id": journal["claim_id"],
+            "branch": journal["branch"],
+            "device_id": authority["device_id"],
+            "clone_id": authority["clone_id"],
+            "workspace_locator": workspace_locator,
+            "quarantine_locator": locator,
+            "journal_binding_digest": journal_binding_digest,
+            "arm_commitment": quarantine_arm_commitment(secret, journal_binding_digest),
+            "arm_secret": secret,
+        }
+        ordered = {field: proof[field] for field in LOCAL_QUARANTINE_PROOF_FIELDS}
+        validate_local_quarantine_proof(
+            ordered,
+            journal["task_id"],
+            journal["claim_id"],
+            journal["branch"],
+            authority["device_id"],
+            authority["clone_id"],
+            workspace_locator,
+            locator,
+            journal_binding_digest,
+        )
+        write_durable_json(bundle, "proof.json", ordered)
+        proof = ordered
+    sys.stdout.write(proof["arm_commitment"] + "\n")
 
 
 def cmd_quarantine_create(args: argparse.Namespace) -> None:
@@ -1199,6 +1481,7 @@ def cmd_quarantine_create(args: argparse.Namespace) -> None:
         ),
         journal,
     )
+    proof = local_proof_for_journal(bundle, journal)
     if os.path.lexists(task_path):
         current = build_local_quarantine_intent(
             root, task_path, common, journal, args.descriptor_file
@@ -1222,7 +1505,9 @@ def cmd_quarantine_create(args: argparse.Namespace) -> None:
             record["filesystem_inode"],
         )
     journal["_quarantine_at"] = args.at
-    receipt = authenticate_local_quarantine(root, bundle, intent, journal)
+    receipt = authenticate_local_quarantine(
+        root, bundle, intent, journal, proof["arm_secret"]
+    )
     write_json(external_quarantine_receipt(receipt))
 
 
@@ -1242,22 +1527,8 @@ def cmd_quarantine_arm(args: argparse.Namespace) -> None:
     common = normalized_real_path(root, git_value(root, "rev-parse", "--git-common-dir"))
     if os.path.dirname(common) != root:
         raise ValueError("cleanup quarantine arm common directory does not bind the workspace")
-    bundle = quarantine_base_directory(common, authority["quarantine_locator"], True)
-    if not os.path.lexists(bundle):
-        os.mkdir(bundle, 0o700)
-        fsync_directory(os.path.dirname(bundle))
-        os.mkdir(os.path.join(bundle, "admins"), 0o700)
-        fsync_directory(bundle)
-    else:
-        value = os.lstat(bundle)
-        admins = os.path.join(bundle, "admins")
-        if (
-            not stat.S_ISDIR(value.st_mode)
-            or stat.S_ISLNK(value.st_mode)
-            or not os.path.isdir(admins)
-            or os.path.islink(admins)
-        ):
-            raise ValueError("cleanup quarantine arm bundle is not exact")
+    bundle = ensure_local_quarantine_bundle(common, authority["quarantine_locator"])
+    local_proof_for_journal(bundle, journal)
     current = build_local_quarantine_intent(
         root, task_path, common, journal, args.descriptor_file
     )
@@ -1274,7 +1545,7 @@ def cmd_quarantine_arm(args: argparse.Namespace) -> None:
         if stored != current:
             raise ValueError("cleanup quarantine arm changed")
     else:
-        unexpected = set(os.listdir(bundle)) - {"admins"}
+        unexpected = set(os.listdir(bundle)) - {"admins", "proof.json"}
         if unexpected or os.listdir(os.path.join(bundle, "admins")):
             raise ValueError("cleanup quarantine arm contains unbound state")
         write_durable_json(bundle, "intent.json", current)
@@ -1703,6 +1974,8 @@ def reduce_prefix(values: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
     if not values:
         raise LookupError("cleanup journal not found")
     current = values[0]
+    if current["stage"] != "prepared":
+        raise ValueError("cleanup journal prefix must begin with prepared")
     binding = immutable_binding(current)
     for candidate in values[1:]:
         if immutable_binding(candidate) != binding:
@@ -1783,6 +2056,7 @@ def cmd_build(args: argparse.Namespace) -> None:
             args.clone_id,
             plan["task_workspace"],
         ),
+        "arm_commitment": args.arm_commitment,
     }
     value = {
         "contract_version": "workbench-task-cleanup-journal/v1",
@@ -2235,6 +2509,7 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--removal-plan-file", required=True)
     build.add_argument("--device-id", required=True)
     build.add_argument("--clone-id", required=True)
+    build.add_argument("--arm-commitment", required=True)
     build.add_argument("--at", required=True)
     build.set_defaults(func=cmd_build)
 
@@ -2259,6 +2534,14 @@ def parser() -> argparse.ArgumentParser:
     quarantine_create.add_argument("--clone-id", required=True)
     quarantine_create.add_argument("--at", required=True)
     quarantine_create.set_defaults(func=cmd_quarantine_create)
+
+    quarantine_proof = commands.add_parser("quarantine-proof")
+    quarantine_proof.add_argument("--journal-file", required=True)
+    quarantine_proof.add_argument("--workspace-root", required=True)
+    quarantine_proof.add_argument("--task-dir", required=True)
+    quarantine_proof.add_argument("--device-id", required=True)
+    quarantine_proof.add_argument("--clone-id", required=True)
+    quarantine_proof.set_defaults(func=cmd_quarantine_proof)
 
     quarantine_arm = commands.add_parser("quarantine-arm")
     quarantine_arm.add_argument("--journal-file", required=True)

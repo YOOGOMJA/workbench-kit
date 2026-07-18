@@ -7354,9 +7354,11 @@ cleanup_journal_latest() {
   else
     rc=$?; rm -f "$observation" "$CLEANUP_JOURNAL_PROVENANCE_FILE"
     CLEANUP_JOURNAL_PROVENANCE_FILE=""
-    [ "$rc" -eq 1 ] && return 1
-    [ "$rc" -eq 3 ] && return 3
-    return 2
+    case "$rc" in
+      1) return 1 ;;
+      2|3) return 3 ;;
+      *) return 2 ;;
+    esac
   fi
 }
 
@@ -8041,6 +8043,7 @@ cmd_done_v2() {
   local journal_file policy_file plan_file payload_file completed_file dirty checkpoint_file checkpoint_latest checkpoint_rc
   local task_workspace=false local_branch=false intent="" manifest="" authorization_ref="" removal_plan=""
   local primary_digest stored_plan recovered_submission=false remote_terminal=false retry_checkpoint=""
+  local arm_commitment=""
   root="$(wb_root)"; helper="$(cleanup_contract_helper)"
   CLEANUP_TASK_ID="$id"; CLEANUP_BRANCH="$branch"; CLEANUP_CLAIM_ID=""
   CLEANUP_BLOCKER_COUNT=0; CLEANUP_REMOVED_COUNT=0; CLEANUP_REMOVED_WRITER_COUNT=0
@@ -8339,6 +8342,27 @@ cmd_done_v2() {
     --action-instance-id "$action_id" --intent-digest "$intent" \
     --removal-plan-digest "$removal_plan" --removal-plan-file "$plan_file" \
     --device-id "$WRITER_DEVICE_ID" --clone-id "$WRITER_CLONE_ID" \
+    --arm-commitment "sha256:0000000000000000000000000000000000000000000000000000000000000000" \
+    --at "$(utc_now)" > "$journal_file"; then
+    cleanup_add_blocker action-binding-stale task.cleanup
+    rm -f "$journal_file" "$policy_file" "$plan_file"
+    print_cleanup_json "" false "$action_id" "$intent" "" "" "$revision" "$removal_plan" false false
+    return 1
+  fi
+  if ! arm_commitment="$(python3 "$helper" quarantine-proof \
+    --journal-file "$journal_file" --workspace-root "$root" --task-dir "$dir" \
+    --device-id "$WRITER_DEVICE_ID" --clone-id "$WRITER_CLONE_ID")"; then
+    cleanup_add_blocker cleanup-quarantine-unconfirmed "$branch"
+    rm -f "$journal_file" "$policy_file" "$plan_file"
+    print_cleanup_json "" false "$action_id" "$intent" "" "" "$revision" "$removal_plan" false false
+    return 1
+  fi
+  if ! python3 "$helper" build --policy-resolution-file "$policy_file" --task-id "$id" \
+    --claim-id "$CLEANUP_CLAIM_ID" --branch "$branch" --revision "$revision" \
+    --action-instance-id "$action_id" --intent-digest "$intent" \
+    --removal-plan-digest "$removal_plan" --removal-plan-file "$plan_file" \
+    --device-id "$WRITER_DEVICE_ID" --clone-id "$WRITER_CLONE_ID" \
+    --arm-commitment "$arm_commitment" \
     --at "$(utc_now)" > "$journal_file"; then
     cleanup_add_blocker action-binding-stale task.cleanup
     rm -f "$journal_file" "$policy_file" "$plan_file"

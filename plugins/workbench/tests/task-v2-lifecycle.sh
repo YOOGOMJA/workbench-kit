@@ -859,6 +859,7 @@ value = {
         "clone_id": clone,
         "workspace_locator": plan["task_workspace"],
         "quarantine_locator": quarantine_locator,
+        "arm_commitment": "sha256:" + "0" * 64,
     },
     "quarantine_receipt": None,
     "effect_owner_events": [],
@@ -4040,7 +4041,7 @@ EOF
 }
 
 test_cleanup_prepared_journal_failure_deletes_nothing() {
-  local out branch action_file
+  local out branch action_file common proof proof_backup actual rc
   prepare_cleanup_fixture cleanup_prepared_failure
   branch="task/29-v2-lifecycle-fixture-29"
   action_file="$CLEANUP_TASK_DIR/task/.workbench/actions/$CLEANUP_ACTION_INSTANCE.record"
@@ -4063,6 +4064,34 @@ test_cleanup_prepared_journal_failure_deletes_nothing() {
   if grep -Fq 'workbench-task-cleanup:v1' "$TMPDIR/cleanup_prepared_failure/comments/29.comments"; then
     fail "failed prepared journal must not appear durable"
   fi
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  proof="$(find "$common/workbench-v2/cleanup-quarantine" -type f -name proof.json -print)"
+  [ -n "$proof" ] && [ "$(printf '%s\n' "$proof" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "prepared journal failure did not retain one local arm proof"
+  proof_backup="$TMPDIR/cleanup_prepared_failure/proof.backup"
+  cp "$proof" "$proof_backup"
+  rm "$proof"
+  ln -s "$proof_backup" "$proof"
+  out="$TMPDIR/cleanup_prepared_failure/symlink-proof.out"
+  if WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_prepared_failure "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup followed a symlinked local arm proof"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "symlinked local arm proof returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "symlinked local proof removed the workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "symlinked local proof removed the branch"
+  rm "$proof"
+  mv "$proof_backup" "$proof"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_prepared_failure "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json)"
+  assert_contains "$actual" '"outcome":"cleaned"'
 }
 
 test_cleanup_revalidates_outer_task_before_forced_removal() {
@@ -4431,7 +4460,7 @@ test_cleanup_releases_work_ref_reservation_after_workspace_removal() {
 }
 
 test_cleanup_prepared_quarantine_cannot_be_promoted_by_foreign_clone() {
-  local out rc foreign branch actual comments common foreign_task device clone
+  local out rc foreign branch actual comments comments_backup common foreign_task device clone
   prepare_cleanup_fixture cleanup_quarantine_foreign
   branch="task/29-v2-lifecycle-fixture-29"
   comments="$TMPDIR/cleanup_quarantine_foreign/comments/29.comments"
@@ -4459,6 +4488,56 @@ test_cleanup_prepared_quarantine_cannot_be_promoted_by_foreign_clone() {
   fi
   git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
     || fail "foreign clone removed the owning clone's retry branch"
+
+  comments_backup="$TMPDIR/cleanup_quarantine_foreign/comments.before-forgery"
+  cp "$comments" "$comments_backup"
+  PYTHONPATH="$PLUGIN_ROOT/lib" python3 - "$comments" <<'PY'
+import json
+import re
+import sys
+
+from workbench_cleanup import quarantine_receipt_digest
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+raw = re.findall(r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->", text)[0]
+journal = json.loads(raw)
+authority = journal["quarantine_authority"]
+receipt = {
+    "contract_version": "workbench-task-quarantine-receipt/v1",
+    "receipt_digest": "",
+    "arm_secret": "f" * 64,
+    "task_id": journal["task_id"],
+    "claim_id": journal["claim_id"],
+    "branch": journal["branch"],
+    "device_id": authority["device_id"],
+    "clone_id": authority["clone_id"],
+    "workspace_locator": authority["workspace_locator"],
+    "quarantine_locator": authority["quarantine_locator"],
+    "workspace_device": "1",
+    "workspace_inode": "1",
+    "workspace_tree_digest": "sha256:" + "a" * 64,
+    "admin_manifest_digest": "sha256:" + "b" * 64,
+    "quarantined_at": journal["at"],
+}
+receipt["receipt_digest"] = quarantine_receipt_digest(receipt)
+journal["stage"] = "quarantined"
+journal["quarantine_receipt"] = receipt
+marker = json.dumps(journal, separators=(",", ":"))
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write("<!-- fixture-comment-author:test@example.invalid -->\n")
+    handle.write("<!-- workbench-task-cleanup:v1\n" + marker + "\n-->\n")
+    handle.write("<!-- fixture-comment-end -->\n")
+PY
+  out="$TMPDIR/cleanup_quarantine_foreign/forged-receipt.out"
+  if run_task cleanup_quarantine_foreign "$foreign" done 29 --format json >"$out" 2>&1; then
+    fail "a foreign clone promoted a forged public quarantine receipt"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "forged foreign quarantine receipt returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-untrusted"'
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "forged quarantine receipt removed the owning branch"
+  mv "$comments_backup" "$comments"
 
   IFS=$'\t' read -r device clone <<EOF
 $(python3 - "$comments" <<'PY'
@@ -4721,7 +4800,8 @@ PY
 )"
   bundle="$common/$locator"
   [ -d "$bundle/workspace" ] || fail "destination race lost the occupying directory"
-  mode="$(stat -f '%Lp' "$bundle/workspace" 2>/dev/null || stat -c '%a' "$bundle/workspace")"
+  mode="$(stat -c '%a' "$bundle/workspace" 2>/dev/null \
+    || stat -f '%Lp' "$bundle/workspace")"
   [ "$mode" = 711 ] || fail "destination race replaced the occupying directory"
   [ ! -e "$bundle/receipt.json" ] || fail "destination race minted a quarantine receipt"
   git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
@@ -4796,7 +4876,7 @@ PY
     fail "deleted cleanup retry accepted an intent-tampered authenticated journal"
   else rc=$?; fi
   [ "$rc" = 1 ] || fail "tampered deleted retry returned $rc"
-  assert_file_contains "$out" '"code":"cleanup-journal-unreconciled"'
+  assert_file_contains "$out" '"code":"cleanup-journal-untrusted"'
 }
 
 test_v2_cleanup_requires_terminal_outcome_even_with_force() {
