@@ -798,7 +798,7 @@ with tempfile.TemporaryDirectory(prefix="workbench-planner-") as temporary:
             "code": "kernel-readiness-indeterminate",
             "ref": missing_binary,
         }],
-    }
+    }, indeterminate
     assert workspace_digest(cli_root) == indeterminate_before
     os.environ["WORKBENCH_KIT_WORKBENCH_BIN"] = str(stub)
     os.environ["UPGRADE_STUB_APPROVAL_FILE"] = str(authority_path)

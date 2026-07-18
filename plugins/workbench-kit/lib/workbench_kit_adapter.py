@@ -1719,8 +1719,11 @@ def _raise_access_descriptor_limit(
     target = soft + required + 32
     if hard != resource.RLIM_INFINITY:
         target = min(target, hard)
-    if target < soft + required:
-        raise AdapterError("public-state-unavailable", "RLIMIT_NOFILE")
+    if target <= soft:
+        # A runner may start at a large finite hard limit.  In that case there
+        # is nothing to raise; the guarded descriptor opens below remain the
+        # authoritative capacity check and fail closed if the limit is full.
+        return None
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
     except (OSError, ValueError) as error:

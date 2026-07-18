@@ -1399,6 +1399,30 @@ finally:
     os.close(exhaustion_fd)
 assert len(os.listdir("/dev/fd")) == descriptor_count - 1
 
+capped_limit_state = {"worktree": {}, "git_admin": []}
+original_getrlimit = adapter.resource.getrlimit
+original_setrlimit = adapter.resource.setrlimit
+capped_setrlimit_calls = []
+
+
+def capped_getrlimit(resource_id):
+    assert resource_id == resource.RLIMIT_NOFILE
+    return (4096, 4096)
+
+
+def record_capped_setrlimit(resource_id, limits):
+    capped_setrlimit_calls.append((resource_id, limits))
+
+
+adapter.resource.getrlimit = capped_getrlimit
+adapter.resource.setrlimit = record_capped_setrlimit
+try:
+    assert adapter._raise_access_descriptor_limit(capped_limit_state) is None
+finally:
+    adapter.resource.getrlimit = original_getrlimit
+    adapter.resource.setrlimit = original_setrlimit
+assert capped_setrlimit_calls == []
+
 capacity_root = repository("descriptor-capacity").resolve()
 for index in range(320):
     (capacity_root / f"directory-{index:03d}").mkdir()
