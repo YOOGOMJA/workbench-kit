@@ -19,6 +19,10 @@ import sys
 from jsonschema import Draft202012Validator
 
 sys.path.insert(0, sys.argv[1])
+from workbench_kit_contracts import (
+    GRANDFATHERED_LANGUAGE_TAGS,
+    language_tag_valid,
+)
 from workbench_kit_schema import load_schema_suite
 
 schema_dir = pathlib.Path(sys.argv[2])
@@ -173,6 +177,57 @@ for filename in (
 
 SHA = "sha256:" + "a" * 64
 OID = "1" * 40
+language = {
+    "contract_version": "workbench-kit-language-decision/v1",
+    "tag": "en",
+    "source": "explicit-cli",
+    "source_ref": "argv:--language",
+    "digest": SHA,
+}
+language_cases = {
+    "en": True,
+    "zh-Hant-TW": True,
+    "zh-cmn-Hans-CN": True,
+    "sl-rozaj-biske-1994": True,
+    "en-a-aaa-b-bbb-x-private": True,
+    "en-GB-oed": True,
+    "i-klingon": True,
+    "x-private": True,
+    "e": False,
+    "en--US": False,
+    "x": False,
+    "en-a": False,
+    "en-x": False,
+    "en-abcdefghi": False,
+    "ko-한국": False,
+    "en-" + "a" * 252: False,
+}
+for tag, expected in language_cases.items():
+    assert language_tag_valid(tag) is expected, tag
+    accepted = definition_accepts(
+        "upgrade-plan.schema.json", "language", {**language, "tag": tag}
+    )
+    assert accepted is expected, (tag, accepted, expected)
+for tag in sorted(GRANDFATHERED_LANGUAGE_TAGS):
+    for spelling in (tag, tag.upper()):
+        assert language_tag_valid(spelling), spelling
+        assert definition_accepts(
+            "upgrade-plan.schema.json",
+            "language",
+            {**language, "tag": spelling},
+        ), spelling
+language_ref = (
+    "https://github.com/YOOGOMJA/workbench-kit/schemas/"
+    "workbench-kit-upgrade-plan-v1#/$defs/language"
+)
+for filename in (
+    "generation-receipt.schema.json",
+    "migration-receipt.schema.json",
+):
+    assert documents[filename]["properties"]["language"] == {
+        "$ref": language_ref
+    }
+
 authority = {
     "contract_version": "workbench-bootstrap-authority-approval/v1",
     "approval_id": "approval-schema",
