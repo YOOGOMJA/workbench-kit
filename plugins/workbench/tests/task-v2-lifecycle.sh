@@ -5187,8 +5187,10 @@ test_writer_root_initialization_recovers_once() {
     || fail "writer root retry did not append claim and owner exactly once"
   ledger="$TMPDIR/writer_root_recovery/writer-claims.tsv"
   git --git-dir="$TMPDIR/writer_root_recovery/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
-  [ "$(grep -c '^claim\t' "$ledger")" = 1 ] || fail "writer root retry duplicated its claim"
-  [ "$(grep -c '^effect-owner\t' "$ledger")" = 1 ] || fail "writer root retry duplicated owner acquisition"
+  [ "$(grep -c $'^claim\t' "$ledger")" = 1 ] \
+    || fail "writer root retry did not retain exactly one claim"
+  [ "$(grep -c $'^effect-owner\t' "$ledger")" = 1 ] \
+    || fail "writer root retry did not retain exactly one owner acquisition"
 }
 
 test_writer_first_observation_adopts_durable_anchor() {
