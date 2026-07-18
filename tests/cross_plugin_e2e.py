@@ -134,6 +134,12 @@ def safe_extract_legacy_archive(destination: pathlib.Path) -> None:
                 if target.is_absolute():
                     fail("unsafe legacy archive symlink: {}".format(member.name))
         archive.extractall(str(destination))
+        for member in archive.getmembers():
+            target = destination / member.name
+            if member.isdir():
+                target.chmod(0o755)
+            elif member.isfile():
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
 
 def materialize_generated_files(workspace: pathlib.Path) -> None:
