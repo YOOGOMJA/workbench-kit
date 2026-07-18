@@ -177,7 +177,7 @@ def public_snapshot(schema, ready):
 
 
 bundle = load_runtime_bundle(PLUGIN_ROOT)
-assert bundle["plugin_equivalence_input"] is None
+assert bundle["plugin_equivalence_input"] is not None
 
 for metadata_path in sorted(FIXTURE_ROOT.glob("*/fixture.json")):
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -196,7 +196,7 @@ for metadata_path in sorted(FIXTURE_ROOT.glob("*/fixture.json")):
     before = workspace_digest(root)
     arguments = {
         "generator_receipts": bundle["generator_receipts"],
-        "equivalence_receipt": None,
+        "equivalence_receipt": bundle["plugin_equivalence_input"]["receipt"],
         "legacy_engine_markers": bundle["legacy_engine_markers"],
     }
     snapshot = public_snapshot(

@@ -39,12 +39,14 @@
 
 ## 무엇을 얻나
 
-workbench-kit은 함께 동작하는 두 플러그인의 **마켓플레이스**입니다. 둘 다 설치하세요.
+workbench-kit은 세 플러그인의 **마켓플레이스**입니다. 엔진과 부트스트랩은 함께
+설치하고, 제품 개발 팩은 필요할 때만 추가합니다.
 
 | 플러그인 | 역할 | 이걸로… |
 |---|---|---|
 | **`workbench`** | **엔진.** 워크트리/task 격리, 점진적 지식 수확, 스킬 기반 task 수명주기. | 일상 작업을 굴립니다 — task 시작·제출, 남길 것 수확. |
 | **`workbench-kit`** | **부트스트랩.** 당신의 컨벤션을 인터뷰한 뒤, 개인화된 최소 워크벤치 레포를 생성. | *새* 워크벤치를 취향에 맞춰 한 번 세팅합니다. |
+| **`toolbox`** *(선택)* | **제품 개발 팩.** 지속되는 제품·시나리오 상태와, 거버넌스를 따르는 기획·디자인·TDD·릴리스·포트폴리오 워크플로. | 에이전트가 제품 의도부터 정책 승인을 받은 구현 한 조각까지 차례로 진행하게 합니다. |
 
 **도구 중립적**입니다 — 같은 `skills/` 소스가 Claude Code와 Codex 양쪽에 설치됩니다.
 "Bring your own rules" — 메커니즘은 고정, 당신의 컨벤션은 자유입니다.
@@ -57,14 +59,18 @@ workbench-kit은 함께 동작하는 두 플러그인의 **마켓플레이스**�
 /plugin marketplace add YOOGOMJA/workbench-kit
 /plugin install workbench@workbench-kit
 /plugin install workbench-kit@workbench-kit
+# 제품 개발 워크플로가 필요할 때만:
+/plugin install toolbox@workbench-kit
 ```
 
 **Codex**
 
 ```
 codex plugin marketplace add https://github.com/YOOGOMJA/workbench-kit
-codex plugin add workbench
-codex plugin add workbench-kit
+codex plugin add workbench@workbench-kit
+codex plugin add workbench-kit@workbench-kit
+# 제품 개발 워크플로가 필요할 때만:
+codex plugin add toolbox@workbench-kit
 ```
 
 요구사항: Claude Code **또는** Codex, `git`(워크트리 지원), 이슈·PR 배관용 `gh` CLI.
@@ -78,6 +84,9 @@ codex plugin add workbench-kit
 /workbench-kit:interview-for-personalizing   # 당신의 persona를 끌어냄
 /workbench-kit:generate-workbench            # 레포를 생성하고 초안은 버림
 ```
+
+Codex에서는 같은 설치 스킬을 `$interview-for-personalizing`,
+`$generate-workbench`로 호출합니다.
 
 <p align="center">
   <img src="demo/workbench-kit-bootstrap.gif" width="820" alt="실제 에이전트가 인터뷰 후 generate-workbench로 최소 워크벤치 레포를 합성" />
@@ -113,9 +122,54 @@ my-workbench/
 /workbench:task-done <issue>      # 머지 후 작업 공간 정리
 ```
 
+Codex에서는 `$task-start`, `$task-submit`, `$task-done`을 사용합니다. 나머지 엔진
+진입점도 같은 `$skill-name` 규칙을 따릅니다.
+
 그 밖의 진입점: `/workbench:ticket-incubate`(아이디어 → 이슈),
 `/workbench:task-status` · `/workbench:task-tickets`(읽기 전용 현황),
 지식 위키용 `docs-query` · `docs-ingest` · `docs-lint` 스킬.
+
+**3. 거버넌스를 따르는 제품 개발 추가하기 (선택).** Toolbox는 호출한 워크벤치의
+`products/` 디렉터리에 지속되는 제품·시나리오 상태를 둡니다. 제품 판단은 toolbox
+스킬이 맡지만, 실제 구현 변경은 별도 수명주기를 만들지 않고 workbench 엔진에
+위임합니다:
+
+```
+/toolbox:product-start       # 제품 목표 하나를 초기화
+/toolbox:scenario-refine     # 시나리오 하나를 구현 가능한 상태로 정제
+/toolbox:design-system       # 제품 디자인 계약을 만들거나 개선
+/toolbox:tdd-slice           # 테스트 증거와 함께 시나리오 하나를 개발
+/toolbox:product-status      # 제품 전체 준비 상태와 차단 요인 확인
+/toolbox:product-run         # 주 시나리오 하나만 승인받아 실행
+/toolbox:release-review      # 게이트를 우회하지 않고 릴리스 증거 수집
+```
+
+Toolbox는 생성된 워크벤치의 필수 의존성이 아닙니다. 엔진·부트스트랩 계약을 바꾸지
+않고 설치하거나 제거할 수 있습니다. Codex에서는 `$product-start`, `$product-run`
+같은 `$skill-name` 형식으로 해당 스킬을 호출합니다.
+
+## 기존 워크벤치 업그레이드
+
+`0.2.0`부터 기존 워크벤치를 거버넌스 절차로 마이그레이션할 수 있습니다.
+`workbench`와 `workbench-kit` 플러그인을 갱신하고, 업그레이드할 워크벤치 안에 전용
+마이그레이션 task를 만든 뒤 Claude Code에서는 `/workbench-kit:upgrade-workbench`,
+Codex에서는 `$upgrade-workbench`를 호출합니다. 스킬은 먼저 읽기 전용 진단을 하고,
+작업 공간 밖에 불변 계획을 만든 다음 그 계획만 crash 복구 저널로 적용합니다.
+
+- 엔진을 복사하지 않은 generated-minimal v1 워크벤치는 repo 안에 엔진을 새로 넣지
+  않고 v2 거버넌스 파일로 전환할 수 있습니다.
+- repo-local embedded 엔진은 소유한 모든 바이트와 discovery symlink가 번들 등가성
+  영수증과 일치할 때만 제거할 수 있습니다. `0.2.0` 영수증의 정확한 대상은
+  `YOOGOMJA/workbench@ffb426f1c316485c56950e599b7560d155fd220c`입니다.
+- 엔진 제거에는 dry-run의 정확한 basis에 묶인 별도 승인이 필요합니다. 알 수 없는
+  revision, 로컬 drift, malformed 작업 공간, 낡은 계획, 바뀐 승인은 아무것도 지우지
+  않고 중단합니다.
+- 영수증의 정확한 제거 표면 밖에 있는 사용자 파일·지식·템플릿·활성 v1 task 사실과
+  Git 상태는 보존하고 적용 뒤 다시 검증합니다.
+
+전체 플래그와 증거 파일 조건은 설치된
+[`upgrade-workbench` CLI 참고서](plugins/workbench-kit/skills/upgrade-workbench/references/cli.md)에
+있습니다.
 
 ## 어떻게 동작하나
 
@@ -124,6 +178,8 @@ my-workbench/
   치워집니다.
 - **두 레이어.** *판단*(무엇을 추출할지, 산문)은 에이전트가, *배관*(git 상태 전이)은
   `utils/`가 합니다. 에이전트의 진입점은 항상 스킬입니다.
+- **수명주기는 하나, 기능 팩은 선택.** Toolbox는 제품 판단과 지속 상태를 소유하지만,
+  task 브랜치·정책 승인·codebase 변경·수확·제출·정리는 workbench 엔진만 소유합니다.
 - **`AGENTS.core` + `AGENTS.overlay` → `AGENTS.md`.** 프레임워크 코어는 고정·영어이며
   (업그레이드가 덮어씀), 당신의 persona — 언어, slug 스타일, 이슈·PR 형태, 라벨,
   게이트 — 는 overlay에 둡니다. 부트스트랩이 둘을 합성합니다.
@@ -140,9 +196,11 @@ plugins/
   workbench/        엔진 — skills, utils/, bin/workbench, tests/
   workbench-kit/    부트스트랩 — interview + generate-workbench 스킬,
                     그리고 사용자 레포에 까는 scaffold/ (AGENTS.core.md 포함)
+  toolbox/          선택형 제품 개발 — 제품·시나리오 상태, 스킬,
+                    결정적 CLI, 스키마, 템플릿, 테스트
 framework-docs/     설계 결정·교훈·런북·종합
 scripts/            릴리스 툴링 (bump / version-sync / release)
-tests/              frontmatter · install-model · CI 검사
+tests/              CI·릴리스 공용 suite와 저장소 단위 계약 검사
 AGENTS.md           레포/개발 가이드 (kit 자체를 개발할 때)
 ```
 
@@ -151,7 +209,9 @@ scaffold는 부트스트랩 플러그인 **안에** 있어 마켓플레이스 �
 
 ## 상태 & 알려진 한계
 
-- **초기 단계**, 첫 릴리스(`0.1.0`) 진행 중. [CHANGELOG.md](CHANGELOG.md) 참고.
+- **초기 단계.** 최신 릴리스는 `0.2.0`이며, 거버넌스를 따르는 수명주기와
+  소스에 결박된 안전한 마이그레이션, 선택형 toolbox를 포함합니다.
+  [CHANGELOG.md](CHANGELOG.md) 참고.
 - **번역 진행 중.** 프레임워크 표면(이 README, `AGENTS.core`, scaffold, 부트스트랩
   스킬)과 모든 스킬 *설명*은 영어입니다. 엔진 스킬 *본문*과 `framework-docs/`는 아직
   한국어이며, 점진적으로 번역됩니다.
@@ -165,8 +225,8 @@ scaffold는 부트스트랩 플러그인 **안에** 있어 마켓플레이스 �
 ## 기여
 
 PR 환영합니다. 동작에 영향을 주는 변경은 [CHANGELOG.md](CHANGELOG.md)의
-`## [Unreleased]` 아래에 한 줄을 추가합니다. CI는 frontmatter 린트, 매니페스트 파싱,
-버전 sync, ShellCheck, 수명주기/compose 스모크 테스트를 돌립니다 —
+`## [Unreleased]` 아래에 한 줄을 추가합니다. CI는 릴리스 준비와 같은 저장소 공용
+suite에 더해 매니페스트 파싱, ShellCheck, compose 스모크 테스트를 돌립니다 —
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 참고.
 
 ## 라이선스

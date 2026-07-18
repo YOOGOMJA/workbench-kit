@@ -373,9 +373,11 @@ def _receipt_provenance(
     if kind == "migration":
         expected_embedded = {
             "state": receipt["embedded_engine"]["after"],
-            "equivalence_receipt_digest": receipt["embedded_engine"][
-                "equivalence_receipt_digest"
-            ],
+            "equivalence_receipt_digest": (
+                receipt["embedded_engine"]["equivalence_receipt_digest"]
+                if receipt["embedded_engine"]["after"] == "present-verified"
+                else None
+            ),
         }
     else:
         expected_embedded = receipt["embedded_engine"]

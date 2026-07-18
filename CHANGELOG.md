@@ -4,21 +4,29 @@ All notable changes to workbench-kit are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims for
 [Semantic Versioning](https://semver.org/).
 
-This is one changelog for the whole marketplace (both the `workbench` and
-`workbench-kit` plugins). When an entry touches only one plugin, it says which.
+This is one changelog for the whole marketplace: three plugins (`workbench`,
+`workbench-kit`, and the optional `toolbox`). When an entry touches only one plugin, it says which.
 See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-18
+
 ### Added
 
+- **Three-plugin marketplace integration** — registers the optional `toolbox` in both Claude
+  Code and Codex marketplaces, validates strict three-plugin/six-manifest parity, and gives
+  CI and release preparation one inventory-checked repository test suite. Public-dispatcher
+  E2E covers toolbox-free v1 callers, codebase-only v2 completion plus harvest, concurrent
+  products with caller isolation, and both supported migration routes (#30).
 - **Governed existing-workbench upgrades** — the `workbench-kit` plugin now
   classifies generated, embedded, staged, current, malformed, and unrecognized
   workspaces; emits deterministic dry-run plans; applies them through an external,
   crash-recoverable journal with preservation and rollback checks; and ships the
   `upgrade-workbench` skill, CLI reference, strict schemas, and filesystem route
-  fixtures. Embedded-engine removal remains fail-closed until a verified equivalence
-  receipt is bundled (#27).
+  fixtures. A bundled, source-bound equivalence receipt now permits explicit removal of the
+  exact verified `YOOGOMJA/workbench@ffb426f` repo-local engine while drift and every
+  unrecognized embedded engine remain fail-closed (#27, #30).
 - **Optional `toolbox` product delivery workflows** — adds atomic repository,
   autonomy, quality, and scenario mutations; canonical workbench policy/context
   adapters; deterministic one-primary-scenario product and portfolio run plans;
@@ -27,7 +35,7 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 - **Optional `toolbox` foundation** — adds cross-tool plugin manifests, a public
   workbench/profile compatibility adapter, profile-bound product language,
   caller-contained strict JSON state, and deterministic product, scenario, and portfolio
-  validation (#28). Marketplace registration remains follow-up work.
+  validation (#28). Marketplace registration ships through #30.
 - **Policy-aware v2 task lifecycle** — the `workbench` plugin now discovers explicit
   workspace/profile contracts and manages opaque task refs, multiple deliverables,
   required checks, revision-bound evidence, policy authorization, harvest disposition,
@@ -176,6 +184,7 @@ First release. Everything below is the initial set.
   English. The engine skill *bodies* and the rest of `framework-docs/` are still Korean —
   to be translated incrementally.
 
-[Unreleased]: https://github.com/YOOGOMJA/workbench-kit/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/YOOGOMJA/workbench-kit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/YOOGOMJA/workbench-kit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/YOOGOMJA/workbench-kit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/YOOGOMJA/workbench-kit/releases/tag/v0.1.0

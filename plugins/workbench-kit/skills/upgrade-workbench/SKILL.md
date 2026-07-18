@@ -35,7 +35,10 @@ interpreting exit status, or preparing external evidence and journal paths.
    `malformed`, continue only when every blocker is exactly
    `generator-composition-invalid` at `AGENTS.md` and a human-supplied reviewed-overlay
    receipt is available; run the documented reviewed-overlay recovery dry-run without
-   editing workspace evidence. All other `malformed` classifications stop.
+   editing workspace evidence. All other `malformed` classifications stop. If embedded
+   engine removal is requested, use the CLI reference's two dry-runs: first obtain the
+   blocked removal basis without a removal receipt, then let a human or trusted adapter
+   supply the basis-bound receipt before producing the canonical plan.
 
 2. **Review before writing.** Summarize `classification_before`, target,
    `actionable`, blockers, embedded-engine before/after, operations, preserved paths,
@@ -45,8 +48,9 @@ interpreting exit status, or preparing external evidence and journal paths.
 3. **Apply only after approval.** Create an external `0600` result file and apply
    the exact plan with the same route inputs. Reuse an explicit journal directory on
    retries. Do not add `--remove-embedded-engine` during apply; the plan already binds
-   that request. If bundled equivalence is unavailable, stop on
-   `plugin-equivalence-unavailable`.
+   that request. Bundled equivalence covers only the exact source revision and node
+   manifest named by its receipt; any absent receipt or byte drift stops on
+   `plugin-equivalence-unavailable` or an embedded-engine verification blocker.
 
 4. **Verify and submit.** Require a `completed` transaction, the expected target
    classification, unchanged preserved paths, and unchanged active v1 task facts.

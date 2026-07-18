@@ -4,6 +4,14 @@ export PYTHONDONTWRITEBYTECODE=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKBENCH="$ROOT/bin/workbench"
+PLUGIN_VERSION="$(python3 - "$ROOT/.claude-plugin/plugin.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["version"])
+PY
+)"
 SOURCE_REPO="$(git -C "$ROOT" rev-parse --show-toplevel)"
 SOURCE_HEAD="$(git -C "$SOURCE_REPO" rev-parse HEAD)"
 SOURCE_STATUS="$(git -C "$SOURCE_REPO" status --porcelain=v1)"
@@ -275,10 +283,11 @@ import json
 import sys
 
 root = sys.argv[1]
+version = sys.argv[2]
 value = json.load(sys.stdin)
 expected = {
     "contract_version": "workbench-contract/v1",
-    "engine": {"name": "workbench", "version": "0.1.1"},
+    "engine": {"name": "workbench", "version": version},
     "workspace": {"root": root, "schema": "workbench/v2", "source": "marker"},
     "profile": {"contract_version": "workbench-profile/v1", "language": "ko", "source": "workspace"},
 }
@@ -287,7 +296,8 @@ if list(value) != ["contract_version", "engine", "workspace", "profile", "suppor
 for key, expected_value in expected.items():
     if value[key] != expected_value:
         raise SystemExit("contract identity mismatch: {}".format(key))
-' "$root" || fail "contract discovery must match the G0 canonical identity shape"
+' "$root" "$PLUGIN_VERSION" \
+    || fail "contract discovery must match the G0 canonical identity shape"
 }
 
 test_contract_show_reads_implicit_v1() {
@@ -385,7 +395,7 @@ test_public_engine_manifest_is_complete_and_canonical() {
   first="$(run_workbench "$repo" engine-manifest show --format json)"
   second="$(run_workbench "$repo" engine-manifest show --format json)"
   assert_eq "$first" "$second" "engine manifest must be deterministic"
-  python3 - "$first" "$ROOT" <<'PY'
+  python3 - "$first" "$ROOT" "$PLUGIN_VERSION" <<'PY'
 import hashlib
 import json
 import os
@@ -394,12 +404,13 @@ import sys
 
 value = json.loads(sys.argv[1])
 root = os.path.realpath(sys.argv[2])
+version = sys.argv[3]
 assert list(value) == [
     "contract_version", "plugin", "source", "included_paths", "excluded_paths", "nodes", "digest",
 ]
 assert value["contract_version"] == "workbench-plugin-manifest/v1"
 assert list(value["plugin"]) == ["name", "version"]
-assert value["plugin"] == {"name": "workbench", "version": "0.1.1"}
+assert value["plugin"] == {"name": "workbench", "version": version}
 assert list(value["source"]) == ["ref", "revision"]
 assert value["source"]["ref"] == "https://github.com/YOOGOMJA/workbench-kit#plugins/workbench"
 assert value["included_paths"] == ["."]

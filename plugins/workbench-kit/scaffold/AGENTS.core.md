@@ -20,8 +20,10 @@
   main history keeps one refined increment commit. (Squash is structural, not taste.)
 - **Two layers.** Judgment (what to extract, prose) is the agent's; plumbing (git
   state transitions) is `utils/`'s.
-  - **The agent's entry point is always a skill** (`workbench:task-start`, etc.).
-    Call scripts directly only from within a skill procedure.
+  - **The agent's entry point is always a skill** (`task-start`, etc.). Invoke it
+    through the host's skill mechanism, for example `/workbench:task-start` in Claude
+    Code or `$task-start` in Codex. Call scripts directly only from within a skill
+    procedure.
   - **Scripts never write prose.** Reader-facing text (PR titles/bodies) is authored
     by the judgment layer and passed in.
   - The lifecycle comment `utils/task` writes to an issue is a fixed-schema machine

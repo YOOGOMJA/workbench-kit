@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bump-version.sh <X.Y.Z> — sync the version across every plugin manifest (Claude Code
-# + Codex) in one shot. The version lives in 4 places (2 plugins × 2 tool manifests);
+# + Codex) in one shot. The version lives in 6 places (3 plugins x 2 tool manifests);
 # bumping by hand drifts, so do it mechanically. Run from anywhere in the repo.
 set -euo pipefail
 
@@ -20,4 +20,5 @@ while IFS= read -r -d '' f; do
 done < <(find "$ROOT/plugins" \( -path '*/.claude-plugin/plugin.json' -o -path '*/.codex-plugin/plugin.json' \) -print0)
 
 echo "bumped $n manifest(s) to $V"
-echo "next: update CHANGELOG.md, commit, then tag (see RELEASING.md)"
+echo "next: follow RELEASING.md — commit/tag the evidence source, then finalize the receipt"
+echo "      the release workflow auto-tags v$V after the finalized PR merges"

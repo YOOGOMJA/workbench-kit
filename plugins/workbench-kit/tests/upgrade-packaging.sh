@@ -23,6 +23,7 @@ required = {
     "bin/workbench-kit",
     "lib/workbench_kit_schema.py",
     "receipts/upgrade-runtime.json",
+    "receipts/workbench-ffb426f1-equivalence.json",
     "schemas/README.md",
     "schemas/requirements.txt",
     "skills/upgrade-workbench/SKILL.md",
@@ -68,7 +69,9 @@ runtime = json.loads(
     (plugin / "receipts/upgrade-runtime.json").read_text(encoding="utf-8")
 )
 assert runtime["contract_version"] == "workbench-kit-upgrade-runtime/v1"
-assert runtime["plugin_equivalence_file"] is None
+assert runtime["plugin_equivalence_file"] == (
+    "receipts/workbench-ffb426f1-equivalence.json"
+)
 assert runtime["legacy_engine_markers"] == sorted(
     runtime["legacy_engine_markers"]
 )
@@ -102,11 +105,22 @@ assert "--authority-file" not in surface
 assert "generator-composition-invalid" in skill
 assert "human-supplied reviewed-overlay" in skill
 assert "All other `malformed`" in skill
+for required_text in (
+    "without `--removal-approval-file`",
+    "removal_plan_basis_digest",
+    "removal-approval.schema.json",
+    "human or trusted adapter",
+):
+    assert required_text in cli, required_text
+candidate = cli.index("without `--removal-approval-file`")
+approved = cli.index('`--removal-approval-file "$REMOVAL"`', candidate)
+assert candidate < approved
 
 changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-assert "upgrade-workbench" in unreleased
-assert "#27" in unreleased
+version_heading = "## [{}]".format(claude_manifest["version"])
+release_notes = changelog.split(version_heading, 1)[1].split("\n## [", 1)[0]
+assert "upgrade-workbench" in release_notes
+assert "#27" in release_notes
 
 suite_path = plugin / "tests/run.sh"
 assert suite_path.is_file()
@@ -128,15 +142,35 @@ for test_name in runnable_upgrade_tests:
 for helper_name in ("upgrade-public-stub.sh", "upgrade-test-lib.sh"):
     assert helper_name not in suite, helper_name
 
+inventory = {}
+for line in (repo / "tests/plugin-suite.tsv").read_text(
+    encoding="utf-8"
+).splitlines():
+    role, relative = line.split("\t")
+    inventory[relative] = role
+for test_name in runnable_upgrade_tests:
+    assert inventory[f"plugins/workbench-kit/tests/{test_name}"] == "test"
+for helper_name in (
+    "run.sh",
+    "upgrade-public-stub.sh",
+    "upgrade-test-lib.sh",
+):
+    assert inventory[f"plugins/workbench-kit/tests/{helper_name}"] == "helper"
+
 suite_command = "bash plugins/workbench-kit/tests/run.sh"
+root_command = "bash tests/run.sh"
 ci = (repo / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 assert suite_command in ci
+assert root_command in ci
 assert "actions/setup-python@" in ci
 assert "astral-sh/setup-uv@" in ci
 assert 'version: "0.7.6"' in ci
 for documentation in ("AGENTS.md", "CONTRIBUTING.md"):
-    assert suite_command in (repo / documentation).read_text(encoding="utf-8")
-assert suite_command in (repo / "scripts/release.sh").read_text(encoding="utf-8")
+    assert root_command in (repo / documentation).read_text(encoding="utf-8")
+assert root_command in (repo / "scripts/release.sh").read_text(encoding="utf-8")
+assert root_command in (repo / "scripts/release-preflight.sh").read_text(
+    encoding="utf-8"
+)
 PY
 
 bash "$REPO_ROOT/tests/check-skill-frontmatter.sh"

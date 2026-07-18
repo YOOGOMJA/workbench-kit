@@ -49,16 +49,17 @@ If `.persona/` is absent, run `interview-for-personalizing` first — don't inve
 
    The script **self-checks**: it rejects an empty/half-filled `.persona/` up front, and
    after composing it asserts post-conditions (AGENTS.md has both core+overlay markers,
-   overlay/docs/codebases present, engine *not* copied, CLAUDE.md symlink) — failing
+   overlay/docs/codebases present, engine *not* copied, CLAUDE.md real file matching
+   AGENTS.md) — failing
    loudly. So you don't eyeball the result; if `compose.sh` exits 0, the workbench is
    well-formed. If it exits non-zero, read the `FAIL` lines and fix the input.
 
 4. **Discard `.persona/`** — it's temporary scratch; its content now lives in the repo.
 
 5. **Commit and hand off.** Make the initial commit (in the user's output language per
-   the persona), then point the user to their first task: `workbench:task-start <issue>`
-   (engine plugin). Remind them the `workbench` plugin must be installed/enabled for the
-   engine commands to work.
+   the persona), then point the user to the installed `task-start` skill: Claude Code
+   uses `/workbench:task-start <issue>` and Codex uses `$task-start` with the issue ID.
+   Remind them the `workbench` plugin must be installed/enabled for engine commands.
 
 ## Output (what the user gets — minimal by design)
 
@@ -66,6 +67,7 @@ If `.persona/` is absent, run `interview-for-personalizing` first — don't inve
 my-workbench/
   AGENTS.md          composed: framework core + your persona (do not edit directly)
   AGENTS.overlay.md  your rules — edit here, then recompose
+  CLAUDE.md          real file matching AGENTS.md for cross-platform discovery
   codebases.yaml     your targets (or empty template)
   docs/              empty knowledge skeleton (index + empty anchor tables + log)
   templates/  .github/   profile defaults you can tune

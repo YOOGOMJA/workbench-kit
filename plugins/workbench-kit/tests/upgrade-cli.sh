@@ -482,17 +482,31 @@ assert explicit["source"] == "explicit-cli"
 profile = language_decision("ko", "staged-v2")
 assert profile["source"] == "workspace-profile"
 
-runtime_bundle = load_runtime_bundle(pathlib.Path(sys.argv[1]).parent)
+plugin_root = pathlib.Path(sys.argv[1]).parent
+plugin_manifest = strict_load(
+    (plugin_root / ".claude-plugin/plugin.json").read_bytes(),
+    ".claude-plugin/plugin.json",
+)
+expected_version = plugin_manifest["version"]
+runtime_bundle = load_runtime_bundle(plugin_root)
 assert runtime_bundle["planner"]["contract_version"] == (
     "workbench-kit-planner/v1"
 )
-assert runtime_bundle["planner"]["plugin_version"] == "0.1.1"
+assert runtime_bundle["planner"]["plugin_version"] == expected_version
 assert len(runtime_bundle["planner"]["planner_revision"]) == 40
-assert runtime_bundle["target_generator_receipt"]["generator_version"] == "0.1.1"
+assert (
+    runtime_bundle["target_generator_receipt"]["generator_version"]
+    == expected_version
+)
 assert runtime_bundle["generator_receipts"] == [
     runtime_bundle["target_generator_receipt"]
 ]
-assert runtime_bundle["plugin_equivalence_input"] is None
+assert runtime_bundle["plugin_equivalence_input"] is not None
+equivalence_receipt = runtime_bundle["plugin_equivalence_input"]["receipt"]
+assert (
+    equivalence_receipt["replacement_plugin"]["plugin_version"]
+    == expected_version
+)
 assert runtime_bundle["legacy_engine_markers"] == [
     "skills/task-done/SKILL.md",
     "skills/task-start/SKILL.md",

@@ -6,14 +6,21 @@
       "source": { "source": "local", "path": "./plugins/workbench" },
       "policy": { "installation": "AVAILABLE" },
       "category": "Development",
-      "description": "Engine — worktree/task isolation, incremental knowledge harvest, skill-driven lifecycle (@workbench:task-start …)."
+      "description": "Engine — worktree/task isolation, incremental knowledge harvest, skill-driven lifecycle ($task-start …)."
     },
     {
       "name": "workbench-kit",
       "source": { "source": "local", "path": "./plugins/workbench-kit" },
       "policy": { "installation": "AVAILABLE" },
       "category": "Development",
-      "description": "Bootstrap — interview for persona, then generate a minimal personalized workbench (@workbench-kit:generate-workbench)."
+      "description": "Bootstrap — interview for persona, then generate a minimal personalized workbench ($generate-workbench)."
+    },
+    {
+      "name": "toolbox",
+      "source": { "source": "local", "path": "./plugins/toolbox" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Development",
+      "description": "Optional product delivery capability pack — governed product state, scenarios, portfolios, and agent-led workflows ($product-start …)."
     }
   ]
 }
