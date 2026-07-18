@@ -26,16 +26,54 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/equivalence-receipt.py" check
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT" <<'PY'
 import hashlib
 import importlib.util
+import io
 import json
 import pathlib
+import stat
 import subprocess
 import sys
+import tarfile
+import tempfile
 
 root = pathlib.Path(sys.argv[1])
 script = root / "scripts/equivalence-receipt.py"
 spec = importlib.util.spec_from_file_location("equivalence_receipt", script)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+# Python 3.14's default tar extraction filter strips group-write bits while
+# older supported Python versions preserve Git archive's default 0002 modes.
+# The receipt source tree must use Git checkout modes on every interpreter.
+archive_bytes = io.BytesIO()
+with tarfile.open(fileobj=archive_bytes, mode="w") as archive:
+    for relative, kind, mode, content in (
+        ("plugins", "directory", 0o775, b""),
+        ("plugins/workbench", "directory", 0o775, b""),
+        ("plugins/workbench/bin", "directory", 0o775, b""),
+        ("plugins/workbench/plugin.json", "file", 0o664, b"{}\n"),
+        ("plugins/workbench/bin/workbench", "file", 0o775, b"#!/bin/sh\n"),
+    ):
+        member = tarfile.TarInfo(relative)
+        member.mode = mode
+        if kind == "directory":
+            member.type = tarfile.DIRTYPE
+            archive.addfile(member)
+        else:
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+with tempfile.TemporaryDirectory(prefix="workbench-git-modes-") as raw:
+    extracted = pathlib.Path(raw)
+    module.safe_extract_git_archive(archive_bytes.getvalue(), extracted)
+    expected_modes = {
+        "plugins": 0o755,
+        "plugins/workbench": 0o755,
+        "plugins/workbench/bin": 0o755,
+        "plugins/workbench/plugin.json": 0o644,
+        "plugins/workbench/bin/workbench": 0o755,
+    }
+    for relative, expected_mode in expected_modes.items():
+        actual_mode = stat.S_IMODE((extracted / relative).lstat().st_mode)
+        assert actual_mode == expected_mode, (relative, actual_mode, expected_mode)
 
 receipt = json.loads(
     (root / "plugins/workbench-kit/receipts/workbench-ffb426f1-equivalence.json")

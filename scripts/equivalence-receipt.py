@@ -173,7 +173,8 @@ def public_json(
 
 def safe_extract_git_archive(raw: bytes, destination: pathlib.Path) -> None:
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
-        for member in archive.getmembers():
+        members = archive.getmembers()
+        for member in members:
             path = pathlib.PurePosixPath(member.name)
             under_workbench = path.parts == ("plugins",) or tuple(
                 path.parts[:2]
@@ -187,6 +188,17 @@ def safe_extract_git_archive(raw: bytes, destination: pathlib.Path) -> None:
             if not (member.isdir() or member.isreg() or member.issym()):
                 die("unsupported replacement archive node: {}".format(member.name))
         archive.extractall(str(destination))
+        # Git tracks only the executable bit for blobs. Its tar backend applies
+        # tar.umask (0002 by default), while Python 3.14's default extraction
+        # filter strips group/other write bits and older Python preserves them.
+        # Normalize to Git checkout semantics so receipt digests do not depend
+        # on the Python version or the producer's tar.umask configuration.
+        for member in members:
+            extracted = destination.joinpath(*pathlib.PurePosixPath(member.name).parts)
+            if member.isdir():
+                extracted.chmod(0o755)
+            elif member.isreg():
+                extracted.chmod(0o755 if member.mode & 0o111 else 0o644)
 
 
 def revision_public_state(replacement_revision: str):
