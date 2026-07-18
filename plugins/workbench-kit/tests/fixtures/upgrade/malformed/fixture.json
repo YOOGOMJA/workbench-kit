@@ -1,0 +1,15 @@
+{
+  "workspace_kind": "partial-v2",
+  "classification": "malformed",
+  "workspace_schema": "workbench/v2",
+  "doctor_ready": false,
+  "materialize": null,
+  "embedded_state": "absent",
+  "blockers": [
+    {
+      "code": "partial-v2",
+      "ref": ".workbench"
+    }
+  ],
+  "route": null
+}

@@ -30,12 +30,14 @@ check. If a PR genuinely needs no entry (CI-only, a typo, docs polish), add the
 
 CI (`.github/workflows/ci.yml`) is dependency-light and runs: skill-frontmatter
 lint, JSON manifest parse, plugin version sync, ShellCheck, the engine lifecycle
-test, the install-model test, the codebases.yaml parsing test, the compose smoke
-test, and the CHANGELOG-entry check above. Run the shell tests locally before
-pushing:
+and public-contract tests, the governed upgrade suite on Python 3.9 and the latest
+Python (with pinned `uv`), the install-model test, the codebases.yaml parsing test,
+the compose smoke test, and the CHANGELOG-entry check above. Run the shell tests
+locally before pushing:
 
 ```
 bash plugins/workbench/tests/task-lifecycle.sh
+bash plugins/workbench-kit/tests/run.sh
 bash tests/check-codebases-yaml.sh
 bash tests/check-install-model.sh
 ```

@@ -12,6 +12,13 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ### Added
 
+- **Governed existing-workbench upgrades** — the `workbench-kit` plugin now
+  classifies generated, embedded, staged, current, malformed, and unrecognized
+  workspaces; emits deterministic dry-run plans; applies them through an external,
+  crash-recoverable journal with preservation and rollback checks; and ships the
+  `upgrade-workbench` skill, CLI reference, strict schemas, and filesystem route
+  fixtures. Embedded-engine removal remains fail-closed until a verified equivalence
+  receipt is bundled (#27).
 - **Optional `toolbox` product delivery workflows** — adds atomic repository,
   autonomy, quality, and scenario mutations; canonical workbench policy/context
   adapters; deterministic one-primary-scenario product and portfolio run plans;

@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-generator-receipt-v1",
+  "title": "Workbench kit generator receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "receipt_id",
+    "generator_id",
+    "generator_version",
+    "source_revision",
+    "compose_contract",
+    "header_base64",
+    "core_base64",
+    "core_digest",
+    "separator_base64",
+    "settings_owned",
+    "generated_nodes",
+    "receipt_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-generator-receipt/v1" },
+    "receipt_id": { "type": "string", "pattern": "^[\\u0020-\\u007E]+$" },
+    "generator_id": { "const": "workbench-kit:generate-workbench" },
+    "generator_version": { "$ref": "#/$defs/semver" },
+    "source_revision": { "$ref": "#/$defs/oid" },
+    "compose_contract": { "const": "workbench-kit-compose/v1" },
+    "header_base64": { "$ref": "#/$defs/nonemptyCanonicalBase64" },
+    "core_base64": { "$ref": "#/$defs/nonemptyCanonicalBase64" },
+    "core_digest": { "$ref": "#/$defs/digest" },
+    "separator_base64": { "$ref": "#/$defs/nonemptyCanonicalBase64" },
+    "settings_owned": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["marketplace", "plugin_enabled"],
+      "properties": {
+        "marketplace": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source"],
+          "properties": {
+            "source": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source", "repo"],
+              "properties": {
+                "source": { "const": "github" },
+                "repo": { "const": "YOOGOMJA/workbench-kit" }
+              }
+            }
+          }
+        },
+        "plugin_enabled": { "const": true }
+      }
+    },
+    "generated_nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "node_type", "mode"],
+        "properties": {
+          "path": { "$ref": "#/$defs/path" },
+          "node_type": { "enum": ["file", "symlink"] },
+          "mode": { "enum": ["100644", "120000"] }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+            "then": { "properties": { "mode": { "const": "100644" } } }
+          },
+          {
+            "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+            "then": { "properties": { "mode": { "const": "120000" }, "path": { "const": "CLAUDE.md" } } }
+          }
+        ]
+      }
+    },
+    "receipt_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "nonemptyCanonicalBase64": {
+      "type": "string",
+      "minLength": 4,
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?$",
+      "format": "canonical-base64",
+      "contentEncoding": "base64"
+    },
+    "path": {
+      "type": "string",
+      "format": "nfc",
+      "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$",
+      "allOf": [
+        { "not": { "pattern": "^(?:\\.[gG][iI][tT]|\\.[wW][oO][rR][kK][tT][rR][eE][eE][sS]|\\.[cC][oO][dD][eE][bB][aA][sS][eE][sS])(?:/|$)" } },
+        { "not": { "pattern": "^[tT][aA][sS][kK]/[cC][oO][dD][eE][bB][aA][sS][eE][sS](?:/|$)" } }
+      ]
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    }
+  }
+}

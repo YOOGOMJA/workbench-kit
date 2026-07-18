@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-generation-receipt-v1",
+  "title": "Workbench kit generation receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "generator_receipt_digest",
+    "workspace_home",
+    "language",
+    "authority_descriptor_digest",
+    "embedded_engine",
+    "artifacts",
+    "candidate_basis_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-generation-receipt/v1" },
+    "generator_receipt_digest": { "$ref": "#/$defs/digest" },
+    "workspace_home": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "not": { "pattern": "^[0-9]+$" }
+    },
+    "language": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/language" },
+    "authority_descriptor_digest": { "$ref": "#/$defs/digest" },
+    "embedded_engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "equivalence_receipt_digest"],
+      "properties": {
+        "state": { "const": "absent" },
+        "equivalence_receipt_digest": {
+          "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifactNode" }
+    },
+    "candidate_basis_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "path": {
+      "type": "string",
+      "format": "nfc",
+      "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$",
+      "allOf": [
+        { "not": { "pattern": "^(?:\\.[gG][iI][tT]|\\.[wW][oO][rR][kK][tT][rR][eE][eE][sS]|\\.[cC][oO][dD][eE][bB][aA][sS][eE][sS])(?:/|$)" } },
+        { "not": { "pattern": "^[tT][aA][sS][kK]/[cC][oO][dD][eE][bB][aA][sS][eE][sS](?:/|$)" } }
+      ]
+    },
+    "artifactNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "node_type", "mode", "digest"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "node_type": { "enum": ["file", "symlink"] },
+        "mode": { "enum": ["100644", "100755", "120000"] },
+        "digest": { "$ref": "#/$defs/digest" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "enum": ["100644", "100755"] } } }
+        },
+        {
+          "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "const": "120000" } } }
+        }
+      ]
+    }
+  }
+}

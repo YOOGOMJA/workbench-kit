@@ -1,0 +1,15 @@
+{
+  "workspace_kind": "embedded-legacy",
+  "classification": "malformed",
+  "workspace_schema": "workbench/v1",
+  "doctor_ready": false,
+  "materialize": "runtime-generated",
+  "embedded_state": "present-unverified",
+  "blockers": [
+    {
+      "code": "embedded-engine-unverified",
+      "ref": "embedded-engine"
+    }
+  ],
+  "route": null
+}

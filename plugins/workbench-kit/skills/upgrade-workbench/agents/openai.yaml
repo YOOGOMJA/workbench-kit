@@ -1,0 +1,4 @@
+interface:
+  display_name: "Upgrade Workbench"
+  short_description: "Plan and apply governed workbench migrations"
+  default_prompt: "Use $upgrade-workbench to safely diagnose and migrate this existing workbench."

@@ -1,0 +1,10 @@
+{
+  "workspace_kind": "migration-staged",
+  "classification": "migration-staged",
+  "workspace_schema": "workbench/v2",
+  "doctor_ready": false,
+  "materialize": "migration-receipt",
+  "embedded_state": "absent",
+  "blockers": [],
+  "route": "staged-v2"
+}

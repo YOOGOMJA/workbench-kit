@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-result-v1",
+  "title": "Workbench kit upgrade result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "result_digest",
+    "plan_digest",
+    "classification_before",
+    "target_classification",
+    "embedded_engine",
+    "provenance_final",
+    "workspace",
+    "transaction",
+    "changed",
+    "applied",
+    "preserved",
+    "active_v1_tasks",
+    "validation",
+    "blockers"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-upgrade-result/v1" },
+    "result_digest": { "$ref": "#/$defs/digest" },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "classification_before": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/classification" },
+    "target_classification": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/classification" },
+    "embedded_engine": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/embedded" },
+    "provenance_final": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/provenance" },
+    "workspace": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/workspace" },
+    "transaction": { "$ref": "#/$defs/transaction" },
+    "changed": { "type": "boolean" },
+    "applied": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/appliedOperation" }
+    },
+    "preserved": {
+      "type": "array",
+      "items": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/preservedNode" }
+    },
+    "active_v1_tasks": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/activeTasks" },
+    "validation": { "$ref": "#/$defs/validation" },
+    "blockers": {
+      "type": "array",
+      "items": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/blocker" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "applied": { "minItems": 1 } }, "required": ["applied"] },
+      "then": { "properties": { "changed": { "const": true } } },
+      "else": { "properties": { "changed": { "const": false } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "transaction": { "properties": { "stage": { "const": "completed" } } }
+        },
+        "required": ["transaction"]
+      },
+      "then": {
+        "properties": {
+          "validation": { "properties": { "status": { "const": "passed" } } },
+          "blockers": { "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "transaction": { "properties": { "stage": { "const": "rolled-back" } } }
+        },
+        "required": ["transaction"]
+      },
+      "then": {
+        "properties": {
+          "transaction": { "properties": { "cursor": { "const": 0 } } },
+          "changed": { "const": false },
+          "applied": { "maxItems": 0 },
+          "validation": { "properties": { "status": { "const": "failed" } } }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nullableDigest": {
+      "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+    },
+    "transaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["journal_id", "workspace_id", "stage", "direction", "cursor", "resumed"],
+      "properties": {
+        "journal_id": { "type": "string", "pattern": "^upgrade-[0-9a-f]{64}$" },
+        "workspace_id": { "type": "string", "pattern": "^ws-[0-9a-f]{64}$" },
+        "stage": { "enum": ["completed", "rolled-back"] },
+        "direction": { "const": "none" },
+        "cursor": { "type": "integer", "minimum": 0 },
+        "resumed": { "type": "boolean" }
+      }
+    },
+    "appliedOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "path", "before_digest", "after_digest"],
+      "properties": {
+        "op": { "enum": ["create", "update", "remove"] },
+        "path": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/path" },
+        "before_digest": { "$ref": "#/$defs/nullableDigest" },
+        "after_digest": { "$ref": "#/$defs/nullableDigest" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "op": { "const": "create" } }, "required": ["op"] },
+          "then": { "properties": { "before_digest": { "type": "null" }, "after_digest": { "$ref": "#/$defs/digest" } } }
+        },
+        {
+          "if": { "properties": { "op": { "const": "update" } }, "required": ["op"] },
+          "then": { "properties": { "before_digest": { "$ref": "#/$defs/digest" }, "after_digest": { "$ref": "#/$defs/digest" } } }
+        },
+        {
+          "if": { "properties": { "op": { "const": "remove" } }, "required": ["op"] },
+          "then": { "properties": { "before_digest": { "$ref": "#/$defs/digest" }, "after_digest": { "type": "null" } } }
+        }
+      ]
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "classification_after",
+        "basis_kind",
+        "basis_digest",
+        "blockers",
+        "digest"
+      ],
+      "properties": {
+        "status": { "enum": ["pending", "passed", "failed"] },
+        "classification_after": {
+          "oneOf": [
+            { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/classification" },
+            { "type": "null" }
+          ]
+        },
+        "basis_kind": { "enum": ["migration-candidate", "removal-plan", null] },
+        "basis_digest": { "$ref": "#/$defs/nullableDigest" },
+        "blockers": {
+          "type": "array",
+          "items": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/blocker" }
+        },
+        "digest": { "$ref": "#/$defs/digest" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "pending" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "classification_after": { "type": "null" },
+              "basis_kind": { "type": "null" },
+              "basis_digest": { "type": "null" },
+              "blockers": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "passed" } }, "required": ["status"] },
+          "then": {
+            "properties": {
+              "classification_after": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/classification" },
+              "basis_kind": { "enum": ["migration-candidate", "removal-plan"] },
+              "basis_digest": { "$ref": "#/$defs/digest" },
+              "blockers": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
+          "then": {
+            "properties": { "blockers": { "minItems": 1 } },
+            "oneOf": [
+              {
+                "properties": {
+                  "classification_after": { "type": "null" },
+                  "basis_kind": { "type": "null" },
+                  "basis_digest": { "type": "null" }
+                }
+              },
+              {
+                "properties": {
+                  "classification_after": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/classification" },
+                  "basis_kind": { "enum": ["migration-candidate", "removal-plan"] },
+                  "basis_digest": { "$ref": "#/$defs/digest" }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

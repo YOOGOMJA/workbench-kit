@@ -1,0 +1,4 @@
+.codebases/
+.worktrees/
+task/codebases/
+.claude/scheduled_tasks.lock

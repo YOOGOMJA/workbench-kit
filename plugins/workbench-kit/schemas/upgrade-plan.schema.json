@@ -1,0 +1,648 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1",
+  "title": "Workbench kit upgrade plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "plan_digest",
+    "classification_before",
+    "target_classification",
+    "embedded_engine",
+    "provenance_before",
+    "provenance_after",
+    "workspace",
+    "planner",
+    "doctor",
+    "legacy_inventory",
+    "inputs",
+    "engine_manifest",
+    "plugin_equivalence",
+    "removal_plan_basis_digest",
+    "removal_approval",
+    "active_v1_tasks",
+    "preserved",
+    "parent_directories",
+    "artifacts",
+    "operations",
+    "blockers",
+    "changed",
+    "actionable"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-upgrade-plan/v1" },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "classification_before": { "$ref": "#/$defs/classification" },
+    "target_classification": { "$ref": "#/$defs/classification" },
+    "embedded_engine": { "$ref": "#/$defs/embedded" },
+    "provenance_before": { "$ref": "#/$defs/provenance" },
+    "provenance_after": { "$ref": "#/$defs/provenance" },
+    "workspace": { "$ref": "#/$defs/workspace" },
+    "planner": { "$ref": "#/$defs/planner" },
+    "doctor": { "$ref": "#/$defs/doctor" },
+    "legacy_inventory": { "$ref": "#/$defs/legacyInventory" },
+    "inputs": { "$ref": "#/$defs/inputs" },
+    "engine_manifest": {
+      "oneOf": [{ "$ref": "#/$defs/engineManifest" }, { "type": "null" }]
+    },
+    "plugin_equivalence": {
+      "oneOf": [{ "$ref": "#/$defs/equivalenceInput" }, { "type": "null" }]
+    },
+    "removal_plan_basis_digest": {
+      "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+    },
+    "removal_approval": {
+      "oneOf": [{ "$ref": "#/$defs/removalInput" }, { "type": "null" }]
+    },
+    "active_v1_tasks": { "$ref": "#/$defs/activeTasks" },
+    "preserved": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/preservedNode" }
+    },
+    "parent_directories": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/parentDirectory" }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "operations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operation" }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/blocker" }
+    },
+    "changed": { "type": "boolean" },
+    "actionable": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "operations": { "minItems": 1 } }, "required": ["operations"] },
+      "then": { "properties": { "changed": { "const": true } } },
+      "else": { "properties": { "changed": { "const": false } } }
+    },
+    {
+      "if": {
+        "allOf": [
+          { "properties": { "operations": { "minItems": 1 } }, "required": ["operations"] },
+          { "properties": { "blockers": { "maxItems": 0 } }, "required": ["blockers"] }
+        ]
+      },
+      "then": { "properties": { "actionable": { "const": true } } },
+      "else": { "properties": { "actionable": { "const": false } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "operations": {
+            "contains": { "properties": { "op": { "const": "remove" } }, "required": ["op"] }
+          }
+        },
+        "required": ["operations"]
+      },
+      "then": {
+        "properties": {
+          "engine_manifest": { "$ref": "#/$defs/engineManifest" },
+          "plugin_equivalence": { "$ref": "#/$defs/equivalenceInput" },
+          "removal_plan_basis_digest": { "$ref": "#/$defs/digest" }
+        }
+      },
+      "else": {
+        "properties": {
+          "removal_plan_basis_digest": { "type": "null" },
+          "removal_approval": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "plugin_equivalence": { "type": "object" } }, "required": ["plugin_equivalence"] },
+      "then": { "properties": { "engine_manifest": { "$ref": "#/$defs/engineManifest" } } }
+    }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nullableDigest": {
+      "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+    },
+    "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "text": { "type": "string", "pattern": "^[^\\u0000-\\u001F\\u007F]+$" },
+    "nullableOid": {
+      "oneOf": [{ "$ref": "#/$defs/oid" }, { "type": "null" }]
+    },
+    "path": {
+      "type": "string",
+      "format": "nfc",
+      "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$",
+      "allOf": [
+        { "not": { "pattern": "^(?:\\.[gG][iI][tT]|\\.[wW][oO][rR][kK][tT][rR][eE][eE][sS]|\\.[cC][oO][dD][eE][bB][aA][sS][eE][sS])(?:/|$)" } },
+        { "not": { "pattern": "^[tT][aA][sS][kK]/[cC][oO][dD][eE][bB][aA][sS][eE][sS](?:/|$)" } }
+      ]
+    },
+    "classification": {
+      "enum": [
+        "generated-minimal",
+        "embedded-legacy",
+        "migration-staged",
+        "already-current",
+        "malformed",
+        "unrecognized",
+        "indeterminate"
+      ]
+    },
+    "embeddedState": {
+      "enum": ["absent", "present-verified", "present-unverified", "indeterminate"]
+    },
+    "embedded": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before", "after", "equivalence_receipt_digest"],
+      "properties": {
+        "before": { "$ref": "#/$defs/embeddedState" },
+        "after": { "$ref": "#/$defs/embeddedState" },
+        "equivalence_receipt_digest": { "$ref": "#/$defs/nullableDigest" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              { "properties": { "before": { "const": "present-verified" } }, "required": ["before"] },
+              { "properties": { "after": { "const": "present-verified" } }, "required": ["after"] }
+            ]
+          },
+          "then": { "properties": { "equivalence_receipt_digest": { "$ref": "#/$defs/digest" } } }
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "state", "receipt_digest", "ref"],
+      "properties": {
+        "kind": { "enum": ["generation", "migration", null] },
+        "state": { "enum": ["absent", "valid", "stale", "invalid"] },
+        "receipt_digest": { "$ref": "#/$defs/nullableDigest" },
+        "ref": { "oneOf": [{ "$ref": "#/$defs/text" }, { "type": "null" }] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "absent" } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "kind": { "type": "null" },
+              "receipt_digest": { "type": "null" },
+              "ref": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "enum": ["valid", "stale"] } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "kind": { "enum": ["generation", "migration"] },
+              "receipt_digest": { "$ref": "#/$defs/digest" },
+              "ref": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "invalid" } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "kind": { "enum": ["generation", "migration"] },
+              "ref": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "migrationTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_id", "claim_id", "task_contract", "branch", "index_digest"],
+      "properties": {
+        "task_id": { "$ref": "#/$defs/text" },
+        "claim_id": { "$ref": "#/$defs/text" },
+        "task_contract": { "enum": ["workbench-task/v1", "workbench-task/v2"] },
+        "branch": { "$ref": "#/$defs/text" },
+        "index_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root",
+        "source_revision",
+        "default_revision",
+        "source_tree_digest",
+        "migration_task"
+      ],
+      "properties": {
+        "root": { "type": "string", "pattern": "^/[^\\u0000-\\u001F\\u007F]*$" },
+        "source_revision": { "$ref": "#/$defs/oid" },
+        "default_revision": { "$ref": "#/$defs/oid" },
+        "source_tree_digest": {
+          "type": "string",
+          "pattern": "^git-tree:(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "migration_task": { "$ref": "#/$defs/migrationTask" }
+      }
+    },
+    "planner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "plugin_version", "planner_revision"],
+      "properties": {
+        "contract_version": { "const": "workbench-kit-planner/v1" },
+        "plugin_version": {
+          "type": "string",
+          "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+        },
+        "planner_revision": { "$ref": "#/$defs/oid" }
+      }
+    },
+    "doctor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "ready",
+        "object_digest",
+        "source_digest",
+        "writer_coordination_digest"
+      ],
+      "properties": {
+        "contract_version": { "const": "workbench-doctor/v1" },
+        "ready": { "type": "boolean" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "writer_coordination_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "legacyInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "command",
+        "object_digest",
+        "source_digest",
+        "authority_revision",
+        "home_set_digest",
+        "complete"
+      ],
+      "properties": {
+        "contract_version": { "const": "workbench-legacy-inventory/v1" },
+        "command": { "enum": ["show", "bootstrap-show"] },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "authority_revision": { "$ref": "#/$defs/oid" },
+        "home_set_digest": { "$ref": "#/$defs/digest" },
+        "complete": { "const": true }
+      }
+    },
+    "language": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "tag", "source", "source_ref", "digest"],
+      "properties": {
+        "contract_version": { "const": "workbench-kit-language-decision/v1" },
+        "tag": {
+          "type": "string",
+          "maxLength": 255,
+          "pattern": "^(?:(?:[A-Za-z]{2,3}(?:-[A-Za-z]{3}){0,3}|[A-Za-z]{4}|[A-Za-z]{5,8})(?:-[A-Za-z]{4})?(?:-(?:[A-Za-z]{2}|[0-9]{3}))?(?:-(?:[A-Za-z0-9]{5,8}|[0-9][A-Za-z0-9]{3}))*(?:-[0-9A-WY-Za-wy-z](?:-[A-Za-z0-9]{2,8})+)*(?:-[xX](?:-[A-Za-z0-9]{1,8})+)?|[xX](?:-[A-Za-z0-9]{1,8})+|[eE][nN]-[gG][bB]-[oO][eE][dD]|[iI]-(?:[aA][mM][iI]|[bB][nN][nN]|[dD][eE][fF][aA][uU][lL][tT]|[eE][nN][oO][cC][hH][iI][aA][nN]|[hH][aA][kK]|[kK][lL][iI][nN][gG][oO][nN]|[lL][uU][xX]|[mM][iI][nN][gG][oO]|[nN][aA][vV][aA][jJ][oO]|[pP][wW][nN]|[tT][aA][oO]|[tT][aA][yY]|[tT][sS][uU])|[sS][gG][nN]-(?:[bB][eE]-(?:[fF][rR]|[nN][lL])|[cC][hH]-[dD][eE]))$"
+        },
+        "source": { "enum": ["explicit-cli", "workspace-profile", "generation-input"] },
+        "source_ref": { "type": "string", "pattern": "^[\\u0020-\\u007E]+$" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "authorityInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt", "object_digest", "source_digest"],
+      "properties": {
+        "receipt": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-bootstrap-authority-approval-v1" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "reviewedInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt", "object_digest", "source_digest"],
+      "properties": {
+        "receipt": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-reviewed-overlay-v1" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "equivalenceInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt", "object_digest", "source_digest"],
+      "properties": {
+        "receipt": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-plugin-equivalence-v1" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "removalInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt", "object_digest", "source_digest"],
+      "properties": {
+        "receipt": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-removal-approval-v1" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "bootstrap_authority_approval", "reviewed_overlay"],
+      "properties": {
+        "language": { "$ref": "#/$defs/language" },
+        "bootstrap_authority_approval": {
+          "oneOf": [{ "$ref": "#/$defs/authorityInput" }, { "type": "null" }]
+        },
+        "reviewed_overlay": {
+          "oneOf": [{ "$ref": "#/$defs/reviewedInput" }, { "type": "null" }]
+        }
+      }
+    },
+    "engineManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "command",
+        "object_digest",
+        "source_digest",
+        "content_revision",
+        "manifest_digest"
+      ],
+      "properties": {
+        "contract_version": { "const": "workbench-plugin-manifest/v1" },
+        "command": { "const": "engine-manifest show" },
+        "object_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "content_revision": { "$ref": "#/$defs/digest" },
+        "manifest_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "activeTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "home",
+        "claim_id",
+        "task_claim_id",
+        "task_contract",
+        "issue",
+        "parent",
+        "branch",
+        "lifecycle_state",
+        "lifecycle_digest",
+        "source_revision",
+        "pr_head_revision",
+        "ancestry_complete"
+      ],
+      "properties": {
+        "source": { "const": "legacy-inventory:homes[].claims" },
+        "home": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "claim_id": { "$ref": "#/$defs/text" },
+        "task_claim_id": { "$ref": "#/$defs/text" },
+        "task_contract": { "const": "workbench-task/v1" },
+        "issue": { "type": "integer", "minimum": 1 },
+        "parent": { "type": ["integer", "null"], "minimum": 1 },
+        "branch": { "$ref": "#/$defs/text" },
+        "lifecycle_state": { "$ref": "#/$defs/text" },
+        "lifecycle_digest": { "$ref": "#/$defs/digest" },
+        "source_revision": { "$ref": "#/$defs/oid" },
+        "pr_head_revision": { "$ref": "#/$defs/nullableOid" },
+        "ancestry_complete": { "const": true }
+      }
+    },
+    "activeTasks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "source_inventory_object_digest", "tasks", "digest"],
+      "properties": {
+        "contract_version": { "const": "workbench-kit-active-v1-tasks/v1" },
+        "source_inventory_object_digest": { "$ref": "#/$defs/digest" },
+        "tasks": { "type": "array", "items": { "$ref": "#/$defs/activeTask" } },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "preservedNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "node_type", "mode", "digest", "link_target"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "node_type": { "enum": ["file", "symlink"] },
+        "mode": { "enum": ["100644", "100755", "120000"] },
+        "digest": { "$ref": "#/$defs/digest" },
+        "link_target": {
+          "type": ["string", "null"],
+          "format": "nfc",
+          "pattern": "^(?!/)(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "enum": ["100644", "100755"] }, "link_target": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "const": "120000" }, "link_target": { "type": "string", "minLength": 1 } } }
+        }
+      ]
+    },
+    "parentDirectory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "before_type", "before_mode", "after_type", "after_mode"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "before_type": { "enum": ["directory", null] },
+        "before_mode": { "type": ["string", "null"], "pattern": "^04[0-7]{4}$" },
+        "after_type": { "const": "directory" },
+        "after_mode": { "type": "string", "pattern": "^04[0-7]{4}$" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "before_type": { "type": "null" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "type": "null" }, "after_mode": { "const": "040755" } } }
+        },
+        {
+          "if": { "properties": { "before_type": { "const": "directory" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "type": "string", "pattern": "^04[0-7]{4}$" } } }
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "node_type",
+        "mode",
+        "content_base64",
+        "link_target",
+        "source_ref",
+        "source_digest"
+      ],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "node_type": { "enum": ["file", "symlink"] },
+        "mode": { "enum": ["100644", "100755", "120000"] },
+        "content_base64": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?$",
+              "format": "canonical-base64",
+              "contentEncoding": "base64"
+            },
+            { "type": "null" }
+          ]
+        },
+        "link_target": {
+          "type": ["string", "null"],
+          "format": "nfc",
+          "pattern": "^(?!/)(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$"
+        },
+        "source_ref": { "type": "string", "pattern": "^[\\u0020-\\u007E]+$" },
+        "source_digest": { "$ref": "#/$defs/digest" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "enum": ["100644", "100755"] }, "content_base64": { "type": "string" }, "link_target": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "const": "120000" }, "content_base64": { "type": "null" }, "link_target": { "type": "string", "minLength": 1 } } }
+        }
+      ]
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "path",
+        "before_type",
+        "before_mode",
+        "before_digest",
+        "after_type",
+        "after_mode",
+        "after_digest",
+        "artifact_source_digest",
+        "equivalence_receipt_ref"
+      ],
+      "properties": {
+        "op": { "enum": ["create", "update", "remove"] },
+        "path": { "$ref": "#/$defs/path" },
+        "before_type": { "enum": ["file", "symlink", null] },
+        "before_mode": { "enum": ["100644", "100755", "120000", null] },
+        "before_digest": { "$ref": "#/$defs/nullableDigest" },
+        "after_type": { "enum": ["file", "symlink", null] },
+        "after_mode": { "enum": ["100644", "100755", "120000", null] },
+        "after_digest": { "$ref": "#/$defs/nullableDigest" },
+        "artifact_source_digest": { "$ref": "#/$defs/nullableDigest" },
+        "equivalence_receipt_ref": {
+          "oneOf": [{ "$ref": "#/$defs/text" }, { "type": "null" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "op": { "const": "create" } }, "required": ["op"] },
+          "then": {
+            "properties": {
+              "before_type": { "type": "null" },
+              "before_mode": { "type": "null" },
+              "before_digest": { "type": "null" },
+              "after_type": { "enum": ["file", "symlink"] },
+              "after_mode": { "enum": ["100644", "100755", "120000"] },
+              "after_digest": { "$ref": "#/$defs/digest" },
+              "artifact_source_digest": { "$ref": "#/$defs/digest" },
+              "equivalence_receipt_ref": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "update" } }, "required": ["op"] },
+          "then": {
+            "properties": {
+              "before_type": { "enum": ["file", "symlink"] },
+              "before_mode": { "enum": ["100644", "100755", "120000"] },
+              "before_digest": { "$ref": "#/$defs/digest" },
+              "after_type": { "enum": ["file", "symlink"] },
+              "after_mode": { "enum": ["100644", "100755", "120000"] },
+              "after_digest": { "$ref": "#/$defs/digest" },
+              "artifact_source_digest": { "$ref": "#/$defs/digest" },
+              "equivalence_receipt_ref": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "remove" } }, "required": ["op"] },
+          "then": {
+            "properties": {
+              "before_type": { "enum": ["file", "symlink"] },
+              "before_mode": { "enum": ["100644", "100755", "120000"] },
+              "before_digest": { "$ref": "#/$defs/digest" },
+              "after_type": { "type": "null" },
+              "after_mode": { "type": "null" },
+              "after_digest": { "type": "null" },
+              "artifact_source_digest": { "type": "null" },
+              "equivalence_receipt_ref": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "before_type": { "const": "file" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "enum": ["100644", "100755"] } } }
+        },
+        {
+          "if": { "properties": { "before_type": { "const": "symlink" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "const": "120000" } } }
+        },
+        {
+          "if": { "properties": { "before_type": { "type": "null" } }, "required": ["before_type"] },
+          "then": { "properties": { "before_mode": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "after_type": { "const": "file" } }, "required": ["after_type"] },
+          "then": { "properties": { "after_mode": { "enum": ["100644", "100755"] } } }
+        },
+        {
+          "if": { "properties": { "after_type": { "const": "symlink" } }, "required": ["after_type"] },
+          "then": { "properties": { "after_mode": { "const": "120000" } } }
+        },
+        {
+          "if": { "properties": { "after_type": { "type": "null" } }, "required": ["after_type"] },
+          "then": { "properties": { "after_mode": { "type": "null" } } }
+        }
+      ]
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "ref"],
+      "properties": {
+        "code": { "$ref": "#/$defs/text" },
+        "ref": { "$ref": "#/$defs/text" }
+      }
+    }
+  }
+}

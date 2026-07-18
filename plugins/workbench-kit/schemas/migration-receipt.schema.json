@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-migration-receipt-v1",
+  "title": "Workbench kit migration receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "source_revision",
+    "source_tree_digest",
+    "planner",
+    "migration_task",
+    "language",
+    "authority_approval_object_digest",
+    "authority_approval_source_digest",
+    "reviewed_overlay_object_digest",
+    "reviewed_overlay_source_digest",
+    "legacy_inventory_object_digest",
+    "legacy_inventory_source_digest",
+    "active_v1_tasks_digest",
+    "embedded_engine",
+    "artifacts",
+    "candidate_basis_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "workbench-kit-migration-receipt/v1" },
+    "source_revision": { "$ref": "#/$defs/oid" },
+    "source_tree_digest": {
+      "type": "string",
+      "pattern": "^git-tree:(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "planner": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/planner" },
+    "migration_task": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/migrationTask" },
+    "language": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/language" },
+    "authority_approval_object_digest": { "$ref": "#/$defs/digest" },
+    "authority_approval_source_digest": { "$ref": "#/$defs/digest" },
+    "reviewed_overlay_object_digest": { "$ref": "#/$defs/nullableDigest" },
+    "reviewed_overlay_source_digest": { "$ref": "#/$defs/nullableDigest" },
+    "legacy_inventory_object_digest": { "$ref": "#/$defs/digest" },
+    "legacy_inventory_source_digest": { "$ref": "#/$defs/digest" },
+    "active_v1_tasks_digest": { "$ref": "#/$defs/digest" },
+    "embedded_engine": { "$ref": "https://github.com/YOOGOMJA/workbench-kit/schemas/workbench-kit-upgrade-plan-v1#/$defs/embedded" },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifactNode" }
+    },
+    "candidate_basis_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nullableDigest": {
+      "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+    },
+    "oid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "path": {
+      "type": "string",
+      "format": "nfc",
+      "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*[/]$).+$",
+      "allOf": [
+        { "not": { "pattern": "^(?:\\.[gG][iI][tT]|\\.[wW][oO][rR][kK][tT][rR][eE][eE][sS]|\\.[cC][oO][dD][eE][bB][aA][sS][eE][sS])(?:/|$)" } },
+        { "not": { "pattern": "^[tT][aA][sS][kK]/[cC][oO][dD][eE][bB][aA][sS][eE][sS](?:/|$)" } }
+      ]
+    },
+    "artifactNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "node_type", "mode", "digest"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "node_type": { "enum": ["file", "symlink"] },
+        "mode": { "enum": ["100644", "100755", "120000"] },
+        "digest": { "$ref": "#/$defs/digest" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "node_type": { "const": "file" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "enum": ["100644", "100755"] } } }
+        },
+        {
+          "if": { "properties": { "node_type": { "const": "symlink" } }, "required": ["node_type"] },
+          "then": { "properties": { "mode": { "const": "120000" } } }
+        }
+      ]
+    }
+  }
+}
