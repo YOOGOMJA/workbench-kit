@@ -351,7 +351,7 @@ def build(replacement_revision: str):
     }
     receipt = {
         "contract_version": "workbench-plugin-equivalence/v1",
-        "receipt_id": "workbench-0.2.0-replaces-workbench-ffb426f1",
+        "receipt_id": "workbench-{}-replaces-workbench-ffb426f1".format(version),
         "replacement_plugin": {
             "plugin_name": "workbench",
             "plugin_version": version,
