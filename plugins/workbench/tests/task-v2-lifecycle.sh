@@ -155,6 +155,41 @@ case "${1:-} ${2:-}" in
       cat "$body_file"
       printf '%s\n' '<!-- fixture-comment-end -->'
     } >> "$GH_COMMENTS_DIR/$issue.comments"
+    if { [ -n "${GH_MUTATE_CLEANUP_STAGE:-}" ] \
+        && grep -Fq "\"stage\":\"$GH_MUTATE_CLEANUP_STAGE\"" "$body_file"; } \
+      || { [ -n "${GH_MUTATE_CLEANUP_EVENT_PHASE:-}" ] \
+        && grep -Fq "\"phase\":\"$GH_MUTATE_CLEANUP_EVENT_PHASE\"" "$body_file" \
+        && { [ -z "${GH_MUTATE_CLEANUP_EVENT_STATE:-}" ] \
+          || grep -Fq "\"state\":\"$GH_MUTATE_CLEANUP_EVENT_STATE\"" "$body_file"; }; }; then
+      python3 - "$GH_COMMENTS_DIR/$issue.comments" \
+        "${GH_MUTATE_CLEANUP_EVENT_PHASE:-}" \
+        "${GH_MUTATE_CLEANUP_EVENT_STATE:-}" <<'PY'
+import json
+import re
+import sys
+
+path, event_phase, event_state = sys.argv[1:]
+text = open(path, encoding="utf-8").read()
+matches = list(re.finditer(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->", text
+))
+assert matches
+match = matches[-1]
+value = json.loads(match.group(1))
+if event_phase:
+    event = value["effect_owner_events"][-1]
+    if event["phase"] != event_phase or (
+        event_state and event["state"] != event_state
+    ):
+        raise SystemExit(0)
+    event["event_id"] = "foreign-clone-replacement"
+else:
+    value["quarantine_authority"]["arm_commitment"] = "sha256:" + "f" * 64
+replacement = json.dumps(value, separators=(",", ":"))
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(text[:match.start(1)] + replacement + text[match.end(1):])
+PY
+    fi
     if [ -n "${GH_LOSE_LIFECYCLE_RESPONSE:-}" ] \
       && grep -Fq "\"event\":\"$GH_LOSE_LIFECYCLE_RESPONSE\"" "$body_file"; then
       exit 44
@@ -623,6 +658,7 @@ run_task_in_dir() {
     WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_ATTEMPT="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_ATTEMPT:-0}" \
     WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PROBE="${WORKBENCH_TEST_FAIL_AFTER_ACCEPTANCE_PROBE:-0}" \
     WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY="${WORKBENCH_TEST_FAIL_AFTER_CONTEXT_PRIMARY:-}" \
+    WORKBENCH_TEST_FAIL_AFTER_CLEANUP_PREPARED_CONFIRM="${WORKBENCH_TEST_FAIL_AFTER_CLEANUP_PREPARED_CONFIRM:-0}" \
     WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM="${WORKBENCH_TEST_FAIL_AFTER_WRITER_CLAIM:-0}" \
     WORKBENCH_TEST_FAIL_WRITER_STAGE="${WORKBENCH_TEST_FAIL_WRITER_STAGE:-}" \
     WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT="${WORKBENCH_TEST_FAIL_AFTER_WRITER_ROOT:-0}" \
@@ -631,8 +667,13 @@ run_task_in_dir() {
     WORKBENCH_TEST_LIFECYCLE_OBSERVATION="${WORKBENCH_TEST_LIFECYCLE_OBSERVATION:-}" \
     WORKBENCH_TEST_GOVERNED_FINAL_HOOK="${WORKBENCH_TEST_GOVERNED_FINAL_HOOK:-}" \
     WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK="${WORKBENCH_TEST_CLEANUP_DESCRIPTOR_HOOK:-}" \
+    WORKBENCH_TEST_CLEANUP_ACTION_STATUS_HOOK="${WORKBENCH_TEST_CLEANUP_ACTION_STATUS_HOOK:-}" \
     WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK="${WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK:-}" \
+    WORKBENCH_TEST_DURABLE_JSON_STAGE="${WORKBENCH_TEST_DURABLE_JSON_STAGE:-}" \
+    WORKBENCH_TEST_DURABLE_JSON_UMASK="${WORKBENCH_TEST_DURABLE_JSON_UMASK:-}" \
     WORKBENCH_TEST_FAIL_QUARANTINE_STAGE="${WORKBENCH_TEST_FAIL_QUARANTINE_STAGE:-}" \
+    WORKBENCH_TEST_QUARANTINE_PARENT_HOOK="${WORKBENCH_TEST_QUARANTINE_PARENT_HOOK:-}" \
+    WORKBENCH_TEST_QUARANTINE_EXTERNAL="${WORKBENCH_TEST_QUARANTINE_EXTERNAL:-}" \
     WORKBENCH_TEST_QUARANTINE_RENAME_HOOK="${WORKBENCH_TEST_QUARANTINE_RENAME_HOOK:-}" \
     WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK="${WORKBENCH_TEST_WORK_REF_PREWRITE_HOOK:-}" \
     WORKBENCH_TEST_WORK_REF_BARRIER_DIR="${WORKBENCH_TEST_WORK_REF_BARRIER_DIR:-}" \
@@ -641,11 +682,15 @@ run_task_in_dir() {
     WORKBENCH_TEST_LOCAL_WRITE_ID="${WORKBENCH_TEST_LOCAL_WRITE_ID:-}" \
     WORKBENCH_TEST_LOCAL_WRITE_READY="${WORKBENCH_TEST_LOCAL_WRITE_READY:-}" \
     WORKBENCH_TEST_LOCAL_WRITE_RELEASE="${WORKBENCH_TEST_LOCAL_WRITE_RELEASE:-}" \
+    WORKBENCH_TEST_NON_UTF8_UNSUPPORTED="${WORKBENCH_TEST_NON_UTF8_UNSUPPORTED:-}" \
     WORKBENCH_TEST_REAL_MV="${WORKBENCH_TEST_REAL_MV:-}" \
     WORKBENCH_TEST_CLEANUP_RACE_MARKER="${WORKBENCH_TEST_CLEANUP_RACE_MARKER:-}" \
     GH_FAIL_LIFECYCLE_EVENT="${GH_FAIL_LIFECYCLE_EVENT:-}" \
     GH_LOSE_LIFECYCLE_RESPONSE="${GH_LOSE_LIFECYCLE_RESPONSE:-}" \
     GH_FAIL_CLEANUP_STAGE="${GH_FAIL_CLEANUP_STAGE:-}" \
+    GH_MUTATE_CLEANUP_STAGE="${GH_MUTATE_CLEANUP_STAGE:-}" \
+    GH_MUTATE_CLEANUP_EVENT_PHASE="${GH_MUTATE_CLEANUP_EVENT_PHASE:-}" \
+    GH_MUTATE_CLEANUP_EVENT_STATE="${GH_MUTATE_CLEANUP_EVENT_STATE:-}" \
     GH_CLEANUP_RACE_COMMIT_WORKTREE="${GH_CLEANUP_RACE_COMMIT_WORKTREE:-}" \
     GH_PR_STATE="${GH_PR_STATE:-}" GH_PR_HEAD="${GH_PR_HEAD:-}" GH_PR_MERGE="${GH_PR_MERGE:-}" \
     WRITER_BARRIER_ID="${WRITER_BARRIER_ID:-}" \
@@ -4131,6 +4176,222 @@ test_cleanup_revalidates_outer_task_before_forced_removal() {
   [ -d "$CLEANUP_TASK_DIR" ] || fail "prepared cleanup retry removed the task workspace"
 }
 
+test_cleanup_duplicate_prepared_marker_retries_idempotently() {
+  local out retry comments rc actual
+  prepare_cleanup_fixture cleanup_duplicate_prepared
+  comments="$TMPDIR/cleanup_duplicate_prepared/comments/29.comments"
+  out="$TMPDIR/cleanup_duplicate_prepared/first.out"
+  if GH_CLEANUP_RACE_DIRTY_WORKTREE="$CLEANUP_TASK_DIR" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_duplicate_prepared "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "duplicate prepared fixture unexpectedly completed its first cleanup"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "duplicate prepared fixture returned $rc"
+  assert_file_contains "$out" '"code":"dirty-task-worktree"'
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "duplicate prepared fixture removed the workspace"
+
+  python3 - "$comments" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+matches = re.findall(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->", text
+)
+assert len(matches) == 1, matches
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write("<!-- fixture-comment-author:test@example.invalid -->\n")
+    handle.write("<!-- workbench-task-cleanup:v1\n" + matches[0] + "\n-->\n")
+    handle.write("workbench task cleanup: prepared `duplicate-response`\n")
+    handle.write("<!-- fixture-comment-end -->\n")
+PY
+  rm -f "$CLEANUP_TASK_DIR/RACE.txt"
+  retry="$TMPDIR/cleanup_duplicate_prepared/retry.err"
+  actual="$(WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_duplicate_prepared "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json 2>"$retry")" \
+    || fail "identical prepared marker retry did not converge: $(cat "$retry")"
+  assert_contains "$actual" '"outcome":"cleaned"'
+  [ ! -e "$CLEANUP_TASK_DIR" ] \
+    || fail "identical prepared marker retry retained the active workspace"
+}
+
+test_cleanup_retry_rejects_action_status_race() {
+  local out retry hook action branch rc
+  prepare_cleanup_fixture cleanup_action_status_race
+  branch=task/29-v2-lifecycle-fixture-29
+  action="$CLEANUP_TASK_DIR/task/.workbench/actions/$CLEANUP_ACTION_INSTANCE.record"
+  out="$TMPDIR/cleanup_action_status_race/first.out"
+  if GH_CLEANUP_RACE_DIRTY_WORKTREE="$CLEANUP_TASK_DIR" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_action_status_race "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "action status race fixture unexpectedly completed its first cleanup"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "action status race fixture returned $rc"
+  assert_file_contains "$action" status=consumed
+  rm -f "$CLEANUP_TASK_DIR/RACE.txt"
+  hook="$TMPDIR/cleanup_action_status_race/change-action-status"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+python3 - "$1" <<'PY'
+import sys
+
+path = sys.argv[1]
+raw = open(path, encoding="utf-8").read()
+assert "status=consumed\n" in raw
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(raw.replace("status=consumed\n", "status=corrupt\n", 1))
+PY
+SH
+  chmod +x "$hook"
+  retry="$TMPDIR/cleanup_action_status_race/retry.out"
+  if WORKBENCH_TEST_CLEANUP_ACTION_STATUS_HOOK="$hook" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_action_status_race "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$retry" 2>&1; then
+    fail "cleanup skipped an action status changed after snapshot validation"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "action status race retry returned $rc"
+  assert_file_contains "$retry" '"code":"action-effect-unreconciled"'
+  assert_file_contains "$action" status=corrupt
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "action status race removed the workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "action status race removed the local branch"
+}
+
+test_cleanup_reconfirms_journal_immediately_before_retry_consume() {
+  local out retry hook comments action branch rc
+  prepare_cleanup_fixture cleanup_action_confirmation_race
+  branch=task/29-v2-lifecycle-fixture-29
+  comments="$TMPDIR/cleanup_action_confirmation_race/comments/29.comments"
+  action="$CLEANUP_TASK_DIR/task/.workbench/actions/$CLEANUP_ACTION_INSTANCE.record"
+  out="$TMPDIR/cleanup_action_confirmation_race/first.out"
+  if WORKBENCH_TEST_FAIL_AFTER_CLEANUP_PREPARED_CONFIRM=1 \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_action_confirmation_race "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "prepared-confirm interruption fixture unexpectedly completed cleanup"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "prepared-confirm interruption returned $rc"
+  assert_file_contains "$comments" '"stage":"prepared"'
+  assert_file_contains "$action" status=authorized
+  [ -d "$CLEANUP_TASK_DIR" ] \
+    || fail "prepared-confirm interruption removed the workspace"
+
+  hook="$TMPDIR/cleanup_action_confirmation_race/replace-confirmed-journal"
+  cat > "$hook" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+python3 - '$comments' <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+matches = list(re.finditer(
+    r"<!-- workbench-task-cleanup:v1\n([^\r\n]+)\n-->", text
+))
+assert matches
+match = matches[-1]
+value = json.loads(match.group(1))
+value["quarantine_authority"]["arm_commitment"] = "sha256:" + "f" * 64
+replacement = json.dumps(value, separators=(",", ":"))
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(text[:match.start(1)] + replacement + text[match.end(1):])
+PY
+EOF
+  chmod +x "$hook"
+  retry="$TMPDIR/cleanup_action_confirmation_race/retry.out"
+  if WORKBENCH_TEST_CLEANUP_ACTION_STATUS_HOOK="$hook" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_action_confirmation_race "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$retry" 2>&1; then
+    fail "cleanup consumed after its previously confirmed journal was replaced"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "retry consume confirmation returned $rc"
+  assert_file_contains "$retry" '"code":"cleanup-journal-untrusted"'
+  assert_file_contains "$action" status=authorized
+  [ -d "$CLEANUP_TASK_DIR" ] \
+    || fail "retry consume confirmation removed the workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "retry consume confirmation removed the local branch"
+}
+
+test_cleanup_prepared_publication_requires_fresh_observation() {
+  local out retry branch action_file rc
+  prepare_cleanup_fixture cleanup_prepared_confirmation
+  branch="task/29-v2-lifecycle-fixture-29"
+  action_file="$CLEANUP_TASK_DIR/task/.workbench/actions/$CLEANUP_ACTION_INSTANCE.record"
+  out="$TMPDIR/cleanup_prepared_confirmation/done.out"
+  if GH_MUTATE_CLEANUP_STAGE=prepared \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_prepared_confirmation "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup trusted an unconfirmed prepared publication"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "unconfirmed prepared publication returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-untrusted"'
+  [ "$(sed -n 's/^status=//p' "$action_file")" = authorized ] \
+    || fail "unconfirmed prepared publication consumed the cleanup action"
+  [ -d "$CLEANUP_TASK_DIR" ] \
+    || fail "unconfirmed prepared publication removed the workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "unconfirmed prepared publication removed the branch"
+
+  retry="$TMPDIR/cleanup_prepared_confirmation/retry.out"
+  if WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_prepared_confirmation "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$retry" 2>&1; then
+    fail "cleanup accepted a prepared journal detached from its local arm proof"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "detached prepared arm retry returned $rc"
+  assert_file_contains "$retry" '"code":"cleanup-quarantine-unconfirmed"'
+  [ -d "$CLEANUP_TASK_DIR" ] \
+    || fail "detached prepared arm retry moved the workspace before proof rejection"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "detached prepared arm retry removed the branch"
+}
+
+test_cleanup_quarantined_publication_requires_fresh_observation() {
+  local work_ref reservation selection out branch rc
+  work_ref=toolbox:scenario/SCN-QUARANTINE-CONFIRMATION
+  prepare_cleanup_fixture cleanup_quarantined_confirmation "$work_ref"
+  reservation="$(work_ref_remote_ref "$work_ref")"
+  selection="$(work_ref_selection_remote_ref "$CLEANUP_CLAIM")"
+  branch="task/29-v2-lifecycle-fixture-29"
+  out="$TMPDIR/cleanup_quarantined_confirmation/done.out"
+  if GH_MUTATE_CLEANUP_STAGE=quarantined \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantined_confirmation "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup released state after an unconfirmed quarantine publication"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "unconfirmed quarantine publication returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-untrusted"'
+  [ ! -e "$CLEANUP_TASK_DIR" ] \
+    || fail "unconfirmed quarantine publication restored an active workspace path"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "unconfirmed quarantine publication released the local branch"
+  [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_quarantined_confirmation/origin.git" \
+    "$reservation")" ] || fail "unconfirmed quarantine publication released its reservation"
+  [ -n "$(git ls-remote --heads "$TMPDIR/cleanup_quarantined_confirmation/origin.git" \
+    "$selection")" ] || fail "unconfirmed quarantine publication released its selection"
+}
+
 test_cleanup_refuses_bytes_created_at_task_removal_boundary() {
   local out branch hook injected action common locator quarantine actual
   prepare_cleanup_fixture cleanup_task_removal_boundary
@@ -4716,6 +4977,188 @@ PY
     || fail "hardlinked quarantine removed the retry branch"
 }
 
+test_cleanup_quarantine_authenticates_non_utf8_names() {
+  local out hook common bundle unsupported
+  prepare_cleanup_fixture cleanup_quarantine_non_utf8
+  PYTHONPATH="$PLUGIN_ROOT/lib" python3 - <<'PY'
+import os
+from workbench_cleanup import tree_digest_path_field
+
+relative = os.fsdecode(b"non-utf8-\xff")
+assert tree_digest_path_field(relative) == "path-bytes:" + os.fsencode(relative).hex()
+PY
+  hook="$TMPDIR/cleanup_quarantine_non_utf8/inject-non-utf8"
+  unsupported="$TMPDIR/cleanup_quarantine_non_utf8/non-utf8-unsupported"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+python3 - "$1/task/codebases" <<'PY'
+import errno
+import os
+import sys
+
+directory = os.fsencode(sys.argv[1])
+os.makedirs(directory, exist_ok=True)
+path = os.path.join(directory, b"non-utf8-\xff")
+try:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+except OSError as error:
+    if error.errno not in (errno.EILSEQ, errno.EINVAL):
+        raise
+    with open(os.environ["WORKBENCH_TEST_NON_UTF8_UNSUPPORTED"], "w") as handle:
+        handle.write("unsupported\n")
+    raise SystemExit(0)
+try:
+    os.write(descriptor, b"preserved\n")
+finally:
+    os.close(descriptor)
+PY
+SH
+  chmod +x "$hook"
+  out="$TMPDIR/cleanup_quarantine_non_utf8/done.err"
+  if ! WORKBENCH_TEST_CLEANUP_TASK_REMOVE_HOOK="$hook" \
+    WORKBENCH_TEST_NON_UTF8_UNSUPPORTED="$unsupported" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_non_utf8 "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json \
+      >"$TMPDIR/cleanup_quarantine_non_utf8/done.out" 2>"$out"; then
+    fail "cleanup could not authenticate a valid non-UTF8 POSIX filename: $(cat "$out")"
+  fi
+  [ ! -f "$unsupported" ] || return 0
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  bundle="$(find "$common/workbench-v2/cleanup-quarantine" \
+    -mindepth 1 -maxdepth 1 -type d -print | head -n 1)"
+  python3 - "$bundle/workspace/task/codebases" <<'PY'
+import os
+import sys
+
+names = os.listdir(os.fsencode(sys.argv[1]))
+assert b"non-utf8-\xff" in names, names
+path = os.path.join(os.fsencode(sys.argv[1]), b"non-utf8-\xff")
+assert open(path, "rb").read() == b"preserved\n"
+PY
+}
+
+test_cleanup_quarantine_durable_proof_rolls_forward() {
+  local out rc branch common pending actual mode
+  prepare_cleanup_fixture cleanup_quarantine_durable_proof
+  branch="task/29-v2-lifecycle-fixture-29"
+  out="$TMPDIR/cleanup_quarantine_durable_proof/interrupted.out"
+  : > "$out"
+  chmod 0600 "$out"
+  if WORKBENCH_TEST_DURABLE_JSON_STAGE=proof.json:pending \
+    WORKBENCH_TEST_DURABLE_JSON_UMASK=0777 \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_durable_proof "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "durable proof interruption fixture unexpectedly completed cleanup"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "durable proof interruption returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  [ -d "$CLEANUP_TASK_DIR" ] \
+    || fail "durable proof interruption removed the active workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "durable proof interruption removed the local branch"
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  pending="$(find "$common/workbench-v2/cleanup-quarantine" \
+    -type f -name '.proof.json.pending' -print)"
+  [ -n "$pending" ] && [ "$(printf '%s\n' "$pending" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "durable proof interruption did not retain one reserved pending record"
+  mode="$(stat -c '%a' "$pending" 2>/dev/null || stat -f '%Lp' "$pending")"
+  [ "$mode" = 600 ] || fail "durable pending mode ignored its 0600 contract: $mode"
+  [ ! -e "${pending%/.proof.json.pending}/proof.json" ] \
+    || fail "durable proof interruption published its target early"
+
+  actual="$(WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_durable_proof "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json)" \
+    || fail "durable proof retry did not roll forward"
+  assert_contains "$actual" '"outcome":"cleaned"'
+}
+
+test_cleanup_quarantine_partial_proof_rolls_forward() {
+  local out rc branch common pending actual
+  prepare_cleanup_fixture cleanup_quarantine_partial_proof
+  branch="task/29-v2-lifecycle-fixture-29"
+  out="$TMPDIR/cleanup_quarantine_partial_proof/interrupted.out"
+  if WORKBENCH_TEST_DURABLE_JSON_STAGE=proof.json:partial \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_partial_proof "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "partial proof interruption fixture unexpectedly completed cleanup"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "partial proof interruption returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  [ -d "$CLEANUP_TASK_DIR" ] \
+    || fail "partial proof interruption removed the active workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "partial proof interruption removed the local branch"
+  common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+  common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+  pending="$(find "$common/workbench-v2/cleanup-quarantine" \
+    -type f -name '.proof.json.pending' -print)"
+  [ -n "$pending" ] && [ "$(printf '%s\n' "$pending" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "partial proof interruption did not retain one pending record"
+  if python3 -m json.tool "$pending" >/dev/null 2>&1; then
+    fail "partial proof interruption unexpectedly retained complete JSON"
+  fi
+
+  actual="$(WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_partial_proof "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json)" \
+    || fail "partial proof retry did not rebuild and roll forward"
+  assert_contains "$actual" '"outcome":"cleaned"'
+}
+
+test_cleanup_quarantine_edge_pending_rolls_forward() {
+  local mode case_name out rc common pending actual
+  for mode in pre-newline full-before-fsync; do
+    case_name="cleanup_quarantine_${mode//-/_}"
+    prepare_cleanup_fixture "$case_name"
+    out="$TMPDIR/$case_name/interrupted.out"
+    if WORKBENCH_TEST_DURABLE_JSON_STAGE="proof.json:$mode" \
+      WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+      WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+      run_task "$case_name" "$CLEANUP_REPO" done 29 \
+        --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+      fail "$mode proof interruption fixture unexpectedly completed cleanup"
+    else rc=$?; fi
+    [ "$rc" = 1 ] || fail "$mode proof interruption returned $rc"
+    assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+    [ -d "$CLEANUP_TASK_DIR" ] \
+      || fail "$mode proof interruption removed the active workspace"
+    common="$(git -C "$CLEANUP_REPO" rev-parse --git-common-dir)"
+    common="$(cd "$CLEANUP_REPO" && cd "$common" && pwd -P)"
+    pending="$(find "$common/workbench-v2/cleanup-quarantine" \
+      -type f -name '.proof.json.pending' -print)"
+    [ -n "$pending" ] || fail "$mode proof interruption retained no pending record"
+    python3 - "$pending" "$mode" <<'PY'
+import json
+import sys
+
+raw = open(sys.argv[1], "rb").read()
+json.loads(raw)
+if sys.argv[2] == "pre-newline":
+    assert not raw.endswith(b"\n"), raw[-16:]
+else:
+    assert raw.endswith(b"\n"), raw[-16:]
+PY
+    actual="$(WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+      WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+      run_task "$case_name" "$CLEANUP_REPO" done 29 \
+        --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json)" \
+      || fail "$mode proof retry did not roll forward"
+    assert_contains "$actual" '"outcome":"cleaned"'
+  done
+}
+
 test_cleanup_quarantine_rolls_forward_after_workspace_rename_crash() {
   local out rc branch common locator bundle actual comments
   prepare_cleanup_fixture cleanup_quarantine_roll_forward
@@ -4841,6 +5284,50 @@ SH
   [ -d "$CLEANUP_TASK_DIR" ] || fail "parent symlink swap moved the source workspace"
   git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
     || fail "parent symlink swap removed the retry branch"
+}
+
+test_cleanup_quarantine_parent_creation_is_dirfd_bound() {
+  local out rc hook marker external mode branch
+  prepare_cleanup_fixture cleanup_quarantine_parent_dirfd
+  branch="task/29-v2-lifecycle-fixture-29"
+  hook="$TMPDIR/cleanup_quarantine_parent_dirfd/swap-created-parent"
+  marker="$TMPDIR/cleanup_quarantine_parent_dirfd/swapped"
+  external="$TMPDIR/cleanup_quarantine_parent_dirfd/external"
+  mkdir -m 0755 "$external"
+  printf '%s\n' untouched > "$external/sentinel"
+  cat > "$hook" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+candidate="$1"
+if [ "${candidate##*/}" = cleanup-quarantine ] \
+  && [ ! -e "$WORKBENCH_TEST_CLEANUP_RACE_MARKER" ]; then
+  mv "$candidate" "$candidate.original"
+  ln -s "$WORKBENCH_TEST_QUARANTINE_EXTERNAL" "$candidate"
+  printf '%s\n' swapped > "$WORKBENCH_TEST_CLEANUP_RACE_MARKER"
+fi
+SH
+  chmod +x "$hook"
+  out="$TMPDIR/cleanup_quarantine_parent_dirfd/done.out"
+  if WORKBENCH_TEST_QUARANTINE_PARENT_HOOK="$hook" \
+    WORKBENCH_TEST_QUARANTINE_EXTERNAL="$external" \
+    WORKBENCH_TEST_CLEANUP_RACE_MARKER="$marker" \
+    WORKBENCH_PLATFORM_POLICY="$CLEANUP_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/cleanup \
+    run_task cleanup_quarantine_parent_dirfd "$CLEANUP_REPO" done 29 \
+      --action-instance-id "$CLEANUP_ACTION_INSTANCE" --format json >"$out" 2>&1; then
+    fail "cleanup followed a parent component replaced between validation and open"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "dirfd parent swap returned $rc"
+  [ -f "$marker" ] || fail "dirfd parent swap hook did not run"
+  assert_file_contains "$out" '"code":"cleanup-quarantine-unconfirmed"'
+  [ -d "$CLEANUP_TASK_DIR" ] || fail "dirfd parent swap moved the active workspace"
+  git -C "$CLEANUP_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "dirfd parent swap removed the local branch"
+  mode="$(stat -c '%a' "$external" 2>/dev/null || stat -f '%Lp' "$external")"
+  [ "$mode" = 755 ] || fail "dirfd parent swap changed external directory mode to $mode"
+  [ "$(find "$external" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1 ] \
+    || fail "dirfd parent swap created quarantine state outside the common directory"
+  assert_file_contains "$external/sentinel" untouched
 }
 
 test_cleanup_deleted_retry_rejects_tampered_immutable_intent() {
@@ -6352,6 +6839,111 @@ PY
   [ "$rc" = 1 ] || fail "detached writer provenance must fail at exit 1, got $rc"
   assert_file_contains "$out" '"code":"writer-claim-unreconciled"'
   assert_file_contains "$out" "\"ref\":\"$operation_id\""
+}
+
+prepare_writer_cleanup_confirmation_fixture() {
+  local case_name="$1" work_ref="$2" actual
+  setup_writer_workbench "$case_name"
+  printf '%s\n' 'action.task.abandon=allow' >> "$WRITER_REPO/.workbench/policy.conf"
+  git -C "$WRITER_REPO" add .workbench/policy.conf
+  git -C "$WRITER_REPO" commit -q -m "test: allow confirmation abandonment"
+  git -C "$WRITER_REPO" push -q
+  prepare_writer_task "$case_name" 29
+  WRITER_CONFIRM_TASK_DIR="$WRITER_TASK_DIR"
+  run_task_in_dir "$case_name" "$WRITER_CONFIRM_TASK_DIR" refs set \
+    --work-ref "$work_ref" --format json >/dev/null
+  actual="$(WORKBENCH_PLATFORM_POLICY="$WRITER_PLATFORM_POLICY" \
+    WORKBENCH_PLATFORM_POLICY_REF=platform:fixture/writer \
+    run_task_in_dir "$case_name" "$WRITER_CONFIRM_TASK_DIR" \
+      add-repo shared-api --format json)"
+  WRITER_CONFIRM_OPERATION_ID="$(json_get "$actual" operation_id)"
+  WRITER_CONFIRM_CLAIM_ID="$(json_get "$actual" claim_id)"
+  run_task_in_dir "$case_name" "$WRITER_CONFIRM_TASK_DIR" abandon \
+    --reason-code superseded --reason-ref issue:81 --format json >/dev/null
+  git -C "$WRITER_CONFIRM_TASK_DIR" add task
+  if ! git -C "$WRITER_CONFIRM_TASK_DIR" diff --cached --quiet; then
+    git -C "$WRITER_CONFIRM_TASK_DIR" commit -q \
+      -m "test: persist confirmation terminal state"
+  fi
+  git -C "$WRITER_CONFIRM_TASK_DIR" push -q
+}
+
+test_cleanup_owner_intended_confirmation_precedes_cas() {
+  local case_name work_ref reservation selection out rc ledger ref branch
+  case_name=cleanup_owner_intended_confirmation
+  work_ref=toolbox:scenario/SCN-OWNER-INTENDED-CONFIRMATION
+  branch=task/29-v2-lifecycle-fixture-29
+  prepare_writer_cleanup_confirmation_fixture "$case_name" "$work_ref"
+  reservation="$(work_ref_remote_ref "$work_ref")"
+  selection="$(work_ref_selection_remote_ref \
+    "$(sed -n 's/^claim_id: *//p' "$WRITER_CONFIRM_TASK_DIR/task/index.md")")"
+  out="$TMPDIR/$case_name/done.out"
+  if GH_MUTATE_CLEANUP_EVENT_PHASE=intended \
+    GH_MUTATE_CLEANUP_EVENT_STATE=released \
+    run_task "$case_name" "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
+    fail "cleanup performed an owner CAS after intended publication replacement"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "owner intended confirmation returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-untrusted"'
+  [ ! -e "$WRITER_CONFIRM_TASK_DIR" ] \
+    || fail "owner intended confirmation restored the quarantined workspace"
+  git -C "$WRITER_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "owner intended confirmation removed the local branch"
+  [ -n "$(git ls-remote --heads "$TMPDIR/$case_name/origin.git" "$reservation")" ] \
+    || fail "owner intended confirmation released the work-ref reservation"
+  [ -n "$(git ls-remote --heads "$TMPDIR/$case_name/origin.git" "$selection")" ] \
+    || fail "owner intended confirmation released the work-ref selection"
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/$case_name/writer-claims.tsv"
+  git --git-dir="$TMPDIR/$case_name/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$WRITER_CONFIRM_OPERATION_ID" "$WRITER_CONFIRM_CLAIM_ID" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row[-1] for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row[-1] for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert claims == ["active"], claims
+assert effects == ["acquired"], effects
+PY
+}
+
+test_cleanup_owner_verified_confirmation_precedes_final_releases() {
+  local case_name work_ref reservation selection out rc ledger ref branch
+  case_name=cleanup_owner_verified_confirmation
+  work_ref=toolbox:scenario/SCN-OWNER-VERIFIED-CONFIRMATION
+  branch=task/29-v2-lifecycle-fixture-29
+  prepare_writer_cleanup_confirmation_fixture "$case_name" "$work_ref"
+  reservation="$(work_ref_remote_ref "$work_ref")"
+  selection="$(work_ref_selection_remote_ref \
+    "$(sed -n 's/^claim_id: *//p' "$WRITER_CONFIRM_TASK_DIR/task/index.md")")"
+  out="$TMPDIR/$case_name/done.out"
+  if GH_MUTATE_CLEANUP_EVENT_PHASE=verified \
+    GH_MUTATE_CLEANUP_EVENT_STATE=released \
+    run_task "$case_name" "$WRITER_REPO" done 29 --format json >"$out" 2>&1; then
+    fail "cleanup finalized releases after verified publication replacement"
+  else rc=$?; fi
+  [ "$rc" = 1 ] || fail "owner verified confirmation returned $rc"
+  assert_file_contains "$out" '"code":"cleanup-journal-untrusted"'
+  [ ! -e "$WRITER_CONFIRM_TASK_DIR" ] \
+    || fail "owner verified confirmation restored the quarantined workspace"
+  git -C "$WRITER_REPO" show-ref --verify --quiet "refs/heads/$branch" \
+    || fail "owner verified confirmation removed the local branch"
+  [ -n "$(git ls-remote --heads "$TMPDIR/$case_name/origin.git" "$reservation")" ] \
+    || fail "owner verified confirmation released the work-ref reservation"
+  [ -n "$(git ls-remote --heads "$TMPDIR/$case_name/origin.git" "$selection")" ] \
+    || fail "owner verified confirmation released the work-ref selection"
+  ref=refs/heads/workbench-coordination/writer-claims
+  ledger="$TMPDIR/$case_name/writer-claims.tsv"
+  git --git-dir="$TMPDIR/$case_name/origin.git" show "$ref:writer-claims.tsv" > "$ledger"
+  python3 - "$ledger" "$WRITER_CONFIRM_OPERATION_ID" "$WRITER_CONFIRM_CLAIM_ID" <<'PY'
+import sys
+
+rows = [line.split("\t") for line in open(sys.argv[1], encoding="utf-8").read().splitlines()[1:]]
+claims = [row[-1] for row in rows if row[0] == "claim" and row[1:3] == sys.argv[2:4]]
+effects = [row[-1] for row in rows if row[0] == "effect-owner" and row[2:4] == sys.argv[2:4]]
+assert claims == ["active"], claims
+assert effects == ["acquired", "released"], effects
+PY
 }
 
 test_cleanup_retires_consumed_writer_before_local_deletion() {
@@ -8444,6 +9036,11 @@ run_case test_terminal_lifecycle_rejects_post_terminal_reactivation
 run_case test_forged_local_terminal_has_no_freeze_or_outcome_authority
 run_case test_cleanup_prepared_journal_failure_deletes_nothing
 run_case test_cleanup_revalidates_outer_task_before_forced_removal
+run_case test_cleanup_duplicate_prepared_marker_retries_idempotently
+run_case test_cleanup_retry_rejects_action_status_race
+run_case test_cleanup_reconfirms_journal_immediately_before_retry_consume
+run_case test_cleanup_prepared_publication_requires_fresh_observation
+run_case test_cleanup_quarantined_publication_requires_fresh_observation
 run_case test_cleanup_refuses_bytes_created_at_task_removal_boundary
 run_case test_cleanup_revalidates_clean_head_after_prepared_journal
 run_case test_cleanup_rejects_untrusted_prepared_journal
@@ -8454,9 +9051,14 @@ run_case test_cleanup_prepared_quarantine_cannot_be_promoted_by_foreign_clone
 run_case test_cleanup_quarantine_conflict_preserves_recreated_path
 run_case test_cleanup_rejects_tampered_local_quarantine_receipt
 run_case test_cleanup_quarantine_rejects_hardlinked_boundary_without_deletion
+run_case test_cleanup_quarantine_authenticates_non_utf8_names
+run_case test_cleanup_quarantine_durable_proof_rolls_forward
+run_case test_cleanup_quarantine_partial_proof_rolls_forward
+run_case test_cleanup_quarantine_edge_pending_rolls_forward
 run_case test_cleanup_quarantine_rolls_forward_after_workspace_rename_crash
 run_case test_cleanup_quarantine_never_replaces_a_racing_destination
 run_case test_cleanup_quarantine_rejects_parent_symlink_swap
+run_case test_cleanup_quarantine_parent_creation_is_dirfd_bound
 run_case test_cleanup_deleted_retry_rejects_tampered_immutable_intent
 run_case test_v2_cleanup_requires_terminal_outcome_even_with_force
 run_case test_writer_claim_cas_retry_rechecks_conflict_before_local_creation
@@ -8486,6 +9088,8 @@ run_case test_writer_compensation_prefixes_resume_exact_cursor
 run_case test_writer_persists_allow_replacement_before_first_effect
 run_case test_writer_authority_revalidation_fails_closed_without_compensation
 run_case test_terminal_writer_verification_joins_exact_record_and_lifecycle_provenance
+run_case test_cleanup_owner_intended_confirmation_precedes_cas
+run_case test_cleanup_owner_verified_confirmation_precedes_final_releases
 run_case test_cleanup_retires_consumed_writer_before_local_deletion
 run_case test_cleanup_removal_failure_keeps_remote_claim_reserved
 run_case test_cleanup_rejects_symlinked_external_worktree_with_copied_marker

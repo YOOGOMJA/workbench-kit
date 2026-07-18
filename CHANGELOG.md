@@ -61,6 +61,11 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ### Fixed
 
+- **Cleanup release and quarantine hardening** — the `workbench` plugin now confirms the
+  exact authenticated cleanup journal immediately before every external release, rejects
+  detached local arm proofs and action-status races, creates quarantine paths through
+  no-follow directory descriptors, rolls forward partial or complete durable JSON writes
+  without hardlink residue, and authenticates POSIX filename bytes losslessly (#26).
 - **Task commit subject policy enforcement** — the `workbench` plugin now rejects
   invalid `workbench task commit` subjects and audits raw/bypassed task commits in
   `workbench task check`, restoring current workbench Conventional Commits behavior while

@@ -653,79 +653,33 @@ def fsync_directory(path: str) -> None:
         os.close(descriptor)
 
 
-def write_durable_json(directory: str, name: str, value: Mapping[str, Any]) -> None:
-    target = os.path.join(directory, name)
-    if os.path.lexists(target):
-        raise ValueError("cleanup quarantine record already exists: {}".format(name))
-    raw = canonical_json_bytes(value)
-    directory_fd = open_absolute_directory_nofollow(directory)
-    try:
-        for attempt in range(32):
-            temporary = ".{}.tmp.{}.{}".format(name, os.getpid(), attempt)
-            try:
-                descriptor = os.open(
-                    temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=directory_fd,
-                )
-            except FileExistsError:
-                continue
-            break
-        else:
-            raise OSError("cannot allocate cleanup quarantine record")
-        try:
-            view = memoryview(raw)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("cleanup quarantine record write made no progress")
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        try:
-            os.link(
-                temporary,
-                name,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError as exc:
-            raise ValueError(
-                "cleanup quarantine record path became occupied: {}".format(name)
-            ) from exc
-        os.fsync(directory_fd)
-        os.unlink(temporary, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+def durable_json_pending_name(name: str) -> str:
+    if os.path.basename(name) != name or name in ("", ".", ".."):
+        raise ValueError("cleanup quarantine record name is invalid")
+    return ".{}.pending".format(name)
 
 
-def read_strict_local_json(path: str, fields: Sequence[str], name: str) -> Mapping[str, Any]:
-    directory_fd = open_absolute_directory_nofollow(os.path.dirname(path))
+def read_private_bytes_at(directory_fd: int, filename: str, name: str) -> bytes:
     descriptor = -1
+    before = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+    ):
+        raise ValueError("{} is not a private regular record".format(name))
     try:
-        filename = os.path.basename(path)
-        before = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) != 0o600
-        ):
-            raise ValueError("{} is not a private regular record".format(name))
         descriptor = os.open(filename, secure_file_flags(), dir_fd=directory_fd)
         opened = os.fstat(descriptor)
-        identity = lambda item: (
-            item.st_dev,
-            item.st_ino,
-            item.st_mode,
-            item.st_nlink,
-            item.st_size,
-            item.st_mtime_ns,
-            item.st_ctime_ns,
-        )
         if identity(opened) != identity(before):
             raise ValueError("{} changed before secure open".format(name))
         chunks = []
@@ -742,10 +696,194 @@ def read_strict_local_json(path: str, fields: Sequence[str], name: str) -> Mappi
         current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
         if identity(after) != identity(opened) or identity(current) != identity(after):
             raise ValueError("{} changed during secure read".format(name))
-        raw = b"".join(chunks)
+        return b"".join(chunks)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def fsync_private_file_at(directory_fd: int, filename: str, name: str) -> None:
+    descriptor = -1
+    before = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+    ):
+        raise ValueError("{} is not a private regular record".format(name))
+    try:
+        descriptor = os.open(filename, secure_file_flags(), dir_fd=directory_fd)
+        opened = os.fstat(descriptor)
+        if identity(opened) != identity(before):
+            raise ValueError("{} changed before durable open".format(name))
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        if identity(after) != identity(opened) or identity(current) != identity(after):
+            raise ValueError("{} changed during durable sync".format(name))
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def read_pending_local_json(
+    path: str, fields: Sequence[str], name: str
+) -> Optional[Mapping[str, Any]]:
+    directory_fd = open_absolute_directory_nofollow(os.path.dirname(path))
+    try:
+        raw = read_private_bytes_at(directory_fd, os.path.basename(path), name)
+    finally:
+        os.close(directory_fd)
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        directory_fd = open_absolute_directory_nofollow(os.path.dirname(path))
+        try:
+            filename = os.path.basename(path)
+            read_private_bytes_at(directory_fd, filename, name)
+            os.unlink(filename, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return None
+    require_fields(value, fields, name)
+    if tuple(value) != tuple(fields):
+        raise ValueError("{} fields are not canonical".format(name))
+    canonical = canonical_json_bytes(value)
+    if raw != canonical and not canonical.startswith(raw):
+        raise ValueError("{} bytes are not canonical".format(name))
+    return value
+
+
+def write_durable_json(directory: str, name: str, value: Mapping[str, Any]) -> None:
+    test_umask = os.environ.get("WORKBENCH_TEST_DURABLE_JSON_UMASK")
+    if test_umask:
+        if re.fullmatch(r"0?[0-7]{3}", test_umask) is None:
+            raise ValueError("invalid durable JSON test umask")
+        os.umask(int(test_umask, 8))
+    raw = canonical_json_bytes(value)
+    pending = durable_json_pending_name(name)
+    directory_fd = open_absolute_directory_nofollow(directory)
+    try:
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError(
+                "cleanup quarantine record already exists: {}".format(name)
+            )
+        try:
+            observed = read_private_bytes_at(
+                directory_fd, pending, "pending cleanup quarantine record"
+            )
+        except FileNotFoundError:
+            observed = None
+        if observed is not None and observed != raw:
+            if not raw.startswith(observed):
+                raise ValueError("pending cleanup quarantine record changed")
+            os.unlink(pending, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            observed = None
+        if observed is None:
+            previous_umask = os.umask(0)
+            try:
+                descriptor = os.open(
+                    pending,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError as exc:
+                raise ValueError(
+                    "pending cleanup quarantine record became occupied"
+                ) from exc
+            finally:
+                os.umask(previous_umask)
+            os.fchmod(descriptor, 0o600)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+                os.close(descriptor)
+                raise ValueError("pending cleanup quarantine record mode is not exact")
+            stage = os.environ.get("WORKBENCH_TEST_DURABLE_JSON_STAGE")
+            if stage in (
+                name + ":partial",
+                name + ":pre-newline",
+                name + ":full-before-fsync",
+            ):
+                try:
+                    prefix = (
+                        raw
+                        if stage == name + ":full-before-fsync"
+                        else
+                        raw[:-1]
+                        if stage == name + ":pre-newline"
+                        else raw[: max(1, len(raw) // 2)]
+                    )
+                    view = memoryview(prefix)
+                    while view:
+                        written = os.write(descriptor, view)
+                        if written <= 0:
+                            raise OSError(
+                                "cleanup quarantine record write made no progress"
+                            )
+                        view = view[written:]
+                    if stage != name + ":full-before-fsync":
+                        os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.fsync(directory_fd)
+                raise OSError("injected interruption during pending record write")
+            try:
+                view = memoryview(raw)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError(
+                            "cleanup quarantine record write made no progress"
+                        )
+                    view = view[written:]
+                os.fsync(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                descriptor = -1
+                try:
+                    os.unlink(pending, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                except OSError:
+                    pass
+                raise
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            os.fsync(directory_fd)
+        if os.environ.get("WORKBENCH_TEST_DURABLE_JSON_STAGE") == name + ":pending":
+            raise OSError("injected interruption after durable pending record")
+        fsync_private_file_at(
+            directory_fd, pending, "pending cleanup quarantine record"
+        )
+        rename_noreplace_at(
+            directory_fd, pending, directory_fd, name, os.path.join(directory, name)
+        )
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def read_strict_local_json(path: str, fields: Sequence[str], name: str) -> Mapping[str, Any]:
+    directory_fd = open_absolute_directory_nofollow(os.path.dirname(path))
+    try:
+        filename = os.path.basename(path)
+        raw = read_private_bytes_at(directory_fd, filename, name)
+    finally:
         os.close(directory_fd)
     value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
     require_fields(value, fields, name)
@@ -778,6 +916,10 @@ def relative_managed_path(root: str, path: str, field: str) -> str:
     return require_relative_path(relative, field)
 
 
+def tree_digest_path_field(relative: str) -> str:
+    return "path-bytes:" + os.fsencode(relative).hex()
+
+
 def strict_tree_digest(path: str) -> str:
     digest = hashlib.sha256()
     seen_regular = set()
@@ -785,7 +927,7 @@ def strict_tree_digest(path: str) -> str:
     def update(kind: str, relative: str, value: os.stat_result) -> None:
         row = [
             kind,
-            relative,
+            tree_digest_path_field(relative),
             stat.S_IMODE(value.st_mode),
             str(value.st_dev),
             str(value.st_ino),
@@ -875,25 +1017,70 @@ def strict_tree_digest(path: str) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def quarantine_base_directory(common: str, locator: str, create: bool) -> str:
+def quarantine_locator_parts(locator: str) -> List[str]:
     parts = locator.split("/")
     if len(parts) != 3 or parts[:2] != ["workbench-v2", "cleanup-quarantine"]:
         raise ValueError("cleanup quarantine locator is invalid")
-    current = common
-    for index, part in enumerate(parts[:-1]):
-        candidate = os.path.join(current, part)
-        if not os.path.lexists(candidate):
-            if not create:
-                raise FileNotFoundError(candidate)
-            os.mkdir(candidate, 0o700)
-            fsync_directory(current)
-        value = os.lstat(candidate)
-        if not stat.S_ISDIR(value.st_mode) or stat.S_ISLNK(value.st_mode):
-            raise ValueError("cleanup quarantine parent is not a private directory")
-        if index == 1:
-            os.chmod(candidate, 0o700)
-        current = candidate
-    return os.path.join(current, parts[-1])
+    return parts
+
+
+def open_private_directory_tree(
+    root: str, parts: Sequence[str], create: bool
+) -> int:
+    current = open_absolute_directory_nofollow(root)
+    current_path = root
+    try:
+        for index, part in enumerate(parts):
+            if part in ("", ".", "..") or os.path.basename(part) != part:
+                raise ValueError("cleanup quarantine path component is invalid")
+            try:
+                os.stat(part, dir_fd=current, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                previous_umask = os.umask(0)
+                try:
+                    os.mkdir(part, 0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
+                finally:
+                    os.umask(previous_umask)
+            candidate = os.path.join(current_path, part)
+            hook = os.environ.get("WORKBENCH_TEST_QUARANTINE_PARENT_HOOK")
+            if hook:
+                subprocess.check_call([hook, candidate, str(index)])
+            child = os.open(part, secure_directory_flags(), dir_fd=current)
+            try:
+                value = os.fstat(child)
+                if not stat.S_ISDIR(value.st_mode):
+                    raise ValueError(
+                        "cleanup quarantine parent is not a private directory"
+                    )
+                changed_mode = stat.S_IMODE(value.st_mode) != 0o700
+                if changed_mode:
+                    os.fchmod(child, 0o700)
+                if changed_mode or create:
+                    os.fsync(child)
+                    os.fsync(current)
+            except Exception:
+                os.close(child)
+                raise
+            os.close(current)
+            current = child
+            current_path = candidate
+        descriptor = current
+        current = -1
+        return descriptor
+    finally:
+        if current >= 0:
+            os.close(current)
+
+
+def quarantine_base_directory(common: str, locator: str, create: bool) -> str:
+    parts = quarantine_locator_parts(locator)
+    descriptor = open_private_directory_tree(common, parts, create)
+    os.close(descriptor)
+    return os.path.join(common, *parts)
 
 
 def validate_local_quarantine_proof(
@@ -933,7 +1120,7 @@ def validate_local_quarantine_proof(
 
 def local_proof_for_journal(bundle: str, journal: Mapping[str, Any]) -> Mapping[str, Any]:
     authority = journal["quarantine_authority"]
-    return validate_local_quarantine_proof(
+    proof = validate_local_quarantine_proof(
         read_strict_local_json(
             os.path.join(bundle, "proof.json"),
             LOCAL_QUARANTINE_PROOF_FIELDS,
@@ -948,6 +1135,9 @@ def local_proof_for_journal(bundle: str, journal: Mapping[str, Any]) -> Mapping[
         authority["quarantine_locator"],
         quarantine_arm_binding(journal),
     )
+    if proof["arm_commitment"] != authority["arm_commitment"]:
+        raise ValueError("local quarantine proof does not match journal authority")
+    return proof
 
 
 def admin_intent(
@@ -1146,59 +1336,75 @@ def move_quarantine_entry(
         raise ValueError("cleanup quarantine rename changed entry identity")
 
 
+def rename_noreplace_at(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+    destination: str,
+) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source_name)
+    encoded_destination = os.fsencode(destination_name)
+    if sys.platform == "darwin" and hasattr(library, "renameatx_np"):
+        function = library.renameatx_np
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        function.restype = ctypes.c_int
+        result = function(
+            source_parent,
+            encoded_source,
+            destination_parent,
+            encoded_destination,
+            0x00000004,  # RENAME_EXCL
+        )
+    elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
+        function = library.renameat2
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        function.restype = ctypes.c_int
+        result = function(
+            source_parent,
+            encoded_source,
+            destination_parent,
+            encoded_destination,
+            1,  # RENAME_NOREPLACE
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "cleanup quarantine requires an atomic no-replace rename",
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in (errno.EEXIST, errno.ENOTEMPTY):
+            raise ValueError("cleanup quarantine destination became occupied")
+        raise OSError(error, os.strerror(error), destination)
+
+
 def rename_directory_noreplace(source: str, destination: str) -> None:
     source_parent = open_absolute_directory_nofollow(os.path.dirname(source))
     destination_parent = open_absolute_directory_nofollow(
         os.path.dirname(destination)
     )
     try:
-        library = ctypes.CDLL(None, use_errno=True)
-        source_name = os.fsencode(os.path.basename(source))
-        destination_name = os.fsencode(os.path.basename(destination))
-        if sys.platform == "darwin" and hasattr(library, "renameatx_np"):
-            function = library.renameatx_np
-            function.argtypes = (
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_uint,
-            )
-            function.restype = ctypes.c_int
-            result = function(
-                source_parent,
-                source_name,
-                destination_parent,
-                destination_name,
-                0x00000004,  # RENAME_EXCL
-            )
-        elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
-            function = library.renameat2
-            function.argtypes = (
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_uint,
-            )
-            function.restype = ctypes.c_int
-            result = function(
-                source_parent,
-                source_name,
-                destination_parent,
-                destination_name,
-                1,  # RENAME_NOREPLACE
-            )
-        else:
-            raise OSError(
-                errno.ENOTSUP,
-                "cleanup quarantine requires an atomic no-replace rename",
-            )
-        if result != 0:
-            error = ctypes.get_errno()
-            if error in (errno.EEXIST, errno.ENOTEMPTY):
-                raise ValueError("cleanup quarantine destination became occupied")
-            raise OSError(error, os.strerror(error), destination)
+        rename_noreplace_at(
+            source_parent,
+            os.path.basename(source),
+            destination_parent,
+            os.path.basename(destination),
+            destination,
+        )
     finally:
         os.close(destination_parent)
         os.close(source_parent)
@@ -1316,6 +1522,9 @@ def authenticate_local_quarantine(
         admin_receipts.append(item)
     admin_digest = sha256(canonical_json_bytes(admin_receipts))
     receipt_path = os.path.join(bundle, "receipt.json")
+    pending_receipt_path = os.path.join(
+        bundle, durable_json_pending_name("receipt.json")
+    )
     if os.path.lexists(receipt_path):
         receipt = validate_local_quarantine_receipt(
             read_strict_local_json(
@@ -1332,6 +1541,25 @@ def authenticate_local_quarantine(
         ):
             raise ValueError("cleanup quarantine tree changed after receipt publication")
         return receipt
+    if os.path.lexists(pending_receipt_path):
+        pending_receipt = read_pending_local_json(
+            pending_receipt_path,
+            LOCAL_QUARANTINE_RECEIPT_FIELDS,
+            "pending local quarantine receipt",
+        )
+        if pending_receipt is not None:
+            receipt = validate_local_quarantine_receipt(
+                pending_receipt, intent, journal
+            )
+            if (
+                receipt["arm_secret"] != arm_secret
+                or receipt["workspace_tree_digest"] != workspace_digest
+                or receipt["admin_records"] != admin_receipts
+                or receipt["admin_manifest_digest"] != admin_digest
+            ):
+                raise ValueError("pending cleanup quarantine receipt changed its tree")
+            write_durable_json(bundle, "receipt.json", receipt)
+            return receipt
     receipt_body = {
         "contract_version": "workbench-local-task-quarantine-receipt/v1",
         "arm_secret": arm_secret,
@@ -1362,24 +1590,10 @@ def authenticate_local_quarantine(
 
 def ensure_local_quarantine_bundle(common: str, locator: str) -> str:
     bundle = quarantine_base_directory(common, locator, True)
-    admins = os.path.join(bundle, "admins")
-    if not os.path.lexists(bundle):
-        os.mkdir(bundle, 0o700)
-        fsync_directory(os.path.dirname(bundle))
-        os.mkdir(admins, 0o700)
-        fsync_directory(bundle)
-    else:
-        value = os.lstat(bundle)
-        admin_value = os.lstat(admins)
-        if (
-            not stat.S_ISDIR(value.st_mode)
-            or stat.S_ISLNK(value.st_mode)
-            or stat.S_IMODE(value.st_mode) != 0o700
-            or not stat.S_ISDIR(admin_value.st_mode)
-            or stat.S_ISLNK(admin_value.st_mode)
-            or stat.S_IMODE(admin_value.st_mode) != 0o700
-        ):
-            raise ValueError("cleanup quarantine arm bundle is not exact")
+    descriptor = open_private_directory_tree(
+        common, quarantine_locator_parts(locator) + ["admins"], True
+    )
+    os.close(descriptor)
     return bundle
 
 
@@ -1404,6 +1618,10 @@ def cmd_quarantine_proof(args: argparse.Namespace) -> None:
         raise ValueError("local quarantine proof common directory does not bind the workspace")
     bundle = ensure_local_quarantine_bundle(common, locator)
     proof_path = os.path.join(bundle, "proof.json")
+    pending_proof_path = os.path.join(
+        bundle, durable_json_pending_name("proof.json")
+    )
+    proof = None
     if os.path.lexists(proof_path):
         proof = validate_local_quarantine_proof(
             read_strict_local_json(
@@ -1418,7 +1636,26 @@ def cmd_quarantine_proof(args: argparse.Namespace) -> None:
             locator,
             journal_binding_digest,
         )
-    else:
+    elif os.path.lexists(pending_proof_path):
+        pending_proof = read_pending_local_json(
+            pending_proof_path,
+            LOCAL_QUARANTINE_PROOF_FIELDS,
+            "pending local quarantine proof",
+        )
+        if pending_proof is not None:
+            proof = validate_local_quarantine_proof(
+                pending_proof,
+                journal["task_id"],
+                journal["claim_id"],
+                journal["branch"],
+                authority["device_id"],
+                authority["clone_id"],
+                workspace_locator,
+                locator,
+                journal_binding_digest,
+            )
+            write_durable_json(bundle, "proof.json", proof)
+    if proof is None:
         unexpected = set(os.listdir(bundle)) - {"admins"}
         if unexpected or os.listdir(os.path.join(bundle, "admins")):
             raise ValueError("cleanup quarantine proof bundle contains unbound state")
@@ -1470,9 +1707,6 @@ def cmd_quarantine_create(args: argparse.Namespace) -> None:
     if os.path.dirname(common) != root:
         raise ValueError("cleanup quarantine common directory does not bind the workspace")
     bundle = quarantine_base_directory(common, authority["quarantine_locator"], False)
-    value = os.lstat(bundle)
-    if not stat.S_ISDIR(value.st_mode) or stat.S_ISLNK(value.st_mode):
-        raise ValueError("cleanup quarantine bundle is not an exact directory")
     intent = validate_local_quarantine_intent(
         read_strict_local_json(
             os.path.join(bundle, "intent.json"),
@@ -1533,6 +1767,9 @@ def cmd_quarantine_arm(args: argparse.Namespace) -> None:
         root, task_path, common, journal, args.descriptor_file
     )
     intent_path = os.path.join(bundle, "intent.json")
+    pending_intent_path = os.path.join(
+        bundle, durable_json_pending_name("intent.json")
+    )
     if os.path.lexists(intent_path):
         stored = validate_local_quarantine_intent(
             read_strict_local_json(
@@ -1544,6 +1781,19 @@ def cmd_quarantine_arm(args: argparse.Namespace) -> None:
         )
         if stored != current:
             raise ValueError("cleanup quarantine arm changed")
+    elif os.path.lexists(pending_intent_path):
+        pending_intent = read_pending_local_json(
+            pending_intent_path,
+            LOCAL_QUARANTINE_INTENT_FIELDS,
+            "pending local quarantine intent",
+        )
+        if pending_intent is None:
+            write_durable_json(bundle, "intent.json", current)
+        else:
+            stored = validate_local_quarantine_intent(pending_intent, journal)
+            if stored != current:
+                raise ValueError("pending cleanup quarantine arm changed")
+            write_durable_json(bundle, "intent.json", stored)
     else:
         unexpected = set(os.listdir(bundle)) - {"admins", "proof.json"}
         if unexpected or os.listdir(os.path.join(bundle, "admins")):
@@ -2173,7 +2423,9 @@ def cmd_find_observation(args: argparse.Namespace) -> None:
             if comment["author_identity"] != args.expected_author:
                 raise PermissionError("cleanup journal author is not authenticated")
             values.append(value)
-            provenance_digests.append(sha256((match.group(1) + "\n").encode("utf-8")))
+            provenance_digest = sha256((match.group(1) + "\n").encode("utf-8"))
+            if provenance_digest not in provenance_digests:
+                provenance_digests.append(provenance_digest)
     reduced = reduce_prefix(values)
     Path(args.provenance_file).write_text(
         "".join(item + "\n" for item in provenance_digests), encoding="utf-8"

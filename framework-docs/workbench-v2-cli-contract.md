@@ -2444,8 +2444,30 @@ duplicate non-idempotent prefix, or malformed authenticated observation is
 `cleanup-journal-untrusted`; a later remote-state disagreement is
 `cleanup-reconciliation-failed`.
 
+The trusted hosting actor/credential, trusted adapter, and provider's honest current comment
+state are explicit TCB inputs. Before action consumption and before every owner CAS, final
+writer-claim release, work-reference selection/reservation release, and local-branch deletion,
+the kernel performs a new authenticated observation. The reduced bytes must equal the intended
+journal exactly, and that intended byte digest must still occur in authenticated provenance.
+An absent/replaced intended digest is `cleanup-journal-untrusted`; an authenticated valid
+descendant that retains the intended digest is retryable `cleanup-journal-unreconciled`.
+`intended` owner markers are confirmed before CAS and `verified` markers are published and
+confirmed before any later release.
+
+This fence addresses concurrent, stale, or malfunctioning clones beneath the trusted actor.
+Malicious retrospective comment edits/deletes by that actor, credential compromise, a lying
+trusted adapter, and provider rollback after a successful current-state observation are outside
+the contract. Those capabilities can also destroy the repository refs and branches on which
+the broader protocol depends; clone ID and arm-secret possession are not a defense against a
+compromised hosting principal.
+
 The kernel writes `stage: "prepared"` only after final policy resolution and after fsyncing
-the local arm. The prepared journal is the applied-effect consumption source. The reducer
+the local arm. Local proof, intent, and receipt records use private dirfd-bound component
+traversal, exact mode and one-link checks, a durable pending file, atomic no-replace rename,
+and directory fsync. A crash during or after the pending write either rebuilds an incomplete
+reserved record or promotes the exact canonical record; it never leaves a two-link target.
+Tree authentication encodes POSIX path bytes losslessly, including non-UTF8 names where the
+filesystem supports them. The prepared journal is the applied-effect consumption source. The reducer
 never reauthorizes it and marks private status consumed when local state still exists. If the
 comment cannot be written, it returns `cleanup-journal-unavailable` and leaves the active
 workspace untouched. Once prepared is external, only the clone holding the commitment's secret
@@ -2453,10 +2475,11 @@ and matching local arm may mint its exact receipt and promote it. Another clone 
 `cleanup-quarantine-unconfirmed` even if it copies public device/clone IDs and reconstructs the
 task branch; injecting a forged external receipt is `cleanup-journal-untrusted`.
 
-After external `quarantined` is durable, the active workspace path and all live linked-worktree
+After external `quarantined` is durable and freshly confirmed, the active workspace path and all live linked-worktree
 admin records are absent while their exact bytes remain under the opaque quarantine locator.
 Only then may cleanup release remote writer owners/claims, work-reference selections and
-reservations, and the local task branch. A path recreated after local quarantine returns
+reservations, and the local task branch; each such effect has its own immediately preceding
+exact confirmation. A path recreated after local quarantine returns
 `cleanup-quarantine-conflict`; it is never removed or overwritten. Physical deletion of the
 quarantine is not part of `task done` and requires a separate retention/GC contract.
 

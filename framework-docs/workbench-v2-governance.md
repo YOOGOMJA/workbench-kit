@@ -148,6 +148,14 @@ quarantine. Tasks created before this coordination contract remain readable; the
 current value and first selection are materialized lazily on the next matching `refs set`,
 while authoritative inventory continues to protect them during migration.
 
+Every cleanup release boundary re-observes the exact authenticated journal immediately before
+its external effect: action consumption, each effect-owner CAS, final writer-claim release,
+work-reference release, and local-branch deletion. The hosting actor/credential, trusted
+adapter, and provider's current-state integrity are part of the trusted computing base. Device
+and clone IDs plus the private arm secret fence concurrent clones operating under that trusted
+actor; they do not defend against compromise or malicious retrospective edit/delete by the
+trusted actor itself, nor against provider rollback.
+
 ### Work-item and multi-context boundary
 
 One task has one primary work item, represented by at most one `work_ref`, and zero or more
