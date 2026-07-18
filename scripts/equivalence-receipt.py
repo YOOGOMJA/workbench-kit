@@ -43,6 +43,7 @@ sys.path.insert(0, str(KIT_ROOT / "lib"))
 from workbench_kit_contracts import (  # noqa: E402
     canonical_bytes,
     canonical_digest,
+    node_digest,
     strict_load,
     validate_equivalence_receipt,
 )
@@ -114,16 +115,17 @@ def node(path: pathlib.Path, relative: str):
             "path": relative,
             "node_type": "symlink",
             "mode": "120000",
-            "digest": raw_digest(target.encode("utf-8")),
+            "digest": node_digest("symlink", "120000", link_target=target),
             "link_target": target,
         }
     if not stat.S_ISREG(info.st_mode):
         die("legacy archive contains unsupported node: {}".format(relative))
+    mode = "100755" if info.st_mode & 0o111 else "100644"
     return {
         "path": relative,
         "node_type": "file",
-        "mode": "100755" if info.st_mode & 0o111 else "100644",
-        "digest": raw_digest(path.read_bytes()),
+        "mode": mode,
+        "digest": node_digest("file", mode, content=path.read_bytes()),
         "link_target": None,
     }
 
@@ -202,9 +204,14 @@ def build(replacement_revision: str):
         or contract["engine"] != {"name": "workbench", "version": version}
     ):
         die("public engine manifest and contract identities disagree")
-    capabilities = contract["capabilities"]
-    if capabilities != sorted(capabilities) or len(capabilities) != len(set(capabilities)):
-        die("public engine capabilities are not sorted and unique")
+    advertised_capabilities = contract["capabilities"]
+    if (
+        not isinstance(advertised_capabilities, list)
+        or not all(isinstance(item, str) and item for item in advertised_capabilities)
+        or len(advertised_capabilities) != len(set(advertised_capabilities))
+    ):
+        die("public engine capabilities are not unique non-empty strings")
+    capabilities = sorted(advertised_capabilities)
     removable, discovery = archived_nodes()
     legacy_manifest = {
         "contract_version": "workbench-legacy-engine-manifest/v1",

@@ -107,9 +107,10 @@ assert "human-supplied reviewed-overlay" in skill
 assert "All other `malformed`" in skill
 
 changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-assert "upgrade-workbench" in unreleased
-assert "#27" in unreleased
+version_heading = "## [{}]".format(claude_manifest["version"])
+release_notes = changelog.split(version_heading, 1)[1].split("\n## [", 1)[0]
+assert "upgrade-workbench" in release_notes
+assert "#27" in release_notes
 
 suite_path = plugin / "tests/run.sh"
 assert suite_path.is_file()

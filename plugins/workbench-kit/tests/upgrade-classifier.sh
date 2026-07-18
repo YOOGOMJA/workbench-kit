@@ -560,6 +560,26 @@ with tempfile.TemporaryDirectory(prefix="workbench-classifier-") as temporary:
     assert result["provenance"]["state"] == "valid"
     assert diagnose(root, "workbench/v2", True)["classification"] == "already-current"
 
+    root = base / "staged-after-verified-removal"
+    receipt = migration_candidate(root)
+    receipt["embedded_engine"] = {
+        "before": "present-verified",
+        "after": "absent",
+        "equivalence_receipt_digest": canonical_digest(equivalence),
+    }
+    receipt["candidate_basis_digest"] = None
+    receipt["candidate_basis_digest"] = canonical_digest(
+        receipt, null_field="candidate_basis_digest"
+    )
+    write(root, ".workbench/migration.json", canonical_bytes(receipt))
+    result = diagnose(root, "workbench/v2", False)
+    assert result["classification"] == "migration-staged", result
+    assert result["embedded_engine"] == {
+        "state": "absent",
+        "equivalence_receipt_digest": None,
+    }
+    assert result["provenance"]["state"] == "valid", result
+
     root = base / "staged-language-drift"
     receipt = migration_candidate(root)
     receipt["candidate_basis_digest"] = None

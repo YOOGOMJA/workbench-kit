@@ -75,7 +75,14 @@ def run_json(arguments, *, cwd=None, env=None, expected=(0,)):
     try:
         return json.loads(process.stdout), process.returncode
     except json.JSONDecodeError as error:
-        fail("public command did not emit JSON: {}\n{}".format(error, process.stdout))
+        fail(
+            "public command did not emit JSON: {}\ncommand: {}\nstdout: {}\nstderr: {}".format(
+                error,
+                " ".join(str(item) for item in arguments),
+                process.stdout,
+                process.stderr,
+            )
+        )
 
 
 def git(repository, *arguments):
@@ -602,6 +609,7 @@ def migrate_embedded_legacy(base: pathlib.Path) -> None:
     case, workspace, revision = make_migration_workspace(
         base, "embedded-legacy", embedded=True
     )
+    user_before = (workspace / "user.txt").read_bytes()
     approval, env = migration_inputs(case, workspace, revision)
     blocked, status = run_json(
         (
@@ -659,7 +667,7 @@ def migrate_embedded_legacy(base: pathlib.Path) -> None:
     for node in receipt["removable_nodes"]:
         if os.path.lexists(str(workspace / node["path"])):
             fail("approved legacy node survived: {}".format(node["path"]))
-    if (workspace / "user.txt").read_text(encoding="utf-8").strip() != "preserve me":
+    if (workspace / "user.txt").read_bytes() != user_before:
         fail("embedded migration changed a user-owned file")
     contract, _ = run_json(
         (WORKBENCH, "contract", "show", "--format", "json"), cwd=workspace
