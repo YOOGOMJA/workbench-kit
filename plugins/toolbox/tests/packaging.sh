@@ -27,7 +27,13 @@ codex = json.loads((root / ".codex-plugin/plugin.json").read_text())
 
 for name, manifest in (("Claude", claude), ("Codex", codex)):
     assert manifest["name"] == "toolbox", f"{name} manifest name must be toolbox"
-    assert manifest["version"] == "0.1.1", f"{name} manifest must join lockstep 0.1.1"
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", manifest["version"]), (
+        f"{name} manifest version must be semantic"
+    )
+
+assert claude["version"] == codex["version"], (
+    "Claude and Codex manifests must use the same toolbox version"
+)
 
 assert codex["skills"] == "./skills/", "Codex manifest must expose toolbox skills"
 assert codex["interface"] == {
