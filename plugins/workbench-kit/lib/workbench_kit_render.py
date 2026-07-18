@@ -8,9 +8,9 @@ import json
 from typing import Any
 
 from workbench_kit_contracts import (
-    BCP47,
     canonical_bytes,
     fail,
+    language_tag_valid,
     strict_load,
     validate_descriptor,
     validate_generator_receipt,
@@ -154,7 +154,7 @@ def render_profile(language: str) -> bytes:
     if (
         not isinstance(language, str)
         or not language.isascii()
-        or BCP47.fullmatch(language) is None
+        or not language_tag_valid(language)
     ):
         fail("language", "language-invalid")
     return f"schema=workbench-profile/v1\nlanguage={language}\n".encode("ascii")

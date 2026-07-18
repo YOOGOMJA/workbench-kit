@@ -3258,7 +3258,16 @@ def validate_engine_manifest(document: dict[str, Any], engine_version: str) -> N
         ],
         "digest": None,
     }
-    expected_digest = "sha256:" + hashlib.sha256(canonical_line(digest_input)).hexdigest()
+    digest_line = (
+        json.dumps(
+            digest_input,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    expected_digest = "sha256:" + hashlib.sha256(digest_line).hexdigest()
     if document["digest"] != expected_digest:
         raise AdapterError("public-contract-invalid", f"{ref}.digest")
 

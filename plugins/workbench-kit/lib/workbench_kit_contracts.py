@@ -31,11 +31,42 @@ DEFAULT_REF = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
 RFC3339_UTC = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
-BCP47 = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+WORKBENCH_RFC3339_UTC = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
 TREE_DIGEST = re.compile(r"^git-tree:(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 UPGRADE_ID = re.compile(r"^upgrade-[0-9a-f]{64}$")
 WORKSPACE_ID = re.compile(r"^ws-[0-9a-f]{64}$")
 EFFECT_ID = re.compile(r"^effect-[0-9]{4}$")
+
+GRANDFATHERED_LANGUAGE_TAGS = {
+    "art-lojban",
+    "cel-gaulish",
+    "en-gb-oed",
+    "i-ami",
+    "i-bnn",
+    "i-default",
+    "i-enochian",
+    "i-hak",
+    "i-klingon",
+    "i-lux",
+    "i-mingo",
+    "i-navajo",
+    "i-pwn",
+    "i-tao",
+    "i-tay",
+    "i-tsu",
+    "no-bok",
+    "no-nyn",
+    "sgn-be-fr",
+    "sgn-be-nl",
+    "sgn-ch-de",
+    "zh-guoyu",
+    "zh-hakka",
+    "zh-min",
+    "zh-min-nan",
+    "zh-xiang",
+}
 
 
 def rfc3339_utc_valid(value: Any, *, prefix: bool = False) -> bool:
@@ -120,6 +151,118 @@ def rfc3339_utc_valid(value: Any, *, prefix: bool = False) -> bool:
     elif not prefix:
         return False
     return all(character.isdigit() for character in fractional)
+
+
+def workbench_rfc3339_utc_valid(value: Any) -> bool:
+    """Match the integer-second timestamp contract exposed by workbench."""
+    return (
+        isinstance(value, str)
+        and WORKBENCH_RFC3339_UTC.fullmatch(value) is not None
+        and rfc3339_utc_valid(value)
+    )
+
+
+def _ascii_alnum(value: str) -> bool:
+    return value.isascii() and value.isalnum()
+
+
+def language_tag_valid(value: Any) -> bool:
+    """Match the public workbench profile BCP 47 validator."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or not value.isascii()
+    ):
+        return False
+    if value.lower() in GRANDFATHERED_LANGUAGE_TAGS:
+        return True
+
+    parts = value.split("-")
+    if any(not part for part in parts):
+        return False
+    if parts[0].lower() == "x":
+        return len(parts) > 1 and all(
+            1 <= len(part) <= 8 and _ascii_alnum(part) for part in parts[1:]
+        )
+
+    language = parts[0]
+    if not 2 <= len(language) <= 8 or not language.isalpha():
+        return False
+    index = 1
+
+    if len(language) <= 3:
+        extlang_count = 0
+        while (
+            index < len(parts)
+            and extlang_count < 3
+            and len(parts[index]) == 3
+            and parts[index].isalpha()
+        ):
+            index += 1
+            extlang_count += 1
+
+    if (
+        index < len(parts)
+        and len(parts[index]) == 4
+        and parts[index].isalpha()
+    ):
+        index += 1
+
+    if index < len(parts) and (
+        (len(parts[index]) == 2 and parts[index].isalpha())
+        or (len(parts[index]) == 3 and parts[index].isdigit())
+    ):
+        index += 1
+
+    variants = set()
+    while index < len(parts):
+        part = parts[index]
+        is_variant = (5 <= len(part) <= 8 and _ascii_alnum(part)) or (
+            len(part) == 4 and part[0].isdigit() and _ascii_alnum(part)
+        )
+        if not is_variant:
+            break
+        normalized = part.lower()
+        if normalized in variants:
+            return False
+        variants.add(normalized)
+        index += 1
+
+    extensions = set()
+    while (
+        index < len(parts)
+        and len(parts[index]) == 1
+        and parts[index].lower() != "x"
+    ):
+        singleton = parts[index].lower()
+        if not _ascii_alnum(singleton) or singleton in extensions:
+            return False
+        extensions.add(singleton)
+        index += 1
+        start = index
+        while (
+            index < len(parts)
+            and 2 <= len(parts[index]) <= 8
+            and _ascii_alnum(parts[index])
+        ):
+            index += 1
+        if index == start:
+            return False
+
+    if index < len(parts) and parts[index].lower() == "x":
+        index += 1
+        start = index
+        while (
+            index < len(parts)
+            and 1 <= len(parts[index]) <= 8
+            and _ascii_alnum(parts[index])
+        ):
+            index += 1
+        if index == start:
+            return False
+
+    return index == len(parts)
 
 AUTHORITY_FIELDS = (
     "contract_version", "approval_id", "proposed_descriptor", "default_revision",
@@ -447,11 +590,11 @@ def validate_authority_approval(value: Any) -> dict[str, Any]:
         fail("protection.revision")
     if protection["direct_task_actor_writes"] != "blocked":
         fail("protection.direct_task_actor_writes")
-    if not rfc3339_utc_valid(protection["verified_at"]):
+    if not workbench_rfc3339_utc_valid(protection["verified_at"]):
         fail("protection.verified_at")
     text(protection["evidence_ref"], "protection.evidence_ref", ascii_only=True)
     text(approval["actor"], "actor", ascii_only=True)
-    if not rfc3339_utc_valid(approval["approved_at"]):
+    if not workbench_rfc3339_utc_valid(approval["approved_at"]):
         fail("approved_at")
     text(approval["source_ref"], "source_ref", ascii_only=True)
     approval["proposed_descriptor"] = descriptor
@@ -979,7 +1122,7 @@ def validate_language(value: Any) -> dict[str, Any]:
     if language["contract_version"] != "workbench-kit-language-decision/v1":
         fail("language.contract_version")
     tag = text(language["tag"], "language.tag", ascii_only=True)
-    if BCP47.fullmatch(tag) is None:
+    if not language_tag_valid(tag):
         fail("language.tag")
     if language["source"] not in ("explicit-cli", "workspace-profile", "generation-input"):
         fail("language.source")

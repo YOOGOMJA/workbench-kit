@@ -151,6 +151,18 @@ print(json.dumps(snapshot, separators=(",", ":")))
 PY
 }
 
+real_engine_manifest="$("$ROOT/../workbench/bin/workbench" engine-manifest show --format json)"
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/lib" "$real_engine_manifest" <<'PY'
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from workbench_kit_adapter import validate_engine_manifest
+
+manifest = json.loads(sys.argv[2])
+validate_engine_manifest(manifest, manifest["plugin"]["version"])
+PY
+
 set +e
 legacy_git_before="$(git_state_digest "$legacy_workspace")"
 ok="$(probe ok "$legacy_workspace" "$approval")"
@@ -355,7 +367,9 @@ def resign(document):
         ]))
     document["source"]["revision"] = digest(bytes(tree))
     document["digest"] = None
-    document["digest"] = digest(line(document))
+    document["digest"] = digest(
+        (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
 
 def rejected(document):
     try:

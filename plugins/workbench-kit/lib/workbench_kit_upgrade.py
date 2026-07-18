@@ -42,6 +42,7 @@ from workbench_kit_journal import (
     build_prepared_journal,
     execute_upgrade_locked,
     install_prepared_journal_locked,
+    prepared_journal_install_required,
     require_workspace_binding,
     resolve_journal_location_locked,
     workspace_lock,
@@ -981,12 +982,7 @@ def _apply_upgrade_locked(
                 else None
             ),
         )
-        try:
-            os.lstat(location["journal"])
-            journal_exists = True
-        except FileNotFoundError:
-            journal_exists = False
-        if not journal_exists:
+        if prepared_journal_install_required(location):
             dry_request = dict(request)
             dry_request.update({
                 "mode": "dry-run",

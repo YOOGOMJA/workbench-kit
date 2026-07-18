@@ -107,6 +107,36 @@ changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
 unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
 assert "upgrade-workbench" in unreleased
 assert "#27" in unreleased
+
+suite_path = plugin / "tests/run.sh"
+assert suite_path.is_file()
+suite = suite_path.read_text(encoding="utf-8")
+runnable_upgrade_tests = {
+    "upgrade-classification.sh",
+    "upgrade-classifier.sh",
+    "upgrade-cli.sh",
+    "upgrade-journal.sh",
+    "upgrade-json-schemas.sh",
+    "upgrade-packaging.sh",
+    "upgrade-planner.sh",
+    "upgrade-public-adapter.sh",
+    "upgrade-rendering.sh",
+    "upgrade-schemas.sh",
+}
+for test_name in runnable_upgrade_tests:
+    assert suite.count(test_name) == 1, test_name
+for helper_name in ("upgrade-public-stub.sh", "upgrade-test-lib.sh"):
+    assert helper_name not in suite, helper_name
+
+suite_command = "bash plugins/workbench-kit/tests/run.sh"
+ci = (repo / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+assert suite_command in ci
+assert "actions/setup-python@" in ci
+assert "astral-sh/setup-uv@" in ci
+assert 'version: "0.7.6"' in ci
+for documentation in ("AGENTS.md", "CONTRIBUTING.md"):
+    assert suite_command in (repo / documentation).read_text(encoding="utf-8")
+assert suite_command in (repo / "scripts/release.sh").read_text(encoding="utf-8")
 PY
 
 bash "$REPO_ROOT/tests/check-skill-frontmatter.sh"

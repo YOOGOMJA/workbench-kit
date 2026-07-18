@@ -109,10 +109,16 @@ for pattern in strict_semver:
     for invalid in ("01.2.3", "1.2.3-..", "1.2.3-01", "1.2.3+"):
         assert re.fullmatch(pattern, invalid) is None, (pattern, invalid)
 
+bootstrap_timestamp = json.loads(
+    (schema_dir / "bootstrap-authority-approval.schema.json").read_bytes()
+)["$defs"]["timestamp"]
+assert bootstrap_timestamp["format"] == "date-time"
+assert re.fullmatch(bootstrap_timestamp["pattern"], "2026-07-11T23:59:59Z")
+assert re.fullmatch(
+    bootstrap_timestamp["pattern"], "2026-07-11T23:59:59.123Z"
+) is None
+
 timestamp_schemas = (
-    json.loads((schema_dir / "bootstrap-authority-approval.schema.json").read_bytes())[
-        "$defs"
-    ]["timestamp"],
     json.loads((schema_dir / "reviewed-overlay.schema.json").read_bytes())[
         "$defs"
     ]["timestamp"],

@@ -157,7 +157,7 @@ case "$*" in
     exit "$status"
     ;;
   "engine-manifest show --format json")
-    manifest_digest='sha256:860c9aba24b4dd284d3bb7cc0b15458f5e19118efb080c7e553e6be276746347'
+    manifest_digest='sha256:665cdae6a0f633e6ddafd1589de8be0be0049b1dfbc857872b97b8a7c7a55b0f'
     [ "$mode" != manifest-bad-digest ] \
       || manifest_digest='sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
     printf '{"contract_version":"workbench-plugin-manifest/v1","plugin":{"name":"workbench","version":"0.2.0"},"source":{"ref":"https://github.com/YOOGOMJA/workbench-kit#plugins/workbench","revision":"sha256:e085144d2b3f317d3c5bcb193be5b15225bce6f21077c9baf33f0d9fc0af476d"},"included_paths":["."],"excluded_paths":[{"path":".DS_Store","match":"exact"},{"path":".git/","match":"prefix"},{"path":"lib/__pycache__/","match":"prefix"}],"nodes":[{"path":".","node_type":"directory","mode":"040755","digest":"sha256:2c02a41b8d6e3311c6bc17707af5c919d46f01d7182f9662e27ea41edeaa8751","link_target":null},{"path":"bin","node_type":"directory","mode":"040755","digest":"sha256:cfc9b8373c5927abcae2b85ccef69a140ce5705b691642c55dc88b3cffba4fc0","link_target":null},{"path":"bin/workbench","node_type":"file","mode":"100755","digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333","link_target":null}],"digest":"%s"}\n' "$manifest_digest"

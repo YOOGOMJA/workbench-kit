@@ -376,6 +376,9 @@ def resolve_journal_location_locked(
             "transaction-in-progress", owner["journal_path"]
         )
     owner_location = _location_from_owner(location, owner)
+    if _initial_install_pending(owner_location):
+        _require_location_binding(root_fd, root, owner_location)
+        return owner_location
     owner_journal = load_journal(
         owner_location, defer_replace_partial=True
     )
@@ -427,6 +430,44 @@ def _existing_file(path: pathlib.Path) -> os.stat_result | None:
         return None
     except OSError as error:
         raise JournalError("journal-unsafe", str(path)) from error
+
+
+def _initial_install_pending(
+    location: dict[str, pathlib.Path],
+) -> bool:
+    final = _existing_file(location["journal"])
+    temporary = _existing_file(location["initial_temp"])
+    if temporary is None:
+        return final is None
+    if final is None:
+        if (
+            stat.S_ISREG(temporary.st_mode)
+            and temporary.st_uid == os.getuid()
+            and stat.S_IMODE(temporary.st_mode) == 0o600
+            and temporary.st_nlink == 1
+        ):
+            return True
+        raise JournalError("journal-unsafe", str(location["initial_temp"]))
+    if (
+        stat.S_ISREG(final.st_mode)
+        and stat.S_ISREG(temporary.st_mode)
+        and final.st_uid == os.getuid()
+        and temporary.st_uid == os.getuid()
+        and stat.S_IMODE(final.st_mode) == 0o600
+        and stat.S_IMODE(temporary.st_mode) == 0o600
+        and final.st_nlink == 2
+        and temporary.st_nlink == 2
+        and (final.st_dev, final.st_ino)
+        == (temporary.st_dev, temporary.st_ino)
+    ):
+        return True
+    raise JournalError("journal-unsafe", str(location["initial_temp"]))
+
+
+def prepared_journal_install_required(
+    location: dict[str, pathlib.Path],
+) -> bool:
+    return _initial_install_pending(location)
 
 
 def _install_prepared_journal_unlocked(
@@ -834,6 +875,37 @@ def _claim_owner(
     return True
 
 
+def _bind_initial_install_owner(
+    journal: dict[str, Any],
+    location: dict[str, pathlib.Path],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    if not _initial_install_pending(location):
+        return journal
+    owner = _read_owner(location)
+    if (
+        owner is None
+        or owner["plan_digest"] != journal["plan_digest"]
+        or not _owner_workspace_matches(owner, location)
+    ):
+        return journal
+    if (
+        owner["owner_id"] != journal["journal_id"]
+        or owner["workspace_id"] != journal["workspace_id"]
+        or owner["plan_source_digest"] != journal["plan_source_digest"]
+        or owner["journal_path"]
+        != str(location["journal"].resolve(strict=False))
+    ):
+        raise JournalError("owner-mismatch", str(location["owner"]))
+    resumed = copy.deepcopy(journal)
+    resumed["created_at"] = owner["created_at"]
+    resumed["updated_at"] = owner["created_at"]
+    normalized = validate_journal(resumed, plan)
+    if _owner_record(normalized, location) != owner:
+        raise JournalError("owner-mismatch", str(location["owner"]))
+    return normalized
+
+
 def _release_owner(
     journal: dict[str, Any], location: dict[str, pathlib.Path]
 ) -> None:
@@ -857,6 +929,10 @@ def install_prepared_journal_locked(
     _require_lifecycle_journal_size(normalized, normalized_plan)
     root = pathlib.Path(normalized["workspace"]["root"]).resolve(strict=True)
     _require_location_binding(root_fd, root, location)
+    normalized = _bind_initial_install_owner(
+        normalized, location, normalized_plan
+    )
+    _require_lifecycle_journal_size(normalized, normalized_plan)
     _require_effect_temps_absent(
         root_fd,
         root,

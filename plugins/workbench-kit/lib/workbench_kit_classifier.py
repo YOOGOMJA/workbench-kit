@@ -10,9 +10,9 @@ import stat
 from typing import Any, Iterable
 
 from workbench_kit_contracts import (
-    BCP47,
     ContractError,
     canonical_digest,
+    language_tag_valid,
     node_digest,
     strict_load,
     validate_descriptor,
@@ -426,10 +426,12 @@ def _source_rows(content: bytes, *, ascii_only: bool) -> dict[str, str] | None:
         decoded = content.decode("ascii" if ascii_only else "utf-8")
     except UnicodeDecodeError:
         return None
-    if not decoded.endswith("\n") or "\r" in decoded:
+    if "\r" in decoded:
         return None
+    if decoded.endswith("\n"):
+        decoded = decoded[:-1]
     rows: dict[str, str] = {}
-    for line in decoded[:-1].split("\n"):
+    for line in decoded.split("\n"):
         if not line or line.startswith("#"):
             continue
         if line.count("=") != 1:
@@ -450,7 +452,7 @@ def _normative_v2(root: pathlib.Path) -> tuple[bool, str | None]:
         schema, profile, policy, authority
     )):
         return False, None
-    if schema["content"] != b"workbench/v2\n":
+    if schema["content"] not in (b"workbench/v2", b"workbench/v2\n"):
         return False, None
     profile_rows = _source_rows(profile["content"], ascii_only=True)
     if profile_rows is None or set(profile_rows) != {"schema", "language"}:
@@ -458,7 +460,7 @@ def _normative_v2(root: pathlib.Path) -> tuple[bool, str | None]:
     if profile_rows["schema"] != "workbench-profile/v1":
         return False, None
     language = profile_rows["language"]
-    if BCP47.fullmatch(language) is None:
+    if not language_tag_valid(language):
         return False, None
     policy_rows = _source_rows(policy["content"], ascii_only=False)
     if policy_rows is None or policy_rows.get("schema") != "workbench-policy/v1":

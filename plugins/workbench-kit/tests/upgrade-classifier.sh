@@ -446,6 +446,49 @@ with tempfile.TemporaryDirectory(prefix="workbench-classifier-") as temporary:
     assert result["classification"] == "already-current", result
     assert result["language"] == "ko"
 
+    for language_tag in ("i-klingon", "x-private"):
+        root = base / f"current-language-{language_tag}"
+        normative_root(root)
+        write(
+            root,
+            ".workbench/profile.conf",
+            (
+                "schema=workbench-profile/v1\n"
+                f"language={language_tag}\n"
+            ).encode("ascii"),
+        )
+        result = diagnose(root, "workbench/v2", True)
+        assert result["classification"] == "already-current", result
+        assert result["language"] == language_tag
+
+    for index, language_tag in enumerate((
+        "en-u-ca-gregory-u-nu-latn",
+        "en-a",
+    )):
+        root = base / f"invalid-language-{index}"
+        normative_root(root)
+        write(
+            root,
+            ".workbench/profile.conf",
+            (
+                "schema=workbench-profile/v1\n"
+                f"language={language_tag}\n"
+            ).encode("ascii"),
+        )
+        assert diagnose(root, "workbench/v2", True)["classification"] == "malformed"
+
+    for path in (
+        ".workbench/schema",
+        ".workbench/profile.conf",
+        ".workbench/policy.conf",
+    ):
+        root = base / ("current-no-final-lf-" + pathlib.Path(path).name)
+        normative_root(root)
+        target = root / path
+        target.write_bytes(target.read_bytes().removesuffix(b"\n"))
+        result = diagnose(root, "workbench/v2", True)
+        assert result["classification"] == "already-current", (path, result)
+
     root = base / "current-generation-provenance"
     migration = migration_candidate(root)
     (root / ".workbench/migration.json").unlink()

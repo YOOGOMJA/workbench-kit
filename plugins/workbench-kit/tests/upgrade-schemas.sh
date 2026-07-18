@@ -8,7 +8,7 @@ command -v uv >/dev/null || {
 }
 PYTHONDONTWRITEBYTECODE=1 uv run --quiet \
   --with-requirements "$ROOT/schemas/requirements.txt" \
-  python3 - "$ROOT/lib" "$ROOT/schemas" <<'PY'
+  python3 - "$ROOT/lib" "$ROOT/schemas" "$ROOT/../workbench/lib" <<'PY'
 import base64
 import copy
 import hashlib
@@ -22,6 +22,7 @@ from workbench_kit_contracts import (
     canonical_bytes,
     canonical_digest,
     decode_artifact,
+    language_tag_valid,
     node_digest,
     parse_authority_approval,
     parse_reviewed_overlay,
@@ -38,8 +39,12 @@ from workbench_kit_contracts import (
     validate_result,
     validate_reviewed_overlay,
     validate_journal,
+    validate_language,
 )
 from workbench_kit_schema import SchemaValidationError, load_schema_suite
+
+sys.path.insert(0, sys.argv[3])
+from workbench_contract import is_language_tag as engine_language_tag_valid
 
 SHA = "sha256:" + "a" * 64
 OID = "1" * 40
@@ -146,6 +151,15 @@ for field in ("approved_at",):
 impossible = copy.deepcopy(authority)
 impossible["protection"]["verified_at"] = "2026-02-29T00:00:00Z"
 rejected(lambda: parse_authority_approval(canonical_bytes(impossible)))
+for container, field in ((None, "approved_at"), ("protection", "verified_at")):
+    fractional = copy.deepcopy(authority)
+    target = fractional if container is None else fractional[container]
+    target[field] = "2026-07-12T15:04:00.1Z"
+    rejected(lambda fractional=fractional: parse_authority_approval(
+        canonical_bytes(fractional)
+    ))
+    schema_rejects("bootstrap-authority-approval.schema.json", fractional)
+    product_rejects("bootstrap-authority-approval.schema.json", fractional)
 nullable = copy.deepcopy(authority)
 nullable["proposed_descriptor"]["hosting_adapter"] = None
 nullable["proposed_descriptor"]["hosting_ref"] = None
@@ -191,6 +205,27 @@ language = {
     "digest": None,
 }
 language["digest"] = canonical_digest(language, null_field="digest")
+language_cases = {
+    "en": True,
+    "zh-Hant-TW": True,
+    "i-klingon": True,
+    "x-private": True,
+    "en-u-ca-gregory": True,
+    "en-u-ca-gregory-u-nu-latn": False,
+    "en-a": False,
+    "en-variant-variant": False,
+    "x": False,
+}
+for tag, expected in language_cases.items():
+    assert engine_language_tag_valid(tag) is expected, tag
+    assert language_tag_valid(tag) is expected, tag
+    candidate = copy.deepcopy(language)
+    candidate["tag"] = tag
+    candidate["digest"] = canonical_digest(candidate, null_field="digest")
+    if expected:
+        assert validate_language(candidate) == candidate
+    else:
+        rejected(lambda candidate=candidate: validate_language(candidate))
 unicode_artifact = {
     "path": "example.txt",
     "node_type": "file",

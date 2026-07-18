@@ -145,9 +145,17 @@ descriptor = {
 }
 assert render_schema() == b"workbench/v2\n"
 assert render_profile("en-US") == b"schema=workbench-profile/v1\nlanguage=en-US\n"
+assert render_profile("i-klingon") == (
+    b"schema=workbench-profile/v1\nlanguage=i-klingon\n"
+)
+assert render_profile("x-private") == (
+    b"schema=workbench-profile/v1\nlanguage=x-private\n"
+)
 assert render_policy() == b"schema=workbench-policy/v1\n"
 assert render_authority(dict(reversed(list(descriptor.items())))) == canonical_bytes(descriptor)
 rejected(lambda: render_profile("not_a_language"))
+rejected(lambda: render_profile("en-u-ca-gregory-u-nu-latn"))
+rejected(lambda: render_profile("en-a"))
 
 header = b"# Workbench\n\n"
 core = b"# Core\n"

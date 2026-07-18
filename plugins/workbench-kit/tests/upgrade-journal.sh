@@ -2163,6 +2163,108 @@ with tempfile.TemporaryDirectory(prefix="workbench-journal-") as temporary:
     assert initial_location["journal"].is_file()
     assert not initial_location["initial_temp"].exists()
 
+    owner_only_root = pathlib.Path(temporary) / "owner-only-install-workbench"
+    owner_only_root.mkdir()
+    owner_only_root = owner_only_root.resolve()
+    owner_only_plan, _, owner_only_after = fixture_plan(owner_only_root)
+    owner_only_source = canonical_digest(
+        canonical_bytes(owner_only_plan), raw=True
+    )
+    owner_only_journal = build_prepared_journal(
+        owner_only_plan, owner_only_source, CREATED_AT
+    )
+    owner_only_location = resolve_journal_location(
+        owner_only_root,
+        owner_only_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    assert journal_module._claim_owner(
+        owner_only_journal, owner_only_location
+    ) is True
+    owner_only_resolved = resolve_journal_location(
+        owner_only_root,
+        owner_only_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    owner_only_retry = build_prepared_journal(
+        owner_only_plan, owner_only_source, "2026-07-11T00:00:01Z"
+    )
+    install_prepared_journal(owner_only_retry, owner_only_resolved)
+    owner_only_installed = load_journal(
+        owner_only_resolved, owner_only_plan
+    )
+    assert owner_only_installed["created_at"] == CREATED_AT
+    owner_only_result = execute_upgrade(
+        owner_only_plan,
+        owner_only_resolved,
+        plan_source_digest=owner_only_source,
+        updated_at="2026-07-11T00:00:02Z",
+        validate_after=passed_validation,
+    )
+    assert owner_only_result["transaction"]["stage"] == "completed"
+    assert not owner_only_resolved["owner"].exists()
+    assert (owner_only_root / ".workbench/schema").read_bytes() == owner_only_after
+
+    linked_install_root = pathlib.Path(temporary) / "linked-install-workbench"
+    linked_install_root.mkdir()
+    linked_install_root = linked_install_root.resolve()
+    linked_install_plan, _, linked_install_after = fixture_plan(linked_install_root)
+    linked_install_source = canonical_digest(
+        canonical_bytes(linked_install_plan), raw=True
+    )
+    linked_install_journal = build_prepared_journal(
+        linked_install_plan, linked_install_source, CREATED_AT
+    )
+    linked_install_location = resolve_journal_location(
+        linked_install_root,
+        linked_install_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    assert journal_module._claim_owner(
+        linked_install_journal, linked_install_location
+    ) is True
+    linked_install_location["initial_temp"].write_bytes(
+        canonical_bytes(linked_install_journal)
+    )
+    linked_install_location["initial_temp"].chmod(0o600)
+    os.link(
+        linked_install_location["initial_temp"],
+        linked_install_location["journal"],
+    )
+    linked_install_resolved = resolve_journal_location(
+        linked_install_root,
+        linked_install_plan["plan_digest"],
+        journal_dir=journal_root,
+        environment={},
+    )
+    linked_install_retry = build_prepared_journal(
+        linked_install_plan,
+        linked_install_source,
+        "2026-07-11T00:00:03Z",
+    )
+    install_prepared_journal(linked_install_retry, linked_install_resolved)
+    assert not linked_install_resolved["initial_temp"].exists()
+    assert os.lstat(linked_install_resolved["journal"]).st_nlink == 1
+    linked_install_installed = load_journal(
+        linked_install_resolved, linked_install_plan
+    )
+    assert linked_install_installed["created_at"] == CREATED_AT
+    linked_install_result = execute_upgrade(
+        linked_install_plan,
+        linked_install_resolved,
+        plan_source_digest=linked_install_source,
+        updated_at="2026-07-11T00:00:04Z",
+        validate_after=passed_validation,
+    )
+    assert linked_install_result["transaction"]["stage"] == "completed"
+    assert not linked_install_resolved["owner"].exists()
+    assert (
+        linked_install_root / ".workbench/schema"
+    ).read_bytes() == linked_install_after
+
     foreign_initial_root = pathlib.Path(temporary) / "foreign-initial-workbench"
     foreign_initial_root.mkdir()
     foreign_initial_root = foreign_initial_root.resolve()
