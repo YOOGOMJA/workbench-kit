@@ -128,15 +128,35 @@ for test_name in runnable_upgrade_tests:
 for helper_name in ("upgrade-public-stub.sh", "upgrade-test-lib.sh"):
     assert helper_name not in suite, helper_name
 
+inventory = {}
+for line in (repo / "tests/plugin-suite.tsv").read_text(
+    encoding="utf-8"
+).splitlines():
+    role, relative = line.split("\t")
+    inventory[relative] = role
+for test_name in runnable_upgrade_tests:
+    assert inventory[f"plugins/workbench-kit/tests/{test_name}"] == "test"
+for helper_name in (
+    "run.sh",
+    "upgrade-public-stub.sh",
+    "upgrade-test-lib.sh",
+):
+    assert inventory[f"plugins/workbench-kit/tests/{helper_name}"] == "helper"
+
 suite_command = "bash plugins/workbench-kit/tests/run.sh"
+root_command = "bash tests/run.sh"
 ci = (repo / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 assert suite_command in ci
+assert root_command in ci
 assert "actions/setup-python@" in ci
 assert "astral-sh/setup-uv@" in ci
 assert 'version: "0.7.6"' in ci
 for documentation in ("AGENTS.md", "CONTRIBUTING.md"):
-    assert suite_command in (repo / documentation).read_text(encoding="utf-8")
-assert suite_command in (repo / "scripts/release.sh").read_text(encoding="utf-8")
+    assert root_command in (repo / documentation).read_text(encoding="utf-8")
+assert root_command in (repo / "scripts/release.sh").read_text(encoding="utf-8")
+assert root_command in (repo / "scripts/release-preflight.sh").read_text(
+    encoding="utf-8"
+)
 PY
 
 bash "$REPO_ROOT/tests/check-skill-frontmatter.sh"
