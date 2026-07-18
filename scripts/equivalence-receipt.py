@@ -204,7 +204,13 @@ def safe_extract_git_archive(raw: bytes, destination: pathlib.Path) -> None:
 def revision_public_state(replacement_revision: str):
     require_commit(replacement_revision)
     archive = git_bytes(
-        "archive", "--format=tar", replacement_revision, "--", WORKBENCH_RELATIVE
+        "-c",
+        "tar.umask=0002",
+        "archive",
+        "--format=tar",
+        replacement_revision,
+        "--",
+        WORKBENCH_RELATIVE,
     )
     with tempfile.TemporaryDirectory(prefix="workbench-replacement-") as raw:
         root = pathlib.Path(raw)

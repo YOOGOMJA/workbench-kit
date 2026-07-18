@@ -23,6 +23,14 @@ PY
 
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/equivalence-receipt.py" check
 
+# A caller's Git configuration must not erase the executable bit in the archive
+# used to reconstruct the tagged plugin. The verifier pins its own tar.umask.
+GIT_CONFIG_COUNT=1 \
+GIT_CONFIG_KEY_0=tar.umask \
+GIT_CONFIG_VALUE_0=0111 \
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 "$ROOT/scripts/equivalence-receipt.py" check
+
 PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT" <<'PY'
 import hashlib
 import importlib.util
