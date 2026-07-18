@@ -40,7 +40,7 @@ The following English identifiers are stable across tools and output languages.
 | knowledge | Reusable decisions, lessons, and runbooks accumulated across tasks |
 | completion | Acceptance of every required outcome under current evidence and policy |
 | abandonment | A terminal decision not to adopt the task's intended result |
-| cleanup | Removal of task workspaces and local branches after a terminal outcome |
+| cleanup | Authenticated retirement of task workspaces into non-deleting quarantine, followed by local-branch release |
 
 Translations may be shown to a person, but stored keys, schema IDs, lifecycle values,
 capability IDs, and command names stay in English.
@@ -115,6 +115,46 @@ digits, dots, underscores, or hyphens. Examples are `toolbox:product/acme` and
 `toolbox:scenario/SCN-001`. The kernel validates syntax, stores the exact value, detects
 duplicate active `work_ref` values, and reports the references. Only the namespace owner
 interprets the value. Missing references have no product meaning and remain valid.
+
+Active-task inventory is the semantic preflight for `work_ref` uniqueness, but it is not the
+serialization point. Every non-null value owns one Git reservation at
+`refs/heads/workbench-coordination/work-refs/<sha256(work_ref)>`. The ref is created by a
+non-force push of a deterministic root commit whose exact `work-ref.json` binds the value,
+task claim, task branch, and workspace-authority descriptor. Concurrent setters may both
+pass inventory; the remote ref creation still selects exactly one winner. An existing
+malformed or differently bound reservation fails closed and is never overwritten.
+
+The per-value ref does not serialize two different values selected concurrently by the same
+claim. Each claim therefore also owns an append-only selection chain at
+`refs/heads/workbench-coordination/work-ref-selections/<sha256(claim_id)>`. Its exact
+`workbench-work-ref-selection/v1` commit binds claim, branch, descriptor, nullable selected
+value, matching reservation ref/OID, and previous selection OID. Changing or clearing a value
+uses one required atomic Git push guarded by exact leases to advance that selection, create or
+retain the chosen reservation, and delete every obsolete reservation owned by the claim. Only
+the winning transaction updates local task metadata. Within one clone, a secure claim-scoped
+process lock covers selection reconciliation, remote transition, local metadata publication,
+and a final authoritative selection check, so an older process cannot overwrite a newer local
+winner. Across clones, a lost response or interrupted local write is repaired from the
+selection chain. Any failed atomic push re-observes the requested reservation so a competing
+owner remains a duplicate-work failure even when this claim already had a prior selection.
+Malformed history or a remote without atomic-push support fails closed.
+
+A terminal task retains its selection and reservation until cleanup has durably published an
+authenticated quarantine receipt for the task workspace. Cleanup then atomically releases the
+selection and every reservation bound to that claim and branch before deleting the local
+branch. This ordering lets a cleanup retry finish after the active workspace path is gone
+without making the work item concurrently reusable before every user byte is preserved in
+quarantine. Tasks created before this coordination contract remain readable; their
+current value and first selection are materialized lazily on the next matching `refs set`,
+while authoritative inventory continues to protect them during migration.
+
+Every cleanup release boundary re-observes the exact authenticated journal immediately before
+its external effect: action consumption, each effect-owner CAS, final writer-claim release,
+work-reference release, and local-branch deletion. The hosting actor/credential, trusted
+adapter, and provider's current-state integrity are part of the trusted computing base. Device
+and clone IDs plus the private arm secret fence concurrent clones operating under that trusted
+actor; they do not defend against compromise or malicious retrospective edit/delete by the
+trusted actor itself, nor against provider rollback.
 
 ### Work-item and multi-context boundary
 
@@ -304,6 +344,12 @@ stateDiagram-v2
 The exact event IDs are `task-claimed`, `task-claim-conflict`, `task-active`,
 `task-verified`, `task-submitted`, `task-completed`, `task-abandoned`, and `task-cleaned`.
 A writer correlates them with `claim_id` and branch.
+After publishing `task-claimed`, start keeps a process-exit compensation guard until the task
+branch is durably pushed. Any worktree, scaffold, commit, or push failure publishes the matching
+`task-claim-conflict`, so a failed concurrent start cannot remain a second live claim. The guard
+is installed before publication. If the host persists `task-claimed` but its response is lost,
+start reduces a fresh trusted lifecycle observation for that exact claim and publishes or
+confirms the matching conflict before returning failure.
 
 The canonical v2 marker is UTF-8 JSON inside a versioned HTML comment:
 
@@ -381,18 +427,27 @@ accepted deliverables, passing evidence, harvest disposition, or completed write
 claiming those would misstate non-adoption as completion. It freezes new writer effects and
 delegates exact compensation and release of existing operations to cleanup.
 
-Cleanup is never a completion predicate. Destructive cleanup before completion or
+Cleanup is never a completion predicate. Cleanup before completion or
 abandonment is invalid for v2 tasks. Existing v1 force-cleanup behavior remains a legacy
 compatibility path until migration policy removes it in a future major contract. V2 cleanup
 is the governed `task.cleanup` action and has its own terminal-revision plus exact
 `workbench-task-removal-plan/v1` intent binding, blockers, and
-retry semantics in [[workbench-v2-cli-contract]]. Before deleting task-local recovery state,
-it persists a `prepared` cleanup journal in the task home's issue comments; retries reconcile
-that external receipt's writer operation/claim pairs and every intended/verified effect-owner
-event through exact worktree retirement, verified CAS release, `completed`, and
-`task-cleaned`. All releases finish before task
-workspace deletion; a post-delete retry uses the external journal and remote ledger. Release
-does not mutate frozen task content.
+retry semantics in [[workbench-v2-cli-contract]]. It first fsyncs a clone-local 256-bit arm
+secret and publishes only its immutable-journal-bound commitment in the `prepared` cleanup
+journal. The owning clone
+uses atomic no-replace renames to move the complete task workspace plus every linked-worktree
+admin record into a private git-common-relative quarantine. A strict no-follow inode/tree
+authentication covers tracked, untracked, ignored, private-action, nested-codebase, and Git
+admin bytes. The resulting fsynced receipt discloses the committed secret and binds its complete
+public body with a domain-separated proof digest. It is published externally as `quarantined` before
+any writer claim, effect owner, work-reference reservation, or task branch is released.
+Retries then reconcile every intended/verified effect-owner event through verified CAS
+release, `completed`, and `task-cleaned`. A crash rolls the local quarantine transaction
+forward; it never restores over an occupied path. The journal reducer requires a `prepared`
+genesis and rejects a forged receipt, so a different clone cannot promote `prepared` by copying
+public runtime IDs. Cleanup does not physically delete
+the quarantine; retention or garbage collection is a separate future operation. Release does
+not mutate frozen task content.
 
 Completion and abandonment both freeze every revision-affecting fact. Refs, context set,
 deliverables and acceptance, required checks, evidence, harvest, and writer claims reject
@@ -618,7 +673,7 @@ The canonical v1 shape is:
       "workbench-owner-acceptance/v1"
     ],
     "external_probe_contracts": ["workbench-probe/github-pr-subject/v1", "workbench-probe/github-pr/v1"],
-    "cleanup_journal_contracts": ["workbench-task-removal-plan/v1", "workbench-task-cleanup-journal/v1"],
+    "cleanup_journal_contracts": ["workbench-task-removal-plan/v1", "workbench-task-cleanup-journal/v1", "workbench-task-quarantine-authority/v1", "workbench-task-quarantine-receipt/v1"],
     "doctor_contracts": ["workbench-doctor/v1"],
     "evidence_contracts": ["workbench-evidence/v1"],
     "writer_claim_contracts": [

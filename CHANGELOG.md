@@ -21,6 +21,15 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
   workbench/profile compatibility adapter, profile-bound product language,
   caller-contained strict JSON state, and deterministic product, scenario, and portfolio
   validation (#28). Marketplace registration remains follow-up work.
+- **Policy-aware v2 task lifecycle** — the `workbench` plugin now discovers explicit
+  workspace/profile contracts and manages opaque task refs, multiple deliverables,
+  required checks, revision-bound evidence, policy authorization, harvest disposition,
+  terminal completion or abandonment, coordinated multi-repo writer claims, legacy-writer
+  projection, claim-scoped atomic work-ref selection with local process serialization,
+  lost-response claim compensation, authenticated terminal recovery, governed cleanup,
+  authenticated non-deleting cleanup quarantine with a secret-commitment external release barrier,
+  readiness diagnosis, and a canonical installed-engine manifest while retaining v1 task
+  flows (#26).
 - **Frozen released-section guard** — a CI `changelog-frozen` job
   (`scripts/check-changelog-section.sh`) fails any PR that adds a CHANGELOG entry under an
   already-released `## [X.Y.Z]` section instead of `## [Unreleased]`, so an in-flight PR
@@ -52,6 +61,11 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 
 ### Fixed
 
+- **Cleanup release and quarantine hardening** — the `workbench` plugin now confirms the
+  exact authenticated cleanup journal immediately before every external release, rejects
+  detached local arm proofs and action-status races, creates quarantine paths through
+  no-follow directory descriptors, rolls forward partial or complete durable JSON writes
+  without hardlink residue, and authenticates POSIX filename bytes losslessly (#26).
 - **Task commit subject policy enforcement** — the `workbench` plugin now rejects
   invalid `workbench task commit` subjects and audits raw/bypassed task commits in
   `workbench task check`, restoring current workbench Conventional Commits behavior while

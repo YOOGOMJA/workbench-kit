@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# Public, read-only exhaustive projection of active workbench-task/v1 state.
+set -euo pipefail
+export LC_ALL=C
+export PYTHONDONTWRITEBYTECODE=1
+
+state_error() { echo "error: $*" >&2; exit 1; }
+usage_error() { echo "error: $*" >&2; exit 2; }
+
+workspace_root() {
+  git rev-parse --show-toplevel 2>/dev/null || state_error "workbench git repository not found"
+}
+
+require_python() {
+  command -v python3 >/dev/null 2>&1 \
+    && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1 \
+    || state_error "Python 3.9 or newer is required for legacy inventory"
+}
+
+require_schema() {
+  local root="$1" expected="$2" marker="$1/.workbench/schema" value helper
+  if [ ! -e "$marker" ]; then value=workbench/v1
+  elif [ -f "$marker" ]; then
+    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+    value="$(python3 "$helper" schema "$marker")" \
+      || state_error "workspace schema marker is invalid"
+  else
+    state_error "workspace schema marker is unreadable"
+  fi
+  [ "$value" = "$expected" ] \
+    || state_error "legacy inventory entrypoint requires $expected"
+}
+
+require_supported_caller_schema() {
+  local root="$1" marker="$1/.workbench/schema" value helper
+  [ -e "$marker" ] || return 0
+  [ -f "$marker" ] || state_error "workspace schema marker is unreadable"
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  value="$(python3 "$helper" schema "$marker")" \
+    || state_error "workspace schema marker is invalid"
+  case "$value" in workbench/v1|workbench/v2) return 0 ;; esac
+  state_error "workspace schema marker is invalid"
+}
+
+find_bootstrap_revision() {
+  local root="$1" revision="$2" commit value bootstrap=""
+  while IFS= read -r commit; do
+    value="$(git -C "$root" show "$commit:.workbench/schema" 2>/dev/null || true)"
+    if [ "$value" = workbench/v2 ]; then bootstrap="$commit"; break; fi
+  done < <(git -C "$root" rev-list --first-parent --reverse "$revision" -- .workbench/schema)
+  printf '%s\n' "${bootstrap:-$revision}"
+}
+
+collect_observation() {
+  local helper="$1" authority="$2" registry="$3" origin="$4" default_ref="$5"
+  local default_revision="$6" bootstrap="$7" observation="$8" adapter
+  adapter="${WORKBENCH_TRUSTED_LEGACY_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] \
+    || state_error "trusted legacy adapter is unavailable"
+  "$adapter" collect --authority-file "$authority" --registry-file "$registry" \
+    --workspace-origin "$origin" --default-ref "$default_ref" \
+    --default-revision "$default_revision" --bootstrap-revision "$bootstrap" \
+    --format json > "$observation" \
+    || state_error "trusted legacy adapter failed before producing a projection"
+}
+
+emit_inventory() {
+  local helper="$1" authority="$2" registry="$3" default_revision="$4"
+  local bootstrap="$5" observation="$6" rc
+  if python3 "$helper" inventory --authority-file "$authority" --registry-file "$registry" \
+    --default-revision "$default_revision" --bootstrap-revision "$bootstrap" \
+    --observation-file "$observation"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 1 ] && return 1
+  return 1
+}
+
+cmd_show() {
+  local format="" root origin remote_lines default_ref default_revision helper contract_helper
+  local authority registry observation verification bootstrap commit value tmpdir adapter rc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ "$format" = json ] || usage_error "unsupported format: ${format:-none} (expected json)"
+  require_python
+  root="$(workspace_root)"; require_schema "$root" workbench/v2
+  origin="$(git -C "$root" remote get-url origin 2>/dev/null)" \
+    || state_error "workspace origin is unavailable"
+  remote_lines="$(git -C "$root" ls-remote --symref "$origin" HEAD 2>/dev/null)" \
+    || state_error "protected default authority is unavailable"
+  default_ref="$(printf '%s\n' "$remote_lines" | awk '$1 == "ref:" && $3 == "HEAD" { print $2 }')"
+  default_revision="$(printf '%s\n' "$remote_lines" | awk '$2 == "HEAD" && $1 ~ /^[0-9a-f]+$/ { print $1 }')"
+  [ -n "$default_ref" ] && printf '%s' "$default_revision" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+    || state_error "protected default authority is incomplete"
+  git -C "$root" fetch --no-write-fetch-head --quiet --no-tags "$origin" "$default_revision" >/dev/null 2>&1 \
+    || state_error "protected default revision is unreadable"
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/workbench-legacy-inventory.XXXXXX")"
+  trap 'rm -rf "$tmpdir"' RETURN
+  authority="$tmpdir/authority.json"; registry="$tmpdir/codebases.yaml"
+  observation="$tmpdir/observation.json"; verification="$tmpdir/hosting-authority.json"
+  git -C "$root" show "$default_revision:.workbench/authority.json" > "$authority" 2>/dev/null \
+    || state_error "protected default authority descriptor is unavailable"
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] \
+    || state_error "protected default authority proof is unavailable"
+  "$adapter" authority --authority-file "$authority" --default-revision "$default_revision" \
+    --format json > "$verification" 2>/dev/null \
+    || state_error "protected default authority proof is unavailable"
+  contract_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+  python3 "$contract_helper" hosting-authority --authority-file "$authority" \
+    --verification-file "$verification" --default-revision "$default_revision" >/dev/null 2>&1 \
+    || state_error "protected default authority proof is invalid"
+  git -C "$root" show "$default_revision:codebases.yaml" > "$registry" 2>/dev/null \
+    || state_error "protected default codebase registry is unavailable"
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_legacy.py"
+
+  bootstrap="$(find_bootstrap_revision "$root" "$default_revision")"
+  collect_observation "$helper" "$authority" "$registry" "$origin" "$default_ref" \
+    "$default_revision" "$bootstrap" "$observation"
+  if emit_inventory "$helper" "$authority" "$registry" "$default_revision" \
+    "$bootstrap" "$observation"; then rc=0; else rc=$?; fi
+  rm -rf "$tmpdir"; trap - RETURN
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 1 ] && return 1
+  return 1
+}
+
+cmd_bootstrap_show() {
+  local format="" approval_file="" root helper tmpdir approval verification authority registry
+  local adapter metadata origin default_ref default_revision workspace_home hosting_adapter hosting_ref
+  local approval_digest remote_lines head_ref head_oid ref_oid bootstrap observation rc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --authority-approval-file)
+        [ $# -ge 2 ] || usage_error "--authority-approval-file requires a value"
+        approval_file="$2"; shift 2 ;;
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ "$format" = json ] || usage_error "unsupported format: ${format:-none} (expected json)"
+  [ -n "$approval_file" ] || usage_error "--authority-approval-file is required"
+  require_python
+  root="$(workspace_root)"; require_supported_caller_schema "$root"
+  [ -f "$approval_file" ] || usage_error "authority approval file is not readable"
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_legacy.py"
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/workbench-legacy-bootstrap.XXXXXX")"
+  trap 'rm -rf "$tmpdir"' RETURN
+  approval="$tmpdir/approval.json"; verification="$tmpdir/verification.json"
+  authority="$tmpdir/authority.json"; registry="$tmpdir/codebases.yaml"
+  observation="$tmpdir/observation.json"
+  cp "$approval_file" "$approval"
+
+  adapter="${WORKBENCH_TRUSTED_BOOTSTRAP_AUTHORITY_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] \
+    || state_error "trusted bootstrap authority adapter is unavailable"
+  "$adapter" verify --approval-file "$approval" --format json > "$verification" \
+    || state_error "bootstrap authority approval authentication failed"
+  if metadata="$(python3 "$helper" bootstrap-approval --approval-file "$approval" \
+    --verification-file "$verification" --descriptor-output "$authority")"; then
+    IFS=$'\t' read -r origin default_ref default_revision workspace_home hosting_adapter \
+      hosting_ref approval_digest <<< "$metadata"
+  else
+    rc=$?
+    [ "$rc" -eq 1 ] && state_error "bootstrap authority approval is not trusted"
+    usage_error "invalid workbench-bootstrap-authority-approval/v1 input"
+  fi
+
+  remote_lines="$(git -C "$root" ls-remote --symref "$origin" HEAD "$default_ref" 2>/dev/null)" \
+    || state_error "approved bootstrap authority is unavailable"
+  head_ref="$(printf '%s\n' "$remote_lines" | awk '$1 == "ref:" && $3 == "HEAD" { print $2 }')"
+  head_oid="$(printf '%s\n' "$remote_lines" | awk '$2 == "HEAD" && $1 ~ /^[0-9a-f]+$/ { print $1 }')"
+  ref_oid="$(printf '%s\n' "$remote_lines" | awk -v ref="$default_ref" '$2 == ref && $1 ~ /^[0-9a-f]+$/ { print $1 }')"
+  [ "$head_ref" = "$default_ref" ] && [ "$head_oid" = "$default_revision" ] \
+    && [ "$ref_oid" = "$default_revision" ] \
+    || state_error "approved bootstrap default ref or revision is stale"
+  git -C "$root" fetch --no-write-fetch-head --quiet --no-tags "$origin" "$default_revision" >/dev/null 2>&1 \
+    || state_error "approved bootstrap revision is unreadable"
+  if git -C "$root" cat-file -e "$default_revision:.workbench/schema" 2>/dev/null \
+    || git -C "$root" cat-file -e "$default_revision:.workbench/authority.json" 2>/dev/null; then
+    state_error "approved protected default is no longer an implicit v1 workspace"
+  fi
+  git -C "$root" show "$default_revision:codebases.yaml" > "$registry" 2>/dev/null \
+    || state_error "approved bootstrap codebase registry is unavailable"
+
+  bootstrap="$(find_bootstrap_revision "$root" "$default_revision")"
+  collect_observation "$helper" "$authority" "$registry" "$origin" "$default_ref" \
+    "$default_revision" "$bootstrap" "$observation"
+  if emit_inventory "$helper" "$authority" "$registry" "$default_revision" \
+    "$bootstrap" "$observation"; then rc=0; else rc=$?; fi
+  rm -rf "$tmpdir"; trap - RETURN
+  return "$rc"
+}
+
+case "${1:-}" in
+  show) shift; cmd_show "$@" ;;
+  bootstrap-show) shift; cmd_bootstrap_show "$@" ;;
+  *) usage_error "usage: workbench legacy-inventory {show --format json|bootstrap-show --authority-approval-file FILE --format json}" ;;
+esac

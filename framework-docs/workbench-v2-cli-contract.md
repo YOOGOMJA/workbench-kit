@@ -164,6 +164,12 @@ context or canonical lazy empty seal at the first explicit governed mutation whi
 null, then explicit `add-repo --role work`. `add-repo --role reference` does not seal the
 context. Legacy `workbench-task/v1` start/resume keeps its existing auto-attach behavior and
 does not emit this v2 contract.
+Once `task-claimed` is published, every failure before the task branch push is compensated by
+one matching `task-claim-conflict`, including concurrent local worktree creation and scaffold
+or commit failure. The guard is armed before publication. A failed publication response triggers
+a fresh trusted observation: an absent exact claim needs no marker, an already conflicted claim
+is complete, and a persisted live claim is retired with `task-claim-conflict`. A successfully
+pushed branch retires that compensation guard.
 
 ## Task references
 
@@ -198,6 +204,33 @@ mutually exclusive. The output shape for both commands is:
 `show` always reports `changed: false`; `set` reports whether stored values changed. A
 duplicate active `work_ref` is an integrity failure at exit `1`. Reference grammar and the
 kernel/domain interpretation boundary are defined in [[workbench-v2-governance]].
+
+`work_ref` mutation keeps the authoritative active-task inventory check and per-value remote
+Git reservation. It additionally reads the claim-scoped ref
+`refs/heads/workbench-coordination/work-ref-selections/<sha256(claim_id)>`. Each selection is
+an exact single-parent `workbench-work-ref-selection/v1` commit with ordered fields
+`contract_version`, `claim_id`, `branch`, `workspace_authority_descriptor_digest`, `work_ref`,
+`reservation_ref`, `reservation_oid`, and `previous_selection_oid`. The first commit is a root;
+every later commit and payload name the exact previous OID. A clear is a tombstone selection
+whose three work/reservation fields are null.
+
+One required `git push --atomic` guarded by exact selection and reservation leases advances
+the selection, creates or retains the selected per-value reservation, and deletes all obsolete
+same-claim reservations. A competing value reservation is the duplicate-work failure. A
+same-claim selection loser returns `work-ref-selection-conflict`; malformed, unreadable,
+unwritable, non-atomic, or unreconciled coordination returns
+`work-ref-reservation-unavailable`. Every failed atomic push re-observes the requested
+reservation before classifying the failure, including when both claims already have selection
+history, so a differently bound reservation always reports duplicate active `work_ref`.
+
+Within one clone, a secure claim-scoped process lock covers the initial selection repair,
+inventory and reservation checks, atomic transition, local `task/index.md` update, and final
+authoritative selection repair/check. Local metadata changes only after remote success, and an
+older process cannot publish after a newer local winner. If a different clone advances the
+selection during the local interval, the final check repairs to that selection and reports
+`work-ref-selection-conflict`. If the remote transaction succeeded but the response or local
+write was lost, repeating the same set/clear first repairs local metadata from the selection and
+then converges without another semantic transition.
 
 Before a context-policy set is sealed, `context_ref` may be set or cleared. Changing it
 invalidates any unsealed registration, which cannot be reused for the new ref. After seal,
@@ -720,6 +753,14 @@ the final proof even after a positive diagnostic.
 cannot be inspected, leaves other unavailable values null, and sets blocker
 `{"code":"writer-lock-unavailable","ref":"refs/heads/workbench-coordination/writer-claims"}`.
 Doctor never mutates the coordination ref.
+
+## Mutation activation safety
+
+Before any task mutation, the kernel reconciles authenticated submission-recovery state from
+the clone-private Git common directory. If that state cannot be inspected through the secure
+directory and file contract, the command returns a `workbench-error/v1` envelope at exit `1`
+with blocker `submission-recovery-unavailable` and ref `workbench:task/<claim_id>`. It performs
+no lifecycle transition, policy resolution, writer claim, or content mutation.
 
 ## Terminal content freeze
 
@@ -1521,7 +1562,7 @@ The kernel-defined action IDs in this contract are:
 | `task.policy-context.register` | Register the owner-validated context participant set |
 | `task.policy-context.seal` | Activate and freeze that participant set |
 | `task.concurrent-write` | Proceed while a writer conflict is reported |
-| `task.cleanup` | Remove a terminal v2 task workspace |
+| `task.cleanup` | Quarantine and retire a terminal v2 task workspace |
 
 This table is the complete executable action registry for v1. Unknown and namespaced action
 IDs are not policy `ask`; `workbench policy resolve` rejects them as `unsupported-action` at
@@ -1711,7 +1752,7 @@ sources and secondary projections are frozen as follows:
 | `task.policy-context.seal` | sealed context-set record | exact registered participant/task-policy set |
 | `task.concurrent-write` | task-content writer row plus matching writer operation | exact operation-owned worktree/record and `consumed` operation stage |
 | `task.complete`, `task.abandon` | terminal outcome record | matching lifecycle event; abandonment also retains reason/removal-plan digest |
-| `task.cleanup` | external `prepared` cleanup journal | exact journal-prefix retirement and final `task-cleaned` projection |
+| `task.cleanup` | local arm plus external `prepared`/`quarantined` cleanup journal | exact quarantine/release prefix and final `task-cleaned` projection |
 
 Reduction is exact and ordered:
 
@@ -1723,7 +1764,7 @@ Reduction is exact and ordered:
    target, subject revision, intent digest, policy-manifest digest, and authorization
    provenance. Verify that the primary record's postcondition is exactly the requested payload.
    Missing private request state is unreconciled; the current pre-state is never substituted.
-   The sole exception is cleanup after task deletion: its strict external journal contains the
+   The sole exception is cleanup after task quarantine: its strict external journal contains the
    terminal revision, complete removal plan, intent, policy manifest, and authorization needed
    to reconstruct the request.
 3. On one exact primary, reconcile only missing derived pointers, lifecycle observations, and
@@ -1923,7 +1964,8 @@ state is committed. Normal execution writes the action-specific primary post-eff
 before marking the private instance consumed. Missing secondary projections are then handled
 by the applied-effect reducer; they are not grounds to repeat policy or the primary effect.
 Cleanup is the documented exception to private status durability: its externally durable
-`prepared` journal is the committed mutation and consumption source because task-local action
+`prepared` journal is the committed mutation and consumption source, while its externally
+durable `quarantined` receipt is the release barrier, because task-local action
 storage is about to be deleted. A failed precondition before any primary provenance leaves the instance
 reusable only for the identical binding. Action, log, status, and other disposable
 bookkeeping records are excluded structurally from the task revision digest, so persisting a
@@ -2233,7 +2275,8 @@ encoded in its dedicated revision binding. Dirty or unpushed work may still bloc
 cleanup, but it is not misrepresented as a completion
 predicate. A valid incomplete writer operation does not block authorized abandonment;
 malformed, ambiguous, or unjoinable writer facts do. Abandonment freezes new writer effects,
-and governed cleanup must compensate/release every existing operation before deletion.
+and governed cleanup must quarantine every existing local effect before compensating or
+releasing its remote operation.
 Like completion, it runs the applied-effect reducer before testing non-terminal state or
 deriving its abandonment revision. An exact existing outcome may only reconcile its matching
 `task-abandoned` projection; a lifecycle marker without the outcome primary is unreconciled.
@@ -2272,6 +2315,13 @@ terminal outcome is idempotent with `changed: false`. A conflicting terminal out
 Completion emits `task-completed`; abandonment emits `task-abandoned`. Either event activates
 the terminal content freeze before the command returns success.
 
+For a submitted task whose private task state may disappear, the terminal outcome and its
+consumed action/request are repeated in one terminal-checkpoint marker paired with that
+terminal lifecycle marker. The trusted hosting adapter authenticates the comment author, and
+the author must equal the unique winning `task-claimed` actor. That actor attests the already
+consumed action; the action's `authorization_actor` remains the independent approving identity
+authenticated by the authorization source and is never required to equal the claimant.
+
 ## Governed cleanup
 
 ```text
@@ -2291,7 +2341,8 @@ has already disappeared. Only when no applied journal exists must the selected t
 pushed task branch. Preflight blockers are `missing-terminal-outcome`,
 `dirty-task-worktree`, `dirty-codebase-worktree`, `unpushed-task-branch`,
 `ambiguous-task-selection`, `cleanup-plan-mismatch`, `writer-recovery-blocked`, and
-`action-binding-stale`. A current effect owner on another device/clone is
+`action-binding-stale`. Quarantine recovery additionally reports
+`cleanup-quarantine-unconfirmed` or `cleanup-quarantine-conflict`. A current effect owner on another device/clone is
 `writer-recovery-blocked`; cleanup never converts elapsed time or source unavailability into
 forced takeover.
 
@@ -2326,13 +2377,19 @@ from the terminal writer snapshot plus current exact owned effects; a different 
 may remove an already completed step but never alter the
 frozen operation identity or desired final absence. A changed operation set, identity, path,
 branch, or disposition changes the digest and supersedes a pending cleanup authorization.
+`prepared`, `authorization-pending`, and `cancelled` operations with no remote effect use
+`cancel-no-effect`; `remote-claimed` and interrupted compensation use
+`compensate-release`; `handoff-ready` uses `release-handoff`; and `consumed` uses
+`retire-consumed`.
 
 The durable recovery journal is stored in the task home's GitHub issue comments, outside the
-local task workspace, using this marker before any deletion:
+local task workspace. Before publishing it, the selected clone generates and fsyncs a private
+256-bit local arm secret under the exact git-common-relative quarantine locator. The first
+external marker carries only its domain-separated commitment:
 
 ```html
 <!-- workbench-task-cleanup:v1
-{"contract_version":"workbench-task-cleanup-journal/v1","journal_id":"cleanup-task__workbench-kit__25","stage":"prepared","task_id":"workbench-kit#25","claim_id":"task__workbench-kit__25-20260711T030000Z-1234","branch":"task/25-example","revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","intent_digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777","policy_manifest":{"contract_version":"workbench-policy-manifest/v1","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","sources":[{"layer":"workspace","context_ref":null,"policy_ref":".workbench/policy.conf","policy_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","authority_identity":"github:example/workbench","authority_ref":"refs/heads/main","authority_revision":"1111111111111111111111111111111111111111","authority_receipt_digest":"sha256:abababababababababababababababababababababababababababababababab","decision":"allow"}]},"authorization_ref":"conversation:message/msg-123","removal_plan_digest":"sha256:9999999999999999999999999999999999999999999999999999999999999999","removal_plan":{"writer_operations":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","disposition":"retire-consumed"}],"codebase_worktrees":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","owner":"web-app","expected_path":"task/codebases/web-app"}],"task_workspace":".worktrees/task__workbench-kit__25","local_branch":"task/25-example"},"effect_owner_events":[],"at":"2026-07-11T03:30:00Z"}
+{"contract_version":"workbench-task-cleanup-journal/v1","journal_id":"cleanup-task__workbench-kit__25","stage":"prepared","task_id":"workbench-kit#25","claim_id":"task__workbench-kit__25-20260711T030000Z-1234","branch":"task/25-example","revision":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","action_instance_id":"act_01J00000000000000000000000","intent_digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777","policy_manifest":{"contract_version":"workbench-policy-manifest/v1","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","sources":[{"layer":"workspace","context_ref":null,"policy_ref":".workbench/policy.conf","policy_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","authority_identity":"github:example/workbench","authority_ref":"refs/heads/main","authority_revision":"1111111111111111111111111111111111111111","authority_receipt_digest":"sha256:abababababababababababababababababababababababababababababababab","decision":"allow"}]},"authorization_ref":"conversation:message/msg-123","removal_plan_digest":"sha256:9999999999999999999999999999999999999999999999999999999999999999","removal_plan":{"writer_operations":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","disposition":"retire-consumed"}],"codebase_worktrees":[{"operation_id":"wop_01J00000000000000000000000","claim_id":"wc_01J00000000000000000000000","owner":"web-app","expected_path":"task/codebases/web-app"}],"task_workspace":".worktrees/task__workbench-kit__25","local_branch":"task/25-example"},"quarantine_authority":{"contract_version":"workbench-task-quarantine-authority/v1","device_id":"device:trusted/mac-1","clone_id":"123e4567-e89b-12d3-a456-426614174000","workspace_locator":".worktrees/task__workbench-kit__25","quarantine_locator":"workbench-v2/cleanup-quarantine/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","arm_commitment":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"quarantine_receipt":null,"effect_owner_events":[],"at":"2026-07-11T03:30:00Z"}
 -->
 ```
 
@@ -2340,41 +2397,101 @@ The exact top-level key order is shown. `removal_plan` has exact keys
 `writer_operations`, `codebase_worktrees`, `task_workspace`, and `local_branch`; operation
 objects have `operation_id`, `claim_id`, `disposition`, and worktree objects have
 `operation_id`, `claim_id`, `owner`, `expected_path`, in those orders. Arrays use the same
-canonical sorting as the manifest. `stage` is `prepared`, `effect-owner-acquired`,
-`effect-owner-released`, or `completed`. `effect_owner_events` is a prefix-ordered array of
-strict objects with exact fields `event_id`, `operation_id`, `claim_id`, `device_id`,
-`clone_id`, `state`, `phase`, and `at`; `state` is `acquired` or `released` and `phase` is
-`intended` or `verified`. Before every effect-owner CAS used by cleanup, the kernel appends an
-`intended` prefix, then appends the matching `verified` prefix after the ledger event is
-observed. Recovery requires every verified prefix to agree exactly with the remote ledger and
-never infers an owner transition from missing local state.
+canonical sorting as the manifest. `quarantine_authority` has exact fields
+`contract_version`, `device_id`, `clone_id`, `workspace_locator`, and
+`quarantine_locator`, and `arm_commitment`. The locator is an opaque SHA-256-derived path
+relative to the selected clone's Git common directory; no external record contains an absolute
+quarantine path. `arm_commitment` domain-separates and hashes the secret together with the
+complete immutable journal projection: task/claim/branch, revision, action, intent, policy,
+authorization, removal plan, and quarantine authority except the commitment itself. Stage,
+receipt, owner-event prefix, and observation time are the only excluded fields.
+
+`stage` is exactly `prepared`, `quarantined`, or `completed`. `prepared` requires a null
+`quarantine_receipt` and no owner events. The owning clone atomically no-replace renames the
+complete task workspace and each task/codebase linked-worktree admin directory into its armed
+quarantine. It follows no symlink component, preserves ignored and private files, rejects
+hard-linked or special files, checks stable inode/metadata before and after every read, fsyncs
+the transaction, and never rolls back over a path recreated by another process. The local
+receipt is projected externally with exact fields `contract_version`, `receipt_digest`,
+`arm_secret`, `task_id`, `claim_id`, `branch`, `device_id`, `clone_id`, `workspace_locator`,
+`quarantine_locator`, `workspace_device`, `workspace_inode`, `workspace_tree_digest`,
+`admin_manifest_digest`, and `quarantined_at`. That projection produces `stage:
+"quarantined"` and is immutable thereafter. The secret is disclosed only after local
+quarantine. The reducer recomputes both the prepared commitment and a domain-separated
+`receipt_digest` over that secret plus the complete public receipt body.
+
+Only `quarantined` may append `effect_owner_events`. It is a prefix-ordered array of strict
+objects with exact fields `event_id`, `operation_id`, `claim_id`, `device_id`, `clone_id`,
+`state`, `phase`, and `at`; `state` is `acquired` or `released` and `phase` is `intended` or
+`verified`. Before every effect-owner CAS used by cleanup, the kernel appends an `intended`
+prefix, then appends the matching `verified` prefix after the ledger event is observed.
+Recovery requires every verified prefix to agree exactly with the remote ledger and never
+infers an owner transition from missing local state. `completed` requires the same receipt,
+no pending event, and a final `released` state for every owner sequence that appears in the
+journal. Completion and every retry also re-read the remote ledger: `cancel-no-effect` must
+remain absent, every other claim must be released, no effect owner may remain acquired, and
+every journal event must join the exact remote row. A `release-handoff` operation already
+carries a source-led release, while a `remote-claimed` compensation may have no owner event;
+cleanup retires those remaining claims without inventing an effect transition.
 
 Comments with one `journal_id` form an append-only prefix chain: immutable top-level bindings
-and removal plan are byte-equal, every later event array strictly extends the prior array, and
-timestamps are nondecreasing. The unique longest valid prefix is current. A fork, rewrite,
-duplicate non-idempotent prefix, or remote disagreement is `cleanup-reconciliation-failed`.
+and removal plan are byte-equal, the receipt transitions exactly once from null to one exact
+value, every later event array extends the prior array, and timestamps are nondecreasing. The
+only stage transitions are `prepared -> quarantined -> completed`; the first observation must
+be `prepared`, and repeated identical observations are idempotent. The unique longest valid
+prefix is current. A missing genesis, forged proof, fork, receipt replacement, rewrite,
+duplicate non-idempotent prefix, or malformed authenticated observation is
+`cleanup-journal-untrusted`; a later remote-state disagreement is
+`cleanup-reconciliation-failed`.
 
-The kernel writes `stage: "prepared"` only after final policy resolution; that durable
-receipt is the applied-effect consumption source. The reducer never reauthorizes it and marks
-private status consumed when local state still exists. If the comment cannot be written, it returns
-`cleanup-journal-unavailable` and deletes nothing. The plan lists every writer operation and
-claim ID. For each pair, cleanup uses the remote row to recover expected path/branch/origin,
-removes only the exact planned nested worktree, prunes it, and verifies that no exact or
-possible orphan remains. The prepared journal then acts as the external retirement record for
-the otherwise frozen task-content repo row; a consumed operation therefore begins cleanup at
-the `worktree` cursor and never edits that frozen row. Cleanup appends the matching remote
-`released` row only after persisting `release-pending` with next `claim`, then refetches it and
-advances finish. All operation releases must be verified before
-the task workspace or local task branch is deleted.
+The trusted hosting actor/credential, trusted adapter, and provider's honest current comment
+state are explicit TCB inputs. Before action consumption and before every owner CAS, final
+writer-claim release, work-reference selection/reservation release, and local-branch deletion,
+the kernel performs a new authenticated observation. The reduced bytes must equal the intended
+journal exactly, and that intended byte digest must still occur in authenticated provenance.
+An absent/replaced intended digest is `cleanup-journal-untrusted`; an authenticated valid
+descendant that retains the intended digest is retryable `cleanup-journal-unreconciled`.
+`intended` owner markers are confirmed before CAS and `verified` markers are published and
+confirmed before any later release.
+
+This fence addresses concurrent, stale, or malfunctioning clones beneath the trusted actor.
+Malicious retrospective comment edits/deletes by that actor, credential compromise, a lying
+trusted adapter, and provider rollback after a successful current-state observation are outside
+the contract. Those capabilities can also destroy the repository refs and branches on which
+the broader protocol depends; clone ID and arm-secret possession are not a defense against a
+compromised hosting principal.
+
+The kernel writes `stage: "prepared"` only after final policy resolution and after fsyncing
+the local arm. Local proof, intent, and receipt records use private dirfd-bound component
+traversal, exact mode and one-link checks, a durable pending file, atomic no-replace rename,
+and directory fsync. A crash during or after the pending write either rebuilds an incomplete
+reserved record or promotes the exact canonical record; it never leaves a two-link target.
+Tree authentication encodes POSIX path bytes losslessly, including non-UTF8 names where the
+filesystem supports them. The prepared journal is the applied-effect consumption source. The reducer
+never reauthorizes it and marks private status consumed when local state still exists. If the
+comment cannot be written, it returns `cleanup-journal-unavailable` and leaves the active
+workspace untouched. Once prepared is external, only the clone holding the commitment's secret
+and matching local arm may mint its exact receipt and promote it. Another clone returns
+`cleanup-quarantine-unconfirmed` even if it copies public device/clone IDs and reconstructs the
+task branch; injecting a forged external receipt is `cleanup-journal-untrusted`.
+
+After external `quarantined` is durable and freshly confirmed, the active workspace path and all live linked-worktree
+admin records are absent while their exact bytes remain under the opaque quarantine locator.
+Only then may cleanup release remote writer owners/claims, work-reference selections and
+reservations, and the local task branch; each such effect has its own immediately preceding
+exact confirmation. A path recreated after local quarantine returns
+`cleanup-quarantine-conflict`; it is never removed or overwritten. Physical deletion of the
+quarantine is not part of `task done` and requires a separate retention/GC contract.
 
 Release changes coordination state, not frozen task content. Ambiguous/external worktrees or
-CAS failure keep the task workspace and remote claim active and return
+CAS failure keep the quarantined workspace and remote claim reserved and return
 `writer-recovery-blocked` or `writer-lock-unavailable`. Cleanup never closes the issue,
 changes labels, deletes the remote task branch, or deletes coordination history. Finally it
 appends the same journal shape with `stage: "completed"` and emits `task-cleaned`. If a crash
-occurs after task deletion but before completion observation, retry reconstructs solely from
-the external journal plus remote ledger, finishes any missing release verification, and then
-reconciles the lifecycle marker.
+occurs after external quarantine but before completion observation, any clone can use the
+authenticated external receipt plus remote ledger to finish missing release verification and
+reconcile the lifecycle marker. A crash before external quarantine can roll forward only from
+the owning clone's fsynced local transaction.
 
 Success or a computed blocker returns:
 
@@ -2414,15 +2531,16 @@ The exact cleanup field order is `contract_version`, `task_contract`, `task_id`,
 `released_writer_operations`, `removed`, and `blockers`.
 Blocked preflight sets `outcome: null`, `changed: false`, `action_instance_id: null`, and
 lists blockers at exit `1`. Policy `ask` and `deny` return the policy object at exit `3` and
-`4`. Retry first reads the issue journal: `prepared` resumes only exact worktree retirement,
-writer-operation release, verification, and removal steps and does not reauthorize the
-already consumed action; `completed` reconciles a missing `task-cleaned` lifecycle marker; a
+`4`. Retry first reads the issue journal: `prepared` resumes only from the owning clone's
+armed local quarantine transaction and does not reauthorize the already consumed action;
+`quarantined` permits remote writer/work-reference/branch release from any clone using the
+authenticated receipt; `completed` reconciles a missing `task-cleaned` lifecycle marker; a
 prior lifecycle marker is idempotent with `changed: false`. Failures use
 `cleanup-plan-mismatch`, `cleanup-journal-unavailable`, `cleanup-reconciliation-failed`,
+`cleanup-quarantine-unconfirmed`, `cleanup-quarantine-conflict`,
 `action-effect-unreconciled`, `writer-recovery-blocked`, `writer-lock-unavailable`, or
-`lifecycle-write-failed`. The external
-prepared receipt and remote operation row are the recovery and consumption sources after
-task-local state disappears.
+`lifecycle-write-failed`. The external quarantined receipt and remote operation row are the
+cross-clone recovery sources after the active task path disappears.
 
 Legacy `workbench-task/v1` tasks retain the existing `done ID [--parent N] [--force]`
 behavior and do not accept the v2 JSON contract by implication.

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Read-only workspace authority and writer-coordination readiness.
+set -euo pipefail
+export LC_ALL=C
+export PYTHONDONTWRITEBYTECODE=1
+
+COORDINATION_REF=refs/heads/workbench-coordination/writer-claims
+
+usage_error() { echo "error: $*" >&2; exit 2; }
+
+workspace_root() {
+  git rev-parse --show-toplevel 2>/dev/null || usage_error "workbench git repository not found"
+}
+
+require_python() {
+  command -v python3 >/dev/null 2>&1 \
+    && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1 \
+    || usage_error "Python 3.9 or newer is required for workbench doctor"
+}
+
+record_value() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
+
+cmd_show() {
+  local format="" root schema marker lib doctor_helper contract_helper writer_helper legacy_util
+  local tmpdir descriptor ledger inventory verification parsed remote_lines origin head_ref head_oid
+  local authority_identity="" authority_origin="" authority_ref="" descriptor_digest=""
+  local coordination_revision="" readable=false legacy_readable=false protected=false
+  local permission=unknown permission_source="" push_ready=false adapter hosting rc output
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ "$format" = json ] || usage_error "unsupported format: ${format:-none} (expected json)"
+  require_python
+  root="$(workspace_root)"; marker="$root/.workbench/schema"; schema=workbench/v1
+  if [ -e "$marker" ]; then
+    [ -f "$marker" ] || usage_error "workspace schema marker is unreadable"
+    contract_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/workbench_contract.py"
+    schema="$(python3 "$contract_helper" schema "$marker")" \
+      || usage_error "workspace schema marker is invalid"
+  fi
+  lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
+  doctor_helper="$lib/workbench_doctor.py"; contract_helper="$lib/workbench_contract.py"
+  writer_helper="$lib/workbench_writer.py"
+  legacy_util="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/legacy-inventory"
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/workbench-doctor.XXXXXX")"
+  descriptor="$tmpdir/authority.json"; ledger="$tmpdir/writer-claims.tsv"
+  inventory="$tmpdir/legacy-inventory.json"; verification="$tmpdir/hosting.json"
+
+  if [ "$schema" = workbench/v2 ]; then
+    origin="$(git -C "$root" remote get-url origin 2>/dev/null || true)"
+    if [ -n "$origin" ]; then
+      remote_lines="$(git -C "$root" ls-remote --symref "$origin" HEAD 2>/dev/null || true)"
+      head_ref="$(printf '%s\n' "$remote_lines" | awk '$1 == "ref:" && $3 == "HEAD" { print $2 }')"
+      head_oid="$(printf '%s\n' "$remote_lines" | awk '$2 == "HEAD" && $1 ~ /^[0-9a-f]+$/ { print $1 }')"
+      if [ -n "$head_ref" ] && printf '%s' "$head_oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+        && git -C "$root" fetch --no-write-fetch-head --quiet --no-tags "$origin" "$head_oid" \
+          >/dev/null 2>&1 \
+        && git -C "$root" show "$head_oid:.workbench/authority.json" > "$descriptor" 2>/dev/null \
+        && parsed="$(python3 "$contract_helper" authority-descriptor "$descriptor" 2>/dev/null)"; then
+        authority_identity="$(record_value "$parsed" authority_identity)"
+        authority_origin="$(record_value "$parsed" origin_url)"
+        authority_ref="$(record_value "$parsed" default_ref)"
+        descriptor_digest="$(record_value "$parsed" descriptor_digest)"
+        if [ "$authority_origin" != "$origin" ] || [ "$authority_ref" != "$head_ref" ]; then
+          authority_identity=""; authority_origin=""; authority_ref=""; descriptor_digest=""; head_oid=""
+        fi
+      else
+        head_oid=""
+      fi
+    else
+      head_ref=""; head_oid=""
+    fi
+  else
+    origin=""; head_ref=""; head_oid=""
+  fi
+
+  if [ -n "$descriptor_digest" ]; then
+    local coordination_rows coordination_count coordination_oid tree
+    coordination_rows="$(git -C "$root" ls-remote --refs "$authority_origin" "$COORDINATION_REF" 2>/dev/null || true)"
+    coordination_count="$(printf '%s\n' "$coordination_rows" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "$coordination_count" -eq 0 ]; then
+      printf '%s\n' workbench-writer-claims/v1 > "$ledger"
+      if python3 "$writer_helper" ledger-validate "$ledger" >/dev/null 2>&1; then readable=true; fi
+    elif [ "$coordination_count" -eq 1 ]; then
+      coordination_oid="${coordination_rows%%[[:space:]]*}"
+      if printf '%s' "$coordination_oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+        && git -C "$root" fetch --no-write-fetch-head --quiet --no-tags "$authority_origin" \
+          "$coordination_oid" >/dev/null 2>&1 \
+        && [ "$(git -C "$root" cat-file -t "$coordination_oid" 2>/dev/null || true)" = commit ]; then
+        tree="$(git -C "$root" ls-tree "$coordination_oid" 2>/dev/null || true)"
+        if [ "$(printf '%s\n' "$tree" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ] \
+          && printf '%s\n' "$tree" | grep -Eq '^100644 blob [0-9a-f]+[[:space:]]+writer-claims\.tsv$' \
+          && git -C "$root" show "$coordination_oid:writer-claims.tsv" > "$ledger" 2>/dev/null \
+          && python3 "$writer_helper" ledger-validate "$ledger" >/dev/null 2>&1; then
+          readable=true; coordination_revision="$coordination_oid"
+        fi
+      fi
+    fi
+
+    if "$legacy_util" show --format json > "$inventory" 2>/dev/null; then
+      legacy_readable=true
+    fi
+
+    adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+    if [ -n "$adapter" ] && [ -x "$adapter" ] \
+      && "$adapter" doctor --authority-file "$descriptor" --default-revision "$head_oid" \
+        --coordination-ref "$COORDINATION_REF" --format json > "$verification" 2>/dev/null \
+      && hosting="$(python3 "$doctor_helper" hosting --verification-file "$verification" \
+        --authority-file "$descriptor" --default-revision "$head_oid" \
+        --coordination-ref "$COORDINATION_REF" 2>/dev/null)"; then
+      protected="$(record_value "$hosting" default_ref_protected)"
+      permission="$(record_value "$hosting" push_permission)"
+      permission_source="$(record_value "$hosting" permission_source)"
+      push_ready="$(record_value "$hosting" push_ready)"
+    fi
+  fi
+
+  if output="$(python3 "$doctor_helper" output \
+    --authority-identity "$authority_identity" --origin-url "$authority_origin" \
+    --default-ref "$authority_ref" --default-ref-revision "$head_oid" \
+    --descriptor-digest "$descriptor_digest" --coordination-revision "$coordination_revision" \
+    --default-ref-protected "$protected" --readable "$readable" \
+    --legacy-inventory-readable "$legacy_readable" --push-permission "$permission" \
+    --permission-source "$permission_source" --push-ready "$push_ready")"; then rc=0
+  else rc=$?; fi
+  rm -rf "$tmpdir"
+  printf '%s\n' "$output"
+  return "$rc"
+}
+
+case "${1:-}" in
+  --format) cmd_show "$@" ;;
+  *) usage_error "usage: workbench doctor --format json" ;;
+esac

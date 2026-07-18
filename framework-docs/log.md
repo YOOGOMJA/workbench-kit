@@ -100,3 +100,9 @@ docs/ 변경의 append-only 이력. 항목 형식:
 ## [2026-07-11 10:42:46] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Bound authorizations to exact action intent, added effect-owner handoff and cursor recovery, separated abandonment revision, preserved submitted-v1 writers through PR ancestry, and froze cleanup removal plans
 
 ## [2026-07-11 13:08:05] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Added applied-effect-first recovery, receipt-first governed pack acceptance, ungoverned kernel acceptance, zero-history writer rebind, and mandatory pre-CAS release state
+
+## [2026-07-13 06:01:59] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Replaced destructive worktree removal with an armed non-deleting quarantine, strict inode/tree receipts, and a durable external release barrier
+
+## [2026-07-13 08:31:34] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md, decisions/0024-workbench-v2-governance.md | Bound quarantine promotion to a private arm-secret commitment and required prepared journal genesis
+
+## [2026-07-18 14:48:00] edit · update workbench-v2-cli-contract.md, workbench-v2-governance.md | Defined the trusted hosting TCB, per-effect exact journal confirmation, crash-safe local records, and byte-exact path authentication

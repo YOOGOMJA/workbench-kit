@@ -4,6 +4,8 @@ set -euo pipefail
 # ROOT = the workbench engine plugin (holds utils/). SCAFFOLD_TEMPLATES = the kit's
 # scaffold/templates (profile defaults live there, not under the plugin).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LIFECYCLE_HELPER="$ROOT/lib/workbench_lifecycle.py"
+TIME_HELPER="$ROOT/lib/workbench_time.py"
 SCAFFOLD_TEMPLATES="$(cd "$ROOT/../workbench-kit/scaffold/templates" && pwd)"
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/workbench-task-lifecycle.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -108,6 +110,33 @@ EOF
   chmod +x "$bin_dir/gh"
 }
 
+write_fake_hosting_adapter() {
+  local file="$1"
+  cat > "$file" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = lifecycle ] && [ "${2:-}" = --repository ] \
+  && [ "${4:-}" = --issue ] && [ "${6:-}" = --format ] && [ "${7:-}" = json ]
+origin="$(git -C "$3" remote get-url origin)"
+python3 - "$origin" "$5" "$GH_COMMENTS_DIR/$5.comments" <<'PY'
+import json
+import os
+import sys
+
+body = open(sys.argv[3], encoding="utf-8").read() if os.path.isfile(sys.argv[3]) else ""
+value = {
+    "contract_version": "workbench-hosting-lifecycle-observation/v1",
+    "repository_origin_url": sys.argv[1],
+    "issue": int(sys.argv[2]),
+    "pagination": {"complete": True, "pages_fetched": 1, "end_cursor": None, "failure": None},
+    "comments": [] if not body else [{"author_identity": "test@example.invalid", "body": body}],
+}
+print(json.dumps(value, separators=(",", ":")))
+PY
+EOF
+  chmod +x "$file"
+}
+
 setup_workbench() {
   local name="$1"
   local repo="$TMPDIR/$name/repo"
@@ -119,19 +148,23 @@ setup_workbench() {
   mkdir -p "$repo" "$fake_bin" "$comments" "$home"
   git init -q --bare "$origin"
   git init -q -b main "$repo"
-  mkdir -p "$repo/utils" "$repo/templates"
+  mkdir -p "$repo/utils" "$repo/lib" "$repo/templates"
   cp "$ROOT/utils/task" "$repo/utils/task"
+  cp "$LIFECYCLE_HELPER" "$repo/lib/workbench_lifecycle.py"
+  cp "$TIME_HELPER" "$repo/lib/workbench_time.py"
   chmod +x "$repo/utils/task"
   cp "$SCAFFOLD_TEMPLATES/task-AGENTS.md" "$repo/templates/task-AGENTS.md"
   git -C "$repo" config user.name "Test User"
   git -C "$repo" config user.email "test@example.invalid"
-  git -C "$repo" add utils/task templates/task-AGENTS.md
+  git -C "$repo" add utils/task lib/workbench_lifecycle.py lib/workbench_time.py templates/task-AGENTS.md
   git -C "$repo" commit -q -m "init"
   git -C "$repo" remote add origin "$origin"
   git -C "$repo" push -q -u origin main
+  git -C "$origin" symbolic-ref HEAD refs/heads/main
 
   : > "$TMPDIR/$name/gh.log"
   write_fake_gh "$fake_bin"
+  write_fake_hosting_adapter "$fake_bin/hosting-adapter"
 
   printf '%s\n' "$repo"
 }
@@ -148,6 +181,7 @@ run_task_in_dir() {
   GH_ISSUE_COMMENT_FAIL_EVENT="${GH_ISSUE_COMMENT_FAIL_EVENT:-}" \
   GH_PR_CREATE_FAIL="${GH_PR_CREATE_FAIL:-}" \
   GH_MERGED_HEAD="${GH_MERGED_HEAD:-}" \
+  WORKBENCH_TRUSTED_HOSTING_ADAPTER="$TMPDIR/$case_name/bin/hosting-adapter" \
   HOME="$TMPDIR/$case_name/home" \
   PATH="$TMPDIR/$case_name/bin:$PATH" \
     bash -c 'dir="$1"; shift; cd "$dir"; "$dir/utils/task" "$@"' bash "$dir" "$@"
@@ -416,9 +450,9 @@ test_lifecycle_latest_for_branch_uses_exact_branch_match() {
   comments="$TMPDIR/tickets_exact_branch/comments/29.comments"
   mkdir -p "$(dirname "$comments")"
   cat > "$comments" <<'EOF'
-<!-- workbench-task-lifecycle:v1 event=task-active claim_id=right issue=29 home=- branch=task/29-task-start-claim-lifecycle pr=- actor=test tool=utils/task at=2026-06-13T00:00:00Z -->
+<!-- workbench-task-lifecycle:v1 event=task-active claim_id=right issue=29 home=- branch=task/29-task-start-claim-lifecycle pr=- actor=test@example.invalid tool=utils/task at=2026-06-13T00:00:00Z -->
 workbench task lifecycle: task-active `task/29-task-start-claim-lifecycle`
-<!-- workbench-task-lifecycle:v1 event=task-active claim_id=wrong issue=29 home=- branch=task/29-task-start-claim-lifecycle-extra pr=- actor=test tool=utils/task at=2026-06-13T00:00:01Z -->
+<!-- workbench-task-lifecycle:v1 event=task-active claim_id=wrong issue=29 home=- branch=task/29-task-start-claim-lifecycle-extra pr=- actor=test@example.invalid tool=utils/task at=2026-06-13T00:00:01Z -->
 workbench task lifecycle: task-active `task/29-task-start-claim-lifecycle-extra`
 EOF
   git -C "$repo" checkout -q -b task/29-task-start-claim-lifecycle

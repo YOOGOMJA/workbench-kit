@@ -1,0 +1,820 @@
+#!/usr/bin/env bash
+# Deterministic canonical policy resolution. This utility never prompts.
+set -euo pipefail
+export LC_ALL=C
+export PYTHONDONTWRITEBYTECODE=1
+
+usage_error() { echo "error: $*" >&2; exit 2; }
+integrity_error() { echo "error: $*" >&2; exit 1; }
+
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}; value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}; value=${value//$'\r'/\\r}; value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
+json_nullable_policy() {
+  if [ -n "$1" ]; then printf '"%s"' "$(json_escape "$1")"; else printf 'null'; fi
+}
+
+workspace_root() {
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" \
+    || usage_error "workbench git repository not found"
+  common="$(cd "$common" && pwd)"
+  dirname "$common"
+}
+
+task_root() {
+  local top
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || usage_error "task workspace not found"
+  [ -f "$top/task/index.md" ] || usage_error "task/index.md not found"
+  printf '%s\n' "$top"
+}
+
+index_get() {
+  sed -n "s/^$1: *//p" "$TOP/task/index.md" | head -1
+}
+
+require_token() {
+  local label="$1" value="$2"
+  [ -n "$value" ] || usage_error "$label is required"
+  case "$value" in *$'\n'*|*$'\r'*|*$'\t'*) usage_error "$label must be a single line without tabs" ;; esac
+}
+
+record_get() { sed -n "s/^$2=//p" "$1" | head -1; }
+
+sha256_file() {
+  local file="$1" digest
+  if command -v sha256sum >/dev/null 2>&1; then digest="$(sha256sum "$file" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then digest="$(shasum -a 256 "$file" | awk '{print $1}')"
+  else integrity_error "SHA-256 utility not available"; fi
+  printf 'sha256:%s\n' "$digest"
+}
+
+action_supported() {
+  case "$1" in
+    task.complete|task.abandon|task.deliverable.accept|task.deliverable.waive|\
+    task.deliverable.reject|task.deliverable.weaken|task.required-check.waive|\
+    task.harvest.dispose|task.policy-context.register|task.policy-context.seal|\
+    task.concurrent-write|task.cleanup) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+policy_file_decision() {
+  local file="$1" action_id="$2" line key value lineno=0 schema="" seen_schema=""
+  local wanted="" seen_actions="|" policy_action
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *=*) key="${line%%=*}"; value="${line#*=}" ;; *) usage_error "malformed policy line $file:$lineno" ;; esac
+    case "$key" in
+      schema)
+        [ -z "$seen_schema" ] || usage_error "duplicate policy key: schema"
+        seen_schema=1; schema="$value"
+        ;;
+      action.*)
+        policy_action="${key#action.}"
+        action_supported "$policy_action" || usage_error "unsupported-action: $policy_action"
+        case "$seen_actions" in *"|$policy_action|"*) usage_error "duplicate policy action: $policy_action" ;; esac
+        seen_actions="$seen_actions$policy_action|"
+        case "$value" in allow|ask|deny) ;; *) usage_error "invalid policy decision: $value" ;; esac
+        [ "$policy_action" != "$action_id" ] || wanted="$value"
+        ;;
+      *) usage_error "unknown policy key: $key" ;;
+    esac
+  done < "$file"
+  [ "$schema" = workbench-policy/v1 ] || usage_error "policy schema must be workbench-policy/v1"
+  printf '%s\n' "${wanted:-ask}"
+}
+
+decision_add() {
+  case "$1" in
+    deny) POLICY_DECISION=deny ;;
+    ask) [ "$POLICY_DECISION" = deny ] || POLICY_DECISION=ask ;;
+  esac
+}
+
+contract_helper() {
+  printf '%s/../lib/workbench_contract.py\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+}
+
+intent_helper() {
+  printf '%s/../lib/workbench_intent.py\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+}
+
+observe_workspace_authority() {
+  local expected_digest="$1" bootstrap_origin remote_lines head_ref head_oid descriptor parsed
+  local descriptor_file verification_file adapter line key value
+  bootstrap_origin="$(git -C "$ROOT" remote get-url origin 2>/dev/null)" \
+    || integrity_error "policy-authority-unavailable"
+  remote_lines="$(git -C "$ROOT" ls-remote --symref "$bootstrap_origin" HEAD 2>/dev/null)" \
+    || integrity_error "policy-authority-unavailable"
+  head_ref="$(printf '%s\n' "$remote_lines" | awk '$1 == "ref:" && $3 == "HEAD" { print $2 }')"
+  head_oid="$(printf '%s\n' "$remote_lines" | awk '$2 == "HEAD" && $1 ~ /^[0-9a-f]+$/ { print $1 }')"
+  [ -n "$head_ref" ] && printf '%s' "$head_oid" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+    || integrity_error "policy-authority-unavailable"
+  git -C "$ROOT" fetch --quiet --no-tags --no-write-fetch-head \
+    "$bootstrap_origin" "$head_oid" >/dev/null 2>&1 \
+    || integrity_error "policy-authority-unavailable"
+  descriptor_file="$(mktemp "${TMPDIR:-/tmp}/workbench-authority.XXXXXX")"
+  verification_file="$(mktemp "${TMPDIR:-/tmp}/workbench-hosting-authority.XXXXXX")"
+  AUTHORITY_WORKSPACE_POLICY_FILE="$(mktemp "${TMPDIR:-/tmp}/workbench-policy.XXXXXX")"
+  git -C "$ROOT" show "$head_oid:.workbench/authority.json" > "$descriptor_file" 2>/dev/null \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
+  git -C "$ROOT" show "$head_oid:.workbench/policy.conf" > "$AUTHORITY_WORKSPACE_POLICY_FILE" 2>/dev/null \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-source-missing"; }
+  parsed="$(python3 "$(contract_helper)" authority-descriptor "$descriptor_file" 2>/dev/null)" \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
+  AUTHORITY_DESCRIPTOR_DIGEST=""; AUTHORITY_IDENTITY=""; AUTHORITY_ORIGIN_URL=""
+  AUTHORITY_DEFAULT_REF=""; AUTHORITY_WORKSPACE_HOME=""; AUTHORITY_REVISION="$head_oid"
+  while IFS= read -r line; do
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      descriptor_digest) AUTHORITY_DESCRIPTOR_DIGEST="$value" ;;
+      authority_identity) AUTHORITY_IDENTITY="$value" ;;
+      origin_url) AUTHORITY_ORIGIN_URL="$value" ;;
+      default_ref) AUTHORITY_DEFAULT_REF="$value" ;;
+      workspace_home) AUTHORITY_WORKSPACE_HOME="$value" ;;
+    esac
+  done <<< "$parsed"
+  descriptor="${AUTHORITY_DESCRIPTOR_DIGEST:-}"
+  [ -n "$descriptor" ] && [ "$AUTHORITY_ORIGIN_URL" = "$bootstrap_origin" ] \
+    && [ "$AUTHORITY_DEFAULT_REF" = "$head_ref" ] \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-mismatch"; }
+  [ "$descriptor" = "$expected_digest" ] \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-mismatch"; }
+  adapter="${WORKBENCH_TRUSTED_HOSTING_ADAPTER:-}"
+  [ -n "$adapter" ] && [ -x "$adapter" ] \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
+  "$adapter" authority --authority-file "$descriptor_file" \
+    --default-revision "$head_oid" --format json > "$verification_file" 2>/dev/null \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-unavailable"; }
+  python3 "$(contract_helper)" hosting-authority --authority-file "$descriptor_file" \
+    --verification-file "$verification_file" --default-revision "$head_oid" >/dev/null 2>&1 \
+    || { rm -f "$descriptor_file" "$verification_file" "$AUTHORITY_WORKSPACE_POLICY_FILE"; integrity_error "policy-authority-mismatch"; }
+  rm -f "$descriptor_file" "$verification_file"
+}
+
+source_add() {
+  local layer="$1" context_ref="$2" policy_ref="$3" file="$4"
+  local authority_identity="$5" authority_ref="$6" authority_revision="$7" receipt_digest="$8"
+  local decision digest i
+  [ -f "$file" ] || integrity_error "required policy source is unreadable: ${policy_ref:-$file}"
+  decision="$(policy_file_decision "$file" "$ACTION_ID")" \
+    || integrity_error "policy-source-invalid"
+  digest="$(sha256_file "$file")"
+  if [ "$layer" = context ]; then
+    for ((i=0; i<SOURCE_COUNT; i++)); do
+      [ "${SOURCE_LAYERS[$i]}" = context ] \
+        && [ "${SOURCE_CONTEXT_REFS[$i]}" = "$context_ref" ] || continue
+      [ "${SOURCE_POLICY_REFS[$i]}" = "$policy_ref" ] \
+        && [ "${SOURCE_POLICY_DIGESTS[$i]}" = "$digest" ] \
+        && [ "${SOURCE_AUTHORITY_IDENTITIES[$i]}" = "$authority_identity" ] \
+        && [ "${SOURCE_AUTHORITY_REFS[$i]}" = "$authority_ref" ] \
+        && [ "${SOURCE_AUTHORITY_REVISIONS[$i]}" = "$authority_revision" ] \
+        && [ "${SOURCE_RECEIPT_DIGESTS[$i]}" = "$receipt_digest" ] \
+        && [ "${SOURCE_DECISIONS[$i]}" = "$decision" ] \
+        || integrity_error "policy-context-union-conflict"
+      return 0
+    done
+  fi
+  SOURCE_LAYERS[$SOURCE_COUNT]="$layer"
+  SOURCE_CONTEXT_REFS[$SOURCE_COUNT]="$context_ref"
+  SOURCE_POLICY_REFS[$SOURCE_COUNT]="$policy_ref"
+  SOURCE_POLICY_DIGESTS[$SOURCE_COUNT]="$digest"
+  SOURCE_AUTHORITY_IDENTITIES[$SOURCE_COUNT]="$authority_identity"
+  SOURCE_AUTHORITY_REFS[$SOURCE_COUNT]="$authority_ref"
+  SOURCE_AUTHORITY_REVISIONS[$SOURCE_COUNT]="$authority_revision"
+  SOURCE_RECEIPT_DIGESTS[$SOURCE_COUNT]="$receipt_digest"
+  SOURCE_DECISIONS[$SOURCE_COUNT]="$decision"
+  SOURCE_COUNT=$((SOURCE_COUNT + 1))
+  decision_add "$decision"
+}
+
+create_auto_null_context() {
+  local state_dir="$TOP/task/.workbench/policy-context" output line key value at
+  local set_digest="" registration_ref="" registration_digest="" registration_json=""
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  output="$(python3 "$(contract_helper)" context-set --auto-null \
+    --task-claim-id "$CLAIM_ID" --at "$at" --sealed true --changed true --format shell)" \
+    || integrity_error "policy-context-invalid"
+  while IFS= read -r line; do
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      digest) set_digest="$value" ;;
+      registration_ref) registration_ref="$value" ;;
+      registration_digest) registration_digest="$value" ;;
+      registration_json) registration_json="$value" ;;
+    esac
+  done <<< "$output"
+  [ -n "$set_digest" ] && [ -n "$registration_json" ] \
+    || integrity_error "policy-context-invalid"
+  mkdir -p "$state_dir"
+  printf '%s\n' "$registration_json" > "$state_dir/registration.json"
+  {
+    printf 'registration_ref=%s\n' "$registration_ref"
+    printf 'registration_digest=%s\n' "$registration_digest"
+    printf 'task_context_ref=\n'
+    printf 'sealed=true\n'
+    printf 'digest=%s\n' "$set_digest"
+    printf 'action_instance_id=\n'
+    printf 'registered_at=%s\n' "$at"
+    printf 'sealed_at=%s\n' "$at"
+  } > "$state_dir/state.record"
+}
+
+load_context_policy_sources() {
+  local mode state_dir state registration_file context_ref rows
+  mode="$1"; state_dir="$TOP/task/.workbench/policy-context"; state="$state_dir/state.record"
+  if [ "$ACTION_ID" = task.policy-context.register ]; then return 0; fi
+  if [ ! -f "$state" ]; then
+    context_ref="$(index_get context_ref)"
+    if [ "${POLICY_REVALIDATING:-false}" = true ]; then
+      integrity_error "policy-context-unavailable"
+    elif [ -z "$context_ref" ]; then
+      create_auto_null_context
+    else
+      integrity_error "policy-context-unsealed"
+    fi
+  fi
+  state="$state_dir/state.record"; registration_file="$state_dir/registration.json"
+  [ -f "$registration_file" ] || integrity_error "policy-source-tampered"
+  [ "$(record_get "$state" task_context_ref)" = "$(index_get context_ref)" ] \
+    || integrity_error "policy-source-tampered"
+  if [ "$mode" = sealed ] && [ "$(record_get "$state" sealed)" != true ]; then
+    integrity_error "policy-context-unsealed"
+  fi
+  rows="$(python3 "$(contract_helper)" registration-sources "$registration_file" \
+    --workspace-root "$TOP" 2>/dev/null)" || integrity_error "policy-source-tampered"
+  while IFS=$'\t' read -r layer context_ref policy_ref expected_digest authority_identity \
+    authority_ref authority_revision receipt_digest; do
+    [ -n "$layer" ] || continue
+    [ "$context_ref" != null ] || context_ref=""
+    local file="$TOP/$policy_ref" actual_digest
+    actual_digest="$(sha256_file "$file")" || integrity_error "policy-source-tampered"
+    [ "$actual_digest" = "$expected_digest" ] || integrity_error "policy-source-tampered"
+    source_add "$layer" "$context_ref" "$policy_ref" "$file" "$authority_identity" \
+      "$authority_ref" "$authority_revision" "$receipt_digest"
+  done <<< "$rows"
+}
+
+load_concurrent_context_sources() {
+  local manifest="${WORKBENCH_CONCURRENT_CONTEXTS_FILE:-}" header kind claim expected_digest
+  local workspace registration extra state output rows layer context_ref policy_ref expected_policy_digest
+  local authority_identity authority_ref authority_revision receipt_digest file actual_digest
+  [ "$ACTION_ID" = task.concurrent-write ] || return 0
+  [ -n "$manifest" ] && [ -f "$manifest" ] || integrity_error "policy-context-unavailable"
+  IFS= read -r header < "$manifest"
+  [ "$header" = workbench-concurrent-context-union/v1 ] \
+    || integrity_error "policy-context-unavailable"
+  while IFS=$'\t' read -r kind claim expected_digest workspace registration extra; do
+    [ -n "$kind" ] || continue
+    [ "$kind" = context ] && [ -z "$extra" ] && [ -d "$workspace" ] \
+      && [ -f "$registration" ] || integrity_error "policy-context-unavailable"
+    state="$workspace/task/.workbench/policy-context/state.record"
+    [ -f "$state" ] || integrity_error "policy-context-unavailable"
+    python3 "$(contract_helper)" context-snapshot --registration-file "$registration" \
+      --state-file "$state" --workspace-root "$workspace" --task-claim-id "$claim" \
+      --context-digest "$expected_digest" >/dev/null 2>&1 \
+      || integrity_error "policy-context-unavailable"
+    rows="$(python3 "$(contract_helper)" registration-sources "$registration" \
+      --workspace-root "$workspace" 2>/dev/null)" || integrity_error "policy-context-unavailable"
+    while IFS=$'\t' read -r layer context_ref policy_ref expected_policy_digest authority_identity \
+      authority_ref authority_revision receipt_digest; do
+      [ -n "$layer" ] || continue
+      case "$layer" in context|task) ;; *) integrity_error "policy-context-unavailable" ;; esac
+      [ "$context_ref" != null ] || context_ref=""
+      file="$workspace/$policy_ref"
+      actual_digest="$(sha256_file "$file")" || integrity_error "policy-context-unavailable"
+      [ "$actual_digest" = "$expected_policy_digest" ] \
+        || integrity_error "policy-context-unavailable"
+      source_add "$layer" "$context_ref" "$policy_ref" "$file" "$authority_identity" \
+        "$authority_ref" "$authority_revision" "$receipt_digest"
+    done <<< "$rows"
+  done < <(tail -n +2 "$manifest")
+}
+
+sort_policy_sources() {
+  local order i rank sorted_index count=0
+  local sorted_layers=() sorted_contexts=() sorted_policy_refs=() sorted_policy_digests=()
+  local sorted_identities=() sorted_authority_refs=() sorted_revisions=()
+  local sorted_receipts=() sorted_decisions=()
+  order="$(mktemp "${TMPDIR:-/tmp}/workbench-policy-order.XXXXXX")" \
+    || integrity_error "policy-source-invalid"
+  for ((i=0; i<SOURCE_COUNT; i++)); do
+    case "${SOURCE_LAYERS[$i]}" in
+      platform) rank=0 ;; workspace) rank=1 ;; context) rank=2 ;; task) rank=3 ;;
+      *) rm -f "$order"; integrity_error "policy-source-invalid" ;;
+    esac
+    printf '%s\t%s\t%s\t%s\t%s\n' "$rank" "${SOURCE_CONTEXT_REFS[$i]}" \
+      "${SOURCE_AUTHORITY_IDENTITIES[$i]}" "${SOURCE_POLICY_REFS[$i]}" "$i" >> "$order"
+  done
+  while IFS= read -r sorted_index; do
+    sorted_layers[$count]="${SOURCE_LAYERS[$sorted_index]}"
+    sorted_contexts[$count]="${SOURCE_CONTEXT_REFS[$sorted_index]}"
+    sorted_policy_refs[$count]="${SOURCE_POLICY_REFS[$sorted_index]}"
+    sorted_policy_digests[$count]="${SOURCE_POLICY_DIGESTS[$sorted_index]}"
+    sorted_identities[$count]="${SOURCE_AUTHORITY_IDENTITIES[$sorted_index]}"
+    sorted_authority_refs[$count]="${SOURCE_AUTHORITY_REFS[$sorted_index]}"
+    sorted_revisions[$count]="${SOURCE_AUTHORITY_REVISIONS[$sorted_index]}"
+    sorted_receipts[$count]="${SOURCE_RECEIPT_DIGESTS[$sorted_index]}"
+    sorted_decisions[$count]="${SOURCE_DECISIONS[$sorted_index]}"
+    count=$((count + 1))
+  done < <(LC_ALL=C sort -t $'\t' -k1,1n -k2,2 -k3,3 -k4,4 "$order" | cut -f5)
+  rm -f "$order"
+  SOURCE_LAYERS=("${sorted_layers[@]}")
+  SOURCE_CONTEXT_REFS=("${sorted_contexts[@]}")
+  SOURCE_POLICY_REFS=("${sorted_policy_refs[@]}")
+  SOURCE_POLICY_DIGESTS=("${sorted_policy_digests[@]}")
+  SOURCE_AUTHORITY_IDENTITIES=("${sorted_identities[@]}")
+  SOURCE_AUTHORITY_REFS=("${sorted_authority_refs[@]}")
+  SOURCE_AUTHORITY_REVISIONS=("${sorted_revisions[@]}")
+  SOURCE_RECEIPT_DIGESTS=("${sorted_receipts[@]}")
+  SOURCE_DECISIONS=("${sorted_decisions[@]}")
+}
+
+build_policy_manifest() {
+  local manifest i descriptor_digest platform_digest platform_ref
+  SOURCE_LAYERS=(); SOURCE_CONTEXT_REFS=(); SOURCE_POLICY_REFS=(); SOURCE_POLICY_DIGESTS=()
+  SOURCE_AUTHORITY_IDENTITIES=(); SOURCE_AUTHORITY_REFS=(); SOURCE_AUTHORITY_REVISIONS=()
+  SOURCE_RECEIPT_DIGESTS=(); SOURCE_DECISIONS=()
+  SOURCE_COUNT=0; POLICY_DECISION=allow
+
+  descriptor_digest="$(index_get workspace_authority_descriptor_digest)"
+  printf '%s' "$descriptor_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+    || integrity_error "policy-authority-mismatch"
+  observe_workspace_authority "$descriptor_digest"
+  if [ -n "${WORKBENCH_PLATFORM_POLICY:-}" ]; then
+    platform_ref="${WORKBENCH_PLATFORM_POLICY_REF:-platform:harness/default}"
+    platform_digest="$(sha256_file "$WORKBENCH_PLATFORM_POLICY")"
+    source_add platform "" "$platform_ref" "$WORKBENCH_PLATFORM_POLICY" \
+      "${WORKBENCH_PLATFORM_AUTHORITY_IDENTITY:-platform:harness}" \
+      "${WORKBENCH_PLATFORM_AUTHORITY_REF:-$platform_ref}" \
+      "${WORKBENCH_PLATFORM_AUTHORITY_REVISION:-$platform_digest}" \
+      "${WORKBENCH_PLATFORM_AUTHORITY_RECEIPT_DIGEST:-$platform_digest}"
+  fi
+  source_add workspace "" .workbench/policy.conf "$AUTHORITY_WORKSPACE_POLICY_FILE" \
+    "$AUTHORITY_IDENTITY" "$AUTHORITY_DEFAULT_REF" "$AUTHORITY_REVISION" "$AUTHORITY_DESCRIPTOR_DIGEST"
+  rm -f "$AUTHORITY_WORKSPACE_POLICY_FILE"
+
+  case "$ACTION_ID" in
+    task.policy-context.register) ;;
+    task.policy-context.seal) load_context_policy_sources registered ;;
+    *) load_context_policy_sources sealed ;;
+  esac
+  [ "$ACTION_ID" != task.concurrent-write ] || load_concurrent_context_sources
+  sort_policy_sources
+
+  manifest="$(mktemp "${TMPDIR:-/tmp}/workbench-policy-manifest.XXXXXX")"
+  printf 'workbench-policy-manifest/v1\n' > "$manifest"
+  for ((i=0; i<SOURCE_COUNT; i++)); do
+    printf 'source\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${SOURCE_LAYERS[$i]}" "${SOURCE_CONTEXT_REFS[$i]:-null}" \
+      "${SOURCE_POLICY_REFS[$i]}" "${SOURCE_POLICY_DIGESTS[$i]}" \
+      "${SOURCE_AUTHORITY_IDENTITIES[$i]}" "${SOURCE_AUTHORITY_REFS[$i]}" \
+      "${SOURCE_AUTHORITY_REVISIONS[$i]}" "${SOURCE_RECEIPT_DIGESTS[$i]}" \
+      "${SOURCE_DECISIONS[$i]}" >> "$manifest"
+  done
+  POLICY_MANIFEST_DIGEST="$(sha256_file "$manifest")"
+  rm -f "$manifest"
+}
+
+write_action_record() {
+  local file="$1" id="$2" action_id="$3" claim_id="$4" target_ref="$5" revision="$6"
+  local intent_digest="$7" manifest_digest="$8" status="$9"
+  local authorization_id="${10:-}" authorization_ref="${11:-}"
+  local authorization_actor="${12:-}" authorization_at="${13:-}"
+  local consumed_provenance_digest="${14:-}" tmp
+  tmp="$file.tmp.$$"
+  {
+    printf 'id=%s\n' "$id"; printf 'action_id=%s\n' "$action_id"
+    printf 'task_claim_id=%s\n' "$claim_id"; printf 'target_ref=%s\n' "$target_ref"
+    printf 'revision=%s\n' "$revision"; printf 'intent_digest=%s\n' "$intent_digest"
+    printf 'policy_manifest_digest=%s\n' "$manifest_digest"
+    printf 'status=%s\n' "$status"
+    printf 'consumed_provenance_digest=%s\n' "$consumed_provenance_digest"
+    printf 'authorization_id=%s\n' "$authorization_id"
+    printf 'authorization_ref=%s\n' "$authorization_ref"
+    printf 'authorization_actor=%s\n' "$authorization_actor"
+    printf 'authorization_at=%s\n' "$authorization_at"
+  } > "$tmp" && chmod 0600 "$tmp" && mv "$tmp" "$file"
+}
+
+rewrite_action_status() {
+  local file="$1" status="$2" consumed_provenance_digest="${3:-}"
+  [ -n "$consumed_provenance_digest" ] \
+    || consumed_provenance_digest="$(record_get "$file" consumed_provenance_digest)"
+  write_action_record "$file" "$(record_get "$file" id)" "$(record_get "$file" action_id)" \
+    "$(record_get "$file" task_claim_id)" "$(record_get "$file" target_ref)" \
+    "$(record_get "$file" revision)" "$(record_get "$file" intent_digest)" \
+    "$(record_get "$file" policy_manifest_digest)" "$status" \
+    "$(record_get "$file" authorization_id)" "$(record_get "$file" authorization_ref)" \
+    "$(record_get "$file" authorization_actor)" "$(record_get "$file" authorization_at)" \
+    "$consumed_provenance_digest"
+}
+
+mint_action_id() {
+  printf 'act_%s_%s_%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "${RANDOM:-0}"
+}
+
+read_authorization() {
+  local file="$1" parsed key value
+  [ -f "$file" ] || usage_error "authorization file not found: $file"
+  parsed="$(python3 "$(intent_helper)" authorization "$file")" \
+    || usage_error "invalid workbench-authorization/v1 input: $file"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      authorization_id) AUTHORIZATION_ID="$value" ;; action_instance_id) AUTH_ACTION_INSTANCE_ID="$value" ;;
+      action_id) AUTH_ACTION_ID="$value" ;; task_claim_id) AUTH_TASK_CLAIM_ID="$value" ;;
+      target_ref) AUTH_TARGET_REF="$value" ;; revision) AUTH_REVISION="$value" ;;
+      intent_digest) AUTH_INTENT_DIGEST="$value" ;;
+      policy_manifest_digest) AUTH_POLICY_MANIFEST_DIGEST="$value" ;; decision) AUTH_DECISION="$value" ;;
+      actor) AUTH_ACTOR="$value" ;; authorized_at) AUTHORIZED_AT="$value" ;; source_ref) AUTH_SOURCE_REF="$value" ;;
+    esac
+  done <<< "$parsed"
+}
+
+authorization_used_elsewhere() {
+  local actions_dir="$1" authorization_id="$2" current_file="$3" file
+  for file in "$actions_dir"/*.record; do
+    [ -f "$file" ] || continue; [ "$file" = "$current_file" ] && continue
+    [ "$(record_get "$file" authorization_id)" != "$authorization_id" ] || return 0
+  done
+  return 1
+}
+
+print_policy_manifest_json() {
+  local i
+  printf '{"contract_version":"workbench-policy-manifest/v1","digest":"%s","sources":[' "$POLICY_MANIFEST_DIGEST"
+  for ((i=0; i<SOURCE_COUNT; i++)); do
+    [ "$i" -eq 0 ] || printf ','
+    printf '{"layer":"%s","context_ref":' "${SOURCE_LAYERS[$i]}"
+    json_nullable_policy "${SOURCE_CONTEXT_REFS[$i]}"
+    printf ',"policy_ref":"%s"' "$(json_escape "${SOURCE_POLICY_REFS[$i]}")"
+    printf ',"policy_digest":"%s"' "${SOURCE_POLICY_DIGESTS[$i]}"
+    printf ',"authority_identity":"%s"' "$(json_escape "${SOURCE_AUTHORITY_IDENTITIES[$i]}")"
+    printf ',"authority_ref":"%s"' "$(json_escape "${SOURCE_AUTHORITY_REFS[$i]}")"
+    printf ',"authority_revision":"%s"' "$(json_escape "${SOURCE_AUTHORITY_REVISIONS[$i]}")"
+    printf ',"authority_receipt_digest":"%s"' "${SOURCE_RECEIPT_DIGESTS[$i]}"
+    printf ',"decision":"%s"}' "${SOURCE_DECISIONS[$i]}"
+  done
+  printf ']}'
+}
+
+print_policy_json() {
+  local file="$1" decision="$2" authorization_ref="$3"
+  printf '{"contract_version":"workbench-policy/v1","action_instance":{"id":"%s","action_id":"%s","task_claim_id":"%s","target_ref":"%s","revision":"%s","intent_digest":"%s","policy_manifest":' \
+    "$(json_escape "$(record_get "$file" id)")" "$(json_escape "$(record_get "$file" action_id)")" \
+    "$(json_escape "$(record_get "$file" task_claim_id)")" "$(json_escape "$(record_get "$file" target_ref)")" \
+    "$(json_escape "$(record_get "$file" revision)")" "$(record_get "$file" intent_digest)"
+  print_policy_manifest_json
+  printf ',"status":"%s"},"decision":"%s","authorization_ref":' "$(record_get "$file" status)" "$decision"
+  json_nullable_policy "$authorization_ref"; printf '}\n'
+}
+
+mint_bound_action() {
+  local actions_dir="$1" requires_auth="$2" id status decision
+  id="$(mint_action_id)"; CURRENT_ACTION_FILE="$actions_dir/$id.record"
+  decision="$POLICY_DECISION"
+  if [ "$decision" = deny ]; then status=denied
+  elif [ "$requires_auth" = 1 ] || [ "$decision" = ask ]; then decision=ask; status=pending
+  else status=authorized
+  fi
+  write_action_record "$CURRENT_ACTION_FILE" "$id" "$ACTION_ID" "$CLAIM_ID" "$TARGET_REF" \
+    "$REVISION" "$INTENT_DIGEST" "$POLICY_MANIFEST_DIGEST" "$status"
+  if [ -n "${REQUEST_FILE:-}" ]; then
+    local request_target="$actions_dir/$id.request.json"
+    local request_tmp="$actions_dir/.$id.request.$$"
+    cp "$REQUEST_FILE" "$request_tmp" && chmod 0600 "$request_tmp" \
+      && mv "$request_tmp" "$request_target"
+  fi
+  CURRENT_DECISION="$decision"
+}
+
+cmd_resolve() {
+  local format="" instance_id="" authorization_file="" actions_dir file status
+  local authorization_id="" authorization_ref="" authorization_actor="" authorization_at=""
+  local requires_auth=0 stored_manifest stored_intent request_file="" asserted_intent=""
+  local parsed key value
+  ACTION_ID=""; CLAIM_ID=""; TARGET_REF=""; REVISION=""; INTENT_DIGEST=""; REQUEST_FILE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --request-file) [ $# -ge 2 ] || usage_error "--request-file requires a value"; request_file="$2"; shift 2 ;;
+      --intent-digest) [ $# -ge 2 ] || usage_error "--intent-digest requires a value"; asserted_intent="$2"; shift 2 ;;
+      --format) [ $# -ge 2 ] || usage_error "--format requires a value"; format="$2"; shift 2 ;;
+      --action-instance-id) [ $# -ge 2 ] || usage_error "--action-instance-id requires a value"; instance_id="$2"; shift 2 ;;
+      --authorization-file) [ $# -ge 2 ] || usage_error "--authorization-file requires a value"; authorization_file="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ -n "$request_file" ] || usage_error "--request-file is required"
+  [ -n "$asserted_intent" ] || usage_error "--intent-digest is required"
+  parsed="$(python3 "$(intent_helper)" request "$request_file" \
+    --intent-digest "$asserted_intent" --format shell)" \
+    || usage_error "invalid workbench-action-request/v1 input: $request_file"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      action_id) ACTION_ID="$value" ;;
+      task_claim_id) CLAIM_ID="$value" ;;
+      target_ref) TARGET_REF="$value" ;;
+      subject_revision) REVISION="$value" ;;
+      intent_digest) INTENT_DIGEST="$value" ;;
+    esac
+  done <<< "$parsed"
+  REQUEST_FILE="$request_file"
+  require_token action_id "$ACTION_ID"; require_token task_claim_id "$CLAIM_ID"
+  require_token target_ref "$TARGET_REF"; require_token revision "$REVISION"
+  action_supported "$ACTION_ID" || usage_error "unsupported-action: $ACTION_ID"
+  case "$format" in json|decision) ;; *) usage_error "unsupported format: ${format:-none}" ;; esac
+  [ -z "$authorization_file" ] || [ -n "$instance_id" ] \
+    || usage_error "authorization requires --action-instance-id"
+
+  ROOT="$(workspace_root)"; TOP="$(task_root)"
+  [ "$(index_get claim_id)" = "$CLAIM_ID" ] || integrity_error "task claim binding mismatch"
+  actions_dir="$TOP/task/.workbench/actions"; mkdir -p "$actions_dir"; chmod 0700 "$actions_dir"
+  build_policy_manifest
+  case "$ACTION_ID" in task.policy-context.register) requires_auth=1 ;; esac
+  [ "${WORKBENCH_REQUIRE_EXPLICIT_AUTHORIZATION:-}" != 1 ] || requires_auth=1
+
+  if [ -z "$instance_id" ]; then
+    mint_bound_action "$actions_dir" "$requires_auth"
+    file="$CURRENT_ACTION_FILE"; CURRENT_DECISION="$CURRENT_DECISION"
+  else
+    case "$instance_id" in *[!A-Za-z0-9._-]*|'') integrity_error "invalid action instance ID" ;; esac
+    file="$actions_dir/$instance_id.record"; [ -f "$file" ] || integrity_error "unknown action instance: $instance_id"
+    [ "$(record_get "$file" action_id)" = "$ACTION_ID" ] || integrity_error "action instance binding mismatch: action_id"
+    [ "$(record_get "$file" task_claim_id)" = "$CLAIM_ID" ] || integrity_error "action instance binding mismatch: task_claim_id"
+    [ "$(record_get "$file" target_ref)" = "$TARGET_REF" ] || integrity_error "action instance binding mismatch: target_ref"
+    if [ "$(record_get "$file" revision)" != "$REVISION" ]; then
+      [ "${WORKBENCH_ALLOW_ACTION_REPLACEMENT:-0}" = 1 ] \
+        || integrity_error "action instance binding mismatch: revision"
+      rewrite_action_status "$file" superseded
+      mint_bound_action "$actions_dir" "$requires_auth"
+      file="$CURRENT_ACTION_FILE"
+    else
+    stored_manifest="$(record_get "$file" policy_manifest_digest)"
+    stored_intent="$(record_get "$file" intent_digest)"
+    if [ -n "$INTENT_DIGEST" ]; then
+      [ -f "$actions_dir/$instance_id.request.json" ] \
+        || integrity_error "action-effect-unreconciled: missing stored request"
+      python3 "$(intent_helper)" request "$actions_dir/$instance_id.request.json" \
+        --intent-digest "$stored_intent" --format shell >/dev/null \
+        || integrity_error "action-effect-unreconciled: invalid stored request"
+    fi
+    if [ "$stored_manifest" != "$POLICY_MANIFEST_DIGEST" ] \
+      || [ "$stored_intent" != "$INTENT_DIGEST" ]; then
+      rewrite_action_status "$file" superseded
+      mint_bound_action "$actions_dir" "$requires_auth"
+      file="$CURRENT_ACTION_FILE"
+    else
+      status="$(record_get "$file" status)"
+      case "$status" in consumed|denied|superseded) integrity_error "action instance is not reusable: $status" ;; pending|authorized) ;; *) integrity_error "invalid action instance status" ;; esac
+      authorization_id="$(record_get "$file" authorization_id)"
+      authorization_ref="$(record_get "$file" authorization_ref)"
+      authorization_actor="$(record_get "$file" authorization_actor)"
+      authorization_at="$(record_get "$file" authorization_at)"
+      if [ -n "$authorization_file" ]; then
+        read_authorization "$authorization_file"
+        [ "$AUTH_ACTION_INSTANCE_ID" = "$instance_id" ] || integrity_error "authorization binding mismatch: action_instance_id"
+        [ "$AUTH_ACTION_ID" = "$ACTION_ID" ] || integrity_error "authorization binding mismatch: action_id"
+        [ "$AUTH_TASK_CLAIM_ID" = "$CLAIM_ID" ] || integrity_error "authorization binding mismatch: task_claim_id"
+        [ "$AUTH_TARGET_REF" = "$TARGET_REF" ] || integrity_error "authorization binding mismatch: target_ref"
+        [ "$AUTH_REVISION" = "$REVISION" ] || integrity_error "authorization binding mismatch: revision"
+        [ "$AUTH_INTENT_DIGEST" = "$INTENT_DIGEST" ] \
+          || integrity_error "authorization binding mismatch: intent_digest"
+        [ "$AUTH_POLICY_MANIFEST_DIGEST" = "$POLICY_MANIFEST_DIGEST" ] \
+          || integrity_error "authorization binding mismatch: policy_manifest_digest"
+        if [ -n "$authorization_id" ] && [ "$authorization_id" != "$AUTHORIZATION_ID" ]; then
+          integrity_error "action instance already has another authorization"
+        fi
+        authorization_used_elsewhere "$actions_dir" "$AUTHORIZATION_ID" "$file" \
+          && integrity_error "authorization_id already used"
+        authorization_id="$AUTHORIZATION_ID"; authorization_ref="$AUTH_SOURCE_REF"
+        authorization_actor="$AUTH_ACTOR"; authorization_at="$AUTHORIZED_AT"
+        if [ "$AUTH_DECISION" = deny ] || [ "$POLICY_DECISION" = deny ]; then
+          CURRENT_DECISION=deny; status=denied
+        else
+          CURRENT_DECISION=allow; status=authorized
+        fi
+        write_action_record "$file" "$instance_id" "$ACTION_ID" "$CLAIM_ID" "$TARGET_REF" \
+          "$REVISION" "$INTENT_DIGEST" "$POLICY_MANIFEST_DIGEST" "$status" "$authorization_id" \
+          "$authorization_ref" "$authorization_actor" "$authorization_at"
+      elif [ "$status" = authorized ] && [ "$POLICY_DECISION" != deny ]; then
+        CURRENT_DECISION=allow
+      elif [ "$POLICY_DECISION" = deny ]; then
+        CURRENT_DECISION=deny; rewrite_action_status "$file" denied
+      elif [ "$requires_auth" = 1 ] || [ "$POLICY_DECISION" = ask ]; then
+        CURRENT_DECISION=ask; rewrite_action_status "$file" pending
+      else
+        CURRENT_DECISION=allow; rewrite_action_status "$file" authorized
+      fi
+    fi
+    fi
+  fi
+
+  authorization_ref="$(record_get "$file" authorization_ref)"
+  if [ "$format" = json ]; then print_policy_json "$file" "$CURRENT_DECISION" "$authorization_ref"
+  else printf '%s\n' "$CURRENT_DECISION"; fi
+  case "$CURRENT_DECISION" in allow) return 0 ;; ask) return 3 ;; deny) return 4 ;; esac
+}
+
+cmd_revalidate() {
+  [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
+  local instance_id="" action_id="" claim_id="" target_ref="" revision="" intent_digest=""
+  local action_record_digest="" file request_file parsed key value status authorization
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --action-instance-id) instance_id="$2"; shift 2 ;;
+      --action-id) action_id="$2"; shift 2 ;;
+      --task-claim-id) claim_id="$2"; shift 2 ;;
+      --target-ref) target_ref="$2"; shift 2 ;;
+      --revision) revision="$2"; shift 2 ;;
+      --intent-digest) intent_digest="$2"; shift 2 ;;
+      --action-record-digest) action_record_digest="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  for value in "$instance_id" "$action_id" "$claim_id" "$target_ref" "$revision" \
+    "$intent_digest" "$action_record_digest"; do
+    require_token governed_revalidation "$value"
+  done
+  case "$instance_id" in *[!A-Za-z0-9._-]*|'') integrity_error "invalid action instance ID" ;; esac
+  printf '%s' "$action_record_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+    || integrity_error "invalid action record digest"
+  action_supported "$action_id" || usage_error "unsupported-action: $action_id"
+
+  TOP="$(task_root)"; ROOT="$(workspace_root)"; ACTION_ID="$action_id"
+  CLAIM_ID="$claim_id"; TARGET_REF="$target_ref"; REVISION="$revision"
+  INTENT_DIGEST="$intent_digest"; REQUEST_FILE=""
+  [ "$(index_get claim_id)" = "$CLAIM_ID" ] || integrity_error "task claim binding mismatch"
+  file="$TOP/task/.workbench/actions/$instance_id.record"
+  request_file="$TOP/task/.workbench/actions/$instance_id.request.json"
+  [ -f "$file" ] && [ -f "$request_file" ] \
+    || integrity_error "action-effect-unreconciled: missing action provenance"
+  [ "$(sha256_file "$file")" = "$action_record_digest" ] \
+    || integrity_error "action-binding-stale"
+  [ "$(record_get "$file" id)" = "$instance_id" ] \
+    && [ "$(record_get "$file" action_id)" = "$ACTION_ID" ] \
+    && [ "$(record_get "$file" task_claim_id)" = "$CLAIM_ID" ] \
+    && [ "$(record_get "$file" target_ref)" = "$TARGET_REF" ] \
+    && [ "$(record_get "$file" revision)" = "$REVISION" ] \
+    && [ "$(record_get "$file" intent_digest)" = "$INTENT_DIGEST" ] \
+    || integrity_error "action-binding-stale"
+  status="$(record_get "$file" status)"
+  [ "$status" = authorized ] || integrity_error "action instance is not authorized"
+
+  parsed="$(python3 "$(intent_helper)" request "$request_file" \
+    --intent-digest "$INTENT_DIGEST" --format shell)" \
+    || integrity_error "action-effect-unreconciled: invalid stored request"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      action_id) [ "$value" = "$ACTION_ID" ] || integrity_error "action-binding-stale" ;;
+      task_claim_id) [ "$value" = "$CLAIM_ID" ] || integrity_error "action-binding-stale" ;;
+      target_ref) [ "$value" = "$TARGET_REF" ] || integrity_error "action-binding-stale" ;;
+      subject_revision) [ "$value" = "$REVISION" ] || integrity_error "action-binding-stale" ;;
+      intent_digest) [ "$value" = "$INTENT_DIGEST" ] || integrity_error "action-binding-stale" ;;
+    esac
+  done <<< "$parsed"
+
+  authorization="$(record_get "$file" authorization_id)$(record_get "$file" authorization_ref)$(record_get "$file" authorization_actor)$(record_get "$file" authorization_at)"
+  if [ -n "$authorization" ]; then
+    [ -n "$(record_get "$file" authorization_id)" ] \
+      && [ -n "$(record_get "$file" authorization_ref)" ] \
+      && [ -n "$(record_get "$file" authorization_actor)" ] \
+      && [ -n "$(record_get "$file" authorization_at)" ] \
+      || integrity_error "action-effect-unreconciled: partial authorization"
+  fi
+  POLICY_REVALIDATING=true build_policy_manifest
+  [ "$(record_get "$file" policy_manifest_digest)" = "$POLICY_MANIFEST_DIGEST" ] \
+    || integrity_error "action-binding-stale"
+}
+
+cmd_revalidate_terminal_checkpoint() {
+  [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
+  local action_file="" request_file="" parsed key value authorization
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --action-file) action_file="$2"; shift 2 ;;
+      --request-file) request_file="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  [ -f "$action_file" ] && [ -f "$request_file" ] \
+    || integrity_error "terminal checkpoint provenance is unavailable"
+  TOP="$(task_root)"; ROOT="$(workspace_root)"
+  ACTION_ID="$(record_get "$action_file" action_id)"
+  CLAIM_ID="$(record_get "$action_file" task_claim_id)"
+  TARGET_REF="$(record_get "$action_file" target_ref)"
+  REVISION="$(record_get "$action_file" revision)"
+  INTENT_DIGEST="$(record_get "$action_file" intent_digest)"
+  REQUEST_FILE="$request_file"
+  case "$ACTION_ID" in task.complete|task.abandon) ;; *) integrity_error "terminal checkpoint action is unsupported" ;; esac
+  [ "$(index_get claim_id)" = "$CLAIM_ID" ] || integrity_error "task claim binding mismatch"
+  [ "$(record_get "$action_file" status)" = consumed ] \
+    || integrity_error "terminal checkpoint action is not consumed"
+  parsed="$(python3 "$(intent_helper)" request "$request_file" \
+    --intent-digest "$INTENT_DIGEST" --format shell)" \
+    || integrity_error "terminal checkpoint request is invalid"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      action_id) [ "$value" = "$ACTION_ID" ] || integrity_error "action-binding-stale" ;;
+      task_claim_id) [ "$value" = "$CLAIM_ID" ] || integrity_error "action-binding-stale" ;;
+      target_ref) [ "$value" = "$TARGET_REF" ] || integrity_error "action-binding-stale" ;;
+      subject_revision) [ "$value" = "$REVISION" ] || integrity_error "action-binding-stale" ;;
+      intent_digest) [ "$value" = "$INTENT_DIGEST" ] || integrity_error "action-binding-stale" ;;
+    esac
+  done <<< "$parsed"
+  authorization="$(record_get "$action_file" authorization_id)$(record_get "$action_file" authorization_ref)$(record_get "$action_file" authorization_actor)$(record_get "$action_file" authorization_at)"
+  if [ -n "$authorization" ]; then
+    [ -n "$(record_get "$action_file" authorization_id)" ] \
+      && [ -n "$(record_get "$action_file" authorization_ref)" ] \
+      && [ -n "$(record_get "$action_file" authorization_actor)" ] \
+      && [ -n "$(record_get "$action_file" authorization_at)" ] \
+      || integrity_error "terminal checkpoint authorization is partial"
+  fi
+  POLICY_REVALIDATING=true build_policy_manifest
+  [ "$(record_get "$action_file" policy_manifest_digest)" = "$POLICY_MANIFEST_DIGEST" ] \
+    || integrity_error "action-binding-stale"
+  [ "$POLICY_DECISION" != deny ] || integrity_error "terminal checkpoint policy is denied"
+  [ -n "$authorization" ] || [ "$POLICY_DECISION" = allow ] \
+    || integrity_error "terminal checkpoint authorization is required"
+}
+
+cmd_invalidate_context() {
+  [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
+  local claim_id="" target_ref="" file status
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --task-claim-id) claim_id="$2"; shift 2 ;;
+      --target-ref) target_ref="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  require_token task_claim_id "$claim_id"; require_token target_ref "$target_ref"
+  TOP="$(task_root)"
+  [ "$(index_get claim_id)" = "$claim_id" ] || integrity_error "task claim binding mismatch"
+  for file in "$TOP/task/.workbench/actions"/*.record; do
+    [ -f "$file" ] || continue
+    [ "$(record_get "$file" action_id)" = task.policy-context.register ] || continue
+    [ "$(record_get "$file" task_claim_id)" = "$claim_id" ] \
+      && [ "$(record_get "$file" target_ref)" = "$target_ref" ] \
+      || integrity_error "context registration action identity mismatch"
+    status="$(record_get "$file" status)"
+    case "$status" in
+      pending|authorized) rewrite_action_status "$file" superseded ;;
+      consumed|denied|superseded) ;;
+      *) integrity_error "invalid action instance status" ;;
+    esac
+  done
+}
+
+cmd_consume() {
+  [ "${WORKBENCH_INTERNAL:-}" = 1 ] || usage_error "internal command"
+  local instance_id="" action_id="" claim_id="" target_ref="" revision="" intent_digest=""
+  local primary_provenance_digest="" file status
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --action-instance-id) instance_id="$2"; shift 2 ;; --action-id) action_id="$2"; shift 2 ;;
+      --task-claim-id) claim_id="$2"; shift 2 ;; --target-ref) target_ref="$2"; shift 2 ;;
+      --revision) revision="$2"; shift 2 ;; --intent-digest) intent_digest="$2"; shift 2 ;;
+      --primary-provenance-digest) primary_provenance_digest="$2"; shift 2 ;;
+      *) usage_error "unknown option: $1" ;;
+    esac
+  done
+  TOP="$(task_root)"; ROOT="$(workspace_root)"; ACTION_ID="$action_id"
+  file="$TOP/task/.workbench/actions/$instance_id.record"; [ -f "$file" ] || integrity_error "unknown action instance"
+  [ "$(record_get "$file" action_id)" = "$action_id" ] \
+    && [ "$(record_get "$file" task_claim_id)" = "$claim_id" ] \
+    && [ "$(record_get "$file" target_ref)" = "$target_ref" ] \
+    && [ "$(record_get "$file" revision)" = "$revision" ] \
+    || integrity_error "action instance binding mismatch"
+  [ "$(record_get "$file" intent_digest)" = "$intent_digest" ] \
+    || integrity_error "action instance binding mismatch: intent_digest"
+  if [ -n "$intent_digest" ]; then
+    printf '%s' "$primary_provenance_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+      || integrity_error "primary provenance digest is required"
+    [ -f "$TOP/task/.workbench/actions/$instance_id.request.json" ] \
+      || integrity_error "action-effect-unreconciled: missing stored request"
+  else
+    build_policy_manifest
+    [ "$(record_get "$file" policy_manifest_digest)" = "$POLICY_MANIFEST_DIGEST" ] || {
+      rewrite_action_status "$file" superseded
+      integrity_error "action-binding-stale"
+    }
+  fi
+  status="$(record_get "$file" status)"; [ "$status" = authorized ] \
+    || integrity_error "action instance is not authorized"
+  rewrite_action_status "$file" consumed "$primary_provenance_digest"
+}
+
+case "${1:-}" in
+  resolve) shift; cmd_resolve "$@" ;;
+  revalidate) shift; cmd_revalidate "$@" ;;
+  revalidate-terminal-checkpoint) shift; cmd_revalidate_terminal_checkpoint "$@" ;;
+  invalidate-context) shift; cmd_invalidate_context "$@" ;;
+  consume) shift; cmd_consume "$@" ;;
+  *) usage_error "usage: workbench policy resolve ..." ;;
+esac

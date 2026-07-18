@@ -14,6 +14,7 @@
   policy authority, effect-owner CAS and explicit cross-device handoff, no-effect
   cancellation plus cursor-based compensation, requested-effect intent digests, a dedicated
   abandonment revision, submitted-v1 PR ancestry projection, exact cleanup removal plans,
+  authenticated non-deleting workspace quarantine with an external release barrier,
   applied-effect-first crash reconciliation, receipt-first pack acceptance, ungoverned
   deterministic kernel acceptance, and capability discovery kernel contracts. Keep product
   semantics in an optional pack.
@@ -37,8 +38,9 @@
   remote effects have one device/clone owner and explicit handoff, abandonment never pretends
   to have a completion revision, submitted legacy work survives branch deletion through its
   PR ancestry, durable effect provenance prevents an AI from repeating an already-applied
-  mutation after a crash, and verification is tied to exact evidence subjects and immutable
-  revisions.
+  mutation after a crash, cleanup never releases shared ownership before an authenticated
+  quarantine receipt preserves every local byte, and verification is tied to exact evidence
+  subjects and immutable revisions.
 - **Rejected alternatives:**
   1. Put product, portfolio, scenario, design, and TDD semantics in the kernel. This would
      burden every non-product workbench and collapse the generic engine/domain boundary.
@@ -79,7 +81,7 @@
       revision.
   16. Store cleanup recovery only in the task workspace. The recovery record would vanish
       during the operation it must recover; a prepared journal is persisted in the home
-      issue before deletion.
+      issue before local quarantine.
   17. Report concurrent codebase writers without enforcing the mutation point. A race could
       still create a second writer; `task add-repo --role work` now resolves policy before
       creating the worktree and serializes claims on one fixed remote ref through parent-OID
@@ -174,6 +176,40 @@
   47. Run deterministic kernel PR acceptance through `task.deliverable.accept` policy. The
       owner probe is not a judgment gate and would create false action provenance; kernel kinds
       branch before policy with null action fields, while pack owner assertions remain governed.
+  48. Use only per-value leases for `work_ref` changes. Two values selected concurrently by one
+      claim could delete each other's reservation; a claim-scoped append-only selection CAS and
+      one atomic multi-ref push now choose one transition before local metadata changes.
+  49. Require a terminal authorization actor to equal the task claimant. Approval is often
+      intentionally third-party; the authenticated winning claimant instead attests the exact
+      consumed action while its independently authenticated authorization provenance is kept.
+  50. Retire a start claim only when branch push fails. Worktree or scaffold failure occurs
+      earlier and could leave two live claims; an exit compensation guard covers the complete
+      post-claim, pre-publication interval.
+  51. Return a plain diagnostic when submitted private-state inspection is unsafe. Mutation
+      callers need a stable machine decision; every such path now returns the operation-bound
+      `submission-recovery-unavailable` blocker envelope before any effect.
+  52. Let a remote selection winner write local task metadata without a claim-scoped process
+      lock and final observation. A later remote winner could return first and then be locally
+      overwritten by the older process; the complete reconcile/transition/local publication
+      interval is now serialized per claim in each clone and checked again after the write.
+  53. Install start compensation only after `task-claimed` returns success. A host may persist
+      the comment while the client loses the response; the guard is now armed first and uses a
+      fresh trusted exact-claim reduction to decide whether conflict compensation is required.
+  54. Diagnose a requested reservation owner only when no selection exists. A claim with prior
+      selection history could misclassify a real cross-task duplicate as infrastructure failure;
+      every failed atomic push now re-observes the requested reservation before classification.
+  55. Stage mutable action files and call `git worktree remove`, even without `--force`.
+      Git still deletes ignored files, and a path-based staging/rollback race can absorb or
+      overwrite bytes created after the final precheck. Cleanup now fsyncs a local arm, moves
+      the complete workspace and linked admin records with atomic no-replace renames, hashes
+      the exact no-follow inode tree, publishes `quarantined` before any release, and leaves
+      physical deletion to a separate retention/GC contract.
+  56. Treat public device/clone bindings and caller-supplied tree digests as proof of local
+      quarantine. Another clone could copy those fields and forge `quarantined`. The owning
+      clone now fsyncs a random secret before `prepared`, publishes only its complete immutable-
+      journal-binding commitment, and reveals it in a proof-digested receipt after quarantine.
+      The reducer also requires `prepared` as the first marker and rejects receipt reuse across
+      revisions, actions, policies, or removal plans.
 - **Compatibility:** The kernel reads implicit `workbench/v1` workspaces and v1 lifecycle
   markers. New v2 workspaces carry `.workbench/schema` and a machine-readable profile;
   only tasks declaring `task_contract: workbench-task/v2` use v2 mutation rules. A missing
