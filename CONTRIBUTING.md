@@ -45,6 +45,7 @@ release gates.
 
 ## Releases
 
-See [RELEASING.md](RELEASING.md). In short: on a branch, promote `## [Unreleased]`
-to `## [X.Y.Z] - <date>`, run `scripts/release.sh X.Y.Z`, open and merge a PR, and
-let the release workflow cut the tag + GitHub Release.
+See [RELEASING.md](RELEASING.md). In short: promote `## [Unreleased]`, run
+`scripts/release.sh prepare X.Y.Z`, commit and permanently tag the evidence source,
+then run `scripts/release.sh finalize X.Y.Z`. Commit the receipt, merge the PR, and let
+the release workflow cut the `vX.Y.Z` tag + GitHub Release.

@@ -56,6 +56,8 @@ fi
 
 grep -Fq 'auto-tags' "$ROOT/scripts/bump-version.sh" \
   || fail "bump-version guidance must point to automatic tagging"
+grep -Fq 'finalize the receipt' "$ROOT/scripts/bump-version.sh" \
+  || fail "bump-version guidance must preserve the two-phase receipt boundary"
 if grep -Fq 'land on `main` → bump version → tag' "$ROOT/RELEASING.md"; then
   fail "RELEASING must not instruct a post-main manual version bump/tag"
 fi

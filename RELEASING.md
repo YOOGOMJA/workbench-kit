@@ -28,16 +28,28 @@ Releasing is **GitOps**: the release happens automatically when a version bump l
 
 1. **Promote `## [Unreleased]` on a branch:** rename it to
    `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]` above it.
-2. **Prepare:** run `scripts/release.sh X.Y.Z`. It validates the dated release notes before
-   changing files, bumps all 6 manifests, and then runs the complete repository suite.
-3. **Verify locally:** run `claude plugin validate --strict` on the marketplace and all
+2. **Prepare:** run `scripts/release.sh prepare X.Y.Z`. It validates the dated notes, bumps
+   all 6 manifests, and runs only receipt-independent manifest/release checks.
+3. **Commit the evidence source:** review and commit the prepared version plus every intended
+   engine/evidence change. Record its full commit ID; this intermediate commit stays on the
+   release branch and will be folded by the final squash merge.
+4. **Preserve the source revision:** create lightweight tag
+   `workbench-equivalence-vX.Y.Z` at that exact commit and push it to `origin`. This tag is
+   permanent evidence: never move, reuse, or delete it. The receipt checker requires the
+   version-matched tag to resolve to its recorded source commit, so task-branch deletion
+   cannot make the audit object disappear.
+5. **Finalize:** run `scripts/release.sh finalize X.Y.Z`. It fetches the remote evidence tag,
+   refuses checked-out engine/evidence drift, generates the source-bound equivalence receipt
+   from that tag, and runs the complete repository suite.
+6. **Verify locally:** run `claude plugin validate --strict` on the marketplace and all
    three plugins, then add/list the local marketplace in an isolated Codex home. CI runs
    the dependency-light shared suite, but these real CLI gates stay local. A release that
-   changes the `workbench` plugin or its embedded-engine coverage must regenerate the
-   equivalence receipt from a committed source revision and pass its offline manifest audit.
-4. **Commit + PR + merge to `main`** (`chore(release): vX.Y.Z`). Install resolves against
+   changes the `workbench` plugin or its embedded-engine coverage must use the tagged source
+   revision above and pass its offline manifest audit.
+7. **Commit + PR + merge to `main`** (`chore(release): vX.Y.Z`). Commit the generated
+   receipt. Install resolves against
    the default branch, so the work must be on `main` to be installable.
-5. **Automatic.** On that push to `main`, `.github/workflows/release.yml` sees the new
+8. **Automatic.** On that push to `main`, `.github/workflows/release.yml` sees the new
    version (matching `CHANGELOG [X.Y.Z]`, no `vX.Y.Z` tag yet) and **cuts the tag +
    GitHub Release** from the CHANGELOG section. Nothing else to do.
 

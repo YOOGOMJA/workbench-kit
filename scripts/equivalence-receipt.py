@@ -38,8 +38,10 @@ EVIDENCE = [
         "tests/fixtures/legacy/workbench-ffb426f1-engine.tar.gz.b64",
     ),
 ]
+BOUND_SOURCE_PATHS = [WORKBENCH_RELATIVE] + [item[2] for item in EVIDENCE]
 OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(KIT_ROOT / "lib"))
 from workbench_kit_contracts import (  # noqa: E402
     canonical_bytes,
@@ -90,6 +92,41 @@ def git_blob(revision: str, relative: str) -> bytes:
     if kind != "blob":
         die("revision source is not a blob: {}".format(specifier))
     return git_bytes("cat-file", "blob", specifier)
+
+
+def evidence_tag(version: str) -> str:
+    if not isinstance(version, str) or not version:
+        die("replacement plugin version is unavailable")
+    return "workbench-equivalence-v{}".format(version)
+
+
+def require_evidence_tag(revision: str, version: str) -> str:
+    tag = evidence_tag(version)
+    resolved = git_bytes(
+        "rev-parse", "--verify", "refs/tags/{}^{{commit}}".format(tag)
+    ).decode("ascii").strip()
+    if resolved != revision:
+        die(
+            "evidence tag {} points to {}, expected {}".format(
+                tag, resolved, revision
+            )
+        )
+    return tag
+
+
+def require_bound_worktree(revision: str) -> None:
+    process = subprocess.run(
+        ("git", "-C", str(ROOT), "diff", "--quiet", revision, "--", *BOUND_SOURCE_PATHS)
+    )
+    if process.returncode == 1:
+        die("checked-out evidence sources differ from {}".format(revision))
+    if process.returncode != 0:
+        die("cannot compare checked-out evidence sources to {}".format(revision))
+    untracked = git_bytes(
+        "ls-files", "--others", "--exclude-standard", "--", *BOUND_SOURCE_PATHS
+    )
+    if untracked:
+        die("checked-out evidence sources contain untracked paths")
 
 
 def public_digest(value) -> str:
@@ -294,6 +331,7 @@ def build(replacement_revision: str):
         or contract["engine"] != {"name": "workbench", "version": version}
     ):
         die("public engine manifest and contract identities disagree")
+    require_evidence_tag(replacement_revision, version)
     advertised_capabilities = contract["capabilities"]
     if (
         not isinstance(advertised_capabilities, list)
@@ -368,6 +406,7 @@ def check() -> None:
 
 
 def generate(output: pathlib.Path, replacement_revision: str) -> None:
+    require_bound_worktree(replacement_revision)
     receipt = build(replacement_revision)
     if output.resolve() != (KIT_ROOT / RECEIPT_RELATIVE).resolve():
         die("output must be {}".format(KIT_ROOT / RECEIPT_RELATIVE))

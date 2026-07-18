@@ -42,6 +42,9 @@ receipt = json.loads(
     .read_text(encoding="utf-8")
 )
 revision = receipt["replacement_plugin"]["source_revision"]
+version = receipt["replacement_plugin"]["plugin_version"]
+expected_tag = "workbench-equivalence-v" + version
+assert module.require_evidence_tag(revision, version) == expected_tag
 
 try:
     module.build("0" * 40)
@@ -72,3 +75,45 @@ assert expected != current, "historical evidence fixture no longer distinguishes
 rows = {item["evidence_id"]: item for item in module.evidence(parent)}
 assert rows["three-plugin-public-e2e"]["digest"] == expected
 PY
+
+TAG="$(python3 - "$ROOT/plugins/workbench-kit/receipts/workbench-ffb426f1-equivalence.json" <<'PY'
+import json
+import sys
+
+receipt = json.load(open(sys.argv[1], encoding="utf-8"))
+print("workbench-equivalence-v" + receipt["replacement_plugin"]["plugin_version"])
+PY
+)"
+REVISION="$(git -C "$ROOT" rev-parse "refs/tags/$TAG^{commit}")"
+RECEIPT_REVISION="$(python3 - "$ROOT/plugins/workbench-kit/receipts/workbench-ffb426f1-equivalence.json" <<'PY'
+import json
+import sys
+
+print(json.load(open(sys.argv[1], encoding="utf-8"))["replacement_plugin"]["source_revision"])
+PY
+)"
+[ "$REVISION" = "$RECEIPT_REVISION" ] || {
+  echo "evidence tag does not preserve the receipt source revision" >&2
+  exit 1
+}
+
+# Simulate a post-squash remote with only main plus the permanent evidence tag. The task
+# branch is intentionally absent; full-history/tag fetch must still make the receipt auditable.
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/workbench-receipt-fresh.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+git init -q --bare "$TMP/origin.git"
+git -C "$ROOT" push -q "$TMP/origin.git" \
+  "HEAD:refs/heads/main" "refs/tags/$TAG:refs/tags/$TAG"
+git init -q "$TMP/checkout"
+git -C "$TMP/checkout" remote add origin "$TMP/origin.git"
+git -C "$TMP/checkout" fetch -q origin \
+  '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+git -C "$TMP/checkout" checkout -q --detach origin/main
+PYTHONDONTWRITEBYTECODE=1 python3 \
+  "$TMP/checkout/scripts/equivalence-receipt.py" check
+
+if find "$ROOT/plugins/workbench-kit" "$ROOT/scripts" -type d -name __pycache__ \
+  -print -quit | grep -q .; then
+  echo "equivalence receipt audit left Python bytecode cache in the repository" >&2
+  exit 1
+fi

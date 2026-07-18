@@ -37,21 +37,44 @@ import pathlib
 import sys
 
 release = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-steps = [
+prepare = release.split("\n  prepare)\n", 1)[1].split("\n    ;;", 1)[0]
+prepare_steps = [
     'bash scripts/check-release-contract.sh --changelog-only "$V"',
     'bash scripts/bump-version.sh "$V"',
+    'bash scripts/check-release-contract.sh "$V"',
+]
+positions = [prepare.find(step) for step in prepare_steps]
+if -1 in positions or positions != sorted(positions):
+    raise SystemExit(
+        f"release prepare order is not changelog -> bump -> contract: {positions}"
+    )
+if "bash tests/run.sh" in prepare:
+    raise SystemExit("release prepare runs the receipt-dependent full suite")
+
+finalize = release.split("\n  finalize)\n", 1)[1].split("\n    ;;", 1)[0]
+finalize_steps = [
+    'git fetch --quiet origin "refs/tags/$TAG:refs/tags/$TAG"',
+    'REVISION="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"',
+    'PYTHONDONTWRITEBYTECODE=1 python3 scripts/equivalence-receipt.py generate',
     'bash tests/run.sh',
 ]
-positions = [release.find(step) for step in steps]
+positions = [finalize.find(step) for step in finalize_steps]
 if -1 in positions or positions != sorted(positions):
-    raise SystemExit(f"release prep order is not changelog -> bump -> tests: {positions}")
+    raise SystemExit(
+        f"release finalize order is not remote tag -> receipt -> tests: {positions}"
+    )
 
 guide = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 cut = guide.split("## Cut a release", 1)[1].split("\n## ", 1)[0]
-promote = cut.find("Promote `## [Unreleased]`")
-prepare = cut.find("`scripts/release.sh X.Y.Z`")
-if promote < 0 or prepare < 0 or promote >= prepare:
-    raise SystemExit("RELEASING must promote CHANGELOG before running release.sh")
+guide_steps = [
+    "Promote `## [Unreleased]`",
+    "`scripts/release.sh prepare X.Y.Z`",
+    "`workbench-equivalence-vX.Y.Z`",
+    "`scripts/release.sh finalize X.Y.Z`",
+]
+positions = [cut.find(step) for step in guide_steps]
+if -1 in positions or positions != sorted(positions):
+    raise SystemExit(f"RELEASING two-phase evidence order is invalid: {positions}")
 
 ci = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 checks = ci.split("\n  checks:\n", 1)[1].split("\n  upgrade-latest:\n", 1)[0]
